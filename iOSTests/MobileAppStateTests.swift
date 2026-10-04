@@ -276,6 +276,13 @@ private func waitUntil(
             ) == .signedIn)
     }
 
+    /// VoiceOver read the raw key while the session restored: the package catalog has no entry for it.
+    @Test func restoringSessionAnnouncesTranslatedText() {
+        let label = MobileRootPresentation.restoringSessionAccessibilityLabel
+        #expect(!label.isEmpty)
+        #expect(label != "auth.checking_session")
+    }
+
     @Test func failedSignOutCleanupReplacesTheWorkingCoverUntilRetry() {
         #expect(
             MobileSignOutCleanupPresentation.resolve(

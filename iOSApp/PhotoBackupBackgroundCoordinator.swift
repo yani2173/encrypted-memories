@@ -117,6 +117,16 @@ final class PhotoBackupBackgroundCoordinator {
         stopScheduling(detachController: true)
     }
 
+    /// Turns backup on from the settings screen. A stop cancelled the background request and detached the
+    /// controller; turning backup on again re-arms both, or backup would run only in the foreground until the
+    /// next launch.
+    func enableBackup(controller: PhotoLibraryBackupController) async {
+        await controller.enableBackup()
+        backupResumed(controller: controller)
+    }
+
+    var isSchedulingStopped: Bool { schedulingStopped }
+
     private func stopScheduling(detachController: Bool) {
         schedulingStopped = true
         scheduler.cancel(taskRequestWithIdentifier: Self.processingTaskIdentifier)

@@ -8,7 +8,7 @@ Encrypted Memories uses one shared backup engine across Mac, iPhone, and iPad. T
 2. Enable Photos backup.
 3. Grant full or limited Photos access.
 4. Keep the app open for the first large pass when practical.
-5. Review progress and any items that need attention.
+5. Review progress and any items that need attention. On iPhone and iPad, **Upload Queue** lists the files that upload now and the files that wait their turn.
 
 The queue is durable. It includes streamed hashing, duplicate detection, retry state, crash recovery, and remote reconciliation.
 

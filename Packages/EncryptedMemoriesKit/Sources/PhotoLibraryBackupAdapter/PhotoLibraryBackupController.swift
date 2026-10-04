@@ -495,6 +495,31 @@ public final class PhotoLibraryBackupController {
         }
     }
 
+    /// The files that upload now and the files that wait, read off the main actor.
+    public func queueList(limit: Int = 200) async -> BackupQueueList {
+        guard let queueStore else { return .empty }
+        return await Task.detached(priority: .utility) {
+            BackupQueueList(rows: queueStore.queueWorkRows(), limit: limit)
+        }.value
+    }
+
+    /// Gives `apply` the queue now and, while a pass runs, again after each `interval`, so an open queue follows
+    /// the files as they upload.
+    public func followQueueList(
+        limit: Int = 200, interval: Duration = .seconds(2), _ apply: (BackupQueueList) -> Void
+    ) async {
+        let list = await queueList(limit: limit)
+        guard !Task.isCancelled else { return }
+        apply(list)
+        while isSyncing {
+            try? await Task.sleep(for: interval)
+            guard !Task.isCancelled else { return }
+            let list = await queueList(limit: limit)
+            guard !Task.isCancelled else { return }
+            apply(list)
+        }
+    }
+
     /// Counts the person's actions on the problem list, so a read that an action overtakes is not shown.
     private(set) var problemListChanges: UInt64 = 0
 
@@ -1002,6 +1027,34 @@ public final class PhotoLibraryBackupController {
             }
             isEnabled = true
             isUserPaused = false
+            accessState = .denied
+            refreshFromQueue()
+            return true
+        }
+
+        /// Seeds one uploading, one waiting, and one problem photo. The pause keeps a pass from changing the rows.
+        public func installQueueFixtureForTesting() -> Bool {
+            guard let queueStore else { return false }
+            let now = Date()
+            let rows: [(String, UploadBackupSyncQueueState, String?)] = [
+                ("Uploading fixture.heic", .uploading, nil),
+                ("Waiting fixture.heic", .queuedForUpload, nil),
+                (
+                    "Network fixture.heic", .discovered,
+                    BackupIssueRecord(kind: .network, detail: "Fixture technical detail").persistedValue
+                ),
+            ]
+            for (index, (filename, state, lastError)) in rows.enumerated() {
+                let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "fixture-queue-\(index)")
+                guard
+                    queueStore.upsert(
+                        .init(
+                            source: source, revision: .init(rawValue: 1), originalFilename: filename, state: state,
+                            lastError: lastError, updatedAt: now))
+                else { return false }
+            }
+            isEnabled = true
+            isUserPaused = true
             accessState = .denied
             refreshFromQueue()
             return true

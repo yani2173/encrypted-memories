@@ -101,6 +101,8 @@ import UploadCore
                 installDeletedBackupFixture()
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesFailedBackupFixture") {
                 installDeletedBackupFixture(failedItems: true)
+            } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesBackupQueueFixture") {
+                installDeletedBackupFixture(queue: true)
             }
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncReasonsFixture") {
                 installAlbumSyncReasonsFixture()
@@ -130,7 +132,7 @@ import UploadCore
             }
         }
 
-        private func installDeletedBackupFixture(failedItems: Bool = false) {
+        private func installDeletedBackupFixture(failedItems: Bool = false, queue: Bool = false) {
             let directory = cacheDirectory.appendingPathComponent("backup", isDirectory: true)
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -144,7 +146,9 @@ import UploadCore
                     identityResolver: MobileFixtureBackupBackend(), uploader: MobileFixtureBackupBackend(),
                     replacementJournal: journal)
                 let installed: Bool
-                if failedItems {
+                if queue {
+                    installed = controller.installQueueFixtureForTesting()
+                } else if failedItems {
                     let arguments = ProcessInfo.processInfo.arguments
                     let kinds: [BackupIssueKind]
                     if arguments.contains("-EncryptedMemoriesNetworkOnlyBackupFixture") {

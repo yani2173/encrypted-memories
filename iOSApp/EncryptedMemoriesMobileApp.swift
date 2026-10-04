@@ -206,6 +206,9 @@ enum MobileRootPresentation: Equatable {
         if isCheckingSession { return .restoringSession }
         return hasSession ? .signedIn : .signedOut
     }
+
+    /// VoiceOver label of the restoring screen. The key lives in the app catalog, so `L10n` cannot resolve it.
+    static var restoringSessionAccessibilityLabel: String { String(localized: "auth.checking_session") }
 }
 
 enum MobileSignOutCleanupPresentation: Equatable {
@@ -238,7 +241,7 @@ private struct MobileRootView: View {
             case .restoringSession:
                 MobileLibraryLoadingView(
                     isPresented: true,
-                    accessibilityLabel: L10n.string("auth.checking_session"),
+                    accessibilityLabel: MobileRootPresentation.restoringSessionAccessibilityLabel,
                     activityMessage: "\(L10n.string("library.title_activity")) …",
                     activityState: .working
                 )
