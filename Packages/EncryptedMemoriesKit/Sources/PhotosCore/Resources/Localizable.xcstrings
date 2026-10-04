@@ -5930,6 +5930,213 @@
         "de": { "stringUnit": { "state": "translated", "value": "Vorschläge werden geladen" } },
         "en": { "stringUnit": { "state": "translated", "value": "Loading suggestions" } }
       }
+    },
+    "duplicates.title": {
+      "comment": "Collections and sidebar entry, and the screen title, like Apple Photos.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Duplicates" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate" } }
+      }
+    },
+    "duplicates.merge": {
+      "comment": "Merges one group of duplicates.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merge" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zusammenführen" } }
+      }
+    },
+    "duplicates.merge_all": {
+      "comment": "Toolbar button that merges every group.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merge All" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alle zusammenführen" } }
+      }
+    },
+    "duplicates.merge_all_title %lld": {
+      "comment": "Confirmation title of Merge All. The count is the photos that move to Recently Deleted.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "Merge %lld Duplicate?" } },
+              "other": { "stringUnit": { "state": "translated", "value": "Merge %lld Duplicates?" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Duplikat zusammenführen?" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Duplikate zusammenführen?" } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.merge_all_message %lld": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld photo moves to Recently Deleted. You can restore it there." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld photos move to Recently Deleted. You can restore them there." } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Foto wird in „Zuletzt gelöscht“ bewegt. Du kannst es dort wiederherstellen." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos werden in „Zuletzt gelöscht“ bewegt. Du kannst sie dort wiederherstellen." } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.group_title %lld": {
+      "comment": "Section title of one group of identical photos.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Copy" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Copies" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Kopie" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Kopien" } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.still_checking": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Still checking your library. More duplicates can appear." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Deine Mediathek wird noch geprüft. Weitere Duplikate können erscheinen." } }
+      }
+    },
+    "duplicates.checking_title": {
+      "comment": "Title of the Duplicates screen while no group was found yet and the library is still being checked.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Checking Your Library" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Mediathek wird geprüft" } }
+      }
+    },
+    "duplicates.none_title": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "No Duplicates" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Keine Duplikate" } }
+      }
+    },
+    "duplicates.none_message": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Your library has no exact copies." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Deine Mediathek enthält keine exakten Kopien." } }
+      }
+    },
+    "duplicates.load_failed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The duplicates could not be loaded." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Duplikate konnten nicht geladen werden." } }
+      }
+    },
+    "duplicates.member_kept": {
+      "comment": "Accessibility label of the photo that a merge keeps.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photo to keep" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto, das bleibt" } }
+      }
+    },
+    "duplicates.member_duplicate": {
+      "comment": "Accessibility label of a photo that a merge moves to Recently Deleted.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Duplicate" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikat" } }
+      }
+    },
+    "duplicates.member_hint": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Keeps this photo instead." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Behält stattdessen dieses Foto." } }
+      }
+    },
+    "duplicates.kept_title %lld": {
+      "comment": "Alert title after a merge that left duplicates in the library.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Duplicate Kept" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Duplicates Kept" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Duplikat behalten" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Duplikate behalten" } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.kept_reason_related_file": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "A file such as a Live Photo video exists only with the duplicate." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eine Datei wie ein Live-Photo-Video gibt es nur beim Duplikat." } }
+      }
+    },
+    "duplicates.kept_reason_pending_edit": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "An edit is still being backed up." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eine Bearbeitung wird noch gesichert." } }
+      }
+    },
+    "duplicates.kept_reason_needed_here": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The backup of this device still needs it." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung dieses Geräts braucht es noch." } }
+      }
+    },
+    "duplicates.kept_reason_unreadable": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "It could not be read. Try again later." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es konnte nicht gelesen werden. Versuche es später erneut." } }
+      }
+    },
+    "duplicates.not_merged_title": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not Merged" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht zusammengeführt" } }
+      }
+    },
+    "duplicates.kept_photo_unreadable": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The photo to keep could not be read. Choose another one or try again later." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Foto, das bleiben soll, konnte nicht gelesen werden. Wähle ein anderes oder versuche es später erneut." } }
+      }
+    },
+    "duplicates.merge_failed_title": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merge Failed" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zusammenführen fehlgeschlagen" } }
+      }
+    },
+    "duplicates.merge_failed_message": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Check your connection and try again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Prüfe deine Verbindung und versuche es erneut." } }
+      }
     }
   },
   "version": "1.0"

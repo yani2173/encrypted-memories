@@ -58,7 +58,18 @@ extension PhotoCarryOverRemote {
         from earlier: [PhotoUID], to replacement: PhotoUID, ownVolumeID: String, albums: any SeriesAlbumCarryOver
     ) async throws {
         guard !earlier.isEmpty else { return }
-        let favorites = try await favoriteUIDs(among: earlier + [replacement])
+        try await carryOver(
+            from: earlier, to: replacement, ownVolumeID: ownVolumeID, albums: albums,
+            favorites: favoriteUIDs(among: earlier + [replacement]))
+    }
+
+    /// `carryOver(from:to:ownVolumeID:albums:)` with the favorites among `earlier` and `replacement` that the caller
+    /// read before, so one listing serves many carry-overs.
+    public func carryOver(
+        from earlier: [PhotoUID], to replacement: PhotoUID, ownVolumeID: String, albums: any SeriesAlbumCarryOver,
+        favorites: Set<PhotoUID>
+    ) async throws {
+        guard !earlier.isEmpty else { return }
         if !favorites.contains(replacement), earlier.contains(where: favorites.contains) {
             try await markFavorite([replacement])
         }

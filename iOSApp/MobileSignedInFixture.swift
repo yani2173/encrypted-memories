@@ -107,6 +107,10 @@ import UploadCore
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncReasonsFixture") {
                 installAlbumSyncReasonsFixture()
             }
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesFixture") {
+                runtime.libraryModel.installIsolatedDuplicatesForTesting(
+                    MobileFixtureDuplicates(groups: sections.prefix(2).map { $0.items.prefix(2).map(\.uid) }))
+            }
             runtime.sessionModel.installIsolatedSession(session)
         }
 
@@ -227,6 +231,35 @@ import UploadCore
         func childMainLinkIDs(albumID: String) async throws -> Set<String> { throw MobileFixtureError.unavailable }
         func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
             throw MobileFixtureError.unavailable
+        }
+    }
+
+    /// Groups of exact copies in memory. A merge keeps the chosen photo and moves the other copies to Trash.
+    final class MobileFixtureDuplicates: ExactDuplicateMerging, @unchecked Sendable {
+        private let lock = NSLock()
+        private var groups: [ExactDuplicateGroup]
+
+        init(groups members: [[PhotoUID]]) {
+            groups = members.enumerated().map { index, members in
+                ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
+            }
+        }
+
+        func duplicateGroups() async throws -> ExactDuplicateScan {
+            ExactDuplicateScan(groups: lock.withLock { groups }, coverage: .complete)
+        }
+
+        func rankedMembers(of groups: [ExactDuplicateGroup]) async throws -> [String: [PhotoUID]] {
+            Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) })
+        }
+
+        func merge(
+            _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
+        ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+            lock.withLock { groups.removeAll { group in requests.contains { $0.group.id == group.id } } }
+            return requests.map { group, kept in
+                .success(.merged(kept: kept, trashed: group.members.filter { $0 != kept }, keptDuplicates: [:]))
+            }
         }
     }
 

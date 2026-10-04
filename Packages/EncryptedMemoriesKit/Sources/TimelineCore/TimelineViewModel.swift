@@ -463,7 +463,16 @@ public final class TimelineViewModel {
     /// Commits a successful server-side trash mutation across the whole-library snapshot and every cached route.
     /// The O(library-size) transforms run off-main; the actor publishes only the completed projections.
     public func commitTrash(_ items: [PhotoItem]) async {
-        let uids = Set(items.map(\.uid))
+        await commitTrash(Set(items.map(\.uid)), knownItems: items)
+    }
+
+    /// Commits a trash that another feature already did on the server, such as the merge of duplicates. A photo that
+    /// no listing has shown yet still stays hidden from every later listing; Recently Deleted gets the known ones.
+    public func commitTrash(uids: Set<PhotoUID>) async {
+        await commitTrash(uids, knownItems: wholeLibraryItemsForViewer.filter { uids.contains($0.uid) })
+    }
+
+    private func commitTrash(_ uids: Set<PhotoUID>, knownItems items: [PhotoItem]) async {
         guard !uids.isEmpty else { return }
         removals.trashed(uids)
         await afterEarlierCommits { [self] in await projectTrash(items, uids: uids) }
@@ -840,6 +849,7 @@ public final class TimelineViewModel {
         case .sharedAlbum(let volumeID, let nodeID, let title): return "shared-album:\(title):\(volumeID)~\(nodeID)"
         case .trash: return "trash"
         case .map: return "map"
+        case .duplicates: return "duplicates"
         }
     }
 

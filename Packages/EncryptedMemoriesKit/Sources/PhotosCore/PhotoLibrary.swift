@@ -55,6 +55,8 @@ public enum PhotoFilter: Equatable, Hashable, Sendable {
     case trash
     /// The whole-library Map view - no timeline load; the detail shows the map instead.
     case map
+    /// Groups of exact copies - no timeline load; the detail shows the Duplicates screen instead.
+    case duplicates
 
     /// True for routes whose items live on another account's volume. Every mutation (trash, favorite,
     /// album membership, cover) targets the owned volume and must stay hidden on these routes.
@@ -66,7 +68,7 @@ public enum PhotoFilter: Equatable, Hashable, Sendable {
     /// Whether selecting this route should load timeline sections into the Metal grid.
     public var hasTimeline: Bool {
         switch self {
-        case .map: false
+        case .map, .duplicates: false
         default: true
         }
     }
@@ -118,6 +120,12 @@ public extension PhotoFilter {
                 title: L10n.string("empty.no_photos_title"),
                 description: L10n.string("empty.no_photos_description"),
                 systemImage: "map"
+            )
+        case .duplicates:
+            PhotoFilterEmptyStateCopy(
+                title: L10n.string("duplicates.none_title"),
+                description: L10n.string("duplicates.none_message"),
+                systemImage: "square.on.square"
             )
         }
     }

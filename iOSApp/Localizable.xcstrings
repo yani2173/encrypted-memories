@@ -462,6 +462,23 @@
         }
       }
     },
+    "collections.section_utilities": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Werkzeuge"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Utilities"
+          }
+        }
+      }
+    },
     "collections.trash": {
       "extractionState": "manual",
       "localizations": {

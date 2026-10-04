@@ -62,6 +62,9 @@ struct MainView: View {
     @State private var showAlbumDestination = false
     @State private var selection: PhotoFilter = .all
     @State private var mapClusterPresentation: MapClusterPresentation?
+    /// The Duplicates route of this account. Nil while the account cannot merge duplicates.
+    @State private var duplicates: ExactDuplicatesModel?
+    @State private var confirmsDuplicateMergeAll = false
     @State private var mapClusterPageIndex = 0
     @State private var mapClusterRouteGeneration = 0
     @State private var routeScrollGeneration = 0
@@ -215,6 +218,8 @@ struct MainView: View {
                         canAddPhotos: albumActions.canAddPhotos && !albumActions.isWorking,
                         thumbnailFeed: feed,
                         sourceAnalysisRevision: model.sourceAnalysisRevision,
+                        showsDuplicates: duplicates != nil,
+                        duplicateCount: duplicates?.knownDuplicateCount,
                         selection: $selection,
                         onRetryAlbums: { Task { await loadAlbums() } },
                         onRetrySharedAlbums: { Task { await albumActions.refreshSharedAlbums() } },
@@ -234,6 +239,7 @@ struct MainView: View {
                 }
             }
             .task(id: model.albumCatalogRevision) { await loadAlbums() }
+            .task(id: ObjectIdentifier(facade)) { await installDuplicates() }
             .onAppear {
                 attachOfflineManager()
                 attachPendingGrid()
@@ -377,6 +383,19 @@ struct MainView: View {
                             onSelectCluster: { uids, coordinate in showMapCluster(uids: uids, coordinate: coordinate) })
                     }
                 }
+                .padding(.leading, leadingObstructionInset)
+                .animation(Self.sidebarAnimation, value: leadingObstructionInset)
+                .ignoresSafeArea()
+            }
+
+            if selection == .duplicates, let duplicates {
+                MacDuplicatesView(
+                    model: duplicates,
+                    thumbnailFeed: feed,
+                    sourceAnalysisRevision: model.sourceAnalysisRevision,
+                    topInset: topBarInset,
+                    confirmsMergeAll: $confirmsDuplicateMergeAll
+                )
                 .padding(.leading, leadingObstructionInset)
                 .animation(Self.sidebarAnimation, value: leadingObstructionInset)
                 .ignoresSafeArea()
@@ -1224,6 +1243,7 @@ struct MainView: View {
         case .sharedAlbum(_, _, let name): return name
         case .trash: return String(localized: "sidebar.recently_deleted")
         case .map: return "Map"
+        case .duplicates: return L10n.string("duplicates.title")
         }
     }
 
@@ -1621,6 +1641,30 @@ struct MainView: View {
                 albumMembershipFailureMessage = L10n.string("albums.remove_photos_failed_message")
             }
         }
+    }
+
+    /// Builds the Duplicates route for this account, or leaves it when the account cannot merge duplicates.
+    private func installDuplicates() async {
+        duplicates = facade.exactDuplicates.map { finder in
+            ExactDuplicatesModel(finder: finder) { trashed in await commitDuplicateTrash(trashed) }
+        }
+        guard let duplicates else {
+            if selection == .duplicates { selection = .all }
+            return
+        }
+        await duplicates.loadCountIfNeeded()
+    }
+
+    /// The finder already moved the copies to Recently Deleted; the library and its derived state stop showing them.
+    private func commitDuplicateTrash(_ uids: [PhotoUID]) async {
+        let trashed = Set(uids)
+        await timelineModel.commitTrash(uids: trashed)
+        await OfflineLibraryManager.shared.reconcileLocations(
+            items: timelineModel.wholeLibraryItemsForViewer,
+            metadata: backend,
+            recrawlRestoredItems: false
+        )
+        await reloadFavorites(trashed: trashed)
     }
 
     private func trashPhotos(_ items: [PhotoItem], closeViewer: Bool) {
@@ -2245,6 +2289,14 @@ struct MainView: View {
             // search field. Fixed spacers only separate independent primary commands.
             if case .album = selection {
                 ToolbarItem(placement: .primaryAction) { albumActionsToolbarMenu }
+                ToolbarSpacer(.fixed, placement: .primaryAction)
+            }
+            if selection == .duplicates, let duplicates {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(L10n.string("duplicates.merge_all")) { confirmsDuplicateMergeAll = true }
+                        .disabled(!duplicates.canMerge)
+                        .accessibilityIdentifier("duplicates.mergeAll")
+                }
                 ToolbarSpacer(.fixed, placement: .primaryAction)
             }
             ToolbarItem(placement: .primaryAction) { uploadToolbarMenu }

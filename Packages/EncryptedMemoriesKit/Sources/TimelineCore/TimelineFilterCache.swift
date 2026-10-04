@@ -91,7 +91,7 @@ public struct TimelineFilterCache: Sendable {
 
     private static func isCacheable(_ route: PhotoFilter) -> Bool {
         switch route {
-        case .all, .map: false
+        case .all, .map, .duplicates: false
         default: true
         }
     }
