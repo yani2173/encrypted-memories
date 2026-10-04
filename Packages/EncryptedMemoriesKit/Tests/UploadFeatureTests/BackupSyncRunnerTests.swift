@@ -383,6 +383,31 @@ final class SourceRemovedDuringResolveResolver: BackupResourceResolving, @unchec
     }
 }
 
+/// Adds source tags to the scripted resource, as the PhotoKit resolver does for an Apple Photos favorite.
+final class TaggingBackupResolver: BackupResourceResolving, @unchecked Sendable {
+    private let inner: ScriptedBackupResolver
+    private let tags: [Int]
+
+    init(inner: ScriptedBackupResolver, tags: [Int]) {
+        self.inner = inner
+        self.tags = tags
+    }
+
+    func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+        guard let resolved = try await inner.resolve(entry) else { return nil }
+        return BackupResolvedResource(
+            candidate: resolved.candidate,
+            descriptor: resolved.descriptor,
+            mediaType: resolved.mediaType,
+            additionalMetadata: resolved.additionalMetadata,
+            tags: tags,
+            captureDate: resolved.captureDate,
+            secondaries: resolved.secondaries,
+            cleanup: resolved.cleanup
+        )
+    }
+}
+
 /// Shared ordered event log for cross-component ordering assertions.
 final class BackupEventLog: @unchecked Sendable {
     private let lock = NSLock()
@@ -1752,6 +1777,28 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
+    /// Optimize Storage: the identity pass downloads the original from iCloud and stages it. When Proton already
+    /// holds the same bytes, nothing uploads and the staged copy leaves the device.
+    func testAnICloudOriginalAlreadyInProtonIsNotUploadedAndItsStagedCopyIsReleased() async throws {
+        let entry = seedEntry("icloud-duplicate.heic")
+        let hashes = expectedHashes(id: "icloud-duplicate.heic")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .active, linkID: "remote-1"
+            )
+        ]
+        // Without a removal, the wrapper only counts the release of the staged files.
+        let staging = SourceRemovedDuringResolveResolver(inner: resolver)
+        let runner = makeRunner(resolver: staging)
+
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .alreadyBackedUp)
+        XCTAssertTrue(uploader.requests.isEmpty, "a photo already in Proton must not upload again")
+        XCTAssertEqual(progress.alreadyBackedUp, 1)
+        XCTAssertEqual(staging.cleanupCount, 1, "the staged iCloud original must not stay on the device")
+    }
+
     func testDraftBlocksWithBackoffAndNeverCountsAsBackedUp() async throws {
         let entry = seedEntry("draft.jpg")
         let hashes = expectedHashes(id: "draft.jpg")
@@ -1875,6 +1922,22 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.backedUp, 1)
         XCTAssertEqual(uploader.requests.count, 1)
         XCTAssertTrue(try XCTUnwrap(uploader.requests.first).overrideExistingDraft)
+    }
+
+    func testApplePhotosTagsReachTheUploadOfTheMainPhoto() async throws {
+        let entry = seedEntry("favorite-screenshot.png")
+        let tags = [PhotoTag.favorites.rawValue, PhotoTag.screenshots.rawValue]
+        let runner = makeRunner(resolver: TaggingBackupResolver(inner: resolver, tags: tags))
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.map(\.tags), [tags], "the photo must land in Favorites and Screenshots")
+    }
+
+    func testCompoundTagsJoinTheSourceTagsOnce() {
+        XCTAssertEqual(BackupSyncRunner.primaryTags(for: [], sourceTags: [1, 0, 1]), [0, 1])
+        XCTAssertEqual(BackupSyncRunner.primaryTags(for: []), [])
     }
 
     func testActiveDuplicateBecomesAlreadyBackedUpWithoutUpload() async throws {

@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import PhotosCore
+import UniformTypeIdentifiers
 import UploadCore
 import os
 
@@ -83,6 +84,13 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         let additionalMetadata = try PhotoLibraryUploadMetadataBuilder.metadata(
             for: asset,
             cloudIdentifier: cloudIdentifier
+        )
+        let traits = PhotoBackupAssetTraits(
+            isFavorite: asset.isFavorite,
+            isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
+            isPortrait: asset.mediaSubtypes.contains(.photoDepthEffect),
+            isPanorama: asset.mediaSubtypes.contains(.photoPanorama),
+            isRaw: UTType(primaryResource.uniformTypeIdentifier)?.conforms(to: .rawImage) == true
         )
         // Track deferred exports so the runner can release them as soon as the entry settles.
         let exportedURLs = ExportedURLBox()
@@ -263,6 +271,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 ?? SupportedMedia.mimeType(for: URL(fileURLWithPath: plan.primary.uploadFilename))
                 ?? "application/octet-stream",
             additionalMetadata: additionalMetadata,
+            tags: traits.protonTags,
             captureDate: captureDate,
             secondaries: secondaries,
             photoLibraryEditTime: info.adjustmentTimestamp,

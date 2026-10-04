@@ -332,4 +332,11 @@ public struct PhotoLocationScanProgress: Equatable, Sendable {
         self.noLocation = noLocation
         self.failed = failed
     }
+
+    /// While a scan runs, the share of this run's photos already checked. A map that already shows places uses it
+    /// to say how much is left. Nil when no scan runs or before it knows its photos.
+    public var fractionScanned: Double? {
+        guard phase == .scanning, total > 0 else { return nil }
+        return min(1, max(0, Double(scanned) / Double(total)))
+    }
 }

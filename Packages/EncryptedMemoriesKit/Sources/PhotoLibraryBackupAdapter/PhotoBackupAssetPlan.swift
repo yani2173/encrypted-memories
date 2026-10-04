@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosCore
 import UploadCore
 
 /// PhotoKit-free description of one photo-library asset - the mapper translates `PHAsset` +
@@ -101,6 +102,41 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
                 return false
             }
         }
+    }
+}
+
+/// What Apple Photos knows about an asset beyond its files. The upload carries it as Proton photo tags, so the
+/// photo appears in the matching collection. Live Photos, series, and videos get their tags elsewhere.
+public struct PhotoBackupAssetTraits: Sendable, Equatable {
+    public var isFavorite: Bool
+    public var isScreenshot: Bool
+    public var isPortrait: Bool
+    public var isPanorama: Bool
+    /// The uploaded main file is a RAW image. A RAW file that Photos keeps next to a JPEG is a related file.
+    public var isRaw: Bool
+
+    public init(
+        isFavorite: Bool = false,
+        isScreenshot: Bool = false,
+        isPortrait: Bool = false,
+        isPanorama: Bool = false,
+        isRaw: Bool = false
+    ) {
+        self.isFavorite = isFavorite
+        self.isScreenshot = isScreenshot
+        self.isPortrait = isPortrait
+        self.isPanorama = isPanorama
+        self.isRaw = isRaw
+    }
+
+    public var protonTags: [Int] {
+        var tags: [PhotoTag] = []
+        if isFavorite { tags.append(.favorites) }
+        if isScreenshot { tags.append(.screenshots) }
+        if isPortrait { tags.append(.portraits) }
+        if isPanorama { tags.append(.panoramas) }
+        if isRaw { tags.append(.raw) }
+        return tags.map(\.rawValue)
     }
 }
 

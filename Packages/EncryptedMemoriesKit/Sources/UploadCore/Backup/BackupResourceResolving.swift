@@ -107,6 +107,9 @@ public struct BackupResolvedResource: Sendable {
     public let descriptor: UploadResourceDescriptor
     public let mediaType: String
     public let additionalMetadata: [PhotoUploadAdditionalMetadata]
+    /// Proton tags that the source already knows for the main photo, such as an Apple Photos favorite. The runner
+    /// adds the tags of the compound (Live Photo, series); the transport adds the video tag.
+    public let tags: [Int]
     /// Best local capture-time evidence (file creation date for folder sync, PHAsset creation
     /// date for photo-library assets) - drives the remote timeline placement.
     public let captureDate: Date
@@ -129,6 +132,7 @@ public struct BackupResolvedResource: Sendable {
         descriptor: UploadResourceDescriptor,
         mediaType: String,
         additionalMetadata: [PhotoUploadAdditionalMetadata] = [],
+        tags: [Int] = [],
         captureDate: Date,
         secondaries: [BackupSecondaryResource] = [],
         photoLibraryEditTime: Date? = nil,
@@ -160,6 +164,7 @@ public struct BackupResolvedResource: Sendable {
             originalSHA1Hex: originals)
         self.mediaType = mediaType
         self.additionalMetadata = additionalMetadata
+        self.tags = tags
         self.captureDate = captureDate
         self.secondaries = secondaries
         if let materializeWithProgress {

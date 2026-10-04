@@ -46,19 +46,27 @@ public actor LocationCrawl {
     private let mergeEvery: Int
     private let saveEvery: Int
     private let logEvery: Int
+    private let progressEvery: Int
+    private let probeConcurrency: Int
 
+    /// `probeConcurrency` probes run at once; each result is handled as soon as it arrives, one at a time.
+    /// `progressEvery` publishes the scanned count, so a map that already shows places can show what is left.
     public init(
         throttle: Duration = .milliseconds(40),
         backoff: Duration = .milliseconds(500),
         mergeEvery: Int = 50,
         saveEvery: Int = 250,
-        logEvery: Int = 500
+        logEvery: Int = 500,
+        progressEvery: Int = 20,
+        probeConcurrency: Int = 1
     ) {
         self.throttle = throttle
         self.backoff = backoff
         self.mergeEvery = max(1, mergeEvery)
         self.saveEvery = max(1, saveEvery)
         self.logEvery = max(1, logEvery)
+        self.progressEvery = max(1, progressEvery)
+        self.probeConcurrency = max(1, probeConcurrency)
     }
 
     /// Crawl GPS for every UID not already indexed.
@@ -88,6 +96,8 @@ public actor LocationCrawl {
         let mergeEvery = mergeEvery
         let saveEvery = saveEvery
         let logEvery = logEvery
+        let progressEvery = progressEvery
+        let probeConcurrency = probeConcurrency
         let storeSessionLease = store.captureSessionLease()
         let isCurrent: @Sendable () async -> Bool = { [weak self] in
             guard let self else { return false }
@@ -137,6 +147,7 @@ public actor LocationCrawl {
             var pendingNoLocationForPersistence = Set<PhotoUID>()
             var sinceSave = 0
             var sinceLog = 0
+            var sinceProgress = 0
             var failureCategories: [String: Int] = [:]
             var loggedBackoff = false
             var nextIndex = 0
@@ -189,80 +200,114 @@ public actor LocationCrawl {
                 return persisted
             }
 
-            while true {
-                while nextIndex < pending.count {
-                    guard await current() else { return }
-                    while await shouldYield() {
-                        guard await current() else { return }
-                        if !loggedBackoff {
-                            loggedBackoff = true
-                            log(
-                                "[LocationCrawl] backing off (live demand) scanned=\(progress.scanned)/\(progress.total)"
-                            )
-                        }
-                        do {
-                            try await Task.sleep(for: backoff)
-                        } catch {
-                            return
-                        }
-                    }
-                    guard await current() else { return }
-                    if loggedBackoff {
-                        loggedBackoff = false
-                        log("[LocationCrawl] resumed scanned=\(progress.scanned)/\(progress.total)")
-                    }
-
-                    let uid = pending[nextIndex]
-                    nextIndex += 1
-                    guard await current() else { return }
-                    let result = await location(uid)
-                    guard await current() else { return }
-                    switch result {
-                    case .found(let latitude, let longitude):
-                        batch.append(
-                            PhotoCoordinate(
-                                uid: uid,
-                                latitude: latitude,
-                                longitude: longitude,
-                                date: dates[uid] ?? .distantPast
-                            ))
-                    case .noLocation:
-                        let accepted = await index.markNoLocation([uid])
-                        pendingNoLocationForPersistence.formUnion(accepted)
-                        progress.noLocation += 1
-                    case .failed(let category):
-                        progress.failed += 1
-                        if failureCategories[category] != nil || failureCategories.count < 4 {
-                            failureCategories[category, default: 0] += 1
-                        }
-                    }
-                    progress.scanned += 1
-                    sinceSave += 1
-                    sinceLog += 1
-
-                    guard await current() else { return }
-                    if batch.count >= mergeEvery, !(await mergeNow()) { return }
-                    if sinceSave >= saveEvery {
-                        sinceSave = 0
-                        if !batch.isEmpty, !(await mergeNow()) { return }
-                        guard await persistIfCurrent() else { return }
-                        guard await refreshInventoryIfCurrent() else { return }
-                    }
-                    if sinceLog >= logEvery {
-                        sinceLog = 0
-                        guard await current() else { return }
-                        await index.updateScanProgress(progress)
-                        guard await current() else { return }
-                        log(
-                            "[LocationCrawl] scanned=\(progress.scanned)/\(progress.total) found=\(progress.found + batch.count) noLocation=\(progress.noLocation) failed=\(progress.failed)"
-                        )
-                    }
-                    do {
-                        try await Task.sleep(for: throttle)
-                    } catch {
-                        return
+            /// Records one probe result. False ends the run.
+            func handle(_ uid: PhotoUID, _ result: LocationProbeResult) async -> Bool {
+                switch result {
+                case .found(let latitude, let longitude):
+                    batch.append(
+                        PhotoCoordinate(
+                            uid: uid,
+                            latitude: latitude,
+                            longitude: longitude,
+                            date: dates[uid] ?? .distantPast
+                        ))
+                case .noLocation:
+                    let accepted = await index.markNoLocation([uid])
+                    pendingNoLocationForPersistence.formUnion(accepted)
+                    progress.noLocation += 1
+                case .failed(let category):
+                    progress.failed += 1
+                    if failureCategories[category] != nil || failureCategories.count < 4 {
+                        failureCategories[category, default: 0] += 1
                     }
                 }
+                progress.scanned += 1
+                sinceSave += 1
+                sinceLog += 1
+                sinceProgress += 1
+
+                guard await current() else { return false }
+                if batch.count >= mergeEvery, !(await mergeNow()) { return false }
+                if sinceSave >= saveEvery {
+                    sinceSave = 0
+                    if !batch.isEmpty, !(await mergeNow()) { return false }
+                    guard await persistIfCurrent() else { return false }
+                    guard await refreshInventoryIfCurrent() else { return false }
+                }
+                if sinceProgress >= progressEvery {
+                    sinceProgress = 0
+                    guard await current() else { return false }
+                    await index.updateScanProgress(progress)
+                }
+                if sinceLog >= logEvery {
+                    sinceLog = 0
+                    guard await current() else { return false }
+                    await index.updateScanProgress(progress)
+                    guard await current() else { return false }
+                    log(
+                        "[LocationCrawl] scanned=\(progress.scanned)/\(progress.total) found=\(progress.found + batch.count) noLocation=\(progress.noLocation) failed=\(progress.failed)"
+                    )
+                }
+                return await current()
+            }
+
+            /// Probes the pending photos, at most `probeConcurrency` at once, and records each result as it
+            /// arrives. While the crawl yields, no new probe starts; the running ones still finish. False ends the run.
+            func drainPending() async -> Bool {
+                await withTaskGroup(of: (PhotoUID, LocationProbeResult).self, returning: Bool.self) { group in
+                    var inFlight = 0
+                    while nextIndex < pending.count || inFlight > 0 {
+                        guard await current() else {
+                            group.cancelAll()
+                            return false
+                        }
+                        if nextIndex < pending.count, inFlight < probeConcurrency {
+                            if await shouldYield() {
+                                if inFlight == 0 {
+                                    if !loggedBackoff {
+                                        loggedBackoff = true
+                                        log(
+                                            "[LocationCrawl] backing off (live demand) scanned=\(progress.scanned)/\(progress.total)"
+                                        )
+                                    }
+                                    do {
+                                        try await Task.sleep(for: backoff)
+                                    } catch {
+                                        return false
+                                    }
+                                    continue
+                                }
+                            } else {
+                                if loggedBackoff {
+                                    loggedBackoff = false
+                                    log("[LocationCrawl] resumed scanned=\(progress.scanned)/\(progress.total)")
+                                }
+                                let uid = pending[nextIndex]
+                                nextIndex += 1
+                                group.addTask { (uid, await location(uid)) }
+                                inFlight += 1
+                                continue
+                            }
+                        }
+                        guard let next = await group.next() else { break }
+                        inFlight -= 1
+                        guard await current(), await handle(next.0, next.1) else {
+                            group.cancelAll()
+                            return false
+                        }
+                        do {
+                            try await Task.sleep(for: throttle)
+                        } catch {
+                            group.cancelAll()
+                            return false
+                        }
+                    }
+                    return true
+                }
+            }
+
+            while true {
+                guard await drainPending() else { return }
 
                 guard await current() else { return }
                 if !batch.isEmpty, !(await mergeNow()) { return }

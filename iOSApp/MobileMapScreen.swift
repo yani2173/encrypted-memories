@@ -83,6 +83,16 @@ struct MobileMapScreen: View {
                     .ignoresSafeArea()
                 }
             }
+            // Places appear while the scan runs; the banner says how much of the library is still left.
+            .overlay(alignment: .bottom) {
+                let progress = model.locationIndex.scanProgress
+                if !model.locationIndex.coordinates.isEmpty, let fraction = progress.fractionScanned {
+                    MobileMapScanBanner(progress: progress, fraction: fraction)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 12)
+                        .transition(.opacity)
+                }
+            }
             .overlay(alignment: .top) { TopFrostBar(height: topFrostHeight) }
             .task(id: verticalSizeClass) {
                 await Task.yield()
@@ -108,6 +118,31 @@ struct MobileMapScreen: View {
         viewerRouter.presentation = MobileViewerPresentation(
             index: index, items: model.items, context: ViewerCollectionContext(filter: .map)
         )
+    }
+}
+
+/// Scan progress over a map that already shows places: how many photos are checked and how many remain.
+private struct MobileMapScanBanner: View {
+    let progress: PhotoLocationScanProgress
+    let fraction: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L10n.string("map.scanning_title"))
+                .font(.footnote.weight(.semibold))
+            Text(L10n.string("map.scanning_message \(progress.scanned) \(progress.total)"))
+                .font(.caption)
+                .foregroundStyle(ProtonColor.textWeak)
+                .monospacedDigit()
+                .fixedSize(horizontal: false, vertical: true)
+            ProgressView(value: fraction)
+                .tint(ProtonColor.primary)
+        }
+        .padding(14)
+        .frame(maxWidth: 420, alignment: .leading)
+        .glassEffect(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("map.scanProgress")
     }
 }
 
