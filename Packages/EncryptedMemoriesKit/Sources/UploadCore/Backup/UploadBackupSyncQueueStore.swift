@@ -1397,6 +1397,25 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
         )
     }
 
+    /// Rows that upload now or wait their turn. A waiting row with an issue record belongs to the problem list
+    /// (`forEachProblemEntry`), so the queue list leaves it out.
+    public func queueWorkRows() -> [UploadBackupQueueRowState] {
+        rowStates(
+            where: """
+                state IN ('checking', 'hashing', 'duplicateChecking', 'uploading', 'finalizing',
+                          'needsRemoteReconciliation', 'discovered', 'queuedForUpload', 'paused')
+                  AND (state NOT IN ('discovered', 'queuedForUpload') OR last_error IS NULL
+                       OR substr(last_error, 1, ?) != ?)
+                """,
+            bindings: [
+                { (stmt: OpaquePointer?) in
+                    sqlite3_bind_int64(stmt, 1, Int64(BackupIssueRecord.storagePrefix.count))
+                    self.bindText(stmt, 2, BackupIssueRecord.storagePrefix)
+                }
+            ]
+        )
+    }
+
     public func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
         guard !identifiers.isEmpty else { return [] }
         return rowStates(

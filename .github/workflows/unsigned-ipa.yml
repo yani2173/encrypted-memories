@@ -1,0 +1,130 @@
+name: Unsigned iOS IPA
+
+# Builds the iPhone and iPad app without code signing and uploads it as an .ipa artifact.
+# The .ipa cannot be installed as is: sign it with your own certificate first. It is never a release build.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label with Xcode 27 (a GitHub-hosted macOS image, or xcode-27 for the self-hosted runner)
+        required: true
+        default: macos-26
+        type: string
+      configuration:
+        description: Build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unsigned-ipa:
+    name: Build unsigned IPA
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode 27
+        id: xcode
+        run: |
+          set -euo pipefail
+          # Self-hosted runners use /Applications/Xcode.app; GitHub-hosted images also install versioned copies.
+          # The last matching copy wins, so a newer Xcode_27.x replaces Xcode.app or Xcode_27.0.
+          selected=""
+          selected_version=""
+          for app in /Applications/Xcode.app /Applications/Xcode_27*.app; do
+            [[ -x "$app/Contents/Developer/usr/bin/xcodebuild" ]] || continue
+            version="$(DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -version | awk '/^Xcode / { print $2; exit }')"
+            if [[ "$version" == 27 || "$version" == 27.* ]]; then
+              selected="$app"
+              selected_version="$version"
+            fi
+          done
+          if [[ -z "$selected" ]]; then
+            echo "::error title=Xcode 27 missing::No Xcode 27 was found in /Applications on this runner."
+            exit 1
+          fi
+          sudo xcode-select --switch "$selected"
+          echo "DEVELOPER_DIR=$selected/Contents/Developer" >> "$GITHUB_ENV"
+          echo "version=$selected_version" >> "$GITHUB_OUTPUT"
+          echo "Using $selected (Xcode $selected_version)"
+
+      - name: Make sure the iOS platform is installed
+        run: |
+          set -euo pipefail
+          if ! xcodebuild -showsdks | grep -q -- '-sdk iphoneos'; then
+            xcodebuild -downloadPlatform iOS
+          fi
+
+      - uses: ./.github/actions/prepare-apple-build
+        with:
+          xcode-version: ${{ steps.xcode.outputs.version }}
+
+      - name: Build the app without signing
+        env:
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          set -euo pipefail
+          source scripts/build-paths.sh
+          encryptedmemories_acquire_build_lock "unsigned-ipa"
+          xcodebuild build \
+            -project EncryptedMemories.xcodeproj \
+            -scheme EncryptedMemoriesMobile \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.ipa.noindex" \
+            -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
+            -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+            -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENCRYPTED_MEMORIES_BUILD_COMMIT="$GITHUB_SHA"
+
+      - name: Package the IPA
+        id: package
+        env:
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          set -euo pipefail
+          source scripts/build-paths.sh
+          app="$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.ipa.noindex/Build/Products/$CONFIGURATION-iphoneos/EncryptedMemoriesMobile.app"
+          if [[ ! -d "$app" ]]; then
+            echo "::error title=App missing::The build did not produce $app."
+            exit 1
+          fi
+          staging="$RUNNER_TEMP/unsigned-ipa"
+          rm -rf "$staging"
+          mkdir -p "$staging/Payload"
+          ditto "$app" "$staging/Payload/EncryptedMemoriesMobile.app"
+          name="EncryptedMemories-unsigned-${CONFIGURATION}-${GITHUB_SHA::7}.ipa"
+          (cd "$staging" && zip -qry "$name" Payload)
+          echo "path=$staging/$name" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          du -h "$staging/$name"
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
