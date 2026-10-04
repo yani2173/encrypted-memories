@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: Runner label with Xcode 27 (a GitHub-hosted macOS image, or xcode-27 for the self-hosted runner)
+        description: Runner label with Xcode 27 (macos-26 has only Xcode 26)
         required: true
-        default: macos-26
+        default: xcode-27
         type: string
       configuration:
         description: Build configuration
@@ -41,20 +41,24 @@ jobs:
         id: xcode
         run: |
           set -euo pipefail
-          # Self-hosted runners use /Applications/Xcode.app; GitHub-hosted images also install versioned copies.
-          # The last matching copy wins, so a newer Xcode_27.x replaces Xcode.app or Xcode_27.0.
+          # The default Xcode.app comes first: on the xcode-27 image it is the release that the pull request
+          # checks use. Versioned copies are a fallback; beta copies are never chosen.
           selected=""
           selected_version=""
           for app in /Applications/Xcode.app /Applications/Xcode_27*.app; do
+            [[ "$app" == *beta* ]] && continue
             [[ -x "$app/Contents/Developer/usr/bin/xcodebuild" ]] || continue
-            version="$(DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -version | awk '/^Xcode / { print $2; exit }')"
+            version="$(DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -version | awk '/^Xcode / { print $2; exit }')" || continue
             if [[ "$version" == 27 || "$version" == 27.* ]]; then
               selected="$app"
               selected_version="$version"
+              break
             fi
           done
           if [[ -z "$selected" ]]; then
-            echo "::error title=Xcode 27 missing::No Xcode 27 was found in /Applications on this runner."
+            echo "Installed Xcode copies:"
+            ls -d /Applications/Xcode*.app || true
+            echo "::error title=Xcode 27 missing::No Xcode 27 is installed on this runner. Run the workflow with the xcode-27 runner."
             exit 1
           fi
           sudo xcode-select --switch "$selected"
