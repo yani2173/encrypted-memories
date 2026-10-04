@@ -1,5 +1,6 @@
 import Foundation
 import PhotoLibraryBackupAdapter
+import PhotosCore
 import XCTest
 
 @testable import UploadCore
@@ -193,6 +194,15 @@ final class PhotoBackupPlannerTests: XCTestCase {
                 modificationDate: Date(timeIntervalSince1970: 1_700_000_100.1234)
             )
         )
+    }
+
+    func testApplePhotosTraitsBecomeTheProtonTagsOfTheirCollections() {
+        XCTAssertEqual(PhotoBackupAssetTraits().protonTags, [], "a plain photo carries no tag of its own")
+        let everything = PhotoBackupAssetTraits(
+            isFavorite: true, isScreenshot: true, isPortrait: true, isPanorama: true, isRaw: true)
+        XCTAssertEqual(
+            everything.protonTags, [PhotoTag.favorites, .screenshots, .portraits, .panoramas, .raw].map(\.rawValue))
+        XCTAssertEqual(PhotoBackupAssetTraits(isFavorite: true).protonTags, [PhotoTag.favorites.rawValue])
     }
 
     func testUneditedAssetGetsStableFingerprintEvidence() {

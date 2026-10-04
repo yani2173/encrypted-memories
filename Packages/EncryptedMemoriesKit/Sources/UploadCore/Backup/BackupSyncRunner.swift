@@ -989,8 +989,10 @@ public actor BackupSyncRunner {
             fileSize: descriptor.fileSize,
             captureTime: resolved.captureDate,
             modificationDate: resolved.descriptor.modificationDate,
-            tags: Self.primaryTags(for: resolved.secondaries),
-            additionalMetadata: resolved.additionalMetadata + (lineage.map { [$0.additionalMetadata] } ?? [])
+            tags: Self.primaryTags(for: resolved.secondaries, sourceTags: resolved.tags),
+            additionalMetadata: UploadCameraMetadata.completing(
+                resolved.additionalMetadata, fileURL: descriptor.fileURL)
+                + (lineage.map { [$0.additionalMetadata] } ?? [])
         )
         .applying(identity: preflightResult.identity)
         .replacingExistingDraft(preflightResult.decision == .uploadReplacingDraft)
@@ -1600,16 +1602,17 @@ public actor BackupSyncRunner {
             )
     }
 
-    /// Proton tags of a compound's main photo. A Live Photo needs tag 3 and a series needs tag 7 at creation.
-    static func primaryTags(for secondaries: [BackupSecondaryResource]) -> [Int] {
-        var tags: [Int] = []
+    /// Proton tags of a compound's main photo: the source's own tags, plus tag 3 for a Live Photo and tag 7 for a
+    /// series, which the compound needs at creation.
+    static func primaryTags(for secondaries: [BackupSecondaryResource], sourceTags: [Int] = []) -> [Int] {
+        var tags = Set(sourceTags)
         if secondaries.contains(where: { $0.descriptor.source.resource == .livePairedVideo }) {
-            tags.append(PhotoTag.livePhotos.rawValue)
+            tags.insert(PhotoTag.livePhotos.rawValue)
         }
         if secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember }) {
-            tags.append(PhotoTag.bursts.rawValue)
+            tags.insert(PhotoTag.bursts.rawValue)
         }
-        return tags
+        return tags.sorted()
     }
 
     static func secondaryTags(for resource: UploadSourceIdentity.Resource) -> [Int] {
@@ -1652,7 +1655,8 @@ public actor BackupSyncRunner {
             captureTime: secondary.descriptor.modificationDate,
             modificationDate: descriptor.modificationDate,
             tags: Self.secondaryTags(for: descriptor.source.resource),
-            additionalMetadata: secondary.additionalMetadata,
+            additionalMetadata: UploadCameraMetadata.completing(
+                secondary.additionalMetadata, fileURL: descriptor.fileURL),
             mainPhotoUID: primaryUID
         )
         .applying(identity: identity)

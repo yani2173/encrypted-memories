@@ -413,6 +413,79 @@ private func waitUntil(timeout: Duration = .seconds(5), _ condition: @MainActor 
         #expect(await index.scanProgress.found == 0)  // UI: now honestly "no geotagged photos"
     }
 
+    @Test func probesRunInParallelUpToTheLimitAndEveryResultCounts() async throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(dir)
+        let index = await PhotoLocationIndex()
+        let crawl = LocationCrawl(throttle: .zero, mergeEvery: 1, probeConcurrency: 3)
+        let entered = Counter()
+        let gate = Flag()
+        let uids = (0..<5).map { uid("c\($0)") }
+
+        await crawl.start(
+            uids: uids,
+            captureDates: [:],
+            location: { _ in
+                _ = entered.increment()
+                while !gate.get() { try? await Task.sleep(for: .milliseconds(5)) }
+                return .found(latitude: 47.8, longitude: 13.0)
+            },
+            index: index,
+            store: store
+        )
+        try await waitUntil { entered.value() == 3 }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(entered.value() == 3, "three probes run at once, and no more")
+
+        gate.set(true)
+        try await waitUntil { await index.scanProgress.phase == .completed }
+        #expect(await index.coordinates.count == uids.count)
+        #expect(await index.scanProgress.scanned == uids.count)
+        #expect(entered.value() == uids.count, "each photo is probed once")
+    }
+
+    @Test func theScannedCountPublishesBeforeThePlacesOfABatch() async throws {
+        // A map that already shows places must still learn how many photos are left.
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(dir)
+        let index = await PhotoLocationIndex()
+        let crawl = LocationCrawl(throttle: .zero, progressEvery: 2)
+        let gate = Flag()
+        let uids = (0..<5).map { uid("s\($0)") }
+
+        await crawl.start(
+            uids: uids,
+            captureDates: [:],
+            location: { value in
+                if value != uids[0], value != uids[1] {
+                    while !gate.get() { try? await Task.sleep(for: .milliseconds(5)) }
+                }
+                return .noLocation
+            },
+            index: index,
+            store: store
+        )
+        try await waitUntil { await index.scanProgress.scanned == 2 }
+        let midRun = await index.scanProgress
+        #expect(midRun.phase == .scanning)
+        #expect(midRun.total == uids.count)
+        #expect(midRun.fractionScanned == 0.4)
+
+        gate.set(true)
+        try await waitUntil { await index.scanProgress.phase == .completed }
+        #expect(await index.scanProgress.fractionScanned == nil, "a finished scan shows no progress")
+    }
+
+    @Test func scanProgressFractionExistsOnlyWhileAScanRuns() {
+        #expect(PhotoLocationScanProgress(phase: .scanning, scanned: 25, total: 100).fractionScanned == 0.25)
+        #expect(PhotoLocationScanProgress(phase: .scanning, scanned: 120, total: 100).fractionScanned == 1)
+        #expect(PhotoLocationScanProgress(phase: .scanning, scanned: 0, total: 0).fractionScanned == nil)
+        #expect(PhotoLocationScanProgress(phase: .completed, scanned: 100, total: 100).fractionScanned == nil)
+        #expect(PhotoLocationScanProgress(phase: .idle).fractionScanned == nil)
+    }
+
     @Test func visibleDemandPausesCrawlWithoutPermanentStarvation() async throws {
         let dir = tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
