@@ -49,6 +49,19 @@ struct MobileCollectionsScreen: View {
                     }
                 }
 
+                if let duplicates = model.duplicates {
+                    Section(String(localized: "collections.section_utilities")) {
+                        NavigationLink {
+                            MobileDuplicatesScreen(model: duplicates)
+                        } label: {
+                            MobileCollectionRow(systemImage: "square.on.square", title: L10n.string("duplicates.title"))
+                        }
+                        .badge(duplicates.knownDuplicateCount ?? 0)
+                        .accessibilityIdentifier("duplicates.entry")
+                        .task { await duplicates.loadCountIfNeeded() }
+                    }
+                }
+
                 Section(String(localized: "collections.section_albums")) {
                     albumsSection
                 }
@@ -209,12 +222,13 @@ struct MobileCollectionsScreen: View {
     }
 }
 
-/// Row cover shared by owned and shared album rows. Shows a symbol until the thumbnail feed has the
-/// cover in memory or on disk.
-private struct MobileAlbumCover: View {
+/// Row cover shared by owned and shared album rows and the Duplicates screen. Shows a symbol until the
+/// thumbnail feed has the cover in memory or on disk.
+struct MobileAlbumCover: View {
     @Environment(MobileLibraryModel.self) private var model
     let coverUID: PhotoUID?
     let fallbackSystemImage: String
+    var size: CGFloat = 44
     @State private var coverImage: UIImage?
     @State private var loadedCoverUID: PhotoUID?
 
@@ -236,7 +250,7 @@ private struct MobileAlbumCover: View {
                     .foregroundStyle(ProtonColor.primary)
             }
         }
-        .frame(width: 44, height: 44)
+        .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .task(id: CoverLoadKey(uid: coverUID, analysisRevision: model.sourceAnalysisRevision)) {
             if loadedCoverUID != coverUID {

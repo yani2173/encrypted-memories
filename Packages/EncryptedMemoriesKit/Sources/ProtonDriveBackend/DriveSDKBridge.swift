@@ -1414,8 +1414,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             return [
                 TimelineSection(id: "trash", date: photos.first?.captureTime ?? .distantPast, title: "", items: photos)
             ]
-        case .map:
-            return []  // the Map route renders the map, not a timeline
+        case .map, .duplicates:
+            return []  // these routes render the map or the duplicate groups, not a timeline
         }
     }
 

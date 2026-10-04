@@ -104,6 +104,10 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func failNextTrash() { lock.withLock { failTrash = true } }
 
+    /// The next favorites read fails.
+    func failNextFavoritesRead() { lock.withLock { failFavoritesRead = true } }
+    private var failFavoritesRead = false
+
     func configureLineageIndex(incomplete: LineageRead? = nil, failing: Bool = false) {
         lock.withLock {
             incompleteLineageRead = incomplete
@@ -153,6 +157,30 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
     private var pendingTrashAfterDuplicateTrash: String?
 
+    /// The visibility reads that fail after the next duplicate trash, before a read succeeds again.
+    var failingVisibilityReadsAfterDuplicateTrash: Int {
+        get { lock.withLock { visibilityFailuresAfterTrash } }
+        set { lock.withLock { visibilityFailuresAfterTrash = newValue } }
+    }
+    private var visibilityFailuresAfterTrash = 0
+    private var armedVisibilityFailures = 0
+    /// The error of those failing reads.
+    var visibilityErrorAfterDuplicateTrash: any Error {
+        get { lock.withLock { visibilityErrorAfterTrash } }
+        set { lock.withLock { visibilityErrorAfterTrash = newValue } }
+    }
+    private var visibilityErrorAfterTrash: any Error = UploadError.backend(
+        "The scenario visibility read after the trash failed")
+
+    /// The reads of the duplicate merge so far.
+    struct ReadCounts: Equatable {
+        var visibility = 0
+        var compound = 0
+        var favorites = 0
+    }
+    var readCounts: ReadCounts { lock.withLock { counted } }
+    private var counted = ReadCounts()
+
     /// The album read of this photo answers these albums, as a stale membership cache does.
     func reportStaleAlbums(_ albums: Set<SeriesAlbumReference>, of uid: PhotoUID) {
         lock.withLock { staleAlbums[uid.nodeID] = albums }
@@ -160,6 +188,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var staleAlbums: [String: Set<SeriesAlbumReference>] = [:]
 
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        lock.withLock { counted.compound += 1 }
         let compound = try readCompound(ofMainLink: linkID)
         lock.withLock {
             guard pendingTrashAfterCompoundRead == linkID else { return }
@@ -390,7 +419,12 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         guard !linkIDs.isEmpty else { return [:] }
         return try lock.withLock {
+            counted.visibility += 1
             if failVisibilityRead { throw UploadError.backend("The scenario visibility read failed") }
+            if armedVisibilityFailures > 0 {
+                armedVisibilityFailures -= 1
+                throw visibilityErrorAfterTrash
+            }
             var result: [String: RemoteLinkVisibility] = [:]
             for linkID in linkIDs {
                 guard let link = table[linkID], link.state != .deleted else { continue }
@@ -420,7 +454,14 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
-        lock.withLock { Set(uids.filter { table[$0.nodeID]?.favorite == true }) }
+        try lock.withLock {
+            counted.favorites += 1
+            if failFavoritesRead {
+                failFavoritesRead = false
+                throw UploadError.backend("The scenario favorites read failed once")
+            }
+            return Set(uids.filter { table[$0.nodeID]?.favorite == true })
+        }
     }
 
     func markFavorite(_ uids: [PhotoUID]) async throws {
@@ -631,6 +672,8 @@ extension EditScenarioServer: ExactDuplicateRemote {
                 table[other]?.personDeleted = true
                 record("other device trash \(other)")
             }
+            armedVisibilityFailures = visibilityFailuresAfterTrash
+            visibilityFailuresAfterTrash = 0
         }
     }
 

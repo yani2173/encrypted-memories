@@ -220,7 +220,14 @@ final class MobileLibraryModel {
 
     /// The shared backend, exposed so the Albums / Map / Viewer tabs can reuse it without re-building anything.
     private(set) var backend: (any PhotosBackend)?
-    private(set) var facade: ProtonClientFacade?
+    private(set) var facade: ProtonClientFacade? {
+        didSet {
+            guard facade !== oldValue else { return }
+            duplicates = facade?.exactDuplicates.map { makeDuplicatesModel($0) }
+        }
+    }
+    /// The Duplicates screen of this account. Nil while the account cannot merge duplicates.
+    private(set) var duplicates: ExactDuplicatesModel?
     /// Shared create/list/add state machine used by every native album presentation in this session.
     private(set) var albumActions: AlbumActionCoordinator?
     /// Account-scoped Photos-library backup controller shared with macOS.
@@ -564,6 +571,38 @@ final class MobileLibraryModel {
             sessionLease: locationStoreLease
         )
         try requireCurrentMutation(mutationLease)
+    }
+
+    private func makeDuplicatesModel(_ finder: any ExactDuplicateMerging) -> ExactDuplicatesModel {
+        ExactDuplicatesModel(finder: finder) { [weak self] trashed in
+            await self?.removeMergedDuplicates(Set(trashed))
+        }
+    }
+
+    /// The finder already moved the photos to Recently Deleted; the library only stops showing them, and the kept
+    /// photos show the favorite tag that the merge carried over. The optimistic removal advances the timeline
+    /// mutation generation, which rejects an initial load in flight, so it waits for that load. The overlay hides
+    /// the photos from every listing that starts meanwhile.
+    private func removeMergedDuplicates(_ uids: Set<PhotoUID>) async {
+        timelineRemovals.trashed(uids)
+        var awaitedLoad: Task<Void, Never>?
+        while !initialLibraryLoadSettled, let load = loadTask, load != awaitedLoad {
+            awaitedLoad = load
+            await load.value
+        }
+        try? await removeFromVisibleLibrary(uids) {}
+        await reloadFavorites(trashed: uids)
+    }
+
+    /// Reads the favorites again. A failed read only drops the trashed photos from them.
+    private func reloadFavorites(trashed: Set<PhotoUID>) async {
+        guard let backend, let activeSession = session else { return }
+        let loadGeneration = loadToken
+        let read = favoriteState.beginLoad()
+        let loaded = try? await backend.favoriteUIDs()
+        guard loadGeneration == loadToken, session == activeSession else { return }
+        favoriteState.finishLoad(loaded, for: read)
+        if loaded == nil { favoriteState.removeTrashed(trashed) }
     }
 
     func restoreItems(_ items: [PhotoItem]) async throws {
@@ -1946,6 +1985,19 @@ final class MobileLibraryModel {
             favoriteState.reset(keepingFavorites: false)
             timelineRevision &+= 1
             loadState = .contentReady(count: projection.snapshot.items.count)
+        }
+
+        func installIsolatedDuplicatesForTesting(_ finder: any ExactDuplicateMerging) {
+            duplicates = makeDuplicatesModel(finder)
+        }
+
+        /// Stands for an initial library load that runs until `load` returns and settles then.
+        func installIsolatedInitialLoadForTesting(_ load: @escaping @MainActor () async -> Void) {
+            initialLibraryLoadSettled = false
+            loadTask = Task { [weak self] in
+                await load()
+                self?.initialLibraryLoadSettled = true
+            }
         }
 
         func installIsolatedBackupForTesting(_ controller: PhotoLibraryBackupController) {

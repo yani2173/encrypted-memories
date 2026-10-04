@@ -26,6 +26,9 @@ struct SidebarView: View {
     let canAddPhotos: Bool
     let thumbnailFeed: ThumbnailFeed
     let sourceAnalysisRevision: UInt64
+    /// Shows the Duplicates route while the account can merge duplicates.
+    let showsDuplicates: Bool
+    let duplicateCount: Int?
     @Binding var selection: PhotoFilter
     let onRetryAlbums: () -> Void
     let onRetrySharedAlbums: () -> Void
@@ -135,6 +138,12 @@ struct SidebarView: View {
                 }
             }
             Section {
+                if showsDuplicates {
+                    Label(L10n.string("duplicates.title"), systemImage: "square.on.square")
+                        .badge(duplicateCount ?? 0)
+                        .tag(PhotoFilter.duplicates)
+                        .accessibilityIdentifier("duplicates.entry")
+                }
                 Label("sidebar.recently_deleted", systemImage: "trash")
                     .tag(PhotoFilter.trash)
             }
@@ -172,13 +181,14 @@ struct SidebarView: View {
     }
 }
 
-/// Sidebar cover thumbnail shared by owned and shared album rows. Falls back to a symbol until the
-/// thumbnail feed has the cover in memory or on disk.
-private struct AlbumSidebarCover: View {
+/// Sidebar cover thumbnail shared by owned and shared album rows and the Duplicates screen. Falls back to a
+/// symbol until the thumbnail feed has the cover in memory or on disk.
+struct AlbumSidebarCover: View {
     let coverUID: PhotoUID?
     let fallbackSystemImage: String
     let thumbnailFeed: ThumbnailFeed
     let sourceAnalysisRevision: UInt64
+    var size: CGFloat = 32
     @State private var coverImage: NSImage?
     @State private var loadedCoverUID: PhotoUID?
 
@@ -200,7 +210,7 @@ private struct AlbumSidebarCover: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .frame(width: 32, height: 32)
+        .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .task(id: CoverLoadKey(uid: coverUID, analysisRevision: sourceAnalysisRevision)) {
             if loadedCoverUID != coverUID {

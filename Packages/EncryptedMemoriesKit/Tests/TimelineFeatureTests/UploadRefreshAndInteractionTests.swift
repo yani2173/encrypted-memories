@@ -366,6 +366,22 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         XCTAssertEqual(model.allItems.map(\.uid), [a.uid])
     }
 
+    @MainActor
+    func testTrashByIdentityHidesAPhotoThatNoListingShowedYet() async {
+        let a = photo("a", seconds: 1)
+        let b = photo("b", seconds: 2)
+        let model = TimelineViewModel(
+            repository: RefreshRepository(timelines: [[section([a])], [section([a, b])]]),
+            feed: makeFeed().feedCore
+        )
+        await model.load()
+
+        await model.commitTrash(uids: [b.uid])
+        await model.refreshLibrary()
+
+        XCTAssertEqual(model.allItems.map(\.uid), [a.uid], "a later listing must not show the trashed photo")
+    }
+
     func testSingleClickSelectsAndDoesNotOpenViewer() {
         let decision = GridInteractionPolicy.decision(click: .single, selectionMode: false)
         XCTAssertFalse(decision.opensViewer)
