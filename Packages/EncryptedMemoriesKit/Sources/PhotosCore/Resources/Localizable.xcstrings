@@ -1191,6 +1191,68 @@
         "de": { "stringUnit": { "state": "translated", "value": "Fertig" } }
       }
     },
+    "backup.queue_title": {
+      "extractionState": "manual",
+      "comment": "Title of the backup screen that lists the files uploading now and the files waiting their turn.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Upload Queue" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Upload-Warteschlange" } }
+      }
+    },
+    "backup.queue_section_uploading": {
+      "extractionState": "manual",
+      "comment": "Upload queue section with the files the backup works on right now.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Uploading now" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Wird gerade hochgeladen" } }
+      }
+    },
+    "backup.queue_section_waiting": {
+      "extractionState": "manual",
+      "comment": "Upload queue section with the files that wait their turn, in the order the backup takes them.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Up next" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Als Nächstes" } }
+      }
+    },
+    "backup.queue_state_uploading": {
+      "extractionState": "manual",
+      "comment": "Upload queue item state while the bytes of a file upload. The queue shows no per-file percentage.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Uploading…" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Wird hochgeladen …" } }
+      }
+    },
+    "backup.queue_empty": {
+      "extractionState": "manual",
+      "comment": "Shown when the upload queue has no file that uploads or waits.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Nothing waiting to upload" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nichts wartet auf den Upload" } }
+      }
+    },
+    "backup.queue_more %lld": {
+      "extractionState": "manual",
+      "comment": "Last row of the waiting section. %lld is the number of waiting files the list does not show.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld more file waiting" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld more files waiting" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld weitere Datei wartet" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld weitere Dateien warten" } }
+            }
+          }
+        }
+      }
+    },
     "backup.failed_item_dismiss": {
       "extractionState": "manual",
       "comment": "Acknowledges a permanent backup warning without claiming that the item was backed up.",
@@ -4870,6 +4932,22 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Turn off Photos backup" } },
         "de": { "stringUnit": { "state": "translated", "value": "Foto-Backup deaktivieren" } }
+      }
+    },
+    "settings.photos_backup_disable_confirm_title": {
+      "extractionState": "manual",
+      "comment": "Title of the question before Photos backup turns off.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Turn off Photos backup?" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto-Backup deaktivieren?" } }
+      }
+    },
+    "settings.photos_backup_disable_confirm_message": {
+      "extractionState": "manual",
+      "comment": "Message of the question before Photos backup turns off. Turning it off removes nothing.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photos that are already backed up stay in Proton Drive. New photos are not backed up until you turn the backup on again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bereits gesicherte Fotos bleiben in Proton Drive. Neue Fotos werden erst wieder gesichert, wenn du das Backup wieder aktivierst." } }
       }
     },
     "settings.photos_backup_enable": {

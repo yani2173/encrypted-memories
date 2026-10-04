@@ -139,6 +139,7 @@ private struct MobilePhotoBackupSections: View {
     @State var controller: PhotoLibraryBackupController
     @State private var rowModel = BackupStatusRowModel()
     @State private var showFailedList = false
+    @State private var confirmsDisable = false
 
     var body: some View {
         if !controller.isAvailable {
@@ -161,7 +162,7 @@ private struct MobilePhotoBackupSections: View {
                 } else {
                     Button(L10n.string("settings.photos_backup_enable")) {
                         Task {
-                            await controller.enableBackup()
+                            await PhotoBackupBackgroundCoordinator.shared.enableBackup(controller: controller)
                         }
                     }
                     .foregroundStyle(ProtonColor.primary)
@@ -200,6 +201,15 @@ private struct MobilePhotoBackupSections: View {
             }
 
             Section {
+                NavigationLink {
+                    MobileBackupQueueScreen(controller: controller)
+                } label: {
+                    Label(L10n.string("backup.queue_title"), systemImage: "list.bullet")
+                }
+                .accessibilityIdentifier("backup.queue")
+            }
+
+            Section {
                 Toggle(isOn: $keepDisplayAwake) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(L10n.string("settings.photos_backup_keep_display_awake"))
@@ -215,8 +225,23 @@ private struct MobilePhotoBackupSections: View {
 
             Section {
                 Button(L10n.string("settings.photos_backup_disable"), role: .destructive) {
-                    PhotoBackupBackgroundCoordinator.shared.backupStopped()
-                    controller.disableBackup()
+                    confirmsDisable = true
+                }
+                .accessibilityIdentifier("backup.disable")
+                .confirmationDialog(
+                    L10n.string("settings.photos_backup_disable_confirm_title"),
+                    isPresented: $confirmsDisable,
+                    titleVisibility: .visible
+                ) {
+                    Button(L10n.string("settings.photos_backup_disable"), role: .destructive) {
+                        PhotoBackupBackgroundCoordinator.shared.backupStopped()
+                        controller.disableBackup()
+                    }
+                    .accessibilityIdentifier("backup.disable.confirm")
+                    Button(L10n.string("action.cancel"), role: .cancel) {}
+                        .accessibilityIdentifier("backup.disable.cancel")
+                } message: {
+                    Text(L10n.string("settings.photos_backup_disable_confirm_message"))
                 }
             }
         }
@@ -461,6 +486,74 @@ private struct MobilePhotoBackupSections: View {
     private func presentLimitedLibraryPicker() {
         guard let presenter = sceneContext.topmostPresenter else { return }
         PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: presenter)
+    }
+}
+
+/// The files that the backup uploads now and the ones that wait their turn. Photos with a problem stay in the
+/// problem sheet; the shared `BackupQueueList` decides which rows belong here.
+private struct MobileBackupQueueScreen: View {
+    let controller: PhotoLibraryBackupController
+    @State private var list: BackupQueueList?
+
+    var body: some View {
+        Group {
+            if let list {
+                if list.isEmpty {
+                    ContentUnavailableView {
+                        Label(L10n.string("backup.queue_empty"), systemImage: "checkmark.shield")
+                    }
+                } else {
+                    List {
+                        section(.uploading, items: list.uploading, hiddenCount: 0)
+                        section(.waiting, items: list.waiting, hiddenCount: list.hiddenWaitingCount)
+                    }
+                }
+            } else {
+                ProgressView()
+            }
+        }
+        .mobileNavigationTitle(L10n.string("backup.queue_title"))
+        // A new pass restarts the reads; without a pass, the queue changes only through the person's actions.
+        .task(id: controller.isSyncing) {
+            await controller.followQueueList { list = $0 }
+        }
+    }
+
+    @ViewBuilder private func section(
+        _ phase: BackupQueueList.Phase, items: [BackupQueueList.Item], hiddenCount: Int
+    ) -> some View {
+        if !items.isEmpty {
+            Section {
+                ForEach(items) { item in
+                    HStack(spacing: 12) {
+                        Image(systemName: phase == .uploading ? "arrow.up.circle" : "clock")
+                            .foregroundStyle(phase == .uploading ? ProtonColor.primary : ProtonColor.textWeak)
+                            .font(.body)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.filename)
+                                .font(.subheadline)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(item.localizedState)
+                                .font(.caption)
+                                .foregroundStyle(ProtonColor.textWeak)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("backup.queueItem.\(item.filename)")
+                }
+                if hiddenCount > 0 {
+                    Text(L10n.string("backup.queue_more \(hiddenCount)"))
+                        .font(.footnote)
+                        .foregroundStyle(ProtonColor.textWeak)
+                        .monospacedDigit()
+                }
+            } header: {
+                Text(phase.localizedTitle)
+                    .accessibilityIdentifier("backup.queueSection.\(phase.rawValue)")
+            }
+        }
     }
 }
 
