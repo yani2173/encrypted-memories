@@ -18,12 +18,19 @@ final class StubURLProtocol: URLProtocol {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var routes: [String: [(status: Int, body: String)]] = [:]
     nonisolated(unsafe) private static var recorded: [Recorded] = []
+    nonisolated(unsafe) private static var hanging: Set<String> = []
 
     static func reset() {
         lock.withLock {
             routes = [:]
             recorded = []
+            hanging = []
         }
+    }
+
+    /// Register "method /path" as a request that never answers until its task is cancelled.
+    static func hang(_ methodAndPath: String) {
+        lock.withLock { _ = hanging.insert(methodAndPath) }
     }
 
     /// Register a canned response for "method /path" (path without query - matching ignores the query).
@@ -52,6 +59,7 @@ final class StubURLProtocol: URLProtocol {
         Self.lock.withLock {
             Self.recorded.append(Recorded(method: method, path: pathAndQuery, body: body))
         }
+        guard !Self.lock.withLock({ Self.hanging.contains("\(method) \(url.path)") }) else { return }
         let match = Self.lock.withLock { () -> (status: Int, body: String)? in
             let key = "\(method) \(url.path)"
             guard var responses = Self.routes[key], let first = responses.first else { return nil }

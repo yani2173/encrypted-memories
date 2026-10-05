@@ -64,6 +64,73 @@ final class UploadRemoteLineageIndexStoreTests: XCTestCase {
         XCTAssertEqual(store.replacingMainLinkIDs(ofReplacedLink: "old", hashKeyEpoch: "epoch"), ["new"])
     }
 
+    func testRepairSweepReadsBoundedBatchesInOrderAndWaitsAfterItsEnd() throws {
+        let clock = ManualClock()
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url, clock: { clock.now }))
+        defer { store.close() }
+        XCTAssertTrue(
+            store.replaceRows(
+                identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                unresolvedRemoteLinkIDs: ["a", "b", "c", "d", "e"]))
+        func next(after seconds: TimeInterval = 1) -> [String] {
+            clock.advance(seconds)
+            return store.unresolvedLinkIDsForRepair(hashKeyEpoch: "epoch", limit: 2, sweepInterval: 60)
+        }
+        XCTAssertEqual(next(), ["a", "b"])
+        XCTAssertEqual(next(), ["c", "d"])
+        XCTAssertEqual(next(), ["e"])
+        XCTAssertEqual(next(), [], "a finished sweep waits for its interval")
+        XCTAssertEqual(next(after: 59), ["a", "b"])
+        XCTAssertTrue(store.unresolvedLinkIDsForRepair(hashKeyEpoch: "other", limit: 2, sweepInterval: 60).isEmpty)
+        XCTAssertEqual(store.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")), .incomplete)
+    }
+
+    func testANewUnresolvedSetFromAFullBuildIsRepairedAtOnce() throws {
+        let clock = ManualClock()
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url, clock: { clock.now }))
+        defer { store.close() }
+        func next() -> [String] {
+            store.unresolvedLinkIDsForRepair(hashKeyEpoch: "epoch", limit: 10, sweepInterval: 60)
+        }
+        XCTAssertTrue(
+            store.replaceRows(
+                identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: ["a"]))
+        XCTAssertEqual(next(), ["a"])
+        XCTAssertEqual(next(), [], "the sweep has ended")
+        XCTAssertTrue(
+            store.replaceRows(
+                identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "two", unresolvedRemoteLinkIDs: ["b"]))
+        XCTAssertEqual(next(), ["b"])
+        XCTAssertEqual(next(), [], "the sweep has ended")
+        let build = UploadRemoteContentIndexBuildCheckpoint(
+            buildID: "build", eventID: "three", sourceFingerprint: "source", cursor: 0, total: 1, updatedAt: Date())
+        XCTAssertTrue(store.prepareBuild(build, hashKeyEpoch: "epoch"))
+        XCTAssertTrue(
+            store.appendBuild(
+                identities: [], lineage: [], hashKeyEpoch: "epoch", buildID: "build", nextCursor: 1,
+                unresolvedRemoteLinkIDs: ["c"]))
+        XCTAssertTrue(store.finishBuild(build, hashKeyEpoch: "epoch"))
+        XCTAssertEqual(next(), ["c"])
+    }
+
+    func testOnlyTwoOmissionsAtLeastOneIntervalApartSettleALink() throws {
+        let clock = ManualClock()
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url, clock: { clock.now }))
+        defer { store.close() }
+        func settle(omitted: Set<String>, returned: Set<String> = [], after seconds: TimeInterval) -> Set<String> {
+            clock.advance(seconds)
+            return store.linksOmittedTwice(omitted: omitted, returned: returned, hashKeyEpoch: "epoch", interval: 60)
+        }
+        XCTAssertEqual(settle(omitted: ["a", "b"], after: 0), [])
+        XCTAssertEqual(settle(omitted: ["a"], after: 30), [], "too soon after the first omission")
+        XCTAssertEqual(settle(omitted: ["a"], returned: ["b"], after: 30), ["a"])
+        XCTAssertEqual(settle(omitted: ["b"], after: 60), [], "a returned link starts over")
+        XCTAssertEqual(settle(omitted: ["a"], after: 60), [], "a settled link starts over")
+        XCTAssertTrue(
+            store.linksOmittedTwice(omitted: ["b"], returned: [], hashKeyEpoch: "other", interval: 0).isEmpty,
+            "each key epoch keeps its own omissions")
+    }
+
     func testEventRefreshDeletesNamedOwnersAndPreservesOtherLineage() throws {
         let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
         defer { store.close() }
@@ -305,6 +372,13 @@ final class UploadRemoteLineageIndexStoreTests: XCTestCase {
             XCTAssertEqual(sqlite3_column_int(statement, 0), 0)
             sqlite3_finalize(statement)
         }
+    }
+
+    private final class ManualClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = Date(timeIntervalSince1970: 1_000_000)
+        var now: Date { lock.withLock { value } }
+        func advance(_ seconds: TimeInterval) { lock.withLock { value += seconds } }
     }
 
     private func identity(_ link: String, isMain: Bool = true) -> UploadRemoteLinkIdentityRecord {
