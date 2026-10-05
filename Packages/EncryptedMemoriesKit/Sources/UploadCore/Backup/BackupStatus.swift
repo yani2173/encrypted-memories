@@ -85,6 +85,8 @@ public struct BackupStatus: Sendable, Equatable {
     public var settled = 0
     /// Ephemeral byte progress for resources currently moving.
     public var activeTransfer: BackupActiveTransferProgress?
+    /// Bytes the backup has sent since its runner started; see `BackupSyncProgress.transferredBytes`.
+    public var transferredBytes: Int64 = 0
     public var activeExecutionItemEquivalents: Double = 0
     /// Dominant typed reason for unfinished work and the next time Core can honestly retry it.
     public var outstandingIssue: BackupIssueKind?
@@ -103,6 +105,11 @@ public struct BackupStatus: Sendable, Equatable {
         totalConsidered.map { max(0, $0 - skippedRemoteDeletions) }
     }
     public var needsAttentionCount: Int { failed + sourceMissing }
+    /// Items the backup still has to check or upload: everything considered that has not settled with any outcome.
+    /// Nil while scanning, like the total.
+    public var remainingCount: Int? {
+        totalConsidered.map { max(0, $0 - settled) }
+    }
     /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
     /// list reloads only when its content can differ.
     public var problemListKey: ProblemListKey {
@@ -152,6 +159,7 @@ public struct BackupStatus: Sendable, Equatable {
         waitingRetry = progress.blocked
         settled = progress.settled
         activeTransfer = progress.activeTransfer
+        transferredBytes = progress.transferredBytes
         activeExecutionItemEquivalents = max(
             progress.activeExecutionItemEquivalents,
             progress.activeTransfer?.completedItemEquivalents ?? 0

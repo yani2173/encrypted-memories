@@ -77,6 +77,9 @@ public struct BackupSyncProgress: Sendable, Equatable {
     public var remoteContentIndexHealth: UploadRemoteContentIndexHealth = .complete(indexedCount: 0)
     /// In-memory only; see `BackupActiveTransferProgress`.
     public var activeTransfer: BackupActiveTransferProgress?
+    /// Bytes the runner has sent since it started: finished transfers and the sent share of active ones. It only
+    /// grows while the runner lives. In-memory only; the upload speed is its growth over time (`BackupTransferRate`).
+    public var transferredBytes: Int64 = 0
     /// Fractional item-equivalents across identity reads, deferred exports and SDK uploads. The runner
     /// combines stages per item monotonically; OS progress can move before upload bytes exist.
     public var activeExecutionItemEquivalents: Double = 0

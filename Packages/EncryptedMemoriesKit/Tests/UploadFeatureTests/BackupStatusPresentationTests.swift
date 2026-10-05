@@ -340,4 +340,44 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertEqual(overcounted.localizedDetail, UploadRemoteIndexPreparationProgress(
             phase: .indexing, completed: 4_800, total: 4_800).localizedDetail, "the count never passes the total")
     }
+
+    func testSubtitleNamesTheItemsLeftWhileWorkRemains() throws {
+        // 100 considered: 30 backed up, 1 deleted in Proton and 2 failed are settled; 67 are still to do.
+        let running = BackupStatusPresentation(
+            status(
+                progress(
+                    total: 100, waiting: 60, checking: 5, uploading: 2, uploaded: 10, alreadyBackedUp: 20,
+                    skippedRemoteDeletions: 1, failed: 2, isRunning: true)))
+        XCTAssertEqual(running.remainingCount, 67)
+        let subtitle = try XCTUnwrap(running.localizedSubtitle)
+        XCTAssertTrue(subtitle.contains("30"))
+        XCTAssertTrue(subtitle.contains("67"))
+
+        let done = BackupStatusPresentation(status(progress(total: 30, uploaded: 10, alreadyBackedUp: 20)))
+        XCTAssertEqual(done.remainingCount, 0)
+        XCTAssertEqual(
+            done.localizedSubtitle, L10n.string("backup.progress_backed_up \(30) \(30)"),
+            "a finished backup names no items left")
+    }
+
+    func testTransferLineNamesTheUploadSpeedOnceItIsMeasured() throws {
+        let transfer = BackupActiveTransferProgress(
+            activeItemCount: 1, completedBytes: 40, totalBytes: 100, completedItemEquivalents: 0.4)
+        var presentation = BackupStatusPresentation(
+            status(progress(total: 10, uploading: 1, isRunning: true, activeTransfer: transfer)))
+        XCTAssertNil(presentation.localizedUploadSpeed, "no speed before the row model measured one")
+        let withoutSpeed = try XCTUnwrap(presentation.localizedTransferDetail)
+
+        presentation.bytesPerSecond = 2_500_000
+        let speed = try XCTUnwrap(presentation.localizedUploadSpeed)
+        XCTAssertEqual(speed, Int64(2_500_000).formatted(.byteCount(style: .file)))
+        let withSpeed = try XCTUnwrap(presentation.localizedTransferDetail)
+        XCTAssertTrue(withSpeed.contains("40"))
+        XCTAssertTrue(withSpeed.contains(speed))
+        XCTAssertNotEqual(withSpeed, withoutSpeed)
+
+        var settled = BackupStatusPresentation(status(progress(total: 10, uploaded: 10)))
+        settled.bytesPerSecond = 2_500_000
+        XCTAssertNil(settled.localizedUploadSpeed, "no speed while no bytes move")
+    }
 }

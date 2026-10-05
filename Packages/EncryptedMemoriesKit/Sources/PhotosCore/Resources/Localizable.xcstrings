@@ -1135,6 +1135,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "%lld von %lld gesichert" } }
       }
     },
+    "backup.progress_backed_up_left %lld %lld %lld": {
+      "extractionState": "manual",
+      "comment": "Backup status subtitle while items still wait: how many items are backed up out of the total, and how many are left to check or upload.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%lld of %lld backed up · %lld left" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%lld von %lld gesichert · %lld übrig" } }
+      }
+    },
     "backup.progress_attention %lld": {
       "extractionState": "manual",
       "comment": "Backup status attention line, shown only when some items could not be backed up and need the user.",
@@ -1157,6 +1165,14 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Transferring data · %lld%%" } },
         "de": { "stringUnit": { "state": "translated", "value": "Überträgt Daten · %lld %%" } }
+      }
+    },
+    "backup.progress_transferring_speed %lld %@": {
+      "extractionState": "manual",
+      "comment": "Byte progress of the resources transferring right now, with the measured upload speed as a byte count per second, such as 2.4 MB.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Transferring data · %lld%% · %@/s" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Überträgt Daten · %lld %% · %@/s" } }
       }
     },
     "backup.fail_reason_generic": {

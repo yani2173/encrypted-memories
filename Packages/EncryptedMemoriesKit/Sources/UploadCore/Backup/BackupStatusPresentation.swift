@@ -44,6 +44,8 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     // attention line.
     public var backedUp: Int
     public var total: Int
+    /// Items still to check or upload (`BackupStatus.remainingCount`); "<k> left" follows the backed-up count.
+    public var remainingCount: Int
     public var attentionCount: Int
     /// Retryable work waiting on external state. It may open details, but is never worded as failure.
     public var waitingCount: Int
@@ -55,6 +57,8 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     /// Exact aggregate byte fraction behind `activeTransferPercent`. When present, the visible progress
     /// bar represents this same transfer instead of an imperceptible one-item step across a large library.
     public var activeTransferFraction: Double?
+    /// Upload speed from `BackupTransferRate`. The status alone has no history, so the timeful row model sets it.
+    public var bytesPerSecond: Double?
     public var nextAttemptAt: Date?
     /// Queue-wide dedupe-index failure. Kept separate from item failures so hosts do not open an empty
     /// per-photo failure list for an account/service problem.
@@ -79,11 +83,13 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         progressFraction: Double?,
         backedUp: Int = 0,
         total: Int = 0,
+        remainingCount: Int = 0,
         attentionCount: Int = 0,
         waitingCount: Int = 0,
         skippedRemoteDeletions: Int = 0,
         activeTransferPercent: Int? = nil,
         activeTransferFraction: Double? = nil,
+        bytesPerSecond: Double? = nil,
         nextAttemptAt: Date? = nil,
         remoteIndexPreparationFailed: Bool = false,
         degradedDedupeUnresolvedCount: Int = 0,
@@ -95,11 +101,13 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         self.progressFraction = progressFraction
         self.backedUp = backedUp
         self.total = total
+        self.remainingCount = max(0, remainingCount)
         self.attentionCount = attentionCount
         self.waitingCount = waitingCount
         self.skippedRemoteDeletions = skippedRemoteDeletions
         self.activeTransferPercent = activeTransferPercent
         self.activeTransferFraction = activeTransferFraction.map { min(1, max(0, $0)) }
+        self.bytesPerSecond = bytesPerSecond
         self.nextAttemptAt = nextAttemptAt
         self.remoteIndexPreparationFailed = remoteIndexPreparationFailed
         self.degradedDedupeUnresolvedCount = max(0, degradedDedupeUnresolvedCount)
@@ -195,6 +203,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
             activeTransferFraction = fraction
             activeTransferPercent = min(100, max(0, Int((fraction * 100).rounded(.down))))
         }
+        if total > 0 { remainingCount = status.remainingCount ?? 0 }
         executionOpportunityIssue = status.executionOpportunityIssue
         if status.remoteContentIndexHealth.shouldWarn {
             degradedDedupeUnresolvedCount = status.remoteContentIndexHealth.unresolvedCount
@@ -228,10 +237,12 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         }
     }
 
-    /// "<n> of <m> backed up". Nil when there is no honest total yet (scanning/idle).
+    /// "<n> of <m> backed up", followed by "<k> left" while items still wait for their check or upload. Nil when
+    /// there is no honest total yet (scanning/idle).
     public var localizedSubtitle: String? {
         guard total > 0 else { return nil }
-        return L10n.string("backup.progress_backed_up \(backedUp) \(total)")
+        guard remainingCount > 0 else { return L10n.string("backup.progress_backed_up \(backedUp) \(total)") }
+        return L10n.string("backup.progress_backed_up_left \(backedUp) \(total) \(remainingCount)")
     }
 
     /// Shown only when something actually needs the user; nil otherwise.
@@ -287,7 +298,16 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     /// "N of M backed up" subtitle so fractional bytes can never inflate the backed-up count.
     public var localizedTransferDetail: String? {
         guard let activeTransferPercent else { return nil }
-        return L10n.string("backup.progress_transferring \(activeTransferPercent)")
+        guard let speed = localizedUploadSpeed else {
+            return L10n.string("backup.progress_transferring \(activeTransferPercent)")
+        }
+        return L10n.string("backup.progress_transferring_speed \(activeTransferPercent) \(speed)")
+    }
+
+    /// The upload speed as a byte count per second, such as "2.4 MB", while bytes move; nil before it is measured.
+    public var localizedUploadSpeed: String? {
+        guard activeTransferPercent != nil, let bytesPerSecond, bytesPerSecond >= 1 else { return nil }
+        return Int64(bytesPerSecond.rounded(.down)).formatted(.byteCount(style: .file))
     }
 
     /// The bar follows the percentage immediately above it while bytes move. Otherwise it remains the
