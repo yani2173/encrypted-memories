@@ -40,6 +40,12 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     private let lock = NSLock()
     private var lookupFailed = false
     private let storePath: String
+    /// Repair sweeps of this process for each key epoch: the last link read and the earliest start of the next sweep.
+    private var repairCursors: [String: String] = [:]
+    private var nextRepairSweeps: [String: Date] = [:]
+    /// For each key epoch, when a repair read first found a link missing from a successful response.
+    private var omittedSince: [String: [String: Date]] = [:]
+    private let clock: @Sendable () -> Date
     // A write failure stays disabled for this file until process exit.
     private static let writeFailures = ProcessWriteFailures()
     private var writesDisabled: Bool { Self.writeFailures.contains(storePath) }
@@ -57,8 +63,11 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         }
     }
 
-    public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
+    public init?(
+        url: URL, policy: LibraryDatabasePolicy = .conservative, clock: @escaping @Sendable () -> Date = { Date() }
+    ) {
         storePath = url.standardizedFileURL.path
+        self.clock = clock
         let schema = """
             CREATE TABLE remote_link_identity(
               key_epoch TEXT NOT NULL, remote_link TEXT NOT NULL,
@@ -177,19 +186,70 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         }
     }
 
+    /// The next unresolved links to read again, at most `limit`. A sweep walks the links in order; after its end the
+    /// next sweep waits `sweepInterval`, so a link that keeps failing costs one read for each interval.
+    public func unresolvedLinkIDsForRepair(hashKeyEpoch: String, limit: Int, sweepInterval: TimeInterval) -> [String] {
+        lock.withLock {
+            guard limit > 0, !writesDisabled else { return [] }
+            let now = clock()
+            let cursor = repairCursors[hashKeyEpoch]
+            if cursor == nil, let next = nextRepairSweeps[hashKeyEpoch], now < next { return [] }
+            guard
+                let links = columnLocked(
+                    "SELECT remote_link FROM lineage_unresolved WHERE key_epoch=? AND remote_link>? "
+                        + "ORDER BY remote_link LIMIT \(limit);",
+                    values: [hashKeyEpoch, cursor ?? ""])
+            else { return [] }
+            if links.count < limit {
+                repairCursors[hashKeyEpoch] = nil
+                nextRepairSweeps[hashKeyEpoch] = now.addingTimeInterval(sweepInterval)
+            } else {
+                repairCursors[hashKeyEpoch] = links.last
+            }
+            return links
+        }
+    }
+
+    /// The links that leave the index as gone: two repair reads at least `interval` apart found each of them missing
+    /// from a successful response. Proton leaves out a link that is deleted for good, but one omission can also be a
+    /// partial response. A link that a read returns starts over.
+    public func linksOmittedTwice(
+        omitted: Set<String>, returned: Set<String>, hashKeyEpoch: String, interval: TimeInterval
+    ) -> Set<String> {
+        lock.withLock {
+            let now = clock()
+            var since = omittedSince[hashKeyEpoch, default: [:]]
+            for linkID in returned { since[linkID] = nil }
+            var settled: Set<String> = []
+            for linkID in omitted {
+                if let first = since[linkID] {
+                    guard now.timeIntervalSince(first) >= interval else { continue }
+                    settled.insert(linkID)
+                    since[linkID] = nil
+                } else {
+                    since[linkID] = now
+                }
+            }
+            omittedSince[hashKeyEpoch] = since.isEmpty ? nil : since
+            return settled
+        }
+    }
+
     @discardableResult
     public func replaceRows(
         identities: [UploadRemoteLinkIdentityRecord], lineage: [UploadRemoteLineageRecord],
         hashKeyEpoch: String, eventID: String, unresolvedRemoteLinkIDs: Set<String>
     ) -> Bool {
         lock.withLock {
-            transactionLocked {
+            let replaced = transactionLocked {
                 clearPublishedLocked()
                     && clearOtherBuildEpochsLocked(hashKeyEpoch)
                     && writeRowsLocked(identities, lineage, hashKeyEpoch: hashKeyEpoch)
                     && writeUnresolvedLocked(unresolvedRemoteLinkIDs, hashKeyEpoch: hashKeyEpoch)
                     && writeCheckpointLocked(hashKeyEpoch, eventID: eventID)
             }
+            if replaced { restartRepairSweepLocked(hashKeyEpoch) }
+            return replaced
         }
     }
 
@@ -269,7 +329,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         lock.withLock {
             guard !writesDisabled else { return false }
             // Checked inside the transaction: another connection may prepare a new build between check and write.
-            return transactionLocked(
+            let finished = transactionLocked(
                 precondition: {
                     buildCursorLocked(hashKeyEpoch: hashKeyEpoch, buildID: build.buildID, eventID: build.eventID)
                         == build.total
@@ -289,7 +349,15 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
                     && clearBuildLocked(hashKeyEpoch)
                     && clearOtherBuildEpochsLocked(hashKeyEpoch)
             }
+            if finished { restartRepairSweepLocked(hashKeyEpoch) }
+            return finished
         }
+    }
+
+    /// A new unresolved set is read at once, not after the interval of the previous sweep.
+    private func restartRepairSweepLocked(_ epoch: String) {
+        repairCursors[epoch] = nil
+        nextRepairSweeps[epoch] = nil
     }
 
     private func checkpointLocked(hashKeyEpoch: String) -> String? {
@@ -420,20 +488,25 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     }
 
     private func linksLocked(_ sql: String, values: [String]) -> Set<String> {
-        var statement: OpaquePointer?
         lookupFailed = true
-        guard prepareLocked(sql, values: values, statement: &statement) else { return [] }
+        guard let rows = columnLocked(sql, values: values) else { return [] }
+        lookupFailed = false
+        return Set(rows)
+    }
+
+    /// The first column of every row in order, or nil when the read fails.
+    private func columnLocked(_ sql: String, values: [String]) -> [String]? {
+        var statement: OpaquePointer?
+        guard prepareLocked(sql, values: values, statement: &statement) else { return nil }
         defer { sqlite3_finalize(statement) }
-        var result: Set<String> = []
+        var result: [String] = []
         while true {
             switch sqlite3_step(statement) {
             case SQLITE_ROW:
-                guard let text = sqlite3_column_text(statement, 0) else { return [] }
-                result.insert(String(cString: text))
-            case SQLITE_DONE:
-                lookupFailed = false
-                return result
-            default: return []
+                guard let text = sqlite3_column_text(statement, 0) else { return nil }
+                result.append(String(cString: text))
+            case SQLITE_DONE: return result
+            default: return nil
             }
         }
     }
