@@ -22,6 +22,8 @@ public struct BackupQueueList: Sendable, Equatable {
         public let id: String
         public let filename: String
         public let state: UploadBackupSyncQueueState
+        /// The local photo that the row shows as its preview; every resource of a photo shows the same one.
+        public let previewUID: PhotoUID
 
         public var localizedState: String {
             switch state {
@@ -85,6 +87,7 @@ public struct BackupQueueList: Sendable, Equatable {
         return Item(
             id: "\(source.kind.rawValue):\(source.identifier):\(source.resource.rawValue):\(row.revision.rawValue)",
             filename: row.originalFilename,
-            state: row.state)
+            state: row.state,
+            previewUID: PendingSourceKey(source).localUID)
     }
 }

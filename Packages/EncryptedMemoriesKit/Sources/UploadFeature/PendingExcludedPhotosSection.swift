@@ -53,27 +53,3 @@ public struct PendingExcludedPhotosSection: View {
         }
     }
 }
-
-private struct PendingPhotoThumbnail: View {
-    let uid: PhotoUID
-    let load: @Sendable (PhotoUID) async -> CGImage?
-    @State private var image: CGImage?
-
-    var body: some View {
-        ZStack {
-            if let image {
-                Image(decorative: image, scale: 1)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                Color.secondary.opacity(0.15)
-                Image(systemName: "photo")
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .frame(width: 40, height: 40)
-        .clipShape(.rect(cornerRadius: 7))
-        .accessibilityHidden(true)
-        .task(id: uid) { image = await load(uid) }
-    }
-}
