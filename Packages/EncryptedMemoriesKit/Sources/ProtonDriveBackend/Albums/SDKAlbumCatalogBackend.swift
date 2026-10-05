@@ -2,6 +2,7 @@ import AlbumCore
 import Foundation
 import PhotosCore
 import ProtonDriveSDK
+import UploadCore
 
 /// Narrow testable surface over the SDK actor. Keeping the protocol here avoids leaking SDK types
 /// into AlbumCore while allowing catalog/cancellation/partial-result behavior to be tested without
@@ -389,6 +390,33 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
             result[uid] = Set(photo.albumUids.map(Self.identifier))
         }
         return result
+    }
+
+    /// The sharing state, the claimed file size, and the albums of each photo. One node read for each photo,
+    /// `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
+    func nodeFacts(of photoUIDs: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await withAdmission {
+            let uniqueUIDs = Array(Set(photoUIDs))
+            let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
+            let nodes = try await self.loadNodes(sdkUIDs)
+            var facts: [PhotoUID: ExactDuplicateNodeFacts] = [:]
+            for (sdkUID, node) in nodes {
+                let fact: ExactDuplicateNodeFacts
+                switch node {
+                case .photo(let photo):
+                    fact = .init(
+                        isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize,
+                        albums: photo.albumUids.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) })
+                case .file(let file):
+                    fact = .init(
+                        isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize)
+                case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
+                case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
+                }
+                facts[PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)] = fact
+            }
+            return facts
+        }
     }
 
     private func withAdmission<T: Sendable>(

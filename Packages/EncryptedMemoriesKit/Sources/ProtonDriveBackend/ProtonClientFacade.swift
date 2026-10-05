@@ -211,7 +211,8 @@ public final class ProtonClientFacade {
                     identities: identities,
                     journal: journal,
                     remote: bridge,
-                    albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo)
+                    albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
+                    log: { DebugLog.log($0) }
                 )
             }(),
             uploadIdentityResolver: identityResolver,

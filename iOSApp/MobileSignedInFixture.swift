@@ -110,6 +110,9 @@ import UploadCore
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesFixture") {
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(groups: sections.prefix(2).map { $0.items.prefix(2).map(\.uid) }))
+            } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesCheckingFixture") {
+                runtime.libraryModel.installIsolatedDuplicatesForTesting(
+                    MobileFixtureDuplicates(groups: [], checking: true))
             }
             runtime.sessionModel.installIsolatedSession(session)
         }
@@ -235,22 +238,45 @@ import UploadCore
     }
 
     /// Groups of exact copies in memory. A merge keeps the chosen photo and moves the other copies to Trash.
+    /// `checking` leaves the library check running: its index is not built, and its build stays at 1,234 of 15,000.
     final class MobileFixtureDuplicates: ExactDuplicateMerging, @unchecked Sendable {
         private let lock = NSLock()
         private var groups: [ExactDuplicateGroup]
+        private let checking: Bool
 
-        init(groups members: [[PhotoUID]]) {
+        init(groups members: [[PhotoUID]], checking: Bool = false) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
             }
+            self.checking = checking
         }
 
-        func duplicateGroups() async throws -> ExactDuplicateScan {
-            ExactDuplicateScan(groups: lock.withLock { groups }, coverage: .complete)
+        func duplicateGroups(
+            progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
+        ) async throws -> ExactDuplicateScan {
+            ExactDuplicateScan(groups: lock.withLock { groups }, coverage: checking ? .indexing : .complete)
         }
 
-        func rankedMembers(of groups: [ExactDuplicateGroup]) async throws -> [String: [PhotoUID]] {
+        func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
             Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) })
+        }
+
+        func rankMembers(
+            of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
+        ) async {
+            await ranked(
+                ExactDuplicateRankingPage(
+                    members: Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) }),
+                    groupCount: groups.count))
+        }
+
+        func prepareIndex(
+            progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+        ) async throws -> Bool {
+            guard checking else { return false }
+            await progress(.init(phase: .indexing, completed: 1_234, total: 15_000))
+            try await Task.sleep(for: .seconds(3_600))
+            return false
         }
 
         func merge(

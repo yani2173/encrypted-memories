@@ -754,9 +754,13 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     ) -> Bool
     @discardableResult
     func upsertRemoteContentRecord(_ record: UploadRemoteContentIndexRecord) -> Bool
-    /// Every indexed content hash of this key epoch that two or more links hold, with those links sorted. Nil when
-    /// the read fails.
+    /// Every indexed content hash of this key epoch that two or more links hold, with those links sorted. Links that
+    /// the remote asset index proves to be related files of another photo are left out. Nil when the read fails.
     func remoteContentDuplicateGroups(hashKeyEpoch: String) -> [String: [String]]?
+    /// The file size in bytes that the upload manifest records for each content hash of
+    /// `remoteContentDuplicateGroups(hashKeyEpoch:)`, with the same links left out. A hash without a manifest row is
+    /// missing. Nil when the read fails.
+    func remoteContentDuplicateSizes(hashKeyEpoch: String) -> [String: Int64]?
 }
 
 extension UploadRemoteContentIndexStore {
@@ -886,6 +890,9 @@ public protocol UploadDuplicateChecking: Sendable {
     /// Drops backend-owned remote duplicate/content caches. Called whenever the upload resolver's
     /// remote view is known stale; the next lookup must re-read server state.
     func invalidateCachedRemoteState() async
+    /// This device moved main photos to or from the trash. That is a later event than the start of any index build, so
+    /// a running or staged build stays: only the cached view goes, and the next lookup applies the events.
+    func remoteMainsChangedHere() async
     /// Updates backend-owned content indexes after this client commits an upload. This is a local
     /// optimization only; the upload manifest remains the authoritative durability boundary.
     func recordUploaded(contentHash: String, remoteLinkID: String) async
@@ -956,6 +963,7 @@ public extension UploadDuplicateChecking {
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] { [:] }
     func invalidateCachedRemoteState() async {}
+    func remoteMainsChangedHere() async { await invalidateCachedRemoteState() }
     func recordUploaded(contentHash: String, remoteLinkID: String) async {}
 }
 
@@ -1011,6 +1019,9 @@ public protocol UploadIdentityResolving: Sendable {
     /// Call after a failed or cancelled upload attempt and before rechecking a draft-blocked item.
     /// The server may have committed work that predates the cache, so stale state could double-upload.
     func invalidateCachedRemoteState() async
+    /// Drops the cached remote state after this device moved main photos to or from the trash, like
+    /// `invalidateCachedRemoteState`, but keeps a running or staged index build.
+    func remoteMainsChangedHere() async
     /// Call when a `.upload` attempt ends without `recordUploaded` because of an error, cancellation,
     /// or stop. This settles the same-content claim and drops the cached remote view.
     /// Waiting identical items re-resolve instead of hanging. Exactly one of `recordUploaded` or
@@ -1040,6 +1051,7 @@ public extension UploadIdentityResolving {
     }
     func prime(_ descriptors: [UploadResourceDescriptor]) async {}
     func invalidateCachedRemoteState() async {}
+    func remoteMainsChangedHere() async { await invalidateCachedRemoteState() }
     func uploadDidFail(_ descriptor: UploadResourceDescriptor) async {}
     func remoteCommitNeedsReconciliation(_ descriptor: UploadResourceDescriptor) async {
         await uploadDidFail(descriptor)

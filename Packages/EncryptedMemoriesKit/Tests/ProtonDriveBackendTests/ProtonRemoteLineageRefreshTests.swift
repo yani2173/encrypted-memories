@@ -3,6 +3,7 @@ import Foundation
 import ProtonAuth
 import ProtonCoreCryptoGoInterface
 import ProtonCoreCryptoPatchedGoImplementation
+import ProtonDriveSDK
 import SQLite3
 import Testing
 import UploadCore
@@ -65,7 +66,7 @@ extension DriveSessionStubSuite {
         }
 
         /// An account indexed before the lineage index existed has a content checkpoint and no lineage checkpoint.
-        /// A lineage read then asks for one full build, which fills both indexes at the same event.
+        /// The index preparation then asks for one full build, which fills both indexes at the same event.
         @Test func aLineageReadRebuildsAMissingOrBehindLineageIndexUnlessItCannotWrite() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -118,6 +119,100 @@ extension DriveSessionStubSuite {
                     #expect(paths == ["/drive/volumes/vol1/events/one"], "\(mode): \(paths)")
                 }
             }
+        }
+
+        /// After an upgrade, the first resolve of an edited photo reads the missing lineage index as incomplete and
+        /// starts no full build, which would hold every duplicate lookup without progress. The index preparation of
+        /// the backup and of Duplicates builds it once and reports the progress of that build.
+        @Test func aResolveStartsNoLineageRebuildAndTheIndexPreparationRunsItWithProgress() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+            let service = makeService(content: content, lineage: lineage)
+
+            let read = try await service.activeMainLinkIDs(forExternalIdentifier: "cloud")
+
+            #expect(!read.complete, "an incomplete lineage index proves nothing")
+            let resolvePaths = StubURLProtocol.requests().map(\.path)
+            #expect(resolvePaths == ["/drive/volumes/vol1/events/one"], "\(resolvePaths)")
+
+            let progress = PreparationLog()
+            try await service.prepareRemoteIndex { await progress.append($0) }
+
+            let paths = StubURLProtocol.requests().map(\.path).dropFirst(resolvePaths.count)
+            #expect(paths.contains { $0.hasPrefix("/drive/volumes/vol1/photos") }, "\(paths)")
+            let phases = await progress.steps.map(\.phase)
+            #expect(phases.contains(.indexing), "\(phases)")
+            #expect(phases.last == .ready)
+            let contentCheckpoint = content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")
+            #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: contentCheckpoint) == .complete)
+
+            let before = StubURLProtocol.requests().count
+            try await service.prepareRemoteIndex { _ in }
+            let later = StubURLProtocol.requests().dropFirst(before).map(\.path)
+            #expect(!later.contains { $0.hasPrefix("/drive/volumes/vol1/photos") }, "the rebuild runs once")
+        }
+
+        /// A merge trashes main photos while the library check runs. The trash is a later event than the build, so the
+        /// staged build stays and resumes where it stopped; a full invalidation still discards it.
+        @Test func aTrashOfMainPhotosKeepsTheStagedBuildAndTheBuildResumes() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            var hasher = SHA256()
+            for id in ["a", "b"] {
+                hasher.update(data: Data(id.utf8))
+                hasher.update(data: Data([0]))
+            }
+            let fingerprint = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            let build = try #require(
+                content.beginRemoteContentIndexBuild(
+                    hashKeyEpoch: "epoch", eventID: "e1", sourceFingerprint: fingerprint, total: 2, updatedAt: Date()))
+            #expect(
+                content.appendRemoteContentIndexBuild(
+                    records: ["a", "b"].map { .init(contentHash: "same", hashKeyEpoch: "epoch", remoteLinkID: $0) },
+                    unresolvedIssues: [], externalIdentities: [], hashKeyEpoch: "epoch", buildID: build.buildID,
+                    nextCursor: 2, updatedAt: Date()))
+            let service = makeService(content: content, lineage: nil)
+
+            await service.remoteMainsChangedHere()
+
+            #expect(content.remoteContentIndexBuildCheckpoint(hashKeyEpoch: "epoch")?.cursor == 2)
+            StubURLProtocol.reset()
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"e1"}"#)
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/photos",
+                json: #"{"Code":1000,"Photos":[{"LinkID":"a","CaptureTime":1,"Tags":[],"RelatedPhotos":[]},"#
+                    + #"{"LinkID":"b","CaptureTime":2,"Tags":[],"RelatedPhotos":[]}]}"#)
+            try await service.prepareRemoteIndex { _ in }
+            let paths = StubURLProtocol.requests().map(\.path)
+            #expect(!paths.contains { $0.contains("fetch_metadata") }, "the build resumes after its rows: \(paths)")
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "e1")
+            #expect(content.remoteContentDuplicateGroups(hashKeyEpoch: "epoch") == ["same": ["a", "b"]])
+
+            let second = try #require(
+                content.beginRemoteContentIndexBuild(
+                    hashKeyEpoch: "epoch", eventID: "e2", sourceFingerprint: fingerprint, total: 2, updatedAt: Date()))
+            #expect(second.cursor == 0)
+            await service.invalidateCachedRemoteState()
+            #expect(content.remoteContentIndexBuildCheckpoint(hashKeyEpoch: "epoch") == nil)
         }
 
         @Test func lineageWriteFailureDisablesFurtherWritesWhileContentKeepsRefreshing() async throws {
@@ -574,6 +669,36 @@ extension DriveSessionStubSuite {
             }
         }
 
+        private func makeService(
+            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?
+        ) -> ProtonUploadDedupeService {
+            ProtonUploadDedupeService(
+                session: makeSession(), crypto: DriveCrypto(addressKeys: [], signers: []),
+                photosClient: NoPhotoDuplicates(), contentIndexStore: content, lineageIndexStore: lineage,
+                material: material
+            ) { throw UploadError.backend("The test material is resolved") }
+        }
+
+        private var material: ProtonUploadDedupeService.Material {
+            Self.material(rootKey: .init(armored: "", passphrase: ""))
+        }
+
+        private static func material(rootKey: UnlockableKey) -> ProtonUploadDedupeService.Material {
+            .init(
+                context: .init(volumeID: "vol1", shareID: "share1", rootLinkID: "root1"),
+                rootKey: rootKey, hashKey: Data(), epoch: "epoch")
+        }
+
+        private func makeSession() -> DriveSession { Self.makeSession() }
+
+        private static func makeSession() -> DriveSession {
+            DriveSession(
+                session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
+                store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
+                accountCacheDirectory: FileManager.default.temporaryDirectory,
+                urlProtocolClasses: [StubURLProtocol.self])
+        }
+
         private func checkpoint(_ eventID: String) -> UploadRemoteContentIndexCheckpoint {
             .init(eventID: eventID, refreshedAt: Date())
         }
@@ -736,18 +861,22 @@ extension DriveSessionStubSuite {
             rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: ""),
             progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { _ in }
         ) async throws {
-            let session = DriveSession(
-                session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
-                store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
-                accountCacheDirectory: FileManager.default.temporaryDirectory,
-                urlProtocolClasses: [StubURLProtocol.self])
             try await ProtonUploadDedupeService.refreshRemoteContentIndex(
-                material: .init(
-                    context: .init(volumeID: "vol1", shareID: "share1", rootLinkID: "root1"),
-                    rootKey: rootKey, hashKey: Data(), epoch: "epoch"),
-                session: session, crypto: DriveCrypto(addressKeys: [], signers: []),
+                material: material(rootKey: rootKey), session: makeSession(),
+                crypto: DriveCrypto(addressKeys: [], signers: []),
                 store: content, lineageStore: lineage, rebuildsMissingLineage: rebuildsMissingLineage,
                 progress: progress)
         }
     }
+}
+
+/// The SDK's exact duplicate query, which these tests never reach.
+private struct NoPhotoDuplicates: SDKPhotoDuplicatesClient {
+    func findPhotoDuplicates(name: String, sha1: Data, cancellationToken: UUID) async throws -> [SDKNodeUid] { [] }
+    func cancelFindPhotoDuplicates(cancellationToken: UUID) async throws {}
+}
+
+private actor PreparationLog {
+    private(set) var steps: [UploadRemoteIndexPreparationProgress] = []
+    func append(_ step: UploadRemoteIndexPreparationProgress) { steps.append(step) }
 }

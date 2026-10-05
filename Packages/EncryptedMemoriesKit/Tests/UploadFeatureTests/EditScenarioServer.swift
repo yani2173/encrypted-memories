@@ -69,6 +69,15 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var cancelCompoundRead = false
     private var failRelatedLookupForTrashedMain = false
     private var healthOverride: UploadRemoteContentIndexHealth?
+    private var sharedLinks: Set<String> = []
+    private var nodeSizes: [String: Int64] = [:]
+    private var missingNodes: Set<String> = []
+    private var covers: [String: String] = [:]
+    private var failCoverWrite = false
+    typealias IndexProgress = @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    typealias IndexBuild = @Sendable (@escaping IndexProgress) async throws -> Void
+    private var indexBuildOverride: IndexBuild?
+    private var indexBuildCount = 0
     private var rejectedRelatedLookups: [String] = []
     private var proofLookups: [[UploadBackupExternalIdentity]] = []
     let uploadGate = EditScenarioUploadGate()
@@ -177,6 +186,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         var visibility = 0
         var compound = 0
         var favorites = 0
+        /// Photos whose album membership was read, one for each photo.
+        var albumMembers = 0
+        /// Photos whose node was read for its sharing state and size, one for each photo.
+        var sharingMembers = 0
+        var albumListings = 0
     }
     var readCounts: ReadCounts { lock.withLock { counted } }
     private var counted = ReadCounts()
@@ -441,6 +455,25 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    func prepareRemoteIndex(
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws {
+        let build = lock.withLock {
+            indexBuildCount += 1
+            return indexBuildOverride
+        }
+        guard let build else { return await progress(.init(phase: .ready)) }
+        try await build(progress)
+    }
+
+    /// Runs in place of the backend's index build. Nil reports a ready index at once.
+    var indexBuild: IndexBuild? {
+        get { lock.withLock { indexBuildOverride } }
+        set { lock.withLock { indexBuildOverride = newValue } }
+    }
+
+    var indexBuilds: Int { lock.withLock { indexBuildCount } }
+
     /// The index state that the next health checks report. Nil reports a complete index.
     var indexHealth: UploadRemoteContentIndexHealth? {
         get { lock.withLock { healthOverride } }
@@ -472,8 +505,10 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
-        lock.withLock {
-            (staleAlbums[uid.nodeID] ?? table[uid.nodeID]?.albums ?? []).sorted {
+        try lock.withLock {
+            counted.albumMembers += 1
+            if missingNodes.contains(uid.nodeID) { throw UploadError.backend("The scenario node is missing") }
+            return (staleAlbums[uid.nodeID] ?? table[uid.nodeID]?.albums ?? []).sorted {
                 ($0.volumeID, $0.albumID) < ($1.volumeID, $1.albumID)
             }
         }
@@ -609,15 +644,32 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         digest: Data, main: PhotoUID? = nil, captureTime: Date = Date(timeIntervalSince1970: 1_720_000_000)
     ) -> PhotoUID {
         lock.withLock {
-            let id = String(format: "link-%04d", nextID)
-            nextID += 1
-            table[id] = Link(
-                linkID: id, nameHash: "nh(\(id))", contentHash: Self.contentHash(digest), state: .active,
-                mainLinkID: main?.nodeID, captureTime: captureTime, assetID: "asset-\(main?.nodeID ?? id)",
-                generation: 0, isOriginal: false)
-            record("other device upload \(id)")
-            return PhotoUID(volumeID: "vol", nodeID: id)
+            let uid = insertLink(digest: digest, main: main, captureTime: captureTime)
+            record("other device upload \(uid.nodeID)")
+            return uid
         }
+    }
+
+    /// Seeds one main photo for each digest with one recorded step, for a large library.
+    @discardableResult
+    func seedLinks(digests: [Data]) -> [PhotoUID] {
+        lock.withLock {
+            let uids = digests.map {
+                insertLink(digest: $0, main: nil, captureTime: Date(timeIntervalSince1970: 1_720_000_000))
+            }
+            record("other device upload of \(uids.count) photos")
+            return uids
+        }
+    }
+
+    private func insertLink(digest: Data, main: PhotoUID?, captureTime: Date) -> PhotoUID {
+        let id = String(format: "link-%04d", nextID)
+        nextID += 1
+        table[id] = Link(
+            linkID: id, nameHash: "nh(\(id))", contentHash: Self.contentHash(digest), state: .active,
+            mainLinkID: main?.nodeID, captureTime: captureTime, assetID: "asset-\(main?.nodeID ?? id)",
+            generation: 0, isOriginal: false)
+        return PhotoUID(volumeID: "vol", nodeID: id)
     }
 
     /// Seeds an earlier device's trashed copy from real uploaded content, without a local journal entry.
@@ -686,6 +738,64 @@ extension EditScenarioServer: ExactDuplicateRemote {
             var dates: [PhotoUID: Date] = [:]
             for uid in uids { dates[uid] = table[uid.nodeID]?.captureTime }
             return dates
+        }
+    }
+
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try lock.withLock {
+            counted.sharingMembers += uids.count
+            if uids.contains(where: { missingNodes.contains($0.nodeID) }) {
+                throw UploadError.backend("The scenario node is missing")
+            }
+            return Dictionary(
+                uniqueKeysWithValues: uids.map {
+                    (
+                        $0,
+                        ExactDuplicateNodeFacts(
+                            isShared: sharedLinks.contains($0.nodeID), byteSize: nodeSizes[$0.nodeID],
+                            albums: (table[$0.nodeID]?.albums ?? []).sorted {
+                                ($0.volumeID, $0.albumID) < ($1.volumeID, $1.albumID)
+                            })
+                    )
+                })
+        }
+    }
+
+    /// The node of the photo states this file size.
+    func setNodeSize(_ size: Int64, of uid: PhotoUID) { lock.withLock { nodeSizes[uid.nodeID] = size } }
+
+    /// The person shares the photo with other people or by a link.
+    func share(_ uid: PhotoUID) { lock.withLock { _ = sharedLinks.insert(uid.nodeID) } }
+
+    /// Every node read of the photo fails, as for a node that the SDK cannot return.
+    func loseNode(_ uid: PhotoUID) { lock.withLock { _ = missingNodes.insert(uid.nodeID) } }
+
+    /// Sets the cover of an own album, as the person does in Albums.
+    func setAlbumCover(_ albumID: String, to uid: PhotoUID) { lock.withLock { covers[albumID] = uid.nodeID } }
+
+    var albumCovers: [String: String] { lock.withLock { covers } }
+
+    func ownAlbumCovers() async throws -> [String: String] {
+        lock.withLock {
+            counted.albumListings += 1
+            return covers.filter { ownAlbumIDs.contains($0.key) }
+        }
+    }
+
+    /// The next cover write fails.
+    func failNextCoverWrite() { lock.withLock { failCoverWrite = true } }
+
+    func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws {
+        try lock.withLock {
+            if failCoverWrite {
+                failCoverWrite = false
+                throw UploadError.backend("The scenario cover write failed")
+            }
+            guard ownAlbumIDs.contains(albumID),
+                table[uid.nodeID]?.albums.contains(.init(volumeID: "vol", albumID: albumID)) == true
+            else { throw UploadError.backend("The scenario cover is no member of the own album") }
+            covers[albumID] = uid.nodeID
+            record("cover \(albumID)")
         }
     }
 }

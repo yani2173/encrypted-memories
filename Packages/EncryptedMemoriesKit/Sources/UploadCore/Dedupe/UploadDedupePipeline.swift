@@ -936,6 +936,11 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         await checker.invalidateCachedRemoteState()
     }
 
+    public func remoteMainsChangedHere() async {
+        invalidateNameCache()
+        await checker.remoteMainsChangedHere()
+    }
+
     private func invalidateNameCache() {
         cacheGeneration += 1
         duplicateCache.removeAll()

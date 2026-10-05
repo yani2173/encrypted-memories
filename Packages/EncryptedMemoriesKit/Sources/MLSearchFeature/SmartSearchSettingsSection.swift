@@ -267,21 +267,8 @@ public struct SmartSearchSettingsSection: View {
         let presentation = controller.modelPresentation
         // The overall status already names a model step when no indexing runs; do not repeat it.
         if let status = presentation.statusText, status != controller.presentation.statusText {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(status)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                if let detail = presentation.detailText {
-                    Text(detail)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                if let progress = presentation.progressFraction {
-                    ProgressView(value: progress)
-                        .progressViewStyle(.linear)
-                }
-            }
+            ActivityProgressRow(
+                title: status, detail: presentation.detailText, fraction: presentation.progressFraction)
             if presentation.canRetry {
                 Button {
                     controller.retry()

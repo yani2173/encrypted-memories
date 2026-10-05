@@ -74,6 +74,12 @@ struct ShutdownGatedUploadIdentityResolver: UploadIdentityResolving {
         }
     }
 
+    func remoteMainsChangedHere() async {
+        _ = try? await admission.withAdmission {
+            await self.base.remoteMainsChangedHere()
+        }
+    }
+
     func uploadDidFail(_ descriptor: UploadResourceDescriptor) async {
         _ = try? await admission.withAdmission {
             await self.base.uploadDidFail(descriptor)

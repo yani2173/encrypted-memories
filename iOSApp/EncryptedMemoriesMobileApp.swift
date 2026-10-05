@@ -103,6 +103,7 @@ private struct MobileSupportedAppRoot: View {
                 .task {
                     await MobileUITestLaunch.installFixtureIfRequested(into: runtime)
                 }
+                .preferredColorScheme(MobileUITestLaunch.preferredColorScheme)
             #endif
             .task {
                 await TipJarTransactionProcessor.shared.start()
