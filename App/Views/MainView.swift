@@ -394,7 +394,10 @@ struct MainView: View {
                     thumbnailFeed: feed,
                     sourceAnalysisRevision: model.sourceAnalysisRevision,
                     topInset: topBarInset,
-                    confirmsMergeAll: $confirmsDuplicateMergeAll
+                    confirmsMergeAll: $confirmsDuplicateMergeAll,
+                    item: { timelineModel.allLibraryItem(matching: $0) },
+                    // The list has no grid cell to zoom from, so the viewer opens directly.
+                    open: { items, index in openPhoto(items[index], items, proxy: GridProxy()) }
                 )
                 .padding(.leading, leadingObstructionInset)
                 .animation(Self.sidebarAnimation, value: leadingObstructionInset)
@@ -1057,6 +1060,8 @@ struct MainView: View {
     }
 
     private func viewerReturnTarget(for vm: PhotoViewerModel) -> (item: PhotoItem, cell: CGRect)? {
+        // The grid under Duplicates keeps another route, so the viewer closes without flying into it.
+        guard selection != .duplicates else { return nil }
         let preferredProxy = activeGridProxy
         for item in vm.gridReturnCandidates {
             if let cell = preferredProxy.windowFrameForItem?(item.uid) { return (item, cell) }
@@ -1689,6 +1694,8 @@ struct MainView: View {
             }
             do {
                 try await backend.trash(uids)
+                // A copy that the person trashed, for example in the viewer of Duplicates, leaves its group.
+                duplicates?.photosLeftLibrary(Set(uids))
                 await timelineModel.commitTrash(items)
                 if mapClusterPresentation != nil { await mapClusterModel.commitTrash(items) }
                 await OfflineLibraryManager.shared.reconcileLocations(

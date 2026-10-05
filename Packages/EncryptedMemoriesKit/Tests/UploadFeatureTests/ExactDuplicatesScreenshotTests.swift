@@ -53,9 +53,23 @@
             }
         }
 
+        /// The library items of the copies: the second copy is a video, the fourth a Live Photo.
+        nonisolated private static func item(_ uid: PhotoUID) -> PhotoItem? {
+            switch uid.nodeID {
+            case "photo-1":
+                PhotoItem(uid: uid, captureTime: Date(), mediaType: "video/quicktime", durationSeconds: 42)
+            case "photo-3":
+                PhotoItem(uid: uid, captureTime: Date(), mediaType: "image/heic", isLivePhoto: true)
+            default:
+                PhotoItem(uid: uid, captureTime: Date(), mediaType: "image/jpeg")
+            }
+        }
+
         private func host(model: ExactDuplicatesModel) -> (NSWindow, NSView) {
-            let view = ExactDuplicatesView(model: model, confirmsMergeAll: .constant(false), accent: .accentColor) {
-                uid in
+            let view = ExactDuplicatesView(
+                model: model, confirmsMergeAll: .constant(false), accent: .accentColor, item: Self.item,
+                open: { _, _ in }
+            ) { uid in
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color(hue: Double(abs(uid.nodeID.hashValue % 100)) / 100, saturation: 0.45, brightness: 0.8))
                     .frame(width: 120, height: 120)

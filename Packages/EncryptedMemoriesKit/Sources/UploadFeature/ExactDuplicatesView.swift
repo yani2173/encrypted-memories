@@ -5,21 +5,29 @@ import UploadCore
 
 /// The Duplicates route of macOS, iOS, and iPadOS: groups of exact copies, one section per group. The shared
 /// `ExactDuplicatesModel` owns the groups, the photo to keep, and the merges; this view renders them with a native
-/// list and dialogs. The host owns the Merge All toolbar button and sets `confirmsMergeAll`, and it draws each photo.
+/// list and dialogs. The host owns the Merge All toolbar button and sets `confirmsMergeAll`, draws each photo, and
+/// presents its viewer when the person opens a copy larger.
 public struct ExactDuplicatesView<Cover: View>: View {
     private let model: ExactDuplicatesModel
     @Binding private var confirmsMergeAll: Bool
     private let accent: Color
+    private let item: (PhotoUID) -> PhotoItem?
+    private let open: ([PhotoItem], Int) -> Void
     private let cover: (PhotoUID) -> Cover
 
-    /// `accent` colors the checkmark of the photo to keep and the progress indicator.
+    /// `accent` colors the checkmark of the photo to keep and the progress indicator. `item` gives the library item
+    /// of a copy, for its video length and the viewer. `open` presents the viewer with the copies of one group,
+    /// starting at the copy at the index, so the person pages through them, zooms into photos, and plays videos.
     public init(
         model: ExactDuplicatesModel, confirmsMergeAll: Binding<Bool>, accent: Color,
+        item: @escaping (PhotoUID) -> PhotoItem?, open: @escaping ([PhotoItem], Int) -> Void,
         @ViewBuilder cover: @escaping (PhotoUID) -> Cover
     ) {
         self.model = model
         _confirmsMergeAll = confirmsMergeAll
         self.accent = accent
+        self.item = item
+        self.open = open
         self.cover = cover
     }
 
@@ -156,10 +164,13 @@ public struct ExactDuplicatesView<Cover: View>: View {
             }
             ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in
                 Section {
-                    ExactDuplicateMembers(model: model, group: group, groupIndex: index, accent: accent, cover: cover)
-                        .accessibilityIdentifier("duplicates.group.\(index)")
-                        // Only the groups that the person scrolls to read their facts.
-                        .onAppear { model.groupAppeared(group.id) }
+                    ExactDuplicateMembers(
+                        model: model, group: group, groupIndex: index, accent: accent, item: item, open: open,
+                        cover: cover
+                    )
+                    .accessibilityIdentifier("duplicates.group.\(index)")
+                    // Only the groups that the person scrolls to read their facts.
+                    .onAppear { model.groupAppeared(group.id) }
                 } header: {
                     HStack(alignment: .firstTextBaseline) {
                         Text(L10n.string("duplicates.group_title \(group.members.count)"))
@@ -195,42 +206,24 @@ public struct ExactDuplicatesView<Cover: View>: View {
     }
 }
 
-/// The copies of one group. A click or tap keeps that photo; a checkmark marks the photo that the merge keeps.
+/// The copies of one group. A click or tap keeps that photo; a checkmark marks the photo that the merge keeps. The
+/// button in the corner, the context menu, and an accessibility action open the copy larger in the viewer of the host,
+/// which pages through every copy of the group and plays a video. A badge shows the length of a video and marks a Live
+/// Photo.
 private struct ExactDuplicateMembers<Cover: View>: View {
     let model: ExactDuplicatesModel
     let group: ExactDuplicatesModel.Group
     let groupIndex: Int
     let accent: Color
+    let item: (PhotoUID) -> PhotoItem?
+    let open: ([PhotoItem], Int) -> Void
     let cover: (PhotoUID) -> Cover
 
     var body: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 10) {
                 ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
-                    let isKept = uid == group.kept
-                    Button {
-                        model.keep(uid, inGroup: group.id)
-                    } label: {
-                        cover(uid)
-                            .overlay(alignment: .bottomTrailing) {
-                                if isKept {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .font(Self.checkmarkFont)
-                                        .symbolRenderingMode(.palette)
-                                        .foregroundStyle(.white, accent)
-                                        .padding(6)
-                                }
-                            }
-                            .opacity(isKept ? 1 : 0.75)
-                    }
-                    .buttonStyle(.plain)
-                    .help(isKept ? "" : L10n.string("duplicates.member_hint"))
-                    .accessibilityLabel(
-                        isKept ? L10n.string("duplicates.member_kept") : L10n.string("duplicates.member_duplicate")
-                    )
-                    .accessibilityHint(isKept ? "" : L10n.string("duplicates.member_hint"))
-                    .accessibilityAddTraits(isKept ? .isSelected : [])
-                    .accessibilityIdentifier("duplicates.member.\(groupIndex).\(index)")
+                    member(uid, index: index)
                 }
             }
             .padding(.vertical, 4)
@@ -239,9 +232,113 @@ private struct ExactDuplicateMembers<Cover: View>: View {
         .accessibilityElement(children: .contain)
     }
 
+    private func member(_ uid: PhotoUID, index: Int) -> some View {
+        let isKept = uid == group.kept
+        let media = item(uid)
+        let viewer = group.viewerItems(opening: uid, item: item)
+        let isVideo = media?.isVideo == true
+        let openTitle = L10n.string(isVideo ? "duplicates.play_video" : "duplicates.show_larger")
+        let openSymbol = isVideo ? "play.fill" : "arrow.up.left.and.arrow.down.right"
+        return Button {
+            model.keep(uid, inGroup: group.id)
+        } label: {
+            cover(uid)
+                .overlay(alignment: .bottomLeading) {
+                    if let media { ExactDuplicateMediaBadge(item: media) }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if isKept {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(Self.checkmarkFont)
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(.white, accent)
+                            .padding(6)
+                    }
+                }
+                .opacity(isKept ? 1 : 0.75)
+        }
+        .buttonStyle(.plain)
+        .help(isKept ? "" : L10n.string("duplicates.member_hint"))
+        .accessibilityLabel(
+            isKept ? L10n.string("duplicates.member_kept") : L10n.string("duplicates.member_duplicate")
+        )
+        .accessibilityValue(media.map(Self.mediaDescription) ?? "")
+        .accessibilityHint(isKept ? "" : L10n.string("duplicates.member_hint"))
+        .accessibilityAddTraits(isKept ? .isSelected : [])
+        .accessibilityActions {
+            if let viewer {
+                Button(openTitle) { open(viewer.items, viewer.index) }
+            }
+        }
+        .accessibilityIdentifier("duplicates.member.\(groupIndex).\(index)")
+        .contextMenu {
+            if let viewer {
+                Button(openTitle, systemImage: openSymbol) { open(viewer.items, viewer.index) }
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if let viewer {
+                Button {
+                    open(viewer.items, viewer.index)
+                } label: {
+                    Image(systemName: openSymbol)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white)
+                        .frame(minWidth: Self.openButtonSize, minHeight: Self.openButtonSize)
+                        .background(.black.opacity(0.45), in: Circle())
+                        .padding(4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(openTitle)
+                .accessibilityLabel(openTitle)
+                .accessibilityIdentifier("duplicates.open.\(groupIndex).\(index)")
+            }
+        }
+    }
+
+    /// The kind of a copy for VoiceOver: a video with its length, or a Live Photo. Empty for a still photo.
+    private static func mediaDescription(_ item: PhotoItem) -> String {
+        if item.isVideo {
+            return [L10n.string("a11y.video"), item.durationText].compactMap { $0 }.joined(separator: ", ")
+        }
+        return item.isLivePhoto ? L10n.string("viewer.live_photo_a11y") : ""
+    }
+
     #if os(iOS)
         private static var checkmarkFont: Font { .title3 }
+        private static var openButtonSize: CGFloat { 28 }
     #else
         private static var checkmarkFont: Font { .title2 }
+        private static var openButtonSize: CGFloat { 24 }
     #endif
+}
+
+/// The length of a video, or the mark of a Live Photo, in the corner of its cover.
+private struct ExactDuplicateMediaBadge: View {
+    let item: PhotoItem
+
+    var body: some View {
+        if item.isVideo {
+            badge(systemImage: PhotoTag.videos.systemImage, text: item.durationText)
+        } else if item.isLivePhoto {
+            badge(systemImage: PhotoTag.livePhotos.systemImage, text: nil)
+        }
+    }
+
+    private func badge(systemImage: String, text: String?) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: systemImage)
+            if let text {
+                Text(text).monospacedDigit()
+            }
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(.white)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(.black.opacity(0.45), in: Capsule())
+        .padding(6)
+        .accessibilityHidden(true)
+    }
 }

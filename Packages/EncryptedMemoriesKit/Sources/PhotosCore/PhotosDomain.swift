@@ -96,6 +96,29 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
     }
 }
 
+extension PhotoItem {
+    /// The length of a video as the library shows it, for example "0:42" or "1:01:01". Nil for a photo and for a
+    /// video whose length is unknown.
+    public var durationText: String? { isVideo ? Self.durationText(for: durationSeconds) : nil }
+
+    /// A video length in seconds as the library shows it. Nil for a missing, invalid, or empty length.
+    public static func durationText(for seconds: Double?) -> String? {
+        guard let seconds, seconds.isFinite, seconds > 0, seconds < Double(Int.max) else { return nil }
+        let total = Int(seconds.rounded())
+        let hours = total / 3_600
+        let minutes = (total % 3_600) / 60
+        let remainder = total % 60
+        if hours > 0 {
+            return "\(hours):\(twoDigits(minutes)):\(twoDigits(remainder))"
+        }
+        return "\(minutes):\(twoDigits(remainder))"
+    }
+
+    private static func twoDigits(_ value: Int) -> String {
+        value < 10 ? "0\(value)" : "\(value)"
+    }
+}
+
 /// A date-grouped run of photos, like the macOS Photos app day/month headers.
 public struct TimelineSection: Identifiable, Sendable, Codable {
     public let id: String  // stable key, e.g. "2026-06-13"
