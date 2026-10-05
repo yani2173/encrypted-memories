@@ -100,6 +100,16 @@ public final class ExactDuplicatesModel {
             keptReason.map { ExactDuplicateMergeNotice.keptDuplicates(count: duplicateCount, reason: $0).message }
         }
 
+        /// The copies that `item` knows, in the order that the screen shows them, and the position of `uid` among
+        /// them, so a viewer that opens `uid` pages through every copy. Nil when `item` does not know `uid`.
+        public func viewerItems(
+            opening uid: PhotoUID, item: (PhotoUID) -> PhotoItem?
+        ) -> (items: [PhotoItem], index: Int)? {
+            let items = members.compactMap(item)
+            guard let index = items.firstIndex(where: { $0.uid == uid }) else { return nil }
+            return (items, index)
+        }
+
         /// Drops the photos that a merge moved to Recently Deleted and shows `stayed`, the photo that the merge kept,
         /// as the photo to keep. False when fewer than two members remain.
         mutating func remove(
@@ -601,6 +611,21 @@ public final class ExactDuplicatesModel {
         guard phase == .idle, scannedDuplicateCount == nil else { return }
         guard let scan = try? await finder.duplicateGroups(progress: { _ in }), phase == .idle else { return }
         scannedDuplicateCount = scan.groups.reduce(0) { $0 + $1.members.count - 1 }
+    }
+
+    /// Drops photos that left the library, for example after a trash in the viewer. A group with fewer than two
+    /// members left leaves the screen. A group whose chosen photo left keeps the ranked photo again.
+    public func photosLeftLibrary(_ uids: Set<PhotoUID>) {
+        guard !uids.isEmpty, groups.contains(where: { !uids.isDisjoint(with: $0.members) }) else { return }
+        groups = groups.compactMap { group in
+            let left = group.members.filter(uids.contains)
+            guard !left.isEmpty else { return group }
+            var group = group
+            let keptLeft = left.contains(group.kept)
+            guard group.remove(left, keeping: group.kept, keptReason: group.keptReason) else { return nil }
+            if keptLeft { group.isKeptChosen = false }
+            return group
+        }
     }
 
     /// Keeps `uid` instead of the ranked photo when the group is merged.

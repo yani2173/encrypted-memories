@@ -4,26 +4,12 @@ import PhotosCore
 /// The single photo-domain to grid-overlay mapping used by macOS, iOS, and iPadOS.
 package enum TimelineThumbnailOverlayPolicy {
     package static func overlay(for item: PhotoItem) -> GridThumbnailOverlay {
-        GridThumbnailOverlay(
-            durationText: item.isVideo ? durationText(for: item.durationSeconds) : nil,
-            showsRAW: isRAW(item)
-        )
+        GridThumbnailOverlay(durationText: item.durationText, showsRAW: isRAW(item))
     }
 
+    /// The grid shows the length of a video like every other screen of the library.
     package static func durationText(for seconds: Double?) -> String? {
-        guard let seconds, seconds.isFinite, seconds > 0, seconds < Double(Int.max) else { return nil }
-        let total = Int(seconds.rounded())
-        let hours = total / 3_600
-        let minutes = (total % 3_600) / 60
-        let remainder = total % 60
-        if hours > 0 {
-            return "\(hours):\(twoDigits(minutes)):\(twoDigits(remainder))"
-        }
-        return "\(minutes):\(twoDigits(remainder))"
-    }
-
-    private static func twoDigits(_ value: Int) -> String {
-        value < 10 ? "0\(value)" : "\(value)"
+        PhotoItem.durationText(for: seconds)
     }
 
     private static func isRAW(_ item: PhotoItem) -> Bool {

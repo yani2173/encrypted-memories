@@ -606,6 +606,42 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.first?.kept, a1, "a choice that left the group falls back to the ranking")
     }
 
+    // MARK: - Opening a copy larger
+
+    func testTheViewerPagesThroughTheCopiesThatTheLibraryKnowsInTheOrderOfTheScreen() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.fallback = ["A": [a2, a1, a3]]
+        finder.unreadableGroups = ["A"]
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let known = [
+            a1: PhotoItem(uid: a1, captureTime: Date(), mediaType: "image/jpeg"),
+            a2: PhotoItem(uid: a2, captureTime: Date(), mediaType: "video/quicktime", durationSeconds: 12),
+        ]
+        let group = try XCTUnwrap(model.groups.first)
+
+        let viewer = group.viewerItems(opening: a1) { known[$0] }
+
+        XCTAssertEqual(viewer?.items.map(\.uid), [a2, a1], "the copies in the order of the screen")
+        XCTAssertEqual(viewer?.index, 1)
+        XCTAssertNil(group.viewerItems(opening: a3) { known[$0] }, "a copy that the library does not know")
+    }
+
+    func testACopyThatLeftTheLibraryLeavesItsGroupAndAGroupWithOneCopyLeavesTheScreen() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        model.keep(a2, inGroup: "A")
+
+        model.photosLeftLibrary([a2, b1])
+
+        XCTAssertEqual(model.groups.map(\.id), ["A"])
+        XCTAssertEqual(model.groups.first?.members, [a1, a3])
+        XCTAssertEqual(model.groups.first?.kept, a1, "the chosen photo left, so the first copy is kept")
+        XCTAssertEqual(model.groups.first?.isKeptChosen, false)
+        XCTAssertEqual(model.knownDuplicateCount, 1)
+    }
+
     // MARK: - Merge
 
     func testMergingOneGroupRemovesOnlyThatGroupAndHidesTheTrashedPhotos() async {

@@ -114,6 +114,25 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 5))
     }
 
+    func testShowLargerOpensTheCopyInTheViewerAndKeepsThePhotoToKeep() {
+        openDuplicates()
+        let kept = app.buttons["duplicates.member.0.0"]
+        XCTAssertTrue(kept.waitForExistence(timeout: 5))
+        XCTAssertTrue(kept.isSelected, "the ranked photo is kept first")
+        let showLarger = app.buttons["duplicates.open.0.1"]
+        XCTAssertTrue(showLarger.waitForExistence(timeout: 5))
+        XCTAssertEqual(showLarger.label, "Show Larger")
+
+        showLarger.tap()
+
+        let close = app.buttons["Close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10), "the copy opens larger in the viewer")
+        close.tap()
+        waitUntilGone(close, "the viewer closes")
+        XCTAssertTrue(group(0).exists, "the group stays")
+        XCTAssertTrue(kept.isSelected, "opening a copy does not change the photo to keep")
+    }
+
     func testTappingAnotherPhotoKeepsItInsteadOfTheRankedOne() {
         openDuplicates()
         let ranked = app.buttons["duplicates.member.0.0"]

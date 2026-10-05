@@ -6187,6 +6187,20 @@
         "de": { "stringUnit": { "state": "translated", "value": "Duplikat" } }
       }
     },
+    "duplicates.show_larger": {
+      "comment": "Button and menu item that opens one copy of a duplicate group larger in the photo viewer.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Show Larger" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Größer anzeigen" } }
+      }
+    },
+    "duplicates.play_video": {
+      "comment": "Button and menu item that opens one video of a duplicate group in the viewer, where it plays.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Play Video" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Video abspielen" } }
+      }
+    },
     "duplicates.member_hint": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Keeps this photo instead." } },
