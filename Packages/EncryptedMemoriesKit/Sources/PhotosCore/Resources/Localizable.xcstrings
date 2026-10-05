@@ -6017,6 +6017,102 @@
         }
       }
     },
+    "duplicates.group_count %lld": {
+      "comment": "Header above the groups of identical photos: the number of groups found.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Group" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Groups" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Gruppe" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Gruppen" } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.unchecked %lld": {
+      "comment": "One line after a finished library check that could not read some photos.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld photo could not be checked." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld photos could not be checked." } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Foto konnte nicht geprüft werden." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos konnten nicht geprüft werden." } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.check_failed": {
+      "comment": "Line above the groups when the library check stopped before it finished.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The library check did not finish." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Prüfung der Mediathek wurde nicht abgeschlossen." } }
+      }
+    },
+    "duplicates.ranking_title": {
+      "comment": "Title while the screen reads which photo of each group to keep.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Choosing Photos to Keep" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zu behaltende Fotos werden gewählt" } }
+      }
+    },
+    "duplicates.ranking_progress %@ %@": {
+      "comment": "Progress of choosing the photos to keep. First %@: groups done, second: all groups, both formatted numbers.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%1$@ of %2$@ groups" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%1$@ von %2$@ Gruppen" } }
+      }
+    },
+    "duplicates.kept_reason_shared": {
+      "comment": "Why a merge left a duplicate in the library: the person shares it.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "It is shared with others." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es ist mit anderen geteilt." } }
+      }
+    },
+    "duplicates.group_frees %@": {
+      "comment": "Next to the copy count of one group: the space that merging the group frees. %@ is a formatted size.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Frees %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Gibt %@ frei" } }
+      }
+    },
+    "duplicates.freed_when_emptied": {
+      "comment": "Footer line below the space that merging all groups frees: merged duplicates wait in Recently Deleted.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Space is freed when Recently Deleted is emptied." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Der Speicher wird frei, wenn „Zuletzt gelöscht“ geleert ist." } }
+      }
+    },
+    "duplicates.total_frees %@": {
+      "comment": "Below the group count: the space that merging all groups found so far frees. %@ is a formatted size.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merging all frees %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alle zusammenführen gibt %@ frei" } }
+      }
+    },
     "duplicates.still_checking": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Still checking your library. More duplicates can appear." } },
@@ -6028,6 +6124,28 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Checking Your Library" } },
         "de": { "stringUnit": { "state": "translated", "value": "Mediathek wird geprüft" } }
+      }
+    },
+    "duplicates.checking_wait": {
+      "comment": "Line below the title while no group was found yet and the library check still runs.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Duplicates appear here when the check is done." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate erscheinen hier, sobald die Prüfung fertig ist." } }
+      }
+    },
+    "duplicates.checking_progress %@ %@": {
+      "extractionState": "manual",
+      "comment": "Progress of the library check. First %@: photos checked, second: all photos, both formatted numbers.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%1$@ of %2$@ photos" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%1$@ von %2$@ Fotos" } }
+      }
+    },
+    "duplicates.loading": {
+      "comment": "Title while the Duplicates screen reads the groups.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Loading Duplicates" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate werden geladen" } }
       }
     },
     "duplicates.none_title": {

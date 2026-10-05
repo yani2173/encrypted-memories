@@ -1,3 +1,4 @@
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 import UploadCore
@@ -47,18 +48,75 @@ public struct ExactDuplicatesView<Cover: View>: View {
     @ViewBuilder private var content: some View {
         switch model.content {
         case .loading:
-            ProgressView().tint(accent)
+            let line = model.loadingLine
+            ContentUnavailableView {
+                Label(line.title, systemImage: "square.on.square")
+            } actions: {
+                progressRow(line, showsTitle: false)
+                    .frame(maxWidth: 320)
+            }
+            .accessibilityIdentifier("duplicates.loading")
         case .failed(let message):
             ContentUnavailableView {
                 Label(message, systemImage: "exclamationmark.icloud")
             } actions: {
                 retryButton
             }
-        case .noDuplicates, .stillChecking:
+        case .noDuplicates:
             let copy = model.emptyStateCopy
             ContentUnavailableView(copy.title, systemImage: copy.systemImage, description: Text(copy.description))
+        case .stillChecking:
+            let copy = model.emptyStateCopy
+            ContentUnavailableView {
+                Label(copy.title, systemImage: copy.systemImage)
+            } description: {
+                Text(copy.description)
+            } actions: {
+                if let line = model.checkLine {
+                    progressRow(line, showsTitle: false)
+                        .frame(maxWidth: 320)
+                        .accessibilityIdentifier("duplicates.checkProgress")
+                }
+            }
         case .groups:
             groupList
+        }
+    }
+
+    /// The shared progress row. Without its title, the surrounding view shows the title.
+    private func progressRow(_ line: ExactDuplicatesModel.ProgressLine, showsTitle: Bool = true) -> some View {
+        ActivityProgressRow(
+            title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
+            showsIndeterminateProgress: true
+        )
+        .tint(accent)
+    }
+
+    /// The state of the check and of the ranking above the groups: progress rows while they run, one line after a check
+    /// that could not read every photo, and a retry when the check stopped.
+    @ViewBuilder private var statusRows: some View {
+        if let line = model.checkLine {
+            progressRow(line).accessibilityIdentifier("duplicates.checkProgress")
+        }
+        if let note = model.stillCheckingNote {
+            Label(note, systemImage: "hourglass")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        if let line = model.rankingLine {
+            progressRow(line).accessibilityIdentifier("duplicates.rankingProgress")
+        }
+        if let note = model.uncheckedNote {
+            Label(note, systemImage: "exclamationmark.circle")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("duplicates.unchecked")
+        }
+        if let note = model.checkFailedNote {
+            Label(note, systemImage: "exclamationmark.icloud")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Button(L10n.string("action.retry")) { Task { await model.load() } }
         }
     }
 
@@ -73,20 +131,42 @@ public struct ExactDuplicatesView<Cover: View>: View {
 
     private var groupList: some View {
         let list = List {
-            if let note = model.stillCheckingNote {
-                Section {
-                    Label(note, systemImage: "hourglass")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+            Section {
+                statusRows
+            } header: {
+                if let count = model.groupCountText {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(count).accessibilityIdentifier("duplicates.groupCount")
+                        if let freed = model.totalFreedText {
+                            Text(freed)
+                                .monospacedDigit()
+                                .accessibilityIdentifier("duplicates.totalFreed")
+                        }
+                        if let note = model.totalFreedNote {
+                            Text(note)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("duplicates.totalFreedNote")
+                        }
+                    }
                 }
             }
             ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in
                 Section {
                     ExactDuplicateMembers(model: model, group: group, groupIndex: index, accent: accent, cover: cover)
                         .accessibilityIdentifier("duplicates.group.\(index)")
+                        // Only the groups that the person scrolls to read their facts.
+                        .onAppear { model.groupAppeared(group.id) }
                 } header: {
-                    HStack {
+                    HStack(alignment: .firstTextBaseline) {
                         Text(L10n.string("duplicates.group_title \(group.members.count)"))
+                        if let freed = group.freedText {
+                            Text(freed)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                                .accessibilityIdentifier("duplicates.freed.\(index)")
+                        }
                         Spacer()
                         Button(L10n.string("duplicates.merge")) {
                             Task { await model.merge(groupID: group.id) }

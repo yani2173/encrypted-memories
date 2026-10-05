@@ -137,6 +137,33 @@ public actor AlbumsRepository: AlbumManaging {
         return Dictionary(uniqueKeysWithValues: uniqueUIDs.map { ($0, membershipCache[$0] ?? []) })
     }
 
+    /// `albumMemberships(for:)` read from the catalog for every photo, never from the cache, which it refreshes. A write
+    /// that depends on the memberships, such as a carry-over before a trash, needs the current state.
+    public func currentAlbumMemberships(
+        for photoUIDs: [PhotoUID]
+    ) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
+        guard !photoUIDs.isEmpty else { return [:] }
+        guard capabilities.canReadMemberships else {
+            throw AlbumError.unsupported(
+                operation: "Read album memberships",
+                gap: "the wired album catalog does not expose photo membership metadata"
+            )
+        }
+        let uniqueUIDs = Self.unique(photoUIDs)
+        let remote = uniqueUIDs.filter { !$0.isLocalPending }
+        if !remote.isEmpty {
+            do {
+                let loaded = try await catalogBackend.albumMemberships(for: remote)
+                for uid in remote {
+                    cacheMemberships(loaded[uid] ?? [], for: uid)
+                }
+            } catch {
+                throw Self.normalized(error)
+            }
+        }
+        return Dictionary(uniqueKeysWithValues: uniqueUIDs.map { ($0, membershipCache[$0] ?? []) })
+    }
+
     public func albumMembershipTitles(for photoUID: PhotoUID) async throws -> [String] {
         let membershipsByPhoto = try await albumMemberships(for: [photoUID])
         let memberships = membershipsByPhoto[photoUID] ?? []

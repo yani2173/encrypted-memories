@@ -99,9 +99,24 @@ public protocol SeriesAlbumCarryOver: Sendable {
     /// Adds the photos to an album of the account's own library. A shared album is never a valid target.
     /// Succeeds only when every photo is a member afterwards; an existing membership counts as success.
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws
+    /// `albums(containing:)` read from the server, never from a cache: a write that follows needs the current state.
+    func currentAlbums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]]
+    /// The link ID of the cover photo of each album of the account's own library that has one, by album ID.
+    func ownAlbumCovers() async throws -> [String: String]
+    /// Makes `uid`, a member of the album, the cover of an album of the account's own library.
+    func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws
 }
 
 extension SeriesAlbumCarryOver {
+    /// Backends without a membership cache read the current state with every read.
+    public func currentAlbums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        try await albums(containing: uids)
+    }
+
+    /// Backends without album covers report none.
+    public func ownAlbumCovers() async throws -> [String: String] { [:] }
+    public func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws {}
+
     public func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
         var albumsByPhoto: [PhotoUID: [SeriesAlbumReference]] = [:]
         for uid in uids where albumsByPhoto[uid] == nil {
@@ -597,5 +612,37 @@ public actor SeriesDissolutionOrchestrator {
             await duplicateChecker.recordUploaded(contentHash: contentHash, remoteLinkID: uid.nodeID)
             return uid
         }
+    }
+}
+
+/// Reads album memberships fresh for a carry-over, so an album that the person added a photo to after an earlier read
+/// still receives the photo that replaces it.
+public struct CurrentAlbumCarryOver: SeriesAlbumCarryOver {
+    let base: any SeriesAlbumCarryOver
+
+    public init(base: any SeriesAlbumCarryOver) {
+        self.base = base
+    }
+
+    public func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
+        try await base.currentAlbums(containing: [uid])[uid] ?? []
+    }
+
+    public func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        try await base.currentAlbums(containing: uids)
+    }
+
+    public func currentAlbums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        try await base.currentAlbums(containing: uids)
+    }
+
+    public func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
+        try await base.addPhotos(uids, toOwnAlbum: albumID)
+    }
+
+    public func ownAlbumCovers() async throws -> [String: String] { try await base.ownAlbumCovers() }
+
+    public func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws {
+        try await base.setCover(uid, ofOwnAlbum: albumID)
     }
 }

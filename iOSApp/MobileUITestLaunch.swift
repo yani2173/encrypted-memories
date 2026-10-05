@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SwiftUI
 
 #if DEBUG
     /// Starts the app signed in to the offline fixture account when a UI test passes `fixtureArgument`.
@@ -12,6 +13,12 @@ import PhotosCore
         /// With this argument the session model skips the saved account, so no real account service starts.
         nonisolated static var isRequested: Bool {
             ProcessInfo.processInfo.arguments.contains(fixtureArgument)
+        }
+
+        /// Dark with `-EncryptedMemoriesDarkAppearance`, so a UI test can render both appearances. XCTest on iOS has
+        /// no appearance switch.
+        nonisolated static var preferredColorScheme: ColorScheme? {
+            isRequested && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDarkAppearance") ? .dark : nil
         }
 
         /// Waits for the session check at launch, so it cannot replace the fixture session afterward.

@@ -69,13 +69,15 @@ final class ExactDuplicateFinderTests: XCTestCase {
     /// A manifest row of a local source that counts `link` as its backup.
     @discardableResult
     private func row(
-        _ identifier: String, names link: String, contentHash: String, epoch rowEpoch: String? = nil
+        _ identifier: String, names link: String, contentHash: String, epoch rowEpoch: String? = nil,
+        fileSize: Int64 = 10
     ) -> UploadSourceIdentity {
         let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
         XCTAssertTrue(
             store.upsert(
                 UploadIdentityRecord(
-                    source: source, filename: "\(identifier).JPG", correctedName: "\(identifier).JPG", fileSize: 10,
+                    source: source, filename: "\(identifier).JPG", correctedName: "\(identifier).JPG",
+                    fileSize: fileSize,
                     modificationDate: date(0), sha1Hex: "sha1", nameHash: "nh", contentHash: contentHash,
                     hashKeyEpoch: rowEpoch ?? epoch, remoteVolumeID: "vol", remoteLinkID: link,
                     outcome: UploadIdentityManifestStore.Outcome.uploaded.rawValue, updatedAt: date(0))))
@@ -140,19 +142,72 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(unbuilt.coverage, .indexing)
         XCTAssertEqual(unbuilt.groups, expected)
 
-        indexServer()
-        server.indexHealth = .degraded(indexedCount: 2, unresolvedCount: 3)
+        let records = server.links.map {
+            UploadRemoteContentIndexRecord(contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
+        }
+        let issues = (1...3).map {
+            UploadRemoteContentIndexIssue(
+                remoteLinkID: "unreadable-\($0)", reason: .decryptFailure, firstObservedAt: date(0),
+                lastObservedAt: date(0), lastRepairAttemptAt: nil, indexGeneration: "event-1")
+        }
+        XCTAssertTrue(
+            store.replaceRemoteContentIndex(
+                records, unresolvedIssues: issues, hashKeyEpoch: epoch,
+                checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
         let degraded = try await finder.duplicateGroups()
         XCTAssertEqual(degraded.coverage, .incomplete(unresolvedCount: 3))
         XCTAssertEqual(degraded.groups, expected)
 
-        server.indexHealth = .unavailable
-        let unavailableCoverage = try await finder.duplicateGroups().coverage
-        XCTAssertEqual(unavailableCoverage, .indexing)
-
-        server.indexHealth = nil
+        indexServer()
         let completeCoverage = try await finder.duplicateGroups().coverage
         XCTAssertEqual(completeCoverage, .complete)
+    }
+
+    func testTheScanReadsTheCoverageFromTheIndexAndNeverWaitsForTheBuildOfTheBackup() async throws {
+        let first = server.seedLink(digest: digest("a"))
+        let second = server.seedLink(digest: digest("a"))
+        indexServer()
+        // The health read of the backend refreshes the index first, so it waits for a running build of the backup.
+        server.indexHealth = .unavailable
+
+        let scan = try await finder.duplicateGroups()
+
+        XCTAssertEqual(scan.coverage, .complete)
+        XCTAssertEqual(scan.groups.map(\.members), [[first, second]])
+        XCTAssertEqual(server.indexBuilds, 0, "a scan builds nothing")
+    }
+
+    func testPrepareIndexBuildsAMissingIndexWithTheBuildOfTheBackupAndTheNextScanFindsTheGroups() async throws {
+        let first = server.seedLink(digest: digest("a"))
+        let second = server.seedLink(digest: digest("a"))
+        let records = server.links.map {
+            UploadRemoteContentIndexRecord(contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
+        }
+        let unbuilt = try await finder.duplicateGroups()
+        XCTAssertEqual(unbuilt, ExactDuplicateScan(groups: [], coverage: .indexing))
+        let store = try XCTUnwrap(store)
+        server.indexBuild = { [epoch] progress in
+            await progress(.init(phase: .indexing, completed: 1, total: 2))
+            _ = store.replaceRemoteContentIndex(
+                records, unresolvedIssues: [], hashKeyEpoch: epoch,
+                checkpoint: .init(eventID: "event-1", refreshedAt: Date()))
+            await progress(.init(phase: .ready))
+        }
+        let reported = ProgressLog()
+
+        let changed = try await finder.prepareIndex { await reported.append($0) }
+
+        XCTAssertTrue(changed)
+        XCTAssertEqual(server.indexBuilds, 1, "the backup's build runs through its resolver")
+        let steps = await reported.steps
+        XCTAssertEqual(steps, [.init(phase: .indexing, completed: 1, total: 2), .init(phase: .ready)])
+        let built = try await finder.duplicateGroups()
+        XCTAssertEqual(built.coverage, .complete)
+        XCTAssertEqual(built.groups.map(\.members), [[first, second]])
+
+        server.indexBuild = nil
+        let unchanged = try await finder.prepareIndex { _ in }
+        XCTAssertFalse(unchanged, "a build that changes nothing needs no new scan")
     }
 
     // MARK: - Keep order
@@ -194,12 +249,12 @@ final class ExactDuplicateFinderTests: XCTestCase {
         indexServer()
 
         let group = try await onlyGroup()
-        let ranked = try await finder.rankedMembers(of: [group])
+        let ranked = await finder.rankedMembers(of: [group])
 
         XCTAssertEqual(ranked, [hash("a"): [album, favorite, manifest, earliest]])
     }
 
-    func testTheRankingAndTheMergeReadTheManifestAndTheAlbumsOnceForAllMembers() async throws {
+    func testTheRankingReadsOneNodeForEachMemberAndTheMergeReadsTheManifestOnce() async throws {
         let members = (0..<4).map { _ in server.seedLink(digest: digest("a")) }
         for (index, member) in members.enumerated() {
             row("asset-\(index)", names: member.nodeID, contentHash: hash("a"))
@@ -210,16 +265,287 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let finder = finder(identities: identities, albums: albums)
         let group = try await onlyGroup()
 
-        _ = try await finder.rankedMembers(of: [group])
+        _ = await finder.rankedMembers(of: [group])
         XCTAssertEqual(identities.reads, CountingIdentityStore.Reads(single: 0, batch: 1))
-        XCTAssertEqual(albums.reads, CountingAlbums.Reads(single: 0, batch: 1))
+        XCTAssertEqual(albums.reads, CountingAlbums.Reads(single: 0, batch: 0), "the node read gives the albums")
+        XCTAssertEqual(server.readCounts.sharingMembers, 4, "one node read for each member")
+        XCTAssertEqual(server.readCounts.albumMembers, 0)
 
         let outcome = try await finder.merge(group, keeping: members[0])
         XCTAssertEqual(outcome, .merged(kept: members[0], trashed: Array(members.dropFirst()), keptDuplicates: [:]))
         XCTAssertEqual(identities.reads, CountingIdentityStore.Reads(single: 0, batch: 2))
     }
 
+    func testASharedMemberIsKeptFirstAndAMissingNodeLeavesOnlyItsGroupInTheFallbackOrder() async throws {
+        let album = server.seedLink(digest: digest("a"), captureTime: date(0))
+        let shared = server.seedLink(digest: digest("a"), captureTime: date(5))
+        try await server.markFavorite([album])
+        try await server.addPhotos([album], toOwnAlbum: "own-album")
+        server.share(shared)
+        let lost = server.seedLink(digest: digest("b"), captureTime: date(9))
+        let other = server.seedLink(digest: digest("b"), captureTime: date(1))
+        server.loseNode(lost)
+        indexServer()
+        let groups = try await finder.duplicateGroups().groups
+
+        let ranked = await finder.rankedMembers(of: groups)
+
+        XCTAssertEqual(ranked, [hash("a"): [shared, album]], "a trash would end the sharing, so it stays")
+        let fallback = await finder.fallbackMembers(of: groups)
+        XCTAssertEqual(fallback[hash("b")], [other, lost], "the group of the missing node keeps the earliest photo")
+    }
+
+    func testTheScanOf1500GroupsReadsNoAlbumNoSharingStateAndNoFavorites() async throws {
+        server.seedLinks(digests: (0..<1_500).flatMap { [digest("group-\($0)"), digest("group-\($0)")] })
+        indexServer()
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        let scan = try await finder.duplicateGroups()
+        let scanned = clock.now
+        _ = await finder.fallbackMembers(of: scan.groups)
+
+        XCTAssertEqual(scan.groups.count, 1_500)
+        let reads = server.readCounts
+        XCTAssertEqual(reads.visibility, 20, "3,000 links in reads of 150")
+        XCTAssertEqual(reads.albumMembers, 0)
+        XCTAssertEqual(reads.sharingMembers, 0)
+        XCTAssertEqual(reads.favorites, 0)
+        print(
+            "[Duplicates timing] scan=\(start.duration(to: scanned)) fallback=\(scanned.duration(to: clock.now)) "
+                + "visibilityRequests=\(reads.visibility)")
+    }
+
+    @MainActor
+    func testTheScreenShows1500GroupsAndTheirSizesBeforeAnyNodeLoadAndRanksOnlyTheShownPages() async throws {
+        let links = server.seedLinks(digests: (0..<1_500).flatMap { [digest("group-\($0)"), digest("group-\($0)")] })
+        for index in 0..<1_500 {
+            row("asset-\(index)", names: links[index * 2].nodeID, contentHash: hash("group-\(index)"), fileSize: 1_000)
+        }
+        indexServer()
+        let remote = FavoritesGatedRemote(base: server)
+        let finder = ExactDuplicateFinder(
+            checker: server, resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
+            index: store, identities: store, journal: journal, remote: remote, albums: server)
+        let model = ExactDuplicatesModel(finder: finder)
+        let clock = ContinuousClock()
+        let start = clock.now
+        let load = Task { await model.load() }
+        for _ in 0..<5_000 where model.rankingLine == nil { try await Task.sleep(for: .milliseconds(1)) }
+        let published = clock.now
+
+        XCTAssertEqual(model.content, .groups)
+        XCTAssertEqual(model.groups.count, 1_500)
+        let beforeRanking = server.readCounts
+        XCTAssertEqual(beforeRanking.albumMembers, 0, "no node load before the groups show")
+        XCTAssertEqual(beforeRanking.sharingMembers, 0, "no node load before the groups show")
+        XCTAssertNotNil(model.rankingLine)
+        XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the manifest knows every size before any node load")
+
+        remote.gate.open()
+        await load.value
+        let reads = server.readCounts
+        let pages = 2 * ExactDuplicatesModel.rankingPageSize
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, pages, "the shown page and the page after it")
+        XCTAssertNil(model.rankingLine)
+        XCTAssertEqual(reads.favorites, 1)
+        XCTAssertEqual(reads.albumMembers, 0, "the node read gives the albums")
+        XCTAssertEqual(reads.sharingMembers, pages * 2, "one node read for each member")
+
+        model.groupAppeared(model.groups[500].id)
+        for _ in 0..<5_000 where model.groups.filter(\.isRanked).count < 2 * pages {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * pages, "scrolling ranks two more pages")
+        XCTAssertEqual(server.readCounts.favorites, 1, "one favorites listing serves every page")
+        XCTAssertEqual(server.readCounts.sharingMembers, 2 * pages * 2)
+
+        await model.load()
+        XCTAssertEqual(server.readCounts.sharingMembers, 2 * pages * 2, "an unchanged group keeps its facts")
+        XCTAssertEqual(server.readCounts.albumMembers, 0)
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * pages)
+        print(
+            "[Duplicates timing] firstGroups=\(start.duration(to: published)) "
+                + "ranking=\(published.duration(to: clock.now)) visibilityRequests=\(reads.visibility) "
+                + "favoritesListings=\(reads.favorites) albumReads=\(reads.albumMembers) "
+                + "sharingReads=\(reads.sharingMembers)")
+    }
+
+    @MainActor
+    func testEachGroupShowsTheSpaceItsMergeFreesFromTheManifestOrTheNodeAndNoneWhenUnknown() async throws {
+        let manifest = (0..<3).map { _ in server.seedLink(digest: digest("manifest")) }
+        let node = (0..<2).map { _ in server.seedLink(digest: digest("node")) }
+        _ = (0..<2).map { _ in server.seedLink(digest: digest("unknown")) }
+        row("asset-1", names: manifest[0].nodeID, contentHash: hash("manifest"), fileSize: 4_000)
+        server.setNodeSize(1_500, of: node[1])
+        indexServer()
+
+        let scan = try await finder.duplicateGroups()
+        XCTAssertEqual(scan.byteSizes, [hash("manifest"): 4_000], "the scan reads sizes from the manifest only")
+
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        let sizes = Dictionary(uniqueKeysWithValues: model.groups.map { ($0.id, $0.freedBytes) })
+        XCTAssertEqual(sizes[hash("manifest")], 8_000, "two duplicates of 4,000 bytes")
+        XCTAssertEqual(sizes[hash("node")], 1_500, "the node read of the ranking gives the size")
+        XCTAssertEqual(sizes[hash("unknown")] ?? nil, nil, "no size until it is known")
+        XCTAssertEqual(model.totalFreedBytes, 9_500)
+        let unknown = try XCTUnwrap(model.groups.first { $0.id == hash("unknown") })
+        XCTAssertNil(unknown.freedText)
+    }
+
+    func testRelatedFilesOfAProvenCompoundAreNoCandidates() throws {
+        let records = [
+            UploadRemoteContentIndexRecord(contentHash: "original", hashKeyEpoch: epoch, remoteLinkID: "earlier-main"),
+            UploadRemoteContentIndexRecord(contentHash: "original", hashKeyEpoch: epoch, remoteLinkID: "edit-original"),
+            UploadRemoteContentIndexRecord(contentHash: "edited", hashKeyEpoch: epoch, remoteLinkID: "edit-main"),
+            UploadRemoteContentIndexRecord(contentHash: "copy", hashKeyEpoch: epoch, remoteLinkID: "copy-1"),
+            UploadRemoteContentIndexRecord(contentHash: "copy", hashKeyEpoch: epoch, remoteLinkID: "copy-2"),
+        ]
+        let compound = UploadRemoteAssetIndexRecord(
+            externalIdentity: UploadBackupExternalIdentity(identifier: "cloud-1", revision: .init(rawValue: 1)),
+            resourceCount: 2, remoteLinkIDs: ["edit-main", "edit-original"], hashKeyEpoch: epoch)
+        XCTAssertTrue(
+            store.replaceRemoteContentIndex(
+                records, remoteAssetRecords: [compound], unresolvedIssues: [], hashKeyEpoch: epoch,
+                checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
+
+        XCTAssertEqual(store.remoteContentDuplicateGroups(hashKeyEpoch: epoch), ["copy": ["copy-1", "copy-2"]])
+    }
+
     // MARK: - Merge
+
+    func testMergeKeepsEverySharedDuplicateAndReadsTheSharingStateOfItsGroupOnly() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let sharedA = server.seedLink(digest: digest("a"))
+        let sharedB = server.seedLink(digest: digest("a"))
+        let plain = server.seedLink(digest: digest("a"))
+        server.share(sharedA)
+        server.share(sharedB)
+        _ = server.seedLink(digest: digest("b"))
+        _ = server.seedLink(digest: digest("b"))
+        indexServer()
+        let groups = try await finder.duplicateGroups().groups
+        let group = try XCTUnwrap(groups.first { $0.contentHash == hash("a") })
+
+        let outcome = try await finder.merge(group, keeping: kept)
+
+        XCTAssertEqual(
+            outcome, .merged(kept: kept, trashed: [plain], keptDuplicates: [sharedA: .shared, sharedB: .shared]))
+        XCTAssertEqual(server.links.first { $0.linkID == sharedA.nodeID }?.state, .active)
+        XCTAssertEqual(server.readCounts.sharingMembers, 4, "only the members of the merged group")
+    }
+
+    func testAMergeWhoseNodeReadFailsTrashesNothingAndCarriesNothingOver() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        server.decorate(duplicate)
+        indexServer()
+        let group = try await onlyGroup()
+        server.loseNode(duplicate)
+        let stepsBefore = server.steps.count
+
+        let results = await finder.merge([(group, kept)])
+
+        guard case .failure = results[0] else { return XCTFail("expected a failure, got \(results[0])") }
+        XCTAssertEqual(server.steps.count, stepsBefore, "no favorite, album, cover, or trash write")
+        XCTAssertEqual(server.links.first { $0.linkID == duplicate.nodeID }?.state, .active)
+    }
+
+    func testAMergeWhoseCoverWriteFailsFailsBeforeTheTrashAndMovesNoRow() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        try await server.addPhotos([duplicate], toOwnAlbum: "own-album")
+        server.setAlbumCover("own-album", to: duplicate)
+        let source = row("asset-1", names: duplicate.nodeID, contentHash: hash("a"))
+        indexServer()
+        server.failNextCoverWrite()
+
+        let results = await finder.merge([(try await onlyGroup(), kept)])
+
+        guard case .failure = results[0] else { return XCTFail("expected a failure, got \(results[0])") }
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash") }, "nothing is trashed")
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, duplicate.nodeID, "the manifest row stays")
+        XCTAssertEqual(server.albumCovers, ["own-album": duplicate.nodeID])
+    }
+
+    func testTheCarryOverReadsTheAlbumsOfTheDuplicatesFreshBeforeTheTrash() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let albums = CachingAlbums(base: server)
+        // An earlier read, for example of the album screen, cached the duplicate in no album.
+        _ = try await albums.albums(containing: [duplicate])
+        try await server.addPhotos([duplicate], toOwnAlbum: "own-album")
+
+        let outcome = try await finder(albums: albums).merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [duplicate], keptDuplicates: [:]))
+        XCTAssertEqual(
+            server.links.first { $0.linkID == kept.nodeID }?.albums, [.init(volumeID: "vol", albumID: "own-album")],
+            "the album added after the earlier read gets the kept photo")
+    }
+
+    func testSizesLeaveOutAHashThatOnlyRelatedFilesHold() throws {
+        let records = [
+            UploadRemoteContentIndexRecord(contentHash: "video", hashKeyEpoch: epoch, remoteLinkID: "video-1"),
+            UploadRemoteContentIndexRecord(contentHash: "video", hashKeyEpoch: epoch, remoteLinkID: "video-2"),
+            UploadRemoteContentIndexRecord(contentHash: "main-1", hashKeyEpoch: epoch, remoteLinkID: "live-1"),
+            UploadRemoteContentIndexRecord(contentHash: "main-2", hashKeyEpoch: epoch, remoteLinkID: "live-2"),
+            UploadRemoteContentIndexRecord(contentHash: "copy", hashKeyEpoch: epoch, remoteLinkID: "copy-1"),
+            UploadRemoteContentIndexRecord(contentHash: "copy", hashKeyEpoch: epoch, remoteLinkID: "copy-2"),
+        ]
+        let compounds = (1...2).map { index in
+            UploadRemoteAssetIndexRecord(
+                externalIdentity: UploadBackupExternalIdentity(
+                    identifier: "cloud-\(index)", revision: .init(rawValue: 1)),
+                resourceCount: 2, remoteLinkIDs: ["live-\(index)", "video-\(index)"], hashKeyEpoch: epoch)
+        }
+        XCTAssertTrue(
+            store.replaceRemoteContentIndex(
+                records, remoteAssetRecords: compounds, unresolvedIssues: [], hashKeyEpoch: epoch,
+                checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
+        row("asset-video", names: "video-1", contentHash: "video", fileSize: 9_000)
+        row("asset-copy", names: "copy-1", contentHash: "copy", fileSize: 500)
+
+        XCTAssertEqual(store.remoteContentDuplicateSizes(hashKeyEpoch: epoch), ["copy": 500])
+        XCTAssertEqual(store.remoteContentDuplicateGroups(hashKeyEpoch: epoch), ["copy": ["copy-1", "copy-2"]])
+    }
+
+    func testMergeMovesTheCoverOfAnOwnAlbumFromATrashedDuplicateToTheKeptPhoto() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        try await server.addPhotos([duplicate], toOwnAlbum: "own-album")
+        server.setAlbumCover("own-album", to: duplicate)
+        indexServer()
+
+        let outcome = try await finder.merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [duplicate], keptDuplicates: [:]))
+        XCTAssertEqual(server.albumCovers, ["own-album": kept.nodeID])
+        let actions = server.steps.map(\.action)
+        let coverStep = try XCTUnwrap(actions.firstIndex(of: "cover own-album"))
+        let trashStep = try XCTUnwrap(actions.firstIndex(of: "duplicate trash [\"\(duplicate.nodeID)\"]"))
+        XCTAssertLessThan(coverStep, trashStep, "the album never shows a trashed cover")
+    }
+
+    func testMergeLeavesACoverThatIsTheKeptPhotoOrAnotherPhoto() async throws {
+        for coverIsKept in [true, false] {
+            server = EditScenarioServer()
+            let kept = server.seedLink(digest: digest("a"))
+            let duplicate = server.seedLink(digest: digest("a"))
+            let other = server.seedLink(digest: digest("x"))
+            try await server.addPhotos([kept, duplicate, other], toOwnAlbum: "own-album")
+            let cover = coverIsKept ? kept : other
+            server.setAlbumCover("own-album", to: cover)
+            indexServer()
+
+            _ = try await finder.merge(try await onlyGroup(), keeping: kept)
+
+            XCTAssertEqual(server.albumCovers, ["own-album": cover.nodeID], "cover is kept: \(coverIsKept)")
+            XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("cover ") }, "cover is kept: \(coverIsKept)")
+        }
+    }
 
     func testMergeCarriesTheFavoriteAndOwnAlbumsToTheKeptPhotoBeforeTheTrash() async throws {
         let kept = server.seedLink(digest: digest("a"))
@@ -649,6 +975,52 @@ final class ExactDuplicateFinderTests: XCTestCase {
 }
 
 /// Counts the reads of the manifest rows that name a remote link.
+/// Holds the favorites listing, the first read of the ranking, while its gate is closed.
+private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Sendable {
+    let base: EditScenarioServer
+    let gate = FinderGate()
+
+    init(base: EditScenarioServer) { self.base = base }
+
+    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids)
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        await gate.pass()
+        return try await base.favoriteUIDs(among: uids)
+    }
+}
+
+/// Holds callers until it opens.
+private actor FinderGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func pass() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    nonisolated func open() { Task { await self.release() } }
+
+    private func release() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters = []
+    }
+}
+
+private actor ProgressLog {
+    private(set) var steps: [UploadRemoteIndexPreparationProgress] = []
+    func append(_ step: UploadRemoteIndexPreparationProgress) { steps.append(step) }
+}
+
 private final class CountingIdentityStore: UploadIdentityStore, @unchecked Sendable {
     struct Reads: Equatable {
         var single = 0
@@ -685,6 +1057,45 @@ private final class CountingIdentityStore: UploadIdentityStore, @unchecked Senda
 }
 
 /// Counts the album reads.
+/// Caches every membership read like the album repository, and reads the server for `currentAlbums`.
+private final class CachingAlbums: SeriesAlbumCarryOver, @unchecked Sendable {
+    private let base: EditScenarioServer
+    private let lock = NSLock()
+    private var cache: [PhotoUID: [SeriesAlbumReference]] = [:]
+
+    init(base: EditScenarioServer) { self.base = base }
+
+    func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
+        try await albums(containing: [uid])[uid] ?? []
+    }
+    func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        var result: [PhotoUID: [SeriesAlbumReference]] = [:]
+        for uid in uids {
+            if let cached = lock.withLock({ cache[uid] }) {
+                result[uid] = cached
+            } else {
+                let read = try await base.albums(containing: uid)
+                lock.withLock { cache[uid] = read }
+                result[uid] = read
+            }
+        }
+        return result
+    }
+    func currentAlbums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        var result: [PhotoUID: [SeriesAlbumReference]] = [:]
+        for uid in uids { result[uid] = try await base.albums(containing: uid) }
+        lock.withLock { cache.merge(result) { _, new in new } }
+        return result
+    }
+    func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
+        try await base.addPhotos(uids, toOwnAlbum: albumID)
+    }
+    func ownAlbumCovers() async throws -> [String: String] { try await base.ownAlbumCovers() }
+    func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws {
+        try await base.setCover(uid, ofOwnAlbum: albumID)
+    }
+}
+
 private final class CountingAlbums: SeriesAlbumCarryOver, @unchecked Sendable {
     struct Reads: Equatable {
         var single = 0
