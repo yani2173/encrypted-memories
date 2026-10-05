@@ -3187,6 +3187,28 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(holding.finished.count, 5)
     }
 
+    func testSentBytesCountEveryFinishedUploadInFullAcrossPasses() async throws {
+        for index in 0..<3 { _ = seedEntry("sized-\(index).jpg") }
+        // No progress callbacks: only the finished uploads move the count.
+        let quiet = MockUploader(deliverProgress: false)
+        let recorder = BackupProgressRecorder()
+        let runner = makeRunner(uploader: quiet)
+        await runner.setOnProgress { recorder.append($0) }
+
+        let first = await runner.runUntilDrained()
+        let sent = quiet.requests.reduce(Int64(0)) { $0 + $1.fileSize }
+        XCTAssertGreaterThan(sent, 0)
+        XCTAssertEqual(first.transferredBytes, sent)
+        let counts = recorder.snapshots.map(\.transferredBytes)
+        XCTAssertFalse(zip(counts, counts.dropFirst()).contains { $0 > $1 }, "the count never goes back")
+
+        _ = seedEntry("later.jpg")
+        let second = await runner.runUntilDrained()
+        XCTAssertEqual(
+            second.transferredBytes, quiet.requests.reduce(Int64(0)) { $0 + $1.fileSize },
+            "a later pass of the same runner keeps counting")
+    }
+
     func testFileChangedAfterScanUploadsCurrentContentAndClosesBothRows() async throws {
         let entry = seedEntry("edited.jpg")
         let newModified = resolver.defaultModified.addingTimeInterval(500)

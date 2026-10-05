@@ -118,8 +118,14 @@ public actor BackupSyncRunner {
         var byteFraction: Double
         var itemBaseFraction: Double
         var itemFractionWeight: Double
+
+        /// The bytes this transfer has sent, at its last quantized progress.
+        var sentBytes: Int64 { Int64((Double(totalBytes) * byteFraction).rounded(.down)) }
     }
     private var activeTransfers: [String: ActiveTransfer] = [:]
+    /// Bytes of every transfer that ended since this runner started, for `BackupSyncProgress.transferredBytes`. It
+    /// spans passes, so the short drains that run beside a scan keep one continuous count.
+    private var finishedTransferBytes: Int64 = 0
     /// Stage high-water marks remain until the item settles, so identity, materialization, upload, and
     /// primary-to-secondary handoffs cannot make continued-processing progress go backwards.
     private struct ActiveExecution {
@@ -298,6 +304,7 @@ public actor BackupSyncRunner {
         guard queue.isOperational() else { return progress }
 
         progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
+        progress.transferredBytes = finishedTransferBytes
         progress.remoteIndexPreparationIssue = queue.runtimeIssue(for: .remoteIndexPreparation)
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
         guard queue.isOperational() else { return progress }
@@ -482,6 +489,7 @@ public actor BackupSyncRunner {
             let wasPausedByPolicy = progress.isPausedByPolicy
             progress = BackupSyncProgress(summary: queue.summary(), isRunning: false)
             progress.isPausedByPolicy = wasPausedByPolicy
+            progress.transferredBytes = finishedTransferBytes
         } else {
             // Preserve the last trustworthy counters. The controller exposes the unavailable store;
             // replacing this with an empty summary would falsely look like a completed backup.
@@ -2058,6 +2066,7 @@ public actor BackupSyncRunner {
         progress.remoteIndexPreparationFailed = previous.remoteIndexPreparationFailed
         progress.remoteIndexPreparationIssue = previous.remoteIndexPreparationIssue
         progress.activeTransfer = previous.activeTransfer
+        progress.transferredBytes = previous.transferredBytes
         progress.activeExecutionItemEquivalents = previous.activeExecutionItemEquivalents
         progress.outstanding = previous.outstanding
     }
@@ -2271,6 +2280,7 @@ public actor BackupSyncRunner {
         switch resolution {
         case .success(let uid):
             await join.settle()
+            markTransferSent(key: progressKey, generation: request.cancellationToken)
             return uid
         case .failure(let error):
             await join.settle()
@@ -2323,14 +2333,23 @@ public actor BackupSyncRunner {
         publishActiveTransferProgress()
     }
 
+    /// A successful upload sent every byte, also when the backend reported no final progress.
+    private func markTransferSent(key: String, generation: UUID) {
+        guard var transfer = activeTransfers[key], transfer.generation == generation else { return }
+        transfer.byteFraction = 1
+        activeTransfers[key] = transfer
+    }
+
     private func endActiveTransfer(key: String, generation: UUID) {
-        guard activeTransfers[key]?.generation == generation else { return }
+        guard let transfer = activeTransfers[key], transfer.generation == generation else { return }
+        finishedTransferBytes += transfer.sentBytes
         activeTransfers.removeValue(forKey: key)
         publishActiveTransferProgress()
     }
 
     private func publishActiveTransferProgress() {
         guard !activeTransfers.isEmpty else {
+            progress.transferredBytes = finishedTransferBytes
             if progress.activeTransfer != nil {
                 progress.activeTransfer = nil
             }
@@ -2342,7 +2361,7 @@ public actor BackupSyncRunner {
         var itemEquivalents = 0.0
         for transfer in activeTransfers.values {
             totalBytes += transfer.totalBytes
-            completedBytes += Int64((Double(transfer.totalBytes) * transfer.byteFraction).rounded(.down))
+            completedBytes += transfer.sentBytes
             itemEquivalents += min(
                 0.999,
                 transfer.itemBaseFraction + transfer.itemFractionWeight * transfer.byteFraction
@@ -2354,6 +2373,7 @@ public actor BackupSyncRunner {
             totalBytes: totalBytes,
             completedItemEquivalents: itemEquivalents
         )
+        progress.transferredBytes = finishedTransferBytes + completedBytes
         guard candidate != progress.activeTransfer else { return }
         progress.activeTransfer = candidate
         publishActiveExecutionProgress()

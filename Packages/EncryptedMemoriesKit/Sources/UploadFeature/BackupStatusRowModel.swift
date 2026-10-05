@@ -4,17 +4,21 @@ import UploadCore
 
 /// Cross-platform timeful wrapper around the pure `BackupStatusStabilizer`. Native settings views feed it
 /// controller changes and render `displayed`; the shared model owns the one deferred wake and never polls.
+/// It also measures the upload speed, which needs the history that a single status lacks.
 @MainActor
 @Observable
 public final class BackupStatusRowModel {
     public private(set) var displayed = BackupStatusPresentation(BackupStatus())
     private var stabilizer = BackupStatusStabilizer()
+    private var transferRate = BackupTransferRate()
     private var wakeTask: Task<Void, Never>?
 
     public init() {}
 
     public func ingest(_ status: BackupStatus) {
-        apply(stabilizer.ingest(BackupStatusPresentation(status), now: Date()))
+        let now = Date()
+        transferRate.record(bytes: status.transferredBytes, at: now)
+        apply(stabilizer.ingest(BackupStatusPresentation(status), now: now))
     }
 
     public func cancel() {
@@ -23,7 +27,9 @@ public final class BackupStatusRowModel {
     }
 
     private func apply(_ decision: BackupStatusStabilizer.Decision) {
-        displayed = decision.display
+        var display = decision.display
+        display.bytesPerSecond = transferRate.bytesPerSecond
+        displayed = display
         wakeTask?.cancel()
         guard let wakeAt = decision.wakeAt else {
             wakeTask = nil
