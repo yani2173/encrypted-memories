@@ -20,11 +20,10 @@ public protocol ExactDuplicateMerging: Sendable {
     func rankMembers(
         of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
     ) async
-    /// Merges each group, keeping its photo. One result for each group, in order. After a cancellation, the groups
-    /// without an outcome fail with `CancellationError`.
-    func merge(
-        _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
-    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>]
+    /// Merges each group, keeping its photo, or a shared duplicate in place of a photo that the person did not choose.
+    /// One result for each group, in order. After a cancellation, the groups without an outcome fail with
+    /// `CancellationError`.
+    func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>]
 }
 
 extension ExactDuplicateFinder: ExactDuplicateMerging {}
@@ -101,34 +100,34 @@ public final class ExactDuplicatesModel {
             keptReason.map { ExactDuplicateMergeNotice.keptDuplicates(count: duplicateCount, reason: $0).message }
         }
 
-        /// Drops the photos that a merge moved to Recently Deleted. False when fewer than two members remain.
-        mutating func remove(_ trashed: [PhotoUID], keptReason reason: ExactDuplicateKeepReason?) -> Bool {
+        /// Drops the photos that a merge moved to Recently Deleted and shows `stayed`, the photo that the merge kept,
+        /// as the photo to keep. False when fewer than two members remain.
+        mutating func remove(
+            _ trashed: [PhotoUID], keeping stayed: PhotoUID, keptReason reason: ExactDuplicateKeepReason?
+        ) -> Bool {
             let remaining = members.filter { !trashed.contains($0) }
             guard remaining.count > 1 else { return false }
             members = remaining
             scanGroup = ExactDuplicateGroup(
                 contentHash: scanGroup.contentHash, hashKeyEpoch: scanGroup.hashKeyEpoch,
                 members: scanGroup.members.filter { !trashed.contains($0) })
-            if !remaining.contains(kept) { kept = remaining[0] }
+            if remaining.contains(stayed) {
+                kept = stayed
+            } else if !remaining.contains(kept) {
+                kept = remaining[0]
+            }
             keptReason = reason
             return true
         }
 
-        /// Takes the ranked order. The photo to keep follows it unless the person chose one. With `keepsShown`, the
-        /// photo that the screen already shows as kept stays, unless another member is shared and it is not: a merge
-        /// keeps every shared member, so the shared one is kept and shown.
-        mutating func rank(_ order: [PhotoUID], shared: Set<PhotoUID>, keepsShown: Bool) {
+        /// Takes the ranked order. The photo to keep follows it unless the person chose one.
+        mutating func rank(_ order: [PhotoUID], shared: Set<PhotoUID>) {
             let current = Set(members)
             let ranked = order.filter(current.contains)
             members = ranked + members.filter { !ranked.contains($0) }
             sharedMembers = shared.intersection(current)
             isRanked = true
-            guard !isKeptChosen else { return }
-            if !keepsShown {
-                kept = members[0]
-            } else if !sharedMembers.contains(kept), let firstShared = members.first(where: sharedMembers.contains) {
-                kept = firstShared
-            }
+            if !isKeptChosen { kept = members[0] }
         }
     }
 
@@ -171,6 +170,8 @@ public final class ExactDuplicatesModel {
     public private(set) var scanProgress: ExactDuplicateScanProgress?
     /// The groups that the ranking has covered, of all groups that it ranks. Nil while no ranking runs.
     public private(set) var rankingProgress: ExactDuplicateScanProgress?
+    /// The duplicates that the running merge has handled, of all duplicates that it takes. Nil while no merge runs.
+    public private(set) var mergeProgress: ExactDuplicateScanProgress?
     /// The message of the last merge, until the person dismisses it.
     public private(set) var notice: ExactDuplicateMergeNotice?
     private var phase = Phase.idle
@@ -292,6 +293,15 @@ public final class ExactDuplicatesModel {
             fraction: Double(rankingProgress.completed) / Double(rankingProgress.total))
     }
 
+    /// The line of a running merge, for example "1,200 of 30,000 photos". Nil while no merge runs.
+    public var mergeLine: ProgressLine? {
+        guard let mergeProgress, mergeProgress.total > 0 else { return nil }
+        return ProgressLine(
+            title: L10n.string("duplicates.merging_title"),
+            detail: Self.photoCount(mergeProgress.completed, of: mergeProgress.total),
+            fraction: Double(mergeProgress.completed) / Double(mergeProgress.total))
+    }
+
     /// The note while the library is still being checked and groups are shown. Nil once the check finished.
     public var stillCheckingNote: String? {
         phase == .loaded && !isComplete && isBuilding ? L10n.string("duplicates.still_checking") : nil
@@ -332,6 +342,11 @@ public final class ExactDuplicatesModel {
 
     /// The groups in one page of the ranking. The screen ranks the page that it shows and the page after it.
     nonisolated static let rankingPageSize = 24
+
+    /// The groups that one merge request takes. Merge All hands the groups to the finder in batches of this size, so
+    /// the screen shows the progress and the library stops showing the merged duplicates batch by batch, and a stop or
+    /// a failure keeps every batch that finished.
+    nonisolated static let mergeBatchSize = 200
 
     /// The number of groups found, for example "1,545 Groups". Nil without a group.
     public var groupCountText: String? {
@@ -497,15 +512,14 @@ public final class ExactDuplicatesModel {
     }
 
     /// Takes the ranked order and the size of each group in `page`. Only the ranking of `token` counts its progress.
-    /// `keepsShown` keeps the photo that the screen shows as kept, as a merge does.
-    private func apply(_ page: ExactDuplicateRankingPage, token: UUID?, keepsShown: Bool = false) {
+    private func apply(_ page: ExactDuplicateRankingPage, token: UUID?) {
         if let token, token == rankingToken, let progress = rankingProgress {
             rankingProgress = ExactDuplicateScanProgress(
                 completed: min(progress.completed + page.groupCount, progress.total), total: progress.total)
         }
         for (id, order) in page.members {
             guard let index = groups.firstIndex(where: { $0.id == id }) else { continue }
-            groups[index].rank(order, shared: page.shared[id] ?? [], keepsShown: keepsShown)
+            groups[index].rank(order, shared: page.shared[id] ?? [])
         }
         for (id, size) in page.byteSizes {
             guard let index = groups.firstIndex(where: { $0.id == id }), groups[index].byteSize == nil else { continue }
@@ -614,54 +628,68 @@ public final class ExactDuplicatesModel {
         notice = nil
     }
 
+    /// Merges the groups in batches of `mergeBatchSize` and counts the progress. The finder reads the server state of a
+    /// batch with few requests, and a group whose photo to keep the person did not choose keeps a shared duplicate
+    /// instead, so no ranking reads the groups first. After each batch the screen drops the merged groups, and the
+    /// library stops showing their duplicates. A batch in which every group failed, for example without a connection,
+    /// ends the merge; a retry continues with the groups that are left.
     private func merge(_ requested: [Group]) async {
         isMerging = true
         notice = nil
-        // Merge All reads the groups that nobody scrolled to page by page, with progress. The photo that the screen
-        // shows as kept stays, unless only another member is shared.
-        let unranked = requested.filter { !$0.isRanked && !$0.isKeptChosen }.map(\.scanGroup)
-        if !unranked.isEmpty {
-            let token = UUID()
-            rankingToken = token
-            rankingProgress = ExactDuplicateScanProgress(completed: 0, total: unranked.count)
-            let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
-                await self?.apply(page, token: token, keepsShown: true)
-            }
-            await finder.rankMembers(of: unranked, ranked: apply)
-            if rankingToken == token { rankingProgress = nil }
-        }
-        let selected = requested.compactMap { request in groups.first { $0.id == request.id } }
-        var trashed: [PhotoUID] = []
+        let total = requested.reduce(0) { $0 + $1.duplicateCount }
+        var completed = 0
+        mergeProgress = ExactDuplicateScanProgress(completed: 0, total: total)
         var kept: [PhotoUID: ExactDuplicateKeepReason] = [:]
         var keptPhotoUnreadable = false
         var failed = false
         var stale = false
-        let results = await finder.merge(selected.map { ($0.scanGroup, $0.kept) })
-        for (group, result) in zip(selected, results) {
-            do {
-                switch try result.get() {
-                case .merged(_, let moved, let keptDuplicates):
+        for start in stride(from: 0, to: requested.count, by: Self.mergeBatchSize) {
+            let batch = requested[start..<min(start + Self.mergeBatchSize, requested.count)]
+            // The groups as the screen shows them now: scrolling can rank a group while the merge runs.
+            let positions = Dictionary(
+                groups.indices.map { (groups[$0].id, $0) }, uniquingKeysWith: { first, _ in first })
+            let selected = batch.compactMap { request in positions[request.id].map { groups[$0] } }
+            let results = await finder.merge(
+                selected.map {
+                    ExactDuplicateMergeRequest(group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen)
+                })
+            var trashed: [PhotoUID] = []
+            var merged: [String: (trashed: [PhotoUID], kept: PhotoUID, reason: ExactDuplicateKeepReason?)] = [:]
+            var failures = 0
+            var cancelled = false
+            for (group, result) in zip(selected, results) {
+                switch result {
+                case .success(.merged(let stayed, let moved, let keptDuplicates)):
                     trashed += moved
                     kept.merge(keptDuplicates) { first, _ in first }
                     // A group with a duplicate left keeps its reason, so the person can keep another photo instead.
-                    if let index = groups.firstIndex(where: { $0.id == group.id }),
-                        !groups[index].remove(moved, keptReason: Self.firstReason(in: keptDuplicates.values))
-                    {
-                        groups.remove(at: index)
-                    }
-                case .skipped(.keptUnreadable):
+                    merged[group.id] = (moved, stayed, Self.firstReason(in: keptDuplicates.values))
+                case .success(.skipped(.keptUnreadable)):
                     keptPhotoUnreadable = true
-                case .skipped:
+                case .success(.skipped):
                     // The library changed since the scan; a new scan shows what is left.
                     stale = true
+                case .failure(let error) where error is CancellationError:
+                    cancelled = true
+                case .failure:
+                    failed = true
+                    failures += 1
                 }
-            } catch is CancellationError {
-                break
-            } catch {
-                failed = true
             }
+            if !merged.isEmpty {
+                groups = groups.compactMap { group in
+                    guard let outcome = merged[group.id] else { return group }
+                    var group = group
+                    let isLeft = group.remove(outcome.trashed, keeping: outcome.kept, keptReason: outcome.reason)
+                    return isLeft ? group : nil
+                }
+            }
+            if !trashed.isEmpty { await didTrash(trashed) }
+            completed += batch.reduce(0) { $0 + $1.duplicateCount }
+            mergeProgress = ExactDuplicateScanProgress(completed: min(completed, total), total: total)
+            if cancelled || (failures > 0 && failures == selected.count) { break }
         }
-        if !trashed.isEmpty { await didTrash(trashed) }
+        mergeProgress = nil
         isMerging = false
         notice = Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
         if stale {

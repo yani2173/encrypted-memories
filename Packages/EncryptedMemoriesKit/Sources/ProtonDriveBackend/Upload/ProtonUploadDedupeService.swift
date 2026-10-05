@@ -232,9 +232,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         guard let main = metadata.first(where: { $0.link.linkID == linkID }),
             main.photo?.hasCompleteRelatedPhotoLinkIDs == true
         else { return nil }
-        let related = Set(main.relatedPhotoLinkIDs)
         // Generic metadata carries State and MainPhotoLinkID, unlike the Photos compound response.
-        let ids = related.union([linkID]).sorted()
+        let ids = Set(main.relatedPhotoLinkIDs).union([linkID]).sorted()
         var resources: [AlbumPhotoLinkBody] = []
         for start in stride(from: 0, to: ids.count, by: UploadDedupePipeline.protonDuplicateBatchSize) {
             let end = min(start + UploadDedupePipeline.protonDuplicateBatchSize, ids.count)
@@ -242,10 +241,64 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 contentsOf: try await session.fetchPhotoLinksMetadata(
                     shareID: material.context.shareID, linkIDs: Array(ids[start..<end])))
         }
+        return try compound(ofMain: linkID, metadata: main, resources: resources, material: material)
+    }
+
+    /// One Photos metadata request and one generic metadata request serve up to
+    /// `UploadDedupePipeline.protonDuplicateBatchSize` links, so the merge of many duplicates needs few requests. A
+    /// main photo whose name or attributes do not decrypt is absent, like a missing one; the other photos still read.
+    func compounds(ofMainLinks linkIDs: [String]) async throws -> [String: UploadRemoteCompound] {
+        let mains = Set(linkIDs).sorted()
+        guard !mains.isEmpty else { return [:] }
+        let material = try await resolveMaterial()
+        let size = UploadDedupePipeline.protonDuplicateBatchSize
+        var metadata: [String: AlbumPhotoMetadata] = [:]
+        for start in stride(from: 0, to: mains.count, by: size) {
+            let batch = Array(mains[start..<min(start + size, mains.count)])
+            let read = try await session.fetchAlbumPhotoMetadata(volumeID: material.context.volumeID, linkIDs: batch)
+            for entry in read {
+                guard let id = entry.link.linkID, metadata[id] == nil else { continue }
+                metadata[id] = entry
+            }
+        }
+        // Generic metadata carries State and MainPhotoLinkID, unlike the Photos compound response.
+        var expected: [String: Set<String>] = [:]
+        for main in mains {
+            guard let entry = metadata[main], entry.photo?.hasCompleteRelatedPhotoLinkIDs == true else { continue }
+            expected[main] = Set(entry.relatedPhotoLinkIDs).union([main])
+        }
+        let ids = Set(expected.values.joined()).sorted()
+        var resources: [String: [AlbumPhotoLinkBody]] = [:]
+        for start in stride(from: 0, to: ids.count, by: size) {
+            let batch = Array(ids[start..<min(start + size, ids.count)])
+            let read = try await session.fetchPhotoLinksMetadata(shareID: material.context.shareID, linkIDs: batch)
+            for resource in read {
+                guard let id = resource.linkID else { continue }
+                resources[id, default: []].append(resource)
+            }
+        }
+        var compounds: [String: UploadRemoteCompound] = [:]
+        for (main, links) in expected {
+            try Task.checkCancellation()
+            guard let entry = metadata[main] else { continue }
+            let own = links.sorted().flatMap { resources[$0] ?? [] }
+            compounds[main] = try? compound(ofMain: main, metadata: entry, resources: own, material: material)
+        }
+        return compounds
+    }
+
+    /// The compound of the main photo `linkID` from its Photos metadata and the generic metadata of the photo and of
+    /// its related files. Nil when a file is missing, inactive, unnamed, or without a digest, or when `resources`
+    /// holds another link or one link twice. Throws when a name or the attributes of a file do not decrypt.
+    private func compound(
+        ofMain linkID: String, metadata main: AlbumPhotoMetadata, resources: [AlbumPhotoLinkBody], material: Material
+    ) throws -> UploadRemoteCompound? {
+        let related = Set(main.relatedPhotoLinkIDs)
         guard let currentMain = resources.first(where: { $0.linkID == linkID }), currentMain.state == 1,
             let role = currentMain.fileProperties?.activeRevision?.photo, role.mainPhotoLinkID == nil
         else { return nil }
         var files: [String: UploadRemoteCompound.File] = [:]
+        var mainAttributes: DedupeXAttr?
         for resource in resources {
             guard let resourceID = resource.linkID, related.contains(resourceID) || resourceID == linkID
             else { return nil }
@@ -253,7 +306,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 resource.fileProperties?.activeRevision?.photo?.mainPhotoLinkID
                     == (resourceID == linkID ? nil : linkID),
                 let armoredName = resource.name, let mimeType = resource.mimeType, !mimeType.isEmpty,
-                let sha1 = try attributes(of: resource, material: material)?.common?.digests?.sha1,
+                let decoded = try attributes(of: resource, material: material),
+                let sha1 = decoded.common?.digests?.sha1,
                 UploadContentSHA1.digest(fromHex: sha1) != nil
             else { return nil }
             let clearName = try crypto.decryptName(armoredName, parent: material.rootKey)
@@ -263,16 +317,16 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 linkID: resourceID,
                 contentHash: ProtonPhotoHMAC.hex(message: sha1.lowercased(), key: material.hashKey),
                 nameHash: ProtonPhotoHMAC.hex(message: correctedName, key: material.hashKey), mimeType: mimeType)
+            if resourceID == linkID { mainAttributes = decoded }
         }
         guard Set(files.keys) == related.union([linkID]), let mainFile = files[linkID],
             let tags = main.photo?.tags
         else { return nil }
-        let attributes = try attributes(of: currentMain, material: material)
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let standard = ISO8601DateFormatter()
         standard.formatOptions = [.withInternetDateTime]
-        let date = attributes?.iOSPhotos?.modificationTime.flatMap {
+        let date = mainAttributes?.iOSPhotos?.modificationTime.flatMap {
             fractional.date(from: $0) ?? standard.date(from: $0)
         }
         let captureDate = main.photo?.captureTime.flatMap { value -> Date? in
@@ -280,7 +334,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         return UploadRemoteCompound(
             main: mainFile, related: related.sorted().compactMap { files[$0] }, tags: Set(tags),
-            externalIdentifier: attributes?.iOSPhotos?.iCloudID, captureDate: captureDate, modificationDate: date)
+            externalIdentifier: mainAttributes?.iOSPhotos?.iCloudID, captureDate: captureDate, modificationDate: date)
     }
 
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {

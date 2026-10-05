@@ -138,6 +138,21 @@ public enum ExactDuplicateMergeOutcome: Sendable, Equatable {
     case skipped(ExactDuplicateSkipReason)
 }
 
+/// One group that a merge takes, with the photo to keep.
+public struct ExactDuplicateMergeRequest: Sendable, Equatable {
+    public let group: ExactDuplicateGroup
+    public let kept: PhotoUID
+    /// The person chose `kept`, so the merge keeps exactly that photo. Otherwise the merge keeps a shared duplicate in
+    /// place of an unshared `kept`: a trash would end the sharing of the duplicate.
+    public let isKeptChosen: Bool
+
+    public init(group: ExactDuplicateGroup, kept: PhotoUID, isKeptChosen: Bool = true) {
+        self.group = group
+        self.kept = kept
+        self.isKeptChosen = isKeptChosen
+    }
+}
+
 /// The facts that rank the members of a group for the photo to keep.
 public struct ExactDuplicateKeepFacts: Sendable, Equatable {
     /// The person shares the photo with other people or by a link.
@@ -442,11 +457,14 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
-    /// Attempts of the read of `kept` after the trash. A failed read leaves the restore unreachable when another
-    /// device trashed `kept` meanwhile, and a later retry finds every copy in Recently Deleted.
+    /// Attempts of the read of the kept photos after the trash. A failed read leaves the restore unreachable when
+    /// another device trashed a kept photo meanwhile, and a later retry finds every copy in Recently Deleted.
     static let keptReadAttempts = 3
     /// The wait between two attempts of that read.
     var keptReadRetryDelay: Duration = .milliseconds(500)
+    /// Groups whose node read fails in a row before the merge takes that failure for every group that is left, for
+    /// example without a connection, instead of reading each of them.
+    static let nodeReadFailureLimit = 3
 
     /// Keeps `kept` and moves the other members of `group` to Recently Deleted.
     ///
@@ -457,30 +475,29 @@ public struct ExactDuplicateFinder: Sendable {
     /// done, moved rows name `kept`, and trashed members are no members anymore. When `kept` left the library during
     /// the trash, the merge restores the duplicates, so one copy always stays.
     public func merge(_ group: ExactDuplicateGroup, keeping kept: PhotoUID) async throws -> ExactDuplicateMergeOutcome {
-        try await merge([(group, kept)])[0].get()
+        try await merge([ExactDuplicateMergeRequest(group: group, kept: kept)])[0].get()
     }
 
-    /// Merges each group like `merge(_:keeping:)`, with one manifest scan, one favorites listing, and one trash for
-    /// all groups.
+    /// Merges each group like `merge(_:keeping:)`. Every read and every write serves all groups at once: one read of
+    /// the members in the library, the compounds in metadata requests of many photos, one node read of all
+    /// duplicates, one manifest scan, one favorites listing, one favorite write, one add for each own album, one row
+    /// move, one trash, and one read of the kept photos after the trash. A request whose photo to keep the person did
+    /// not choose keeps a shared duplicate in place of an unshared photo.
     ///
-    /// Every group reads its server state first. The local checks, the carry-over, and the row moves follow, group by
-    /// group, and then one trash takes the duplicates of every group. Each group holds its outcome or its error; a
-    /// failed trash fails every group that it should have taken. After a cancellation, no further group writes, and
-    /// every group without an outcome fails with `CancellationError`.
+    /// Each group holds its outcome or its error. A failed read of the library fails every group, a node that cannot
+    /// be read fails only its own group, and a failed write fails the groups that it covers. A failed trash fails
+    /// every group that it should have taken. After a cancellation, no further group writes, and every group without
+    /// an outcome fails with `CancellationError`.
     public func merge(
-        _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
+        _ requests: [ExactDuplicateMergeRequest]
     ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        let start = ContinuousClock.now
         var results = [Result<ExactDuplicateMergeOutcome, any Error>?](repeating: nil, count: requests.count)
         var plans: [(index: Int, plan: PlannedMerge)] = []
-        for (index, request) in requests.enumerated() where !Task.isCancelled {
-            do {
-                switch try await plan(request.group, keeping: request.kept) {
-                case .skipped(let reason): results[index] = .success(.skipped(reason))
-                case .planned(let plan): plans.append((index, plan))
-                }
-            } catch {
-                results[index] = .failure(error)
-            }
+        do {
+            plans = try await plan(requests, into: &results)
+        } catch {
+            for index in results.indices where results[index] == nil { results[index] = .failure(error) }
         }
         if !Task.isCancelled, !plans.isEmpty {
             // One manifest scan serves every member. A store that cannot tell keeps every duplicate.
@@ -507,6 +524,18 @@ public struct ExactDuplicateFinder: Sendable {
                 }
             }
         }
+        var trashed = 0
+        var failed = 0
+        for result in results {
+            switch result {
+            case .success(.merged(_, let moved, _))?: trashed += moved.count
+            case .failure?, nil: failed += 1
+            case .success?: break
+            }
+        }
+        log(
+            "[Duplicates] merge groups=\(requests.count) trashed=\(trashed) failedGroups=\(failed) "
+                + "duration=\(start.duration(to: .now))")
         return results.map { $0 ?? .failure(CancellationError()) }
     }
 
@@ -517,61 +546,175 @@ public struct ExactDuplicateFinder: Sendable {
         let epoch: String
         let volumeID: String
         var candidates: [(member: PhotoUID, links: Set<String>, moves: [UploadRemoteLinkMove])] = []
+        /// The albums of each candidate, from the node read of the plan.
+        var albums: [PhotoUID: [SeriesAlbumReference]] = [:]
         var keptDuplicates: [PhotoUID: ExactDuplicateKeepReason] = [:]
         /// The members that the trash takes, and the rows that move with them. `decide` fills both.
         var trashable: [PhotoUID] = []
         var moves: [UploadRemoteLinkMove] = []
     }
 
-    private enum MergePlan {
-        case skipped(ExactDuplicateSkipReason)
-        case planned(PlannedMerge)
+    private typealias NodeFactsRead = Result<GroupFacts, any Error>
+
+    /// Reads the server state of every group at once: the key, the members in the library, the compound of each
+    /// member, and the sharing state and the albums of each duplicate. A group whose state allows no merge holds its
+    /// outcome in `results`, and so does a group whose node read failed. A failed read of the library throws.
+    private func plan(
+        _ requests: [ExactDuplicateMergeRequest], into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
+    ) async throws -> [(index: Int, plan: PlannedMerge)] {
+        var open: [Int] = []
+        for (index, request) in requests.enumerated() {
+            guard request.group.members.contains(request.kept) else {
+                results[index] = .success(.skipped(.keptNotInGroup))
+                continue
+            }
+            open.append(index)
+        }
+        guard !open.isEmpty else { return [] }
+        let epoch = try await checker.hashKeyEpoch()
+        var current: [Int] = []
+        for index in open {
+            guard requests[index].group.hashKeyEpoch == epoch else {
+                results[index] = .success(.skipped(.keyChanged))
+                continue
+            }
+            current.append(index)
+        }
+        guard !current.isEmpty else { return [] }
+        let links = Set(current.flatMap { requests[$0].group.members.map(\.nodeID) }).sorted()
+        let (visibility, _) = try await visibility(of: links, progress: { _ in })
+        var active: [Int: [PhotoUID]] = [:]
+        for index in current {
+            let request = requests[index]
+            let members = request.group.members.filter { visibility[$0.nodeID]?.isActiveMain == true }
+            if !members.contains(request.kept) {
+                results[index] = .success(.skipped(.keptLeftLibrary))
+            } else if members.count < 2 {
+                results[index] = .success(.skipped(.noDuplicateLeft))
+            } else {
+                active[index] = members
+            }
+        }
+        guard !active.isEmpty else { return [] }
+        let volumeID = try await remote.ownPhotosVolumeID()
+        var kept: [Int: PhotoUID] = [:]
+        var duplicates: [Int: [PhotoUID]] = [:]
+        for (index, members) in active {
+            kept[index] = requests[index].kept
+            duplicates[index] = members.filter { $0 != requests[index].kept }
+        }
+        // The compounds come from the metadata endpoints and the nodes from the SDK, so the two reads overlap.
+        let mainLinks = Set(active.values.joined().map(\.nodeID)).sorted()
+        async let compoundRead = checker.compounds(ofMainLinks: mainLinks)
+        var facts = await nodeFacts(of: duplicates)
+        let compounds = try await compoundRead
+
+        // A group whose photo to keep the person did not choose keeps a shared duplicate in place of an unshared
+        // photo: a trash would end the sharing of the duplicate. Only these groups read the node of that photo.
+        var sharedInstead: [Int: PhotoUID] = [:]
+        for (index, result) in facts where !requests[index].isKeptChosen {
+            guard case .success(let read) = result,
+                let shared = duplicates[index]?.first(where: { read[$0]?.isShared == true })
+            else { continue }
+            sharedInstead[index] = shared
+        }
+        if !sharedInstead.isEmpty,
+            let keptFacts = try? await remote.nodeFacts(of: sharedInstead.keys.compactMap { kept[$0] })
+        {
+            for (index, shared) in sharedInstead {
+                guard let photo = kept[index], let fact = keptFacts[photo], !fact.isShared,
+                    case .success(var read)? = facts[index]
+                else { continue }
+                read[photo] = fact
+                facts[index] = .success(read)
+                kept[index] = shared
+                duplicates[index] = active[index]?.filter { $0 != shared }
+            }
+        }
+
+        var plans: [(index: Int, plan: PlannedMerge)] = []
+        for index in active.keys.sorted() {
+            try Task.checkCancellation()
+            let contentHash = requests[index].group.contentHash
+            guard let keptPhoto = kept[index], let keptCompound = compounds[keptPhoto.nodeID],
+                keptCompound.main.contentHash == contentHash
+            else {
+                results[index] = .success(.skipped(.keptUnreadable))
+                continue
+            }
+            let read: [PhotoUID: ExactDuplicateNodeFacts]
+            switch facts[index] {
+            case .success(let value)?:
+                read = value
+            case .failure(let error)?:
+                results[index] = .failure(error)
+                continue
+            case nil:
+                read = [:]
+            }
+            var plan = PlannedMerge(kept: keptPhoto, contentHash: contentHash, epoch: epoch, volumeID: volumeID)
+            for member in duplicates[index] ?? [] {
+                // A node that the read did not return proves nothing, so the duplicate stays.
+                guard let fact = read[member] else {
+                    plan.keptDuplicates[member] = .unreadable
+                    continue
+                }
+                // A trash ends the sharing of a photo, so a shared duplicate stays.
+                guard !fact.isShared else {
+                    plan.keptDuplicates[member] = .shared
+                    continue
+                }
+                guard let compound = compounds[member.nodeID], compound.main.contentHash == contentHash else {
+                    plan.keptDuplicates[member] = .unreadable
+                    continue
+                }
+                // The trash takes the related files along. Each needs a copy under the kept photo.
+                guard let twins = UploadRemoteReplacementSafety.relatedTwins(of: compound, under: keptCompound) else {
+                    plan.keptDuplicates[member] = .relatedFileWithoutTwin
+                    continue
+                }
+                let memberMoves =
+                    [UploadRemoteLinkMove(from: member.nodeID, to: keptPhoto.nodeID, contentHash: contentHash)]
+                    + compound.related.compactMap { file in
+                        twins[file.linkID].map {
+                            UploadRemoteLinkMove(from: file.linkID, to: $0.linkID, contentHash: file.contentHash)
+                        }
+                    }
+                plan.candidates.append((member, Set([member.nodeID] + compound.related.map(\.linkID)), memberMoves))
+                plan.albums[member] = fact.albums
+            }
+            plans.append((index, plan))
+        }
+        return plans
     }
 
-    /// Reads the server state of the group again: the key, the members in the library, and each compound.
-    private func plan(_ group: ExactDuplicateGroup, keeping kept: PhotoUID) async throws -> MergePlan {
-        guard group.members.contains(kept) else { return .skipped(.keptNotInGroup) }
-        let epoch = try await checker.hashKeyEpoch()
-        guard epoch == group.hashKeyEpoch else { return .skipped(.keyChanged) }
-        let visibility = try await checker.linkVisibility(batching: group.members.map(\.nodeID))
-        let active = group.members.filter { visibility[$0.nodeID]?.isActiveMain == true }
-        guard active.contains(kept) else { return .skipped(.keptLeftLibrary) }
-        guard active.count > 1 else { return .skipped(.noDuplicateLeft) }
-        let volumeID = try await remote.ownPhotosVolumeID()
-        guard let keptCompound = try await checker.compound(ofMainLink: kept.nodeID),
-            keptCompound.main.contentHash == group.contentHash
-        else { return .skipped(.keptUnreadable) }
-
-        var plan = PlannedMerge(kept: kept, contentHash: group.contentHash, epoch: epoch, volumeID: volumeID)
-        // A trash ends the sharing of a photo, so a shared duplicate stays. Only the members of this group are read.
-        let shared = Set(try await remote.nodeFacts(of: active).filter(\.value.isShared).keys)
-        for member in active where member != kept {
-            try Task.checkCancellation()
-            guard !shared.contains(member) else {
-                plan.keptDuplicates[member] = .shared
-                continue
-            }
-            guard let compound = try await checker.compound(ofMainLink: member.nodeID),
-                compound.main.contentHash == group.contentHash
-            else {
-                plan.keptDuplicates[member] = .unreadable
-                continue
-            }
-            // The trash takes the related files along. Each needs a copy under the kept photo.
-            guard let twins = UploadRemoteReplacementSafety.relatedTwins(of: compound, under: keptCompound) else {
-                plan.keptDuplicates[member] = .relatedFileWithoutTwin
-                continue
-            }
-            let memberMoves =
-                [UploadRemoteLinkMove(from: member.nodeID, to: kept.nodeID, contentHash: group.contentHash)]
-                + compound.related.compactMap { file in
-                    twins[file.linkID].map {
-                        UploadRemoteLinkMove(from: file.linkID, to: $0.linkID, contentHash: file.contentHash)
-                    }
+    /// The node facts of the duplicates of each group, with one read for all of them. When that read fails, each group
+    /// reads its own duplicates, so a node that cannot be read fails only its own group.
+    private func nodeFacts(of duplicates: [Int: [PhotoUID]]) async -> [Int: NodeFactsRead] {
+        do {
+            let read = try await remote.nodeFacts(of: Array(Set(duplicates.values.joined())))
+            return duplicates.mapValues { _ in .success(read) }
+        } catch {
+            var facts: [Int: NodeFactsRead] = [:]
+            var lastError: any Error = error
+            var failuresInARow = 0
+            for (index, members) in duplicates.sorted(by: { $0.key < $1.key }) {
+                if Task.isCancelled { lastError = CancellationError() }
+                guard failuresInARow < Self.nodeReadFailureLimit, !Task.isCancelled else {
+                    facts[index] = .failure(lastError)
+                    continue
                 }
-            plan.candidates.append((member, Set([member.nodeID] + compound.related.map(\.linkID)), memberMoves))
+                do {
+                    facts[index] = .success(try await remote.nodeFacts(of: members))
+                    failuresInARow = 0
+                } catch {
+                    facts[index] = .failure(error)
+                    lastError = error
+                    failuresInARow += 1
+                }
+            }
+            return facts
         }
-        return .planned(plan)
     }
 
     /// The local checks, right before the writes: a member that the edit replacement tracks, or that a local source
@@ -597,10 +740,12 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
-    /// Carries the favorite tag, the own albums, and the album covers over and moves the rows, group by group. One
-    /// trash then takes the duplicates of every group, and the backup drops its cached remote state once. `favorites`
-    /// holds the favorites among the trashed and the kept photos; `covers` holds the cover link of each own album. A
-    /// group whose carry-over or row move fails takes no part in the trash.
+    /// Carries the favorite tag, the own albums, and the album covers over and moves the rows of every group at once:
+    /// one favorite write for every kept photo whose duplicates carry the tag, one add for each own album, and one row
+    /// move. The node read of the plan gave the albums of the duplicates right before. One trash then takes the
+    /// duplicates of every group, and the backup drops its cached remote state once. `favorites` holds the favorites
+    /// among the trashed and the kept photos; `covers` holds the cover link of each own album. A failed write fails the
+    /// groups that it covers, and they take no part in the trash.
     /// A failed trash fails every group that took part: their rows already name `kept`, which holds the same bytes,
     /// so a retry finds them moved and writes them no second time. Known gap: after a failed or cancelled trash, no
     /// group reads its kept photo again, so a merge on another device that trashed that kept photo at the same moment
@@ -609,30 +754,62 @@ public struct ExactDuplicateFinder: Sendable {
         _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>, covers: [String: String],
         into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
     ) async {
-        var trashing: [(index: Int, plan: PlannedMerge)] = []
-        for (index, plan) in writes where !Task.isCancelled {
+        var failed: Set<Int> = []
+        let tagged = writes.filter {
+            PhotoCarryOverRule.takesFavorite($0.plan.kept, from: $0.plan.trashable, favorites: favorites)
+        }
+        if !tagged.isEmpty, !Task.isCancelled {
             do {
-                // The albums of the duplicates are read fresh: a cached read can predate an album added since.
-                try await remote.carryOver(
-                    from: plan.trashable, to: plan.kept, ownVolumeID: plan.volumeID,
-                    albums: CurrentAlbumCarryOver(base: albums), favorites: favorites)
-                // The carry-over added the kept photo to these albums. A retry finds the kept photo as their cover.
-                let trashedLinks = Set(plan.trashable.map(\.nodeID))
+                try await remote.markFavorite(tagged.map(\.plan.kept))
+            } catch {
+                for (index, _) in tagged {
+                    results[index] = .failure(error)
+                    failed.insert(index)
+                }
+            }
+        }
+        // Every album gets the add: a cached membership of a kept photo can be stale, and an existing membership
+        // counts as success, so a retry adds nothing twice.
+        var albumAdds: [String: [(index: Int, kept: PhotoUID)]] = [:]
+        for (index, plan) in writes where !failed.contains(index) {
+            let albumIDs = PhotoCarryOverRule.ownAlbumIDs(
+                of: plan.trashable, in: plan.albums, ownVolumeID: plan.volumeID)
+            for albumID in albumIDs { albumAdds[albumID, default: []].append((index, plan.kept)) }
+        }
+        for (albumID, members) in albumAdds.sorted(by: { $0.key < $1.key }) {
+            let adding = members.filter { !failed.contains($0.index) }
+            guard !adding.isEmpty, !Task.isCancelled else { continue }
+            do {
+                try await albums.addPhotos(adding.map(\.kept), toOwnAlbum: albumID)
+            } catch {
+                for (index, _) in adding {
+                    results[index] = .failure(error)
+                    failed.insert(index)
+                }
+            }
+        }
+        // The add made each kept photo a member of these albums. A retry finds the kept photo as their cover.
+        for (index, plan) in writes where !failed.contains(index) && !Task.isCancelled {
+            let trashedLinks = Set(plan.trashable.map(\.nodeID))
+            do {
                 for (albumID, cover) in covers.sorted(by: { $0.key < $1.key }) where trashedLinks.contains(cover) {
                     try Task.checkCancellation()
                     try await albums.setCover(plan.kept, ofOwnAlbum: albumID)
                 }
-                // The rows move before the trash: the kept photo holds the same bytes, and after the trash only the
-                // trashed links would name the related files that a retry has to move.
-                guard identities.rebindRemoteLinks(plan.moves, hashKeyEpoch: plan.epoch) else {
-                    throw UploadError.backend("Upload identity manifest could not be updated")
-                }
-                trashing.append((index, plan))
             } catch {
                 results[index] = .failure(error)
+                failed.insert(index)
             }
         }
+        let trashing = writes.filter { !failed.contains($0.index) }
         guard !trashing.isEmpty, !Task.isCancelled else { return }
+        // The rows move before the trash: the kept photos hold the same bytes, and after the trash only the trashed
+        // links would name the related files that a retry has to move. One transaction moves the rows of every group.
+        guard identities.rebindRemoteLinks(trashing.flatMap(\.plan.moves), hashKeyEpoch: trashing[0].plan.epoch) else {
+            let error = UploadError.backend("Upload identity manifest could not be updated")
+            for (index, _) in trashing { results[index] = .failure(error) }
+            return
+        }
         do {
             try await remote.trashDuplicates(trashing.flatMap(\.plan.trashable))
         } catch {
@@ -646,10 +823,25 @@ public struct ExactDuplicateFinder: Sendable {
         await resolver.remoteMainsChangedHere()
         // The carry-over can have tagged a kept photo as favorite.
         rankingContext.invalidate()
+        // A merge on another device can keep another member and trash `kept` at the same moment. Each device reads
+        // `kept` after its own trash, so at least one of them sees the other trash and restores its duplicates.
+        let keptVisibility: [String: RemoteLinkVisibility]
+        do {
+            keptVisibility = try await visibilityAfterTrash(of: trashing.map(\.plan.kept.nodeID))
+        } catch {
+            for (index, _) in trashing { results[index] = .failure(error) }
+            return
+        }
         var restored = false
         for (index, plan) in trashing {
+            guard keptVisibility[plan.kept.nodeID]?.isActiveMain != true else {
+                results[index] = .success(
+                    .merged(kept: plan.kept, trashed: plan.trashable, keptDuplicates: plan.keptDuplicates))
+                continue
+            }
+            restored = true
             do {
-                results[index] = .success(try await settle(plan, restored: &restored))
+                results[index] = .success(try await restore(plan))
             } catch {
                 results[index] = .failure(error)
             }
@@ -657,19 +849,11 @@ public struct ExactDuplicateFinder: Sendable {
         if restored { await resolver.remoteMainsChangedHere() }
     }
 
-    /// Reads `kept` after the trash. When `kept` left the library meanwhile, restores the duplicates of this group
-    /// and moves their rows back. `restored` turns true once a restore was attempted.
-    private func settle(_ plan: PlannedMerge, restored: inout Bool) async throws -> ExactDuplicateMergeOutcome {
-        let kept = plan.kept
-        // A merge on another device can keep another member and trash `kept` at the same moment. Each device reads
-        // `kept` after its own trash, so at least one of them sees the other trash and restores its duplicates.
-        guard try await !isActiveMainAfterTrash(kept) else {
-            return .merged(kept: kept, trashed: plan.trashable, keptDuplicates: plan.keptDuplicates)
-        }
-        restored = true
+    /// Restores the duplicates of a group whose kept photo left the library during the trash, and moves their rows
+    /// back. Rows that named `kept` before the merge move to the first of them: it holds the same bytes and stays in
+    /// the library.
+    private func restore(_ plan: PlannedMerge) async throws -> ExactDuplicateMergeOutcome {
         try await remote.restoreDuplicates(plan.trashable)
-        // The rows move back to the restored duplicates. Rows that named `kept` before the merge move to the first
-        // of them: it holds the same bytes and stays in the library.
         let movesBack = plan.moves.map { UploadRemoteLinkMove(from: $0.to, to: $0.from, contentHash: $0.contentHash) }
         guard identities.rebindRemoteLinks(movesBack, hashKeyEpoch: plan.epoch) else {
             throw UploadError.backend("Upload identity manifest could not be updated")
@@ -677,12 +861,13 @@ public struct ExactDuplicateFinder: Sendable {
         return .skipped(.keptLeftLibraryDuringMerge)
     }
 
-    /// Reads `kept` after the trash, up to `keptReadAttempts` times. Throws the last error when every read fails.
-    private func isActiveMainAfterTrash(_ kept: PhotoUID) async throws -> Bool {
+    /// Reads the kept photos after the trash, up to `keptReadAttempts` times. Throws the last error when every read
+    /// fails.
+    private func visibilityAfterTrash(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         var attempt = 1
         while true {
             do {
-                return try await checker.linkVisibility(batching: [kept.nodeID])[kept.nodeID]?.isActiveMain == true
+                return try await checker.linkVisibility(batching: linkIDs)
             } catch let error where !(error is CancellationError) && attempt < Self.keptReadAttempts {
                 attempt += 1
                 try await Task.sleep(for: keptReadRetryDelay)
