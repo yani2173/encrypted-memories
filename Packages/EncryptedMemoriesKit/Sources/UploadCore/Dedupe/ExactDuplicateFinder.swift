@@ -203,7 +203,9 @@ public struct ExactDuplicateFinder: Sendable {
     /// Visibility reads that run at once. Each reads up to `UploadDedupePipeline.protonDuplicateBatchSize` links.
     static let visibilityConcurrency = 4
     /// Groups whose facts the ranking reads at once. One node read for each member gives its albums and its facts.
-    static let rankingConcurrency = 4
+    /// One group at a time: a group already reads its members several at once through the SDK, so the ranking adds no
+    /// more concurrent SDK node reads than one album membership read.
+    static let rankingConcurrency = 1
     /// Groups in one page of the ranking.
     static let rankingPageSize = 24
 
