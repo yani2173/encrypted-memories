@@ -450,7 +450,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(
             outcome, .merged(kept: kept, trashed: [plain], keptDuplicates: [sharedA: .shared, sharedB: .shared]))
         XCTAssertEqual(server.links.first { $0.linkID == sharedA.nodeID }?.state, .active)
-        XCTAssertEqual(server.readCounts.sharingMembers, 4, "only the members of the merged group")
+        XCTAssertEqual(server.readCounts.sharingMembers, 3, "only the duplicates of the merged group")
     }
 
     func testAMergeWhoseNodeReadFailsTrashesNothingAndCarriesNothingOver() async throws {
@@ -462,7 +462,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         server.loseNode(duplicate)
         let stepsBefore = server.steps.count
 
-        let results = await finder.merge([(group, kept)])
+        let results = await finder.merge([ExactDuplicateMergeRequest(group: group, kept: kept)])
 
         guard case .failure = results[0] else { return XCTFail("expected a failure, got \(results[0])") }
         XCTAssertEqual(server.steps.count, stepsBefore, "no favorite, album, cover, or trash write")
@@ -477,8 +477,9 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let source = row("asset-1", names: duplicate.nodeID, contentHash: hash("a"))
         indexServer()
         server.failNextCoverWrite()
+        let group = try await onlyGroup()
 
-        let results = await finder.merge([(try await onlyGroup(), kept)])
+        let results = await finder.merge([ExactDuplicateMergeRequest(group: group, kept: kept)])
 
         guard case .failure = results[0] else { return XCTFail("expected a failure, got \(results[0])") }
         XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash") }, "nothing is trashed")
@@ -692,7 +693,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let finder = finder(identities: identities)
         let readsBefore = server.readCounts
 
-        let results = await finder.merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder.merge(keepingFirst(groups))
 
         XCTAssertEqual(
             results.map { try? $0.get() },
@@ -701,8 +702,8 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let reads = server.readCounts
         XCTAssertEqual(reads.favorites - readsBefore.favorites, 1)
         XCTAssertEqual(
-            reads.visibility - readsBefore.visibility, 2 * groups.count,
-            "each group reads its members and, after its trash, the kept photo")
+            reads.visibility - readsBefore.visibility, 2,
+            "one read of the members of every group and, after the trash, one read of the kept photos")
         XCTAssertEqual(reads.compound - readsBefore.compound, 2 * groups.count, "each group reads every compound")
         XCTAssertEqual(violations, [])
     }
@@ -725,6 +726,11 @@ final class ExactDuplicateFinderTests: XCTestCase {
         server.links.first { $0.linkID == uid.nodeID }?.state
     }
 
+    /// One request for each group that keeps its first member, as a person who chose it.
+    private func keepingFirst(_ groups: [ExactDuplicateGroup]) -> [ExactDuplicateMergeRequest] {
+        groups.map { ExactDuplicateMergeRequest(group: $0, kept: $0.members[0]) }
+    }
+
     /// The backup's duplicate check of this finder, which logs every drop of its cached remote state.
     private func loggingResolver() -> (resolver: SpyIdentityResolver, log: BackupEventLog) {
         let log = BackupEventLog()
@@ -745,7 +751,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let (groups, sources) = try await threeGroups()
         let (resolver, log) = loggingResolver()
 
-        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder(resolver: resolver).merge(keepingFirst(groups))
 
         XCTAssertEqual(
             results.map { try? $0.get() },
@@ -764,7 +770,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let (resolver, log) = loggingResolver()
         server.failNextTrash()
 
-        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder(resolver: resolver).merge(keepingFirst(groups))
 
         for (index, group) in groups.enumerated() {
             XCTAssertThrowsError(try results[index].get())
@@ -776,7 +782,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(invalidations(in: log), 1)
         let movedRows = sources.map { store.record(for: $0) }
 
-        let retry = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+        let retry = await finder(resolver: resolver).merge(keepingFirst(groups))
 
         XCTAssertEqual(
             retry.map { try? $0.get() },
@@ -793,7 +799,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         // Another device keeps the duplicate of the second group and trashes its kept photo meanwhile.
         server.trashAfterDuplicateTrash = groups[1].members[0].nodeID
 
-        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder(resolver: resolver).merge(keepingFirst(groups))
 
         XCTAssertEqual(try? results[1].get(), .skipped(.keptLeftLibraryDuringMerge))
         XCTAssertEqual(state(of: groups[1].members[1]), .active, "one copy stays")
@@ -816,7 +822,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let (groups, sources) = try await threeGroups()
         server.failNextFavoritesRead()
 
-        let results = await finder.merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder.merge(keepingFirst(groups))
 
         for (index, group) in groups.enumerated() {
             XCTAssertThrowsError(try results[index].get())
@@ -825,6 +831,92 @@ final class ExactDuplicateFinderTests: XCTestCase {
         }
         XCTAssertEqual(count("mark favorite"), 0)
         XCTAssertEqual(violations, [])
+    }
+
+    func testMergeKeepsASharedDuplicateInPlaceOfAnUnsharedPhotoThatThePersonDidNotChoose() async throws {
+        let shown = server.seedLink(digest: digest("a"))
+        let shared = server.seedLink(digest: digest("a"))
+        let plain = server.seedLink(digest: digest("a"))
+        server.decorate(shown)
+        server.share(shared)
+        indexServer()
+        let group = try await onlyGroup()
+
+        let results = await finder.merge([ExactDuplicateMergeRequest(group: group, kept: shown, isKeptChosen: false)])
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: shared, trashed: [shown, plain], keptDuplicates: [:]))
+        let sharedLink = try XCTUnwrap(server.links.first { $0.linkID == shared.nodeID })
+        XCTAssertEqual(sharedLink.state, .active, "a trash would end the sharing")
+        XCTAssertTrue(sharedLink.favorite, "the shared photo takes the favorite tag of the photo that leaves")
+        XCTAssertEqual(sharedLink.albums, [.init(volumeID: "vol", albumID: "own-album")])
+        XCTAssertEqual(state(of: shown), .trashed)
+        XCTAssertEqual(state(of: plain), .trashed)
+        XCTAssertEqual(
+            server.readCounts.sharingMembers, 3, "the duplicates, and the shown photo once a duplicate is shared")
+        XCTAssertEqual(violations, [])
+    }
+
+    func testANodeThatCannotBeReadFailsOnlyItsOwnGroupAndTheOtherGroupsMerge() async throws {
+        let (groups, _) = try await threeGroups()
+        server.loseNode(groups[1].members[1])
+
+        let results = await finder.merge(keepingFirst(groups))
+
+        XCTAssertThrowsError(try results[1].get())
+        XCTAssertEqual(state(of: groups[1].members[1]), .active)
+        for index in [0, 2] {
+            XCTAssertEqual(
+                try? results[index].get(),
+                .merged(kept: groups[index].members[0], trashed: [groups[index].members[1]], keptDuplicates: [:]))
+        }
+        XCTAssertEqual(trashCalls, ["duplicate trash \([groups[0], groups[2]].map(\.members[1].nodeID))"])
+        XCTAssertEqual(violations, [])
+    }
+
+    func testMergeAllCarriesTheFavoritesAndTheAlbumsOfEveryGroupWithOneWriteEach() async throws {
+        let (groups, _) = try await threeGroups()
+        for group in groups { server.decorate(group.members[1]) }
+
+        let results = await finder.merge(keepingFirst(groups))
+
+        XCTAssertEqual(
+            results.map { try? $0.get() },
+            groups.map { .merged(kept: $0.members[0], trashed: [$0.members[1]], keptDuplicates: [:]) })
+        XCTAssertEqual(count("mark favorite"), 1)
+        XCTAssertEqual(count("carry album own-album"), 1)
+        for group in groups {
+            let kept = try XCTUnwrap(server.links.first { $0.linkID == group.members[0].nodeID })
+            XCTAssertTrue(kept.favorite)
+            XCTAssertEqual(kept.albums, [.init(volumeID: "vol", albumID: "own-album")])
+        }
+        XCTAssertEqual(violations, [])
+    }
+
+    func testMergeAllOf400GroupsReadsTheLibraryInFewRequestsAndEachDuplicateNodeOnce() async throws {
+        server.seedLinks(digests: (0..<400).flatMap { [digest("group-\($0)"), digest("group-\($0)")] })
+        indexServer()
+        let groups = try await finder.duplicateGroups().groups
+        XCTAssertEqual(groups.count, 400)
+        let before = server.readCounts
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        let results = await finder.merge(keepingFirst(groups))
+
+        let duration = start.duration(to: clock.now)
+        let reads = server.readCounts
+        XCTAssertEqual(results.compactMap { try? $0.get() }.count, 400)
+        XCTAssertEqual(server.links.filter { $0.state == .trashed }.count, 400)
+        XCTAssertEqual(
+            reads.visibility - before.visibility, 6 + 3, "800 members, and then 400 kept photos, in reads of 150")
+        XCTAssertEqual(reads.sharingMembers - before.sharingMembers, 400, "one node read for each duplicate")
+        XCTAssertEqual(reads.favorites - before.favorites, 1)
+        XCTAssertEqual(reads.albumListings - before.albumListings, 1)
+        XCTAssertEqual(trashCalls.count, 1)
+        XCTAssertEqual(violations, [])
+        print(
+            "[Duplicates timing] merge of 400 groups=\(duration) "
+                + "visibilityRequests=\(reads.visibility - before.visibility)")
     }
 
     func testMergeDropsTheCachedRemoteStateOfTheBackupSoItNeverAdoptsATrashedDuplicate() async throws {

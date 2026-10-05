@@ -70,7 +70,7 @@ extension PhotoCarryOverRemote {
         favorites: Set<PhotoUID>
     ) async throws {
         guard !earlier.isEmpty else { return }
-        if !favorites.contains(replacement), earlier.contains(where: favorites.contains) {
+        if PhotoCarryOverRule.takesFavorite(replacement, from: earlier, favorites: favorites) {
             try await markFavorite([replacement])
         }
         // Every album gets the add: a cached membership of `replacement` can be stale, and an existing membership
@@ -130,6 +130,23 @@ extension SeriesAlbumCarryOver {
     /// albums are skipped: their writes cannot address a foreign volume.
     public func ownAlbumIDs(containing uids: [PhotoUID], ownVolumeID: String) async throws -> [String] {
         let albumsByPhoto = try await albums(containing: uids)
+        return PhotoCarryOverRule.ownAlbumIDs(of: uids, in: albumsByPhoto, ownVolumeID: ownVolumeID)
+    }
+}
+
+/// What a replacement takes over from the photos that leave the library: the favorite tag and the own albums. The
+/// carry-over of one replacement and the merge of many duplicate groups share these rules.
+enum PhotoCarryOverRule {
+    /// True when one of `earlier` carries the favorite tag and `replacement` does not.
+    static func takesFavorite(_ replacement: PhotoUID, from earlier: [PhotoUID], favorites: Set<PhotoUID>) -> Bool {
+        !favorites.contains(replacement) && earlier.contains(where: favorites.contains)
+    }
+
+    /// The albums of the own library that contain any of `uids`, each once, in first-seen order. Shared albums are
+    /// skipped: their writes cannot address a foreign volume.
+    static func ownAlbumIDs(
+        of uids: [PhotoUID], in albumsByPhoto: [PhotoUID: [SeriesAlbumReference]], ownVolumeID: String
+    ) -> [String] {
         var albumIDs: [String] = []
         for uid in uids {
             for album in albumsByPhoto[uid] ?? []

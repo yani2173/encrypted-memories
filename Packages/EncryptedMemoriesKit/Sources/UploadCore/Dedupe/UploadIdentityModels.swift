@@ -874,6 +874,10 @@ public protocol UploadDuplicateChecking: Sendable {
     func modificationDate(ofMainLink linkID: String) async throws -> Date?
     /// Live complete compound metadata. Missing or unreadable evidence returns nil.
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound?
+    /// `compound(ofMainLink:)` for many main photos, with one metadata request for up to
+    /// `UploadDedupePipeline.protonDuplicateBatchSize` links. A main photo whose compound is missing or unreadable is
+    /// absent from the result. A failed request fails the whole read.
+    func compounds(ofMainLinks linkIDs: [String]) async throws -> [String: UploadRemoteCompound]
     /// Earlier links named by an active main's lineage. Uses the same completeness boundary as the head reads.
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool)
     /// Brings the persistent remote identity index current before a queue starts resolving items.
@@ -924,6 +928,15 @@ public extension UploadDuplicateChecking {
 
     func modificationDate(ofMainLink linkID: String) async throws -> Date? { nil }
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? { nil }
+    /// Backends without a batched read read each compound on its own.
+    func compounds(ofMainLinks linkIDs: [String]) async throws -> [String: UploadRemoteCompound] {
+        var compounds: [String: UploadRemoteCompound] = [:]
+        for linkID in Set(linkIDs).sorted() {
+            try Task.checkCancellation()
+            compounds[linkID] = try await compound(ofMainLink: linkID)
+        }
+        return compounds
+    }
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {

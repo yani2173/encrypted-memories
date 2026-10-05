@@ -132,7 +132,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.map(\.isRanked), [false, true])
     }
 
-    func testMergeAllReadsTheFactsOfAnUnrankedGroupButKeepsThePhotoShownAsKept() async {
+    func testMergeAllReadsNoFactsFirstAndHandsOverThePhotoShownAsKeptAndWhetherThePersonChoseIt() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         finder.fallback = ["A": [a2, a1, a3], "B": [b2, b1]]
         finder.ranked = ["A": [a3, a1, a2], "B": [b1, b2]]
@@ -141,31 +141,33 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await model.load()
         finder.unreadableGroups = []
         model.keep(b1, inGroup: "B")
+        let ranksBefore = finder.rankCalls
 
         await model.mergeAll()
 
-        XCTAssertEqual(finder.rankedGroups.last, ["A"], "Merge All reads the facts of an unranked group first")
+        XCTAssertEqual(finder.rankCalls, ranksBefore, "the merge reads the facts of the groups itself")
         XCTAssertEqual(
-            finder.merges, [.init(group: "A", kept: a2), .init(group: "B", kept: b1)],
-            "the merge keeps the photo that the screen showed as kept")
+            finder.merges,
+            [.init(group: "A", kept: a2, isKeptChosen: false), .init(group: "B", kept: b1, isKeptChosen: true)],
+            "only a photo that the person did not choose can give way to a shared duplicate")
     }
 
-    func testMergeAllKeepsASharedMemberInsteadOfTheShownPhotoAndShowsIt() async {
+    func testAMergeThatKeptASharedDuplicateInsteadShowsItAsTheKeptPhoto() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         finder.fallback = ["A": [a2, a1, a3]]
-        finder.ranked = ["A": [a3, a1, a2]]
         finder.unreadableGroups = ["A"]
-        let (model, _) = makeModel(finder)
+        let (model, log) = makeModel(finder)
         await model.load()
-        finder.unreadableGroups = []
-        finder.shared = ["A": [a3]]
-        finder.rankGate.close()
-        let merge = Task { await model.mergeAll() }
-        await waitUntil({ finder.rankGate.hasWaiters }, "Merge All ranks")
-        finder.rankGate.open()
-        await waitUntil({ !finder.merges.isEmpty }, "the merge runs")
-        XCTAssertEqual(finder.merges, [.init(group: "A", kept: a3)], "a trash would end the sharing of a3")
-        await merge.value
+        // The finder kept the shared a3 in place of a2, which the screen showed, and left the shared a1.
+        finder.outcomes["A"] = .merged(kept: a3, trashed: [a2], keptDuplicates: [a1: .shared])
+
+        await model.mergeAll()
+
+        XCTAssertEqual(finder.merges, [.init(group: "A", kept: a2, isKeptChosen: false)])
+        XCTAssertEqual(log.calls, [[a2]])
+        XCTAssertEqual(model.groups.first?.members, [a1, a3])
+        XCTAssertEqual(model.groups.first?.kept, a3, "the screen shows the photo that the merge kept")
+        XCTAssertEqual(model.groups.first?.keptReason, .shared)
     }
 
     func testMergingOneGroupKeepsExactlyThePhotoShownAsKept() async {
@@ -437,23 +439,28 @@ final class ExactDuplicatesModelTests: XCTestCase {
             { model.groups.first { $0.id == groups[98].id }?.isRanked == true }, "scrolling ranks after the merge")
     }
 
-    func testScrollingDuringMergeAllKeepsTheProgressOfTheMerge() async {
+    func testMergeAllShowsItsProgressAndScrollingBesideItShowsNoRankingRow() async {
         let groups = manyGroups(100)
         let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
         let (model, _) = makeModel(finder)
         await model.load()
-        let unranked = 100 - 2 * ExactDuplicatesModel.rankingPageSize
-        finder.rankGate.close()
+        let ranksBefore = finder.rankedGroups.count
+        finder.mergeGate.close()
         let merge = Task { await model.mergeAll() }
-        await waitUntil({ finder.rankGate.hasWaiters }, "Merge All ranks")
-        model.groupAppeared(groups[60].id)
-        await waitUntil({ finder.rankedGroups.count >= 3 }, "scrolling ranks beside the merge")
+        await waitUntil({ finder.mergeGate.hasWaiters }, "Merge All hands the groups to the finder")
+        XCTAssertEqual(model.mergeLine?.title, L10n.string("duplicates.merging_title"))
         XCTAssertEqual(
-            model.rankingLine?.detail,
-            L10n.string("duplicates.ranking_progress \(0.formatted()) \(unranked.formatted())"),
-            "the merge keeps its progress row")
-        finder.rankGate.open()
+            model.mergeLine?.detail, L10n.string("duplicates.checking_progress \(0.formatted()) \(100.formatted())"))
+        XCTAssertEqual(model.mergeLine?.fraction, 0)
+        XCTAssertFalse(model.canMerge)
+
+        model.groupAppeared(groups[60].id)
+        await waitUntil({ finder.rankedGroups.count > ranksBefore }, "scrolling ranks beside the merge")
+        XCTAssertNil(model.rankingLine, "the merge keeps its own progress row")
+        finder.mergeGate.open()
         await merge.value
+        XCTAssertNil(model.mergeLine)
+        XCTAssertEqual(model.content, .noDuplicates)
     }
 
     func testABuildThatFinishesDuringAMergeReadsTheGroupsAfterTheMerge() async {
@@ -512,22 +519,44 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.rankCalls, reads, "the ranked facts stay for the session")
     }
 
-    func testMergeAllReadsTheGroupsThatNobodyScrolledToWithProgress() async {
-        let groups = manyGroups(60)
+    func testMergeAllHandsTheGroupsOverInBatchesAndTheLibraryDropsEachBatchAtOnce() async {
+        let size = ExactDuplicatesModel.mergeBatchSize
+        let groups = manyGroups(size + 10)
         let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
-        let (model, _) = makeModel(finder)
+        let (model, log) = makeModel(finder)
         await model.load()
-        let size = ExactDuplicatesModel.rankingPageSize
-        finder.rankGate.close()
+        finder.mergeGate.close()
         let merge = Task { await model.mergeAll() }
-        await waitUntil({ finder.rankGate.hasWaiters }, "Merge All reads the remaining groups")
-        XCTAssertEqual(finder.rankedGroups.last?.count, 60 - 2 * size)
-        XCTAssertEqual(
-            model.rankingLine?.detail,
-            L10n.string("duplicates.ranking_progress \(0.formatted()) \((60 - 2 * size).formatted())"))
-        finder.rankGate.open()
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch waits")
+        XCTAssertEqual(model.mergeProgress, .init(completed: 0, total: size + 10))
+
+        finder.mergeGate.open()
         await merge.value
-        XCTAssertEqual(finder.batches.last?.count, 60)
+
+        XCTAssertEqual(finder.batches.map(\.count), [size, 10])
+        XCTAssertEqual(finder.batches.joined().count, Set(groups.map(\.id)).count, "every group is merged once")
+        XCTAssertEqual(log.calls.map(\.count), [size, 10])
+        XCTAssertEqual(model.content, .noDuplicates)
+        XCTAssertNil(model.mergeProgress)
+        XCTAssertNil(model.notice)
+    }
+
+    func testMergeAllStopsAfterABatchInWhichEveryGroupFailedAndKeepsTheGroupsForARetry() async {
+        let size = ExactDuplicatesModel.mergeBatchSize
+        let groups = manyGroups(size + 10)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        for group in groups.prefix(size) { finder.mergeErrors[group.id] = URLError(.notConnectedToInternet) }
+        let (model, log) = makeModel(finder)
+        await model.load()
+
+        await model.mergeAll()
+
+        XCTAssertEqual(finder.batches.count, 1, "without a connection the next batch fails too")
+        XCTAssertEqual(model.groups.count, size + 10)
+        XCTAssertEqual(model.notice, .failed)
+        XCTAssertTrue(log.calls.isEmpty)
+        XCTAssertNil(model.mergeProgress)
+        XCTAssertTrue(model.canMerge, "the person can try again")
     }
 
     func testTheEntryCountScansWithoutRanking() async {
@@ -709,6 +738,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     struct Merge: Equatable {
         let group: String
         let kept: PhotoUID
+        var isKeptChosen = true
     }
 
     private let lock = NSLock()
@@ -807,29 +837,19 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
         await report(page)
     }
 
-    func merge(_ group: ExactDuplicateGroup, keeping kept: PhotoUID) async throws -> ExactDuplicateMergeOutcome {
-        try lock.withLock {
-            _merges.append(Merge(group: group.id, kept: kept))
-            if let error = mergeErrors[group.id] { throw error }
-            return outcomes[group.id]
-                ?? .merged(kept: kept, trashed: group.members.filter { $0 != kept }, keptDuplicates: [:])
-        }
-    }
-
-    func merge(
-        _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
-    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+    func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
         lock.withLock { _batches.append(requests.map(\.group.id)) }
         await mergeGate.pass()
-        var results: [Result<ExactDuplicateMergeOutcome, any Error>] = []
-        for request in requests {
-            do {
-                results.append(.success(try await merge(request.group, keeping: request.kept)))
-            } catch {
-                results.append(.failure(error))
+        return requests.map { request in
+            lock.withLock { () -> Result<ExactDuplicateMergeOutcome, any Error> in
+                let (group, kept) = (request.group, request.kept)
+                _merges.append(Merge(group: group.id, kept: kept, isKeptChosen: request.isKeptChosen))
+                if let error = mergeErrors[group.id] { return .failure(error) }
+                return .success(
+                    outcomes[group.id]
+                        ?? .merged(kept: kept, trashed: group.members.filter { $0 != kept }, keptDuplicates: [:]))
             }
         }
-        return results
     }
 }
 

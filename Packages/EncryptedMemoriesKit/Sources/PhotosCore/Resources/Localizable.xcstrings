@@ -6075,6 +6075,13 @@
         "de": { "stringUnit": { "state": "translated", "value": "Zu behaltende Fotos werden gewählt" } }
       }
     },
+    "duplicates.merging_title": {
+      "comment": "Title of the progress row while a merge moves duplicates to Recently Deleted.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merging Duplicates" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate werden zusammengeführt" } }
+      }
+    },
     "duplicates.ranking_progress %@ %@": {
       "comment": "Progress of choosing the photos to keep. First %@: groups done, second: all groups, both formatted numbers.",
       "extractionState": "manual",

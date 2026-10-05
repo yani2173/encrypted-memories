@@ -92,9 +92,12 @@ public struct ExactDuplicatesView<Cover: View>: View {
         .tint(accent)
     }
 
-    /// The state of the check and of the ranking above the groups: progress rows while they run, one line after a check
-    /// that could not read every photo, and a retry when the check stopped.
+    /// The state of the merge, of the check, and of the ranking above the groups: progress rows while they run, one
+    /// line after a check that could not read every photo, and a retry when the check stopped.
     @ViewBuilder private var statusRows: some View {
+        if let line = model.mergeLine {
+            progressRow(line).accessibilityIdentifier("duplicates.mergeProgress")
+        }
         if let line = model.checkLine {
             progressRow(line).accessibilityIdentifier("duplicates.checkProgress")
         }

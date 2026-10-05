@@ -279,12 +279,13 @@ import UploadCore
             return false
         }
 
-        func merge(
-            _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
-        ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
             lock.withLock { groups.removeAll { group in requests.contains { $0.group.id == group.id } } }
-            return requests.map { group, kept in
-                .success(.merged(kept: kept, trashed: group.members.filter { $0 != kept }, keptDuplicates: [:]))
+            return requests.map { request in
+                .success(
+                    .merged(
+                        kept: request.kept, trashed: request.group.members.filter { $0 != request.kept },
+                        keptDuplicates: [:]))
             }
         }
     }
