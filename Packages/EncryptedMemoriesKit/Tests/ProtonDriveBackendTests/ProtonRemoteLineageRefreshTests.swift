@@ -327,9 +327,54 @@ extension DriveSessionStubSuite {
                 json: #"{"Code":1000,"EventID":"\#(to)","More":0,"Refresh":0,"Events":[]}"#)
         }
 
+        /// The metadata of the next window downloads while the current window decrypts. Every photo is still asked
+        /// for, the progress still advances window by window, and the build still finishes with its checkpoint.
+        @Test func aFullBuildOverSeveralWindowsAsksForEveryPhotoInOrder() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            // 601 photos: one full window of 600 and one more. A page that is not exactly 500 long ends the list.
+            let ids = (0..<601).map { String(format: "p%04d", $0) }
+            let photos = ids.map { #"{"LinkID":"\#($0)","CaptureTime":1,"Tags":[],"RelatedPhotos":[]}"# }
+            StubURLProtocol.reset()
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/photos",
+                json: #"{"Code":1000,"Photos":["# + photos.joined(separator: ",") + "]}")
+            StubURLProtocol.route("POST /drive/shares/share1/links/fetch_metadata", json: #"{"Code":1000,"Links":[]}"#)
+            let indexed = IndexedCounts()
+
+            try await refresh(content: content, lineage: nil) { value in
+                if value.phase == .indexing { indexed.append(value.completed) }
+            }
+
+            #expect(indexed.values == [0, 600, 601])
+            let requested = StubURLProtocol.requests()
+                .filter { $0.path == "/drive/shares/share1/links/fetch_metadata" }
+                .flatMap { request -> [String] in
+                    guard let body = request.body,
+                        let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+                    else { return [] }
+                    return json["LinkIDs"] as? [String] ?? []
+                }
+            #expect(Set(requested) == Set(ids))
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
+        }
+
+        private final class IndexedCounts: @unchecked Sendable {
+            private let lock = NSLock()
+            private var stored: [Int] = []
+            var values: [Int] { lock.withLock { stored } }
+            func append(_ value: Int) { lock.withLock { stored.append(value) } }
+        }
+
         private func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
-            rebuildsMissingLineage: Bool = false
+            rebuildsMissingLineage: Bool = false,
+            progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { _ in }
         ) async throws {
             let session = DriveSession(
                 session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
@@ -342,7 +387,7 @@ extension DriveSessionStubSuite {
                     rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
                 session: session, crypto: DriveCrypto(addressKeys: [], signers: []),
                 store: content, lineageStore: lineage, rebuildsMissingLineage: rebuildsMissingLineage,
-                progress: { _ in })
+                progress: progress)
         }
     }
 }

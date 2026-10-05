@@ -326,4 +326,18 @@ final class BackupStatusPresentationTests: XCTestCase {
         let s = status(progress(total: 100, checking: 1, alreadyBackedUp: 40, isRunning: true))
         XCTAssertEqual(BackupStatusPresentation(s), BackupStatusPresentation(s))
     }
+
+    /// The first scan shows how far the index of the photos already in Proton is.
+    func testIndexPreparationShowsItsShareOnceTheTotalIsKnown() {
+        let loading = UploadRemoteIndexPreparationProgress(phase: .loading)
+        let indexing = UploadRemoteIndexPreparationProgress(phase: .indexing, completed: 1_200, total: 4_800)
+        let overcounted = UploadRemoteIndexPreparationProgress(phase: .indexing, completed: 5_000, total: 4_800)
+
+        XCTAssertNil(loading.fractionCompleted, "no bar before the list of photos in Proton is known")
+        XCTAssertEqual(indexing.fractionCompleted, 0.25)
+        XCTAssertEqual(overcounted.fractionCompleted, 1)
+        XCTAssertNotEqual(indexing.localizedDetail, loading.localizedDetail, "a known total names the counts")
+        XCTAssertEqual(overcounted.localizedDetail, UploadRemoteIndexPreparationProgress(
+            phase: .indexing, completed: 4_800, total: 4_800).localizedDetail, "the count never passes the total")
+    }
 }

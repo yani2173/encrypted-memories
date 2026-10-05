@@ -663,6 +663,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "Sicherungsindex wird vorbereitet…" } }
       }
     },
+    "backup.detail_preparing_index_once": {
+      "extractionState": "manual",
+      "comment": "Explains the first backup's index of the photos already in Proton, shown under its progress.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Checks which photos are already in Proton, so none uploads twice. This happens once and can take a few minutes for a large library." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Prüft, welche Fotos bereits in Proton sind, damit keines doppelt hochgeladen wird. Das passiert einmal und kann bei einer großen Mediathek einige Minuten dauern." } }
+      }
+    },
     "backup.detail_preparing_index_failed": {
       "extractionState": "manual",
       "localizations": {

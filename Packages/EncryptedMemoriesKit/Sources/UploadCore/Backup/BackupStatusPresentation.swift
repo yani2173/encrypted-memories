@@ -300,3 +300,20 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         activeTransferFraction == nil ? localizedSubtitle : localizedTransferDetail
     }
 }
+
+extension UploadRemoteIndexPreparationProgress {
+    /// "Preparing backup index: 1,200 of 8,000" while the photos already in Proton are indexed; without numbers
+    /// before the total is known.
+    public var localizedDetail: String {
+        if let total, total > 0 {
+            return L10n.string("backup.detail_preparing_index \(min(completed, total)) \(total)")
+        }
+        return L10n.string("backup.detail_preparing_index_indeterminate")
+    }
+
+    /// Share of the photos in Proton already indexed. Nil before the total is known.
+    public var fractionCompleted: Double? {
+        guard let total, total > 0 else { return nil }
+        return min(1, Double(completed) / Double(total))
+    }
+}
