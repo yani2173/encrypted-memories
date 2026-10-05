@@ -412,6 +412,11 @@ public protocol UploadIdentityStore: Sendable {
     func trustedRecords(contentHash: String, hashKeyEpoch: String, limit: Int) -> [UploadIdentityRecord]
     @discardableResult
     func upsert(_ record: UploadIdentityRecord) -> Bool
+    /// `upsert` for a record that carries the remote link that the caller read as `readLinkID`. When the stored row
+    /// names another link now, for example because a merge of exact duplicates moved it to the kept photo, the
+    /// stored remote link and outcome stay. False when the write fails.
+    @discardableResult
+    func upsert(_ record: UploadIdentityRecord, keepingRemoteLinkChangedFrom readLinkID: String?) -> Bool
     /// Every source whose trustworthy record (`uploaded` or `duplicateActive`) names this remote link. Nil when the
     /// store cannot tell, so a caller never trashes a photo that another source may still need.
     func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]?
@@ -445,6 +450,18 @@ public struct UploadRemoteLinkMove: Sendable, Equatable {
 }
 
 extension UploadIdentityStore {
+    /// Compares and writes in two steps; a store that other writers share overrides it with one step.
+    @discardableResult
+    public func upsert(_ record: UploadIdentityRecord, keepingRemoteLinkChangedFrom readLinkID: String?) -> Bool {
+        var record = record
+        if let stored = self.record(for: record.source), stored.remoteLinkID != readLinkID {
+            record.remoteVolumeID = stored.remoteVolumeID
+            record.remoteLinkID = stored.remoteLinkID
+            record.outcome = stored.outcome
+        }
+        return upsert(record)
+    }
+
     public func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? { nil }
     public func sources(withRemoteLinkIDs linkIDs: Set<String>) -> [String: [UploadSourceIdentity]]? {
         var sourcesByLink: [String: [UploadSourceIdentity]] = [:]

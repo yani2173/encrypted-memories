@@ -233,10 +233,12 @@ public struct ExactDuplicateFinder: Sendable {
         try await merge([(group, kept)])[0].get()
     }
 
-    /// Merges each group like `merge(_:keeping:)`, with one manifest scan and one favorites listing for all groups.
+    /// Merges each group like `merge(_:keeping:)`, with one manifest scan, one favorites listing, and one trash for
+    /// all groups.
     ///
-    /// Every group reads its server state first. The local checks and the writes follow, group by group. Each group
-    /// fails alone: its result holds its outcome or its error. After a cancellation, no further group writes, and
+    /// Every group reads its server state first. The local checks, the carry-over, and the row moves follow, group by
+    /// group, and then one trash takes the duplicates of every group. Each group holds its outcome or its error; a
+    /// failed trash fails every group that it should have taken. After a cancellation, no further group writes, and
     /// every group without an outcome fails with `CancellationError`.
     public func merge(
         _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
@@ -270,13 +272,7 @@ public struct ExactDuplicateFinder: Sendable {
                 do {
                     let favorites = try await remote.favoriteUIDs(
                         among: writes.flatMap { $0.plan.trashable + [$0.plan.kept] })
-                    for (index, plan) in writes where !Task.isCancelled {
-                        do {
-                            results[index] = .success(try await write(plan, favorites: favorites))
-                        } catch {
-                            results[index] = .failure(error)
-                        }
-                    }
+                    await write(writes, favorites: favorites, into: &results)
                 } catch {
                     for (index, _) in writes { results[index] = .failure(error) }
                 }
@@ -366,34 +362,66 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
-    /// Carries the favorite tag and the own albums over, moves the rows, and trashes the duplicates. `favorites`
-    /// holds the favorites among the trashed and the kept photos.
-    private func write(_ plan: PlannedMerge, favorites: Set<PhotoUID>) async throws -> ExactDuplicateMergeOutcome {
-        let kept = plan.kept
-        try Task.checkCancellation()
-        try await remote.carryOver(
-            from: plan.trashable, to: kept, ownVolumeID: plan.volumeID, albums: albums, favorites: favorites)
-        // The rows move before the trash: the kept photo holds the same bytes, and after the trash only the trashed
-        // links would name the related files that a retry has to move.
-        guard identities.rebindRemoteLinks(plan.moves, hashKeyEpoch: plan.epoch) else {
-            throw UploadError.backend("Upload identity manifest could not be updated")
+    /// Carries the favorite tag and the own albums over and moves the rows, group by group. One trash then takes the
+    /// duplicates of every group, and the backup drops its cached remote state once. `favorites` holds the favorites
+    /// among the trashed and the kept photos. A group whose carry-over or row move fails takes no part in the trash.
+    /// A failed trash fails every group that took part: their rows already name `kept`, which holds the same bytes,
+    /// so a retry finds them moved and writes them no second time. Known gap: after a failed or cancelled trash, no
+    /// group reads its kept photo again, so a merge on another device that trashed that kept photo at the same moment
+    /// is not undone here.
+    private func write(
+        _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>,
+        into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
+    ) async {
+        var trashing: [(index: Int, plan: PlannedMerge)] = []
+        for (index, plan) in writes where !Task.isCancelled {
+            do {
+                try await remote.carryOver(
+                    from: plan.trashable, to: plan.kept, ownVolumeID: plan.volumeID, albums: albums,
+                    favorites: favorites)
+                // The rows move before the trash: the kept photo holds the same bytes, and after the trash only the
+                // trashed links would name the related files that a retry has to move.
+                guard identities.rebindRemoteLinks(plan.moves, hashKeyEpoch: plan.epoch) else {
+                    throw UploadError.backend("Upload identity manifest could not be updated")
+                }
+                trashing.append((index, plan))
+            } catch {
+                results[index] = .failure(error)
+            }
         }
+        guard !trashing.isEmpty, !Task.isCancelled else { return }
         do {
-            try await remote.trashDuplicates(plan.trashable)
+            try await remote.trashDuplicates(trashing.flatMap(\.plan.trashable))
         } catch {
             // A failed trash can still have moved some photos.
             await resolver.invalidateCachedRemoteState()
-            throw error
+            for (index, _) in trashing { results[index] = .failure(error) }
+            return
         }
         // The backup's cached remote state names the trashed links as active backups.
         await resolver.invalidateCachedRemoteState()
+        var restored = false
+        for (index, plan) in trashing {
+            do {
+                results[index] = .success(try await settle(plan, restored: &restored))
+            } catch {
+                results[index] = .failure(error)
+            }
+        }
+        if restored { await resolver.invalidateCachedRemoteState() }
+    }
+
+    /// Reads `kept` after the trash. When `kept` left the library meanwhile, restores the duplicates of this group
+    /// and moves their rows back. `restored` turns true once a restore was attempted.
+    private func settle(_ plan: PlannedMerge, restored: inout Bool) async throws -> ExactDuplicateMergeOutcome {
+        let kept = plan.kept
         // A merge on another device can keep another member and trash `kept` at the same moment. Each device reads
         // `kept` after its own trash, so at least one of them sees the other trash and restores its duplicates.
         guard try await !isActiveMainAfterTrash(kept) else {
             return .merged(kept: kept, trashed: plan.trashable, keptDuplicates: plan.keptDuplicates)
         }
+        restored = true
         try await remote.restoreDuplicates(plan.trashable)
-        await resolver.invalidateCachedRemoteState()
         // The rows move back to the restored duplicates. Rows that named `kept` before the merge move to the first
         // of them: it holds the same bytes and stays in the library.
         let movesBack = plan.moves.map { UploadRemoteLinkMove(from: $0.to, to: $0.from, contentHash: $0.contentHash) }

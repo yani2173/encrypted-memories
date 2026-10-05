@@ -382,19 +382,90 @@ final class ExactDuplicateFinderTests: XCTestCase {
         server.links.first { $0.linkID == uid.nodeID }?.state
     }
 
-    func testMergeAllWritesTheOtherGroupsWhenTheTrashOfOneGroupFails() async throws {
-        let (groups, _) = try await threeGroups()
+    /// The backup's duplicate check of this finder, which logs every drop of its cached remote state.
+    private func loggingResolver() -> (resolver: SpyIdentityResolver, log: BackupEventLog) {
+        let log = BackupEventLog()
+        let pipeline = UploadDedupePipeline(store: store, checker: server, replacementJournal: journal)
+        return (SpyIdentityResolver(inner: pipeline, log: log), log)
+    }
+
+    private func invalidations(in log: BackupEventLog) -> Int {
+        log.events.filter { $0 == "manifest.invalidateCachedRemoteState" }.count
+    }
+
+    /// The trash requests of the merge, failed ones too.
+    private var trashCalls: [String] {
+        server.steps.map(\.action).filter { $0.hasPrefix("duplicate trash") || $0 == "failed duplicate trash" }
+    }
+
+    func testMergeAllTrashesEveryGroupWithOneTrashAndDropsTheBackupCacheOnce() async throws {
+        let (groups, sources) = try await threeGroups()
+        let (resolver, log) = loggingResolver()
+
+        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+
+        XCTAssertEqual(
+            results.map { try? $0.get() },
+            groups.map { .merged(kept: $0.members[0], trashed: [$0.members[1]], keptDuplicates: [:]) })
+        XCTAssertEqual(trashCalls, ["duplicate trash \(groups.map(\.members[1].nodeID))"])
+        XCTAssertEqual(invalidations(in: log), 1)
+        for (group, source) in zip(groups, sources) {
+            XCTAssertEqual(state(of: group.members[1]), .trashed)
+            XCTAssertEqual(store.record(for: source)?.remoteLinkID, group.members[0].nodeID)
+        }
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAFailedTrashFailsEveryGroupAndARetryMovesNoRowTwice() async throws {
+        let (groups, sources) = try await threeGroups()
+        let (resolver, log) = loggingResolver()
         server.failNextTrash()
 
-        let results = await finder.merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
 
-        XCTAssertThrowsError(try results[0].get())
-        XCTAssertEqual(state(of: groups[0].members[1]), .active, "the failed trash moved nothing")
-        for (group, result) in zip(groups, results).dropFirst() {
+        for (index, group) in groups.enumerated() {
+            XCTAssertThrowsError(try results[index].get())
+            XCTAssertEqual(state(of: group.members[1]), .active, "the failed trash moved nothing")
             XCTAssertEqual(
-                try? result.get(), .merged(kept: group.members[0], trashed: [group.members[1]], keptDuplicates: [:]))
-            XCTAssertEqual(state(of: group.members[1]), .trashed)
+                store.record(for: sources[index])?.remoteLinkID, group.members[0].nodeID,
+                "the moved row names the kept photo, which holds the same bytes")
         }
+        XCTAssertEqual(invalidations(in: log), 1)
+        let movedRows = sources.map { store.record(for: $0) }
+
+        let retry = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+
+        XCTAssertEqual(
+            retry.map { try? $0.get() },
+            groups.map { .merged(kept: $0.members[0], trashed: [$0.members[1]], keptDuplicates: [:]) })
+        XCTAssertEqual(sources.map { store.record(for: $0) }, movedRows, "the retry moves no row twice")
+        XCTAssertEqual(
+            trashCalls, ["failed duplicate trash", "duplicate trash \(groups.map(\.members[1].nodeID))"])
+        XCTAssertEqual(violations, [])
+    }
+
+    func testMergeAllRestoresOnlyTheGroupWhoseKeptPhotoLeftDuringTheTrash() async throws {
+        let (groups, sources) = try await threeGroups()
+        let (resolver, log) = loggingResolver()
+        // Another device keeps the duplicate of the second group and trashes its kept photo meanwhile.
+        server.trashAfterDuplicateTrash = groups[1].members[0].nodeID
+
+        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+
+        XCTAssertEqual(try? results[1].get(), .skipped(.keptLeftLibraryDuringMerge))
+        XCTAssertEqual(state(of: groups[1].members[1]), .active, "one copy stays")
+        XCTAssertEqual(store.record(for: sources[1])?.remoteLinkID, groups[1].members[1].nodeID, "the row moves back")
+        for index in [0, 2] {
+            XCTAssertEqual(
+                try? results[index].get(),
+                .merged(kept: groups[index].members[0], trashed: [groups[index].members[1]], keptDuplicates: [:]))
+            XCTAssertEqual(state(of: groups[index].members[1]), .trashed)
+            XCTAssertEqual(store.record(for: sources[index])?.remoteLinkID, groups[index].members[0].nodeID)
+        }
+        XCTAssertEqual(
+            server.steps.map(\.action).filter { $0.hasPrefix("person restore") },
+            ["person restore \(groups[1].members[1].nodeID)"])
+        XCTAssertEqual(invalidations(in: log), 2, "once after the trash and once after the restore")
         XCTAssertEqual(violations, [])
     }
 

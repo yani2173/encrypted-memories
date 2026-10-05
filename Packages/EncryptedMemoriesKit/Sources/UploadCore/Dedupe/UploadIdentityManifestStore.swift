@@ -350,6 +350,18 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
     @discardableResult
     public func upsert(_ record: UploadIdentityRecord) -> Bool {
+        write(record, keepingRemoteLinkChangedFrom: nil, onlyIfUnchanged: false)
+    }
+
+    /// One statement, so a merge that moves the row between the comparison and the write cannot slip in.
+    @discardableResult
+    public func upsert(_ record: UploadIdentityRecord, keepingRemoteLinkChangedFrom readLinkID: String?) -> Bool {
+        write(record, keepingRemoteLinkChangedFrom: readLinkID, onlyIfUnchanged: true)
+    }
+
+    private func write(
+        _ record: UploadIdentityRecord, keepingRemoteLinkChangedFrom readLinkID: String?, onlyIfUnchanged: Bool
+    ) -> Bool {
         lock.withLock {
             var stmt: OpaquePointer?
             guard
@@ -365,8 +377,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                       filename=excluded.filename, corrected=excluded.corrected, size=excluded.size,
                       mtime=excluded.mtime, sha1_hex=excluded.sha1_hex, name_hash=excluded.name_hash,
                       content_hash=excluded.content_hash, key_epoch=excluded.key_epoch,
-                      remote_vol=excluded.remote_vol, remote_link=excluded.remote_link,
-                      outcome=excluded.outcome, updated_at=excluded.updated_at;
+                      remote_vol=CASE WHEN ?16 = 0 OR remote_link IS ?17
+                        THEN excluded.remote_vol ELSE remote_vol END,
+                      outcome=CASE WHEN ?16 = 0 OR remote_link IS ?17 THEN excluded.outcome ELSE outcome END,
+                      remote_link=CASE WHEN ?16 = 0 OR remote_link IS ?17
+                        THEN excluded.remote_link ELSE remote_link END,
+                      updated_at=excluded.updated_at;
                     """,
                     -1, &stmt, nil
                 ) == SQLITE_OK
@@ -387,6 +403,8 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             bindOptionalText(stmt, 13, record.remoteLinkID)
             bindOptionalText(stmt, 14, record.outcome)
             sqlite3_bind_double(stmt, 15, record.updatedAt.timeIntervalSince1970)
+            sqlite3_bind_int(stmt, 16, onlyIfUnchanged ? 1 : 0)
+            bindOptionalText(stmt, 17, readLinkID)
             return sqlite3_step(stmt) == SQLITE_DONE
         }
     }
