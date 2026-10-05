@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import XCTest
 
 @testable import UploadCore
@@ -75,10 +76,26 @@ final class BackupQueueListTests: XCTestCase {
         XCTAssertNotEqual(list.uploading.first?.id, list.waiting.first?.id)
     }
 
+    func testEachRowPreviewsItsOwnPhoto() {
+        let list = BackupQueueList(rows: [
+            row("live", .uploading, resource: .primary),
+            row("live", .queuedForUpload, resource: .livePairedVideo),
+            row("other", .discovered, revision: 1),
+        ])
+
+        let live = PhotoUID(localPending: .photoLibrary, identifier: "live")
+        XCTAssertEqual(list.uploading.map(\.previewUID), [live])
+        XCTAssertEqual(
+            list.waiting.map(\.previewUID), [live, PhotoUID(localPending: .photoLibrary, identifier: "other")],
+            "the paired video of a Live Photo shows the photo itself")
+    }
+
     func testEveryQueueStateHasItsOwnWording() {
-        let queued = BackupQueueList.Item(id: "q", filename: "q", state: .queuedForUpload).localizedState
+        let preview = PhotoUID(localPending: .photoLibrary, identifier: "x")
+        let queued = BackupQueueList.Item(id: "q", filename: "q", state: .queuedForUpload, previewUID: preview)
+            .localizedState
         for state: UploadBackupSyncQueueState in [.checking, .hashing, .uploading, .finalizing, .paused] {
-            let wording = BackupQueueList.Item(id: "x", filename: "x", state: state).localizedState
+            let wording = BackupQueueList.Item(id: "x", filename: "x", state: state, previewUID: preview).localizedState
             XCTAssertFalse(wording.isEmpty, state.rawValue)
             XCTAssertNotEqual(wording, queued, state.rawValue)
         }

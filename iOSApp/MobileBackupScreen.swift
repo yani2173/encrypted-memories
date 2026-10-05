@@ -519,11 +519,12 @@ private struct MobileBackupIndexProgress: View {
     }
 }
 
-/// The files that the backup uploads now and the ones that wait their turn. Photos with a problem stay in the
-/// problem sheet; the shared `BackupQueueList` decides which rows belong here.
+/// The files that the backup uploads now and the ones that wait their turn, each with a preview of its photo.
+/// Photos with a problem stay in the problem sheet; the shared `BackupQueueList` decides which rows belong here.
 private struct MobileBackupQueueScreen: View {
     let controller: PhotoLibraryBackupController
     @State private var list: BackupQueueList?
+    private let thumbnails = PhotoKitLocalThumbnailLoader(request: PhotoKitPlatformImages.request)
 
     var body: some View {
         Group {
@@ -567,9 +568,14 @@ private struct MobileBackupQueueScreen: View {
             Section {
                 ForEach(items) { item in
                     HStack(spacing: 12) {
-                        Image(systemName: phase == .uploading ? "arrow.up.circle" : "clock")
-                            .foregroundStyle(phase == .uploading ? ProtonColor.primary : ProtonColor.textWeak)
-                            .font(.body)
+                        PendingPhotoThumbnail(uid: item.previewUID, load: thumbnails.listThumbnail(for:))
+                            .overlay(alignment: .bottomTrailing) {
+                                Image(systemName: phase == .uploading ? "arrow.up.circle.fill" : "clock.fill")
+                                    .foregroundStyle(phase == .uploading ? ProtonColor.primary : ProtonColor.textWeak)
+                                    .font(.caption)
+                                    .background(Circle().fill(.background))
+                                    .offset(x: 4, y: 4)
+                            }
                         VStack(alignment: .leading, spacing: 2) {
                             Text(item.filename)
                                 .font(.subheadline)
