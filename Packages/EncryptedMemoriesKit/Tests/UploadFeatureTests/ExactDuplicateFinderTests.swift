@@ -276,6 +276,23 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(identities.reads, CountingIdentityStore.Reads(single: 0, batch: 2))
     }
 
+    func testTheRankingReadsTheNodesOfOneGroupAtATime() async throws {
+        server.seedLinks(digests: (0..<6).flatMap { [digest("group-\($0)"), digest("group-\($0)")] })
+        indexServer()
+        let remote = ConcurrencyCountingRemote(base: server)
+        let finder = ExactDuplicateFinder(
+            checker: server,
+            resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
+            index: store, identities: store, journal: journal, remote: remote, albums: server)
+        let groups = try await finder.duplicateGroups().groups
+        XCTAssertEqual(groups.count, 6)
+
+        let ranked = await finder.rankedMembers(of: groups)
+
+        XCTAssertEqual(ranked.count, 6, "every group is ranked")
+        XCTAssertEqual(remote.peakConcurrentNodeReads, 1, "the groups read their nodes one after the other")
+    }
+
     func testASharedMemberIsKeptFirstAndAMissingNodeLeavesOnlyItsGroupInTheFallbackOrder() async throws {
         let album = server.seedLink(digest: digest("a"), captureTime: date(0))
         let shared = server.seedLink(digest: digest("a"), captureTime: date(5))
@@ -994,6 +1011,37 @@ private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Senda
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         await gate.pass()
         return try await base.favoriteUIDs(among: uids)
+    }
+}
+
+/// Counts the node reads that run at once. Each read waits a moment, so reads that can overlap do.
+private final class ConcurrencyCountingRemote: ExactDuplicateRemote, @unchecked Sendable {
+    let base: EditScenarioServer
+    private let lock = NSLock()
+    private var running = 0
+    private var peak = 0
+
+    init(base: EditScenarioServer) { self.base = base }
+
+    var peakConcurrentNodeReads: Int { lock.withLock { peak } }
+
+    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        lock.withLock {
+            running += 1
+            peak = max(peak, running)
+        }
+        defer { lock.withLock { running -= 1 } }
+        try await Task.sleep(for: .milliseconds(20))
+        return try await base.nodeFacts(of: uids)
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        try await base.favoriteUIDs(among: uids)
     }
 }
 

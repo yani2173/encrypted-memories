@@ -293,8 +293,7 @@ final class MobileLibraryModel {
     @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
     private var locationPrivacyStopTask: Task<Void, Never>?
     private let locationStore = PhotoLocationStore()
-    /// Each probe waits for one Proton metadata read, so four in parallel find places about four times as fast.
-    private let locationCrawl = LocationCrawl(probeConcurrency: 4)
+    private let locationCrawl = LocationCrawl()
     private var locationCrawlStarted = false
     private var locationCrawlGeneration: UInt64 = 0
     private var locationCrawlStartTask: Task<Void, Never>?
