@@ -563,15 +563,31 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         var lineageBuildReady = lineageStore?.prepareBuild(build, hashKeyEpoch: material.epoch) == true
         await progress(.init(phase: .indexing, completed: build.cursor, total: ids.count))
-        for start in stride(from: build.cursor, to: ids.count, by: remoteMetadataWindow) {
+        let shareID = material.context.shareID
+        let windows = stride(from: build.cursor, to: ids.count, by: remoteMetadataWindow).map {
+            $0..<min($0 + remoteMetadataWindow, ids.count)
+        }
+        func prefetch(_ position: Int) -> Task<RemoteMetadataFetch, any Error>? {
+            guard windows.indices.contains(position) else { return nil }
+            let window = Array(ids[windows[position]])
+            return Task { try await Self.fetchLinks(ids: window, shareID: shareID, session: session) }
+        }
+        // The metadata of the next window downloads while this window decrypts, so the network and the processor
+        // work at the same time. Decryption and the store update stay serialized; each checkpoint stays in order.
+        var nextFetch = prefetch(0)
+        defer { nextFetch?.cancel() }
+        for (position, range) in windows.enumerated() {
             try Task.checkCancellation()
-            let end = min(start + remoteMetadataWindow, ids.count)
-            let window = Array(ids[start..<end])
-            let fetched = try await fetchLinks(
-                ids: window,
-                shareID: material.context.shareID,
-                session: session
-            )
+            guard let currentFetch = nextFetch else { break }
+            let fetched = try await withTaskCancellationHandler {
+                try await currentFetch.value
+            } onCancel: {
+                currentFetch.cancel()
+            }
+            try Task.checkCancellation()
+            nextFetch = prefetch(position + 1)
+            let end = range.upperBound
+            let window = Array(ids[range])
             var rows = try makeIndexRows(
                 links: fetched.links,
                 expectedActiveFileIDs: Set(window),
@@ -748,7 +764,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
     }
 
-    private struct RemoteMetadataFetch {
+    private struct RemoteMetadataFetch: Sendable {
         var links: [String: AlbumPhotoLinkBody]
         var endpointFailureIDs: Set<String>
     }

@@ -268,6 +268,11 @@ private struct MobilePhotoBackupSections: View {
 
                 statusDetails(display)
 
+                if let preparation = controller.scanIndexPreparation {
+                    MobileBackupIndexProgress(preparation: preparation)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+
                 if let retry = display.localizedRetryDetail {
                     Text(retry)
                         .font(.caption)
@@ -489,6 +494,31 @@ private struct MobilePhotoBackupSections: View {
     }
 }
 
+/// Progress of the Proton index that a first backup builds before it can tell which photos still need an upload.
+private struct MobileBackupIndexProgress: View {
+    let preparation: UploadRemoteIndexPreparationProgress
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(preparation.localizedDetail)
+                .font(.footnote.monospacedDigit())
+                .foregroundStyle(ProtonColor.textWeak)
+                .contentTransition(.numericText())
+            if let fraction = preparation.fractionCompleted {
+                ProgressView(value: fraction)
+                    .tint(ProtonColor.primary)
+            }
+            Text(L10n.string("backup.detail_preparing_index_once"))
+                .font(.caption)
+                .foregroundStyle(ProtonColor.textWeak)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("backup.indexProgress")
+    }
+}
+
 /// The files that the backup uploads now and the ones that wait their turn. Photos with a problem stay in the
 /// problem sheet; the shared `BackupQueueList` decides which rows belong here.
 private struct MobileBackupQueueScreen: View {
@@ -498,7 +528,18 @@ private struct MobileBackupQueueScreen: View {
     var body: some View {
         Group {
             if let list {
-                if list.isEmpty {
+                if list.isEmpty, controller.status.phase == .scanning {
+                    // A first scan writes no queue row until the Proton index is ready; the list is not done.
+                    ContentUnavailableView {
+                        Label(L10n.string("backup.phase_scanning"), systemImage: "magnifyingglass")
+                    } description: {
+                        if let preparation = controller.scanIndexPreparation {
+                            MobileBackupIndexProgress(preparation: preparation)
+                                .frame(maxWidth: 320)
+                        }
+                    }
+                    .accessibilityIdentifier("backup.queueScanning")
+                } else if list.isEmpty {
                     ContentUnavailableView {
                         Label(L10n.string("backup.queue_empty"), systemImage: "checkmark.shield")
                     }

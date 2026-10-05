@@ -96,6 +96,9 @@ public final class PhotoLibraryBackupController {
     /// Latest catalog scan tally for diagnostics. It is not upload progress and is not shown in the backup
     /// status row.
     public private(set) var lastCatalogProgress: PhotoLibraryCatalogProgress?
+    /// The Proton index that a first scan builds before its first queue row: it lists every photo already in
+    /// Proton and decrypts its metadata, which can take minutes. Nil when no such build runs.
+    public private(set) var scanIndexPreparation: UploadRemoteIndexPreparationProgress?
     /// Bumps only when durable queue truth records newly uploaded media bytes. UI hosts observe this
     /// to refresh their library immediately; duplicate matches do not cause needless timeline loads.
     public private(set) var uploadedLibraryMutationRevision: UInt64 = 0
@@ -121,6 +124,9 @@ public final class PhotoLibraryBackupController {
 
     private let engine: UploadBackupSyncEngine?
     private let runner: BackupSyncRunner?
+    /// Builds the Proton index on behalf of a first scan, so the scan can show its progress.
+    private let remoteIndexPreparer: (any UploadIdentityResolving)?
+    private var scanIndexFollower: Task<Void, Never>?
     /// Durable runner events for the pending grid. Nil without a pending store.
     public let pendingRecorder: PendingBackupEventRecorder?
     /// The earlier uploads of edited photos, so the pending grid shows an edit in place of its earlier photo.
@@ -255,6 +261,7 @@ public final class PhotoLibraryBackupController {
             leaseInterval: Self.lockLease
         )
 
+        remoteIndexPreparer = identityResolver
         if let queueStore, let stateStore, let catalogStore, let identityResolver {
             let preflight = UploadBackupPreflightIndex(store: stateStore)
             engine = UploadBackupSyncEngine(
@@ -1362,11 +1369,34 @@ public final class PhotoLibraryBackupController {
         lastCatalogProgress = nil
         isScanning = true
         refreshFromQueue()
+        followRemoteIndexPreparationOfFirstScan()
     }
 
     private func finishScanPhase() {
         isScanning = false
+        scanIndexFollower?.cancel()
+        scanIndexFollower = nil
+        scanIndexPreparation = nil
         refreshFromQueue()
+    }
+
+    /// The first queue write of a first scan waits for the Proton index, and the drain reports the index only
+    /// while photos wait in the queue. Without this, the scan would show no progress for minutes. Later scans
+    /// update the index from recent changes in moments and need no progress.
+    private func followRemoteIndexPreparationOfFirstScan() {
+        guard let remoteIndexPreparer, catalogStore?.hasCompletedFullScan() == false else { return }
+        scanIndexFollower?.cancel()
+        scanIndexFollower = Task { [weak self] in
+            // A failure is not shown here: the scan's queue writes and the drain report it.
+            try? await remoteIndexPreparer.prepareRemoteIndex { [weak self] value in
+                await self?.setScanIndexPreparation(value)
+            }
+        }
+    }
+
+    private func setScanIndexPreparation(_ value: UploadRemoteIndexPreparationProgress) {
+        guard isScanning, scanIndexFollower?.isCancelled == false else { return }
+        scanIndexPreparation = value.phase == .ready ? nil : value
     }
 
     /// Cancels every targeted writer and waits briefly before deciding whether retirement is needed.
