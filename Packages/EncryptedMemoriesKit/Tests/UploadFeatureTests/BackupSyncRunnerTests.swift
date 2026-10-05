@@ -858,6 +858,35 @@ actor BackupUploadTestLatch {
     func isSignaled() -> Bool { signaled }
 }
 
+/// Holds the first upload until the test releases it; every other upload finishes at once.
+final class FirstUploadHoldingUploader: PhotoUploading, @unchecked Sendable {
+    let capabilities = UploadBackendCapabilities.sdkUploader
+    let release = BackupUploadTestLatch()
+
+    private let lock = NSLock()
+    private var _heldName: String?
+    private var _finished: [String] = []
+
+    var heldName: String? { lock.withLock { _heldName } }
+    var finished: [String] { lock.withLock { _finished } }
+
+    func upload(
+        _ request: PhotoUploadRequest,
+        onProgress: @Sendable @escaping (UploadProgress) -> Void
+    ) async throws -> PhotoUID {
+        let holds = lock.withLock { () -> Bool in
+            guard _heldName == nil else { return false }
+            _heldName = request.name
+            return true
+        }
+        if holds { await release.wait() }
+        lock.withLock { _finished.append(request.name) }
+        return testUID(request.name)
+    }
+
+    func cancel(token: UUID) async {}
+}
+
 /// Ignores Swift task cancellation until its upload and native-cancel latches are released.
 /// This models an SDK continuation that can return late after the caller requests cancellation.
 final class NonCooperativeBackupUploader: PhotoUploading, @unchecked Sendable {
@@ -3135,6 +3164,27 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         XCTAssertEqual(progress.uploaded, 8)
         XCTAssertLessThanOrEqual(slowUploader.peakConcurrent, 2)
+    }
+
+    func testASlowUploadDoesNotHoldBackTheNextPhotos() async throws {
+        for index in 0..<5 { _ = seedEntry("photo-\(index).jpg") }
+        let holding = FirstUploadHoldingUploader()
+        let runner = makeRunner(uploader: holding, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let drain = Task { await runner.runUntilDrained() }
+
+        // The second slot takes the next photo each time one finishes, while the first upload still runs.
+        let deadline = Date().addingTimeInterval(10)
+        while holding.finished.count < 4, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let heldName = try XCTUnwrap(holding.heldName)
+        XCTAssertEqual(holding.finished.count, 4, "the other photos upload while the first one still runs")
+        XCTAssertFalse(holding.finished.contains(heldName))
+
+        await holding.release.signal()
+        let progress = await drain.value
+        XCTAssertEqual(progress.uploaded, 5)
+        XCTAssertEqual(holding.finished.count, 5)
     }
 
     func testFileChangedAfterScanUploadsCurrentContentAndClosesBothRows() async throws {

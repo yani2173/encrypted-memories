@@ -357,91 +357,123 @@ public actor BackupSyncRunner {
         // hits (see primeRunnableLookahead). Re-warmed periodically as the queue drains.
         await primeRunnableLookahead()
         guard queue.isOperational() else { return progress }
-        var wavesSincePrime = 0
+        var claimedSincePrime = 0
 
-        while !stopRequested, !Task.isCancelled {
-            guard queue.isOperational() else {
-                stopRequested = true
-                break
-            }
-            await requeueDueBlockedRows()
-            guard queue.isOperational() else {
-                stopRequested = true
-                break
-            }
-
-            let throttleSnapshot = throttleInputs()
-            let policyLimit = configuration.throttle.maxConcurrentItems(for: throttleSnapshot)
-            // Back off concurrency while a marginal connection is dropping requests, but never below 1
-            // (never stall - a single in-flight item keeps making progress and probes recovery).
-            let limit = policyLimit == 0 ? 0 : max(1, policyLimit - networkErrorStreak)
-            if limit == 0 {
-                if !progress.isPausedByPolicy {
-                    progress.isPausedByPolicy = true
-                    emitProgress()
-                }
-                if mode == .eligibleOnly { break }
-                do {
-                    try await clock.sleep(for: configuration.pausedPollInterval)
-                } catch {
-                    break
-                }
-                continue
-            }
-            if progress.isPausedByPolicy {
-                progress.isPausedByPolicy = false
-                emitProgress()
-            }
-
-            // Re-warm the dedup cache once the current lookahead is largely consumed. prime()
-            // invalidates the previous batch first, so we do this on a cadence (not every wave) to
-            // avoid dropping still-useful cached state mid-drain.
-            if wavesSincePrime >= Self.wavesPerPrime {
-                await primeRunnableLookahead()
-                wavesSincePrime = 0
-            }
-
-            let wave = nextEligibleWave(limit: limit)
-            if wave.isEmpty {
-                guard queue.isOperational() else {
-                    stopRequested = true
-                    break
-                }
-                guard let wait = shortestPendingWait() else {
-                    if !queue.isOperational() { stopRequested = true }
-                    break
-                }
-                if mode == .eligibleOnly { break }
-                // Only an item waiting for Proton storage waits longer than any regular retry. A one-shot drain the
-                // user waits for ends then instead of sleeping for hours.
-                if wait > longestRegularRetryWait { break }
-                do {
-                    try await clock.sleep(for: wait)
-                } catch {
-                    break
-                }
-                continue
-            }
-
+        // Up to `limit` items run at once, and a finished item frees its slot for the next one at once: one long
+        // upload, such as a video, never holds back the items behind it. Rows are claimed only for free slots, and
+        // the loop ends only when no item runs, so every claimed row keeps its worker.
+        await withTaskGroup(of: String.self) { group in
+            var running = 0
             // Two revisions of one photo (a preliminary camera version and the finished one) run one after the
             // other: both read the current file, and the second then finds it backed up instead of uploading
-            // the same bytes at the same time.
-            let bySource = Dictionary(grouping: wave) {
-                Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)
-            }
-            await withTaskGroup(of: Void.self) { group in
-                for entries in bySource.values {
-                    group.addTask {
-                        for entry in entries { await self.process(entry, workIntent: workIntent) }
+            // the same bytes at the same time. A claimed row of a photo that runs now waits here for its turn.
+            var busySources: Set<String> = []
+            var waitingBehindSource: [String: [UploadBackupSyncQueueEntry]] = [:]
+
+            drain: while true {
+                // A whole batch that could not reserve disk space means the volume is full, not busy.
+                // Stop draining and leave the rows runnable: the next pass retries once space frees,
+                // and the status reads "waiting" (never a permanent, unactionable failure).
+                let mayClaim =
+                    !stopRequested && !Task.isCancelled && resourcePressureStreak < configuration.batchSize
+                if mayClaim {
+                    if queue.isOperational() {
+                        await requeueDueBlockedRows()
+                        if !queue.isOperational() { stopRequested = true }
+                    } else {
+                        stopRequested = true
                     }
                 }
-            }
-            wavesSincePrime += 1
+                if mayClaim, !stopRequested {
+                    let throttleSnapshot = throttleInputs()
+                    let policyLimit = configuration.throttle.maxConcurrentItems(for: throttleSnapshot)
+                    // Back off concurrency while a marginal connection is dropping requests, but never below 1
+                    // (never stall - a single in-flight item keeps making progress and probes recovery).
+                    let limit = policyLimit == 0 ? 0 : max(1, policyLimit - networkErrorStreak)
+                    if limit == 0 {
+                        // Items that already run finish first; the pause starts once none runs.
+                        if running == 0 {
+                            if !progress.isPausedByPolicy {
+                                progress.isPausedByPolicy = true
+                                emitProgress()
+                            }
+                            if mode == .eligibleOnly { break drain }
+                            do {
+                                try await clock.sleep(for: configuration.pausedPollInterval)
+                            } catch {
+                                break drain
+                            }
+                            continue drain
+                        }
+                    } else {
+                        if progress.isPausedByPolicy {
+                            progress.isPausedByPolicy = false
+                            emitProgress()
+                        }
 
-            // A whole wave that could not reserve disk space means the volume is full, not busy.
-            // Stop draining and leave the rows runnable: the next pass retries once space frees,
-            // and the status reads "waiting" (never a permanent, unactionable failure).
-            if resourcePressureStreak >= configuration.batchSize { break }
+                        // Re-warm the dedup cache once the current lookahead is largely consumed. prime()
+                        // invalidates the previous batch first, so we do this on a cadence (not every claim) to
+                        // avoid dropping still-useful cached state mid-drain.
+                        if claimedSincePrime >= Self.claimsPerPrime {
+                            await primeRunnableLookahead()
+                            claimedSincePrime = 0
+                        }
+
+                        if running < limit {
+                            let claimed = nextEligibleWave(limit: limit - running)
+                            claimedSincePrime += claimed.count
+                            for entry in claimed {
+                                let key = Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier)
+                                if busySources.contains(key) {
+                                    waitingBehindSource[key, default: []].append(entry)
+                                    continue
+                                }
+                                busySources.insert(key)
+                                running += 1
+                                group.addTask {
+                                    await self.process(entry, workIntent: workIntent)
+                                    return key
+                                }
+                            }
+                            if claimed.isEmpty, running == 0 {
+                                guard queue.isOperational() else {
+                                    stopRequested = true
+                                    break drain
+                                }
+                                guard let wait = shortestPendingWait() else {
+                                    if !queue.isOperational() { stopRequested = true }
+                                    break drain
+                                }
+                                if mode == .eligibleOnly { break drain }
+                                // Only an item waiting for Proton storage waits longer than any regular retry. A
+                                // one-shot drain the user waits for ends then instead of sleeping for hours.
+                                if wait > longestRegularRetryWait { break drain }
+                                do {
+                                    try await clock.sleep(for: wait)
+                                } catch {
+                                    break drain
+                                }
+                                continue drain
+                            }
+                        }
+                    }
+                }
+
+                // Wait for the next item to finish. Its slot goes to a waiting revision of the same photo first.
+                guard running > 0, let key = await group.next() else { break drain }
+                running -= 1
+                if var waiting = waitingBehindSource[key], !waiting.isEmpty {
+                    let next = waiting.removeFirst()
+                    waitingBehindSource[key] = waiting.isEmpty ? nil : waiting
+                    running += 1
+                    group.addTask {
+                        await self.process(next, workIntent: workIntent)
+                        return key
+                    }
+                } else {
+                    busySources.remove(key)
+                }
+            }
         }
 
         // Truth re-sync from the store: incremental counters were exact (single writer), but the
@@ -569,11 +601,11 @@ public actor BackupSyncRunner {
 
     // MARK: - Dedup batch prewarm
 
-    /// How many runnable rows to prewarm per batch, and how many waves to run before re-warming.
-    /// `wavesPerPrime` is kept below `primeBatch / typical-wave` so the next batch is warmed before
-    /// the current one is exhausted.
+    /// How many runnable rows to prewarm per batch, and how many rows to claim before re-warming.
+    /// `claimsPerPrime` is kept below `primeBatch` so the next batch is warmed before the current
+    /// one is exhausted.
     private static let primeBatch = 400
-    private static let wavesPerPrime = 50
+    private static let claimsPerPrime = 300
     private static let primePlaceholderURL = URL(fileURLWithPath: "/dev/null")
 
     /// Batch-prewarm the dedup pipeline's remote duplicate cache for the rows about to be processed,
