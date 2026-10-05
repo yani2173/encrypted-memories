@@ -204,7 +204,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             outcome: hmacReusable ? cached?.outcome : nil,
             updatedAt: now()
         )
-        try persistRecord(record)
+        try persistRecord(record, readFrom: cached)
 
         // Account-wide content dedupe + same-run coalescing. Loop invariant on exit: either we
         // returned a known-content skip, or we hold the pending-upload claim for this content.
@@ -284,7 +284,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             if let exact = exactMatches.first {
                 let decision = UploadDuplicateDecision.skip(.activeDuplicate, remoteLinkID: exact.nodeID)
                 do {
-                    try persist(decision, in: &record)
+                    try persist(decision, in: &record, readFrom: cached)
                 } catch {
                     releasePendingUploadClaims(ownedBy: descriptor)
                     throw error
@@ -351,7 +351,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             if decision != .awaitDeletionCheck {
                 try replacementJournal?.clearDeletionCheck(for: descriptor.source)
             }
-            try persist(decision, in: &record)
+            try persist(decision, in: &record, readFrom: cached)
         } catch {
             releasePendingUploadClaims(ownedBy: descriptor)
             throw error
@@ -843,24 +843,34 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// Persists only outcomes that remain useful across runs. Active duplicates are trusted by the
     /// manifest fast path. Trashed rows are diagnostic only and are rechecked because users can
     /// restore or permanently delete them. Draft/deleted states stay transient.
-    private func persist(_ decision: UploadDuplicateDecision, in record: inout UploadIdentityRecord) throws {
+    private func persist(
+        _ decision: UploadDuplicateDecision, in record: inout UploadIdentityRecord,
+        readFrom cached: UploadIdentityRecord?
+    ) throws {
         switch decision {
         case .skip(.activeDuplicate, let remoteLinkID):
             record.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
             record.remoteLinkID = remoteLinkID
             record.updatedAt = now()
-            try persistRecord(record)
+            try persistRecord(record, readFrom: cached)
         case .skip(.trashedDuplicate, _):
             record.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
             record.updatedAt = now()
-            try persistRecord(record)
+            try persistRecord(record, readFrom: cached)
         case .upload, .uploadReplacingDraft, .awaitDeletionCheck, .uploadMissingSecondaries, .skip:
             break
         }
     }
 
-    private func persistRecord(_ record: UploadIdentityRecord) throws {
-        guard store.upsert(record) else {
+    /// A record that still names the remote link of `cached`, the row that this resolve read, keeps the link and
+    /// outcome that the store holds when they changed since that read: a merge of exact duplicates can move the row to
+    /// the kept photo while this resolve runs, and the link that it read can be in the trash.
+    private func persistRecord(_ record: UploadIdentityRecord, readFrom cached: UploadIdentityRecord? = nil) throws {
+        let carriesReadLink = cached.map { record.remoteLinkID == $0.remoteLinkID } ?? false
+        let written =
+            carriesReadLink
+            ? store.upsert(record, keepingRemoteLinkChangedFrom: cached?.remoteLinkID) : store.upsert(record)
+        guard written else {
             throw UploadError.backend("Upload identity manifest could not be updated")
         }
     }

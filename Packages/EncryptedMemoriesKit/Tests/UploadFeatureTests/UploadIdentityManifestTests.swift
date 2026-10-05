@@ -49,6 +49,52 @@ final class UploadIdentityManifestTests: XCTestCase {
         return Int(sqlite3_column_int64(statement, 0))
     }
 
+    func testAnUpsertThatCarriesAReadLinkKeepsALinkThatChangedSinceTheRead() throws {
+        let store = try XCTUnwrap(
+            UploadIdentityManifestStore(
+                url: tempDir.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)))
+        func row(
+            _ identifier: String, link: String?, outcome: UploadIdentityManifestStore.Outcome?, size: Int64
+        )
+            -> UploadIdentityRecord
+        {
+            UploadIdentityRecord(
+                source: .file(URL(fileURLWithPath: "/photos/\(identifier)")), filename: identifier,
+                correctedName: identifier, fileSize: size, modificationDate: Date(timeIntervalSince1970: 1),
+                sha1Hex: "sha1", nameHash: "nh", contentHash: "ch", hashKeyEpoch: "epoch",
+                remoteVolumeID: link == nil ? nil : "vol", remoteLinkID: link, outcome: outcome?.rawValue,
+                updatedAt: Date(timeIntervalSince1970: 2))
+        }
+        XCTAssertTrue(store.upsert(row("moved", link: "kept", outcome: .duplicateActive, size: 1)))
+        XCTAssertTrue(store.upsert(row("same", link: "read", outcome: .uploaded, size: 1)))
+        XCTAssertTrue(store.upsert(row("empty", link: nil, outcome: nil, size: 1)))
+
+        XCTAssertTrue(
+            store.upsert(
+                row("moved", link: "read", outcome: .duplicateTrashed, size: 2), keepingRemoteLinkChangedFrom: "read"))
+        XCTAssertTrue(
+            store.upsert(
+                row("same", link: "read", outcome: .duplicateTrashed, size: 2), keepingRemoteLinkChangedFrom: "read"))
+        XCTAssertTrue(
+            store.upsert(row("empty", link: "new", outcome: .uploaded, size: 2), keepingRemoteLinkChangedFrom: nil))
+        XCTAssertTrue(
+            store.upsert(row("fresh", link: "read", outcome: .uploaded, size: 2), keepingRemoteLinkChangedFrom: "read"))
+
+        XCTAssertEqual(
+            store.record(for: .file(URL(fileURLWithPath: "/photos/moved"))),
+            row("moved", link: "kept", outcome: .duplicateActive, size: 2),
+            "the moved link and its outcome stay; the other columns update")
+        XCTAssertEqual(
+            store.record(for: .file(URL(fileURLWithPath: "/photos/same"))),
+            row("same", link: "read", outcome: .duplicateTrashed, size: 2))
+        XCTAssertEqual(
+            store.record(for: .file(URL(fileURLWithPath: "/photos/empty"))),
+            row("empty", link: "new", outcome: .uploaded, size: 2))
+        XCTAssertEqual(
+            store.record(for: .file(URL(fileURLWithPath: "/photos/fresh"))),
+            row("fresh", link: "read", outcome: .uploaded, size: 2), "a new row is written as given")
+    }
+
     func testSHA1MatchesKnownVector() throws {
         // FIPS 180 test vector: SHA1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d.
         let url = try writeFile("abc.bin", Data("abc".utf8))
