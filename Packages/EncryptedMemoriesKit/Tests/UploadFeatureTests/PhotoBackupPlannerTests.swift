@@ -165,6 +165,23 @@ final class PhotoBackupPlannerTests: XCTestCase {
         XCTAssertEqual(plan.secondaries.first?.uploadFilename, "IMG_2000.MOV")
     }
 
+    func testTheLivePhotoVideoUploadsAfterEveryOtherRelatedFile() throws {
+        // Proton lists the newest related file first; an app that plays the first one must get the video.
+        let resources: [PhotoBackupAssetInfo.Resource] = [
+            .init(role: .originalPhoto, originalFilename: "IMG_2000.HEIC", mimeType: "image/heic"),
+            .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.heic", mimeType: "image/heic"),
+            .init(role: .pairedVideo, originalFilename: "IMG_2000.MOV", mimeType: "video/quicktime"),
+            .init(role: .fullSizePairedVideo, originalFilename: "FullSizeRender.mov", mimeType: "video/quicktime"),
+            .init(role: .adjustmentData, originalFilename: "Adjustments.plist"),
+            .init(role: .other, originalFilename: "Other.dat"),
+        ]
+        let live = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info(live: true, resources: resources)))
+        XCTAssertEqual(
+            live.secondaries.map(\.role),
+            [.originalPhoto, .fullSizePairedVideo, .adjustmentData, .other, .pairedVideo])
+        XCTAssertEqual(live.secondaries.last?.sourceResource, .livePairedVideo)
+    }
+
     func testCatalogRoundTripKeepsTheRevisionOfAnEditWithoutItsRenderedFile() throws {
         let asset = edited(secondsAgo: 600, rendered: false)
         let entry = PhotoLibraryCatalogMapper.entry(for: asset, observedAt: Date())

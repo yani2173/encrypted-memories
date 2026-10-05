@@ -229,8 +229,8 @@ struct PhotosListEntry: Decodable, Sendable {
 
     /// Server-side PhotoTag: livePhotos = 3.
     var isLivePhoto: Bool { tags.contains(3) }
-    /// The paired video file for a Live Photo (first related node).
-    var relatedVideoLinkID: String? { relatedPhotos.first?.linkID }
+    /// The related files in listing order, newest first. `LivePhotoMotionLinks` chooses the motion of a Live Photo.
+    var relatedLinkIDs: [String] { relatedPhotos.map(\.linkID) }
 }
 
 private struct PhotosListResponse: Decodable {
