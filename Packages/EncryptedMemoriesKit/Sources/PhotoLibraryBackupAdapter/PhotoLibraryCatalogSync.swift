@@ -143,14 +143,19 @@ public struct PhotoLibraryCatalogSync: Sendable {
     private let now: @Sendable () -> Date
     private let onProgress: (@Sendable (PhotoLibraryCatalogProgress) -> Void)?
     private let onRemoved: (@Sendable ([String]) async -> Void)?
+    private let onFirstScanResumable: (@Sendable () -> Void)?
 
+    /// `onFirstScanResumable` runs when the first full scan of the library has a durable snapshot, before its
+    /// metadata chunks: from then on an interrupted first scan resumes at its cursor on the next pass. A later full
+    /// scan never calls it; the caller starts such a rescan over.
     public init(
         store: any PhotoLibraryCatalogStore,
         enumerator: any PhotoLibraryAssetEnumerator = PhotoKitAssetEnumerator(),
         chunkSize: Int = 200,
         now: @Sendable @escaping () -> Date = { Date() },
         onProgress: (@Sendable (PhotoLibraryCatalogProgress) -> Void)? = nil,
-        onRemoved: (@Sendable ([String]) async -> Void)? = nil
+        onRemoved: (@Sendable ([String]) async -> Void)? = nil,
+        onFirstScanResumable: (@Sendable () -> Void)? = nil
     ) {
         self.store = store
         self.enumerator = enumerator
@@ -158,6 +163,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         self.now = now
         self.onProgress = onProgress
         self.onRemoved = onRemoved
+        self.onFirstScanResumable = onFirstScanResumable
     }
 
     /// `identifiers == nil` = full library scan (resumable, mark-and-sweep removals); otherwise a
@@ -204,6 +210,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         // unseen item behind the cursor. Persist the epoch's identifiers first, then resolve that
         // immutable list in chunks. New assets are handled independently by persistent changes.
         let existingProgress = store.fullScanProgress()
+        let isFirstScan = !store.hasCompletedFullScan()
         guard store.isOperational() else {
             throw UploadError.backend("Photo library scan state is unavailable")
         }
@@ -247,6 +254,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         guard store.isOperational() else {
             throw UploadError.backend("Photo library scan snapshot could not be read")
         }
+        if isFirstScan { onFirstScanResumable?() }
         var cursor = resume.cursor
         let metadataWorkBase = buildsSnapshotThisPass ? total : 0
         progress.executionTotalUnitCount = Int64(total + metadataWorkBase)

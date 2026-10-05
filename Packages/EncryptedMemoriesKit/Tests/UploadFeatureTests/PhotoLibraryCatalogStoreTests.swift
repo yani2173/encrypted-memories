@@ -333,6 +333,78 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertNotNil(store.entry(for: "D"))
     }
 
+    /// The controller saves the change token when the first scan reports that it can resume. Without the token, the
+    /// next pass after a closed app or a pause started the scan of the whole library over.
+    func testFirstFullScanReportsResumableBeforeItsChunksAndAgainWhenItResumes() async throws {
+        let store = try makeStore()
+        let resumable = ResumableBox(store: store, probe: "A")
+        let aborting = AbortingEnumerator(
+            snapshotIdentifiers: ["A", "B"],
+            chunks: [[photoInfo(id: "A")]],
+            thenThrow: CancellationError()
+        )
+        do {
+            _ = try await PhotoLibraryCatalogSync(
+                store: store, enumerator: aborting, chunkSize: 1, now: { Date(timeIntervalSince1970: 100) },
+                onFirstScanResumable: { resumable.record() }
+            ).run(engine: RecordingEnqueuer())
+            XCTFail("an aborted scan must rethrow")
+        } catch is CancellationError {
+            // expected
+        }
+
+        XCTAssertEqual(
+            resumable.calls, [.init(hasResumePoint: true, probeCatalogued: false)],
+            "the scan reports once its snapshot is durable, before it catalogues a photo")
+        XCTAssertNotNil(store.fullScanProgress(), "the aborted first scan keeps its snapshot and cursor")
+
+        let enqueuer = RecordingEnqueuer()
+        _ = try await PhotoLibraryCatalogSync(
+            store: store, enumerator: StubEnumerator(infos: [photoInfo(id: "A"), photoInfo(id: "B")]), chunkSize: 1,
+            now: { Date(timeIntervalSince1970: 200) },
+            onFirstScanResumable: { resumable.record() }
+        ).run(engine: enqueuer)
+
+        XCTAssertEqual(enqueuer.enqueued, ["B"], "the resumed scan continues with the photo it had not reached")
+        XCTAssertEqual(resumable.calls.last, ResumableBox.Call(hasResumePoint: true, probeCatalogued: true))
+        XCTAssertEqual(resumable.calls.count, 2)
+        XCTAssertTrue(store.hasCompletedFullScan())
+    }
+
+    /// A full scan after a completed one is a rescan for an expired or unreadable change history. The controller
+    /// starts it over, so a saved token must not let a later pass skip it.
+    func testLaterFullScanNeverReportsResumable() async throws {
+        let store = try makeStore()
+        let enumerator = StubEnumerator(infos: [photoInfo(id: "A")])
+        let resumable = ResumableBox(store: store, probe: "A")
+        for seconds in [100.0, 200.0] {
+            _ = try await PhotoLibraryCatalogSync(
+                store: store, enumerator: enumerator, now: { Date(timeIntervalSince1970: seconds) },
+                onFirstScanResumable: { resumable.record() }
+            ).run(engine: RecordingEnqueuer())
+        }
+
+        XCTAssertEqual(resumable.calls.count, 1, "only the first scan of the library reports")
+    }
+
+    /// A snapshot that never completed resumes nothing: the next pass builds a new one, so no token may be saved.
+    func testInterruptedSnapshotNeverReportsResumable() async throws {
+        let store = try makeStore()
+        let resumable = ResumableBox(store: store, probe: "A")
+        do {
+            _ = try await PhotoLibraryCatalogSync(
+                store: store, enumerator: SnapshotFailingEnumerator(), now: { Date(timeIntervalSince1970: 100) },
+                onFirstScanResumable: { resumable.record() }
+            ).run(engine: RecordingEnqueuer())
+            XCTFail("an interrupted snapshot must rethrow")
+        } catch is CancellationError {
+            // expected
+        }
+
+        XCTAssertTrue(resumable.calls.isEmpty)
+        XCTAssertNil(store.fullScanProgress())
+    }
+
     func testDriverEnqueuesOnlyNewAndChangedAssets() async throws {
         let store = try makeStore()
         let enumerator = StubEnumerator(infos: [photoInfo(id: "A"), photoInfo(id: "B")])
@@ -796,6 +868,47 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
                 for chunk in chunks { continuation.yield(chunk) }
                 continuation.finish(throwing: error)
             }
+        }
+    }
+
+    /// Delivers part of the identifier snapshot, then stops like a cancelled PhotoKit fetch.
+    private struct SnapshotFailingEnumerator: PhotoLibraryAssetEnumerator {
+        func identifierChunks(chunkSize: Int) -> AsyncThrowingStream<PhotoLibraryIdentifierChunk, any Error> {
+            AsyncThrowingStream { continuation in
+                continuation.yield(PhotoLibraryIdentifierChunk(identifiers: ["A"], totalCount: 2))
+                continuation.finish(throwing: CancellationError())
+            }
+        }
+
+        func infoChunks(
+            identifiers: [String]?, startOffset: Int, chunkSize: Int
+        ) -> AsyncThrowingStream<[PhotoBackupAssetInfo], any Error> {
+            AsyncThrowingStream { $0.finish() }
+        }
+    }
+
+    /// Records what the catalog held each time a first scan reported that it can resume.
+    private final class ResumableBox: @unchecked Sendable {
+        struct Call: Equatable {
+            var hasResumePoint: Bool
+            var probeCatalogued: Bool
+        }
+
+        private let store: any PhotoLibraryCatalogStore
+        private let probe: String
+        private let lock = NSLock()
+        private var values: [Call] = []
+        var calls: [Call] { lock.withLock { values } }
+
+        init(store: any PhotoLibraryCatalogStore, probe: String) {
+            self.store = store
+            self.probe = probe
+        }
+
+        func record() {
+            let call = Call(
+                hasResumePoint: store.fullScanProgress() != nil, probeCatalogued: store.entry(for: probe) != nil)
+            lock.withLock { values.append(call) }
         }
     }
 
