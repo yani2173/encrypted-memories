@@ -31,7 +31,7 @@ struct TimelineTagEnrichmentTests {
                 try await onPage([entry("video-2")])
             case .livePhotos:
                 try await onPage([
-                    entry("live-1", related: ["motion-1"]),
+                    entry("live-1", related: ["plist-1", "motion-1"]),
                     entry("still", related: []),
                 ])
             case .bursts:
@@ -42,7 +42,9 @@ struct TimelineTagEnrichmentTests {
         }
 
         #expect(enrichment.videos.value == Set(["video-1", "video-2"]))
-        #expect(enrichment.livePhotos.value == ["live-1": "motion-1"])
+        #expect(
+            enrichment.livePhotos.value == ["live-1": ["plist-1", "motion-1"], "still": []],
+            "every related file in listing order, so the motion is not the newest one")
         #expect(enrichment.bursts.value?.map(\.linkID) == ["burst-1", "burst-2"])
     }
 

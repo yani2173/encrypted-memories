@@ -64,7 +64,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private static let remoteContentIndexLifetime: TimeInterval = 15
     /// Four metadata requests overlap network latency without producing the unbounded request fan-out
     /// used by the reference client. Decryption and the transactional store update remain serialized.
-    private static let remoteMetadataRequestConcurrency = 4
+    static let remoteMetadataRequestConcurrency = 4
     private static let remoteMetadataWindow =
         UploadDedupePipeline.protonDuplicateBatchSize * remoteMetadataRequestConcurrency
 

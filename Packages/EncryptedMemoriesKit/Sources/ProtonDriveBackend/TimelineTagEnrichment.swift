@@ -20,7 +20,8 @@ struct TimelineTagFetchResult<Value: Sendable>: Sendable {
 
 struct TimelineTagEnrichment: Sendable {
     let videos: TimelineTagFetchResult<Set<String>>
-    let livePhotos: TimelineTagFetchResult<[String: String]>
+    /// The related files of each Live Photo in listing order, by link ID.
+    let livePhotos: TimelineTagFetchResult<[String: [String]]>
     let bursts: TimelineTagFetchResult<[PhotosListEntry]>
 
     var wasCancelled: Bool {
@@ -64,12 +65,12 @@ enum TimelineTagEnrichmentLoader {
             },
             fetchPages: fetchPages
         )
-        async let livePhotos: TimelineTagFetchResult<[String: String]> = fetchOne(
+        async let livePhotos: TimelineTagFetchResult<[String: [String]]> = fetchOne(
             tag: .livePhotos,
             initialValue: [:],
             merge: { result, page in
                 for entry in page where result[entry.linkID] == nil {
-                    result[entry.linkID] = entry.relatedVideoLinkID
+                    result[entry.linkID] = entry.relatedLinkIDs
                 }
             },
             fetchPages: fetchPages

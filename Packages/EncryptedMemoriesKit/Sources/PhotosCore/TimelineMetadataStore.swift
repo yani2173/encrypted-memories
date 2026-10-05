@@ -191,6 +191,7 @@ public final class TimelineMetadataStore {
     private static let metaValidationTokenKey = "timeline.validationToken"
     private static let metaValidationTokenStoredAtKey = "timeline.validationTokenStoredAt"
     private static let metaMediaTypeEvidenceRevisionKey = "mediaTypeEvidence.revision"
+    private static let metaRelatedVideoRuleKey = "timeline.relatedVideoRule"
 
     private enum ValidationTokenUpdate {
         case preserve
@@ -1047,6 +1048,37 @@ public final class TimelineMetadataStore {
             rowsReturned: result.count
         )
         return result
+    }
+
+    /// The stored `relvid` of the given photos, by node ID, when `rule` chose the related videos of the stored timeline
+    /// (`markRelatedVideosChosen(by:)`). Empty otherwise: an earlier build, or a save after the mark, chose them.
+    public func relatedVideoIDs(for uids: [PhotoUID], chosenBy rule: String) -> [String: String] {
+        guard !uids.isEmpty, readMeta(Self.metaRelatedVideoRuleKey) == relatedVideoRuleMark(rule) else { return [:] }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT relvid FROM photos WHERE vol=? AND node=?;", -1, &stmt, nil) == SQLITE_OK
+        else { return [:] }
+        defer { sqlite3_finalize(stmt) }
+        var result: [String: String] = [:]
+        for uid in uids {
+            sqlite3_reset(stmt)
+            sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
+            sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
+            guard sqlite3_step(stmt) == SQLITE_ROW, let relvid = sqlite3_column_text(stmt, 0) else { continue }
+            result[uid.nodeID] = String(cString: relvid)
+        }
+        return result
+    }
+
+    /// Records that `rule` chose the related videos of the stored timeline. Call it after a save of a timeline that
+    /// `rule` built. The mark names the timeline generation, so a later save by any build without a new mark, for
+    /// example an earlier build after a downgrade, voids it. `store_meta` holds it; the schema stays unchanged.
+    @discardableResult
+    public func markRelatedVideosChosen(by rule: String) -> Bool {
+        writeMeta(Self.metaRelatedVideoRuleKey, relatedVideoRuleMark(rule))
+    }
+
+    private func relatedVideoRuleMark(_ rule: String) -> String {
+        "\(rule)@\(readMetaInt(Self.metaGenerationKey) ?? 0)"
     }
 
     /// Capture time and media type of the given photos that this store lists, by primary key. The items carry no

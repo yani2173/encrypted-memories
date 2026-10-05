@@ -345,7 +345,12 @@ public enum PhotoBackupAssetPlanner {
                     sourceResource: sourceResource(for: resource)
                 ))
         }
-        return PhotoBackupExportPlan(primary: primary, secondaries: secondaries)
+        // Related files upload in this order, and Proton lists the newest related file first. The Live Photo video
+        // uploads last, so a clean first pass lists it first. A related file whose upload failed and succeeds on a later
+        // retry becomes the newest instead, so the timeline still chooses the first video, not the first file.
+        let liveVideo = secondaries.filter { $0.sourceResource == .livePairedVideo }
+        secondaries.removeAll { $0.sourceResource == .livePairedVideo }
+        return PhotoBackupExportPlan(primary: primary, secondaries: secondaries + liveVideo)
     }
 
     private static func normalizedResources(

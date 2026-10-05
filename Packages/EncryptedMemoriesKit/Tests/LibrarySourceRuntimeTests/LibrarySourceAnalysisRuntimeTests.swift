@@ -455,7 +455,9 @@ func livePhotoTagWithoutMotionDoesNotRejectTheFirstLibraryInventory(
                 .utf8
         )
     )
-    let projection = TimelineContentProjection(sections: DriveSDKBridge.group(entries, volumeID: "v"))
+    // The type read found the related file of "live" to be a video.
+    let projection = TimelineContentProjection(
+        sections: DriveSDKBridge.group(entries, volumeID: "v", motions: ["live": .video("motion")]))
     let items = projection.snapshot.items
     #expect(items.count == 3)
     #expect(items[0].tags.contains(.livePhotos))
