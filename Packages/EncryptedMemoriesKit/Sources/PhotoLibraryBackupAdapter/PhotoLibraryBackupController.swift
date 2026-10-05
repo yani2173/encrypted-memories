@@ -780,7 +780,8 @@ public final class PhotoLibraryBackupController {
                     engine: engine,
                     runner: runner,
                     catalogStore: catalogStore,
-                    changes: preparedChanges.changes
+                    changes: preparedChanges.changes,
+                    onFirstScanResumable: { monitor.commit(preparedChanges) }
                 )
                 monitor.commit(preparedChanges)
             } catch is CancellationError {
@@ -898,11 +899,17 @@ public final class PhotoLibraryBackupController {
 
     /// Runs the scan phase through the persistent catalog driver. `nonisolated` keeps SQLite and
     /// PhotoKit enumeration off the main actor.
+    ///
+    /// Without a change token every pass starts the full scan over, and the token is otherwise saved only after a
+    /// complete pass. The first scan of a large library takes minutes, so a pause, an iOS stop, or a closed app
+    /// restarted it each time. `onFirstScanResumable` saves the token once that scan resumes by itself: the next
+    /// pass then reads the changes since this one and continues the scan at its cursor.
     private nonisolated func runScanPass(
         engine: UploadBackupSyncEngine,
         runner: BackupSyncRunner,
         catalogStore: PhotoLibraryCatalogManifestStore,
-        changes: PhotoLibraryChangeMonitor.ChangeSet
+        changes: PhotoLibraryChangeMonitor.ChangeSet,
+        onFirstScanResumable: @escaping @Sendable () -> Void
     ) async throws {
         let sync = PhotoLibraryCatalogSync(
             store: catalogStore,
@@ -911,7 +918,8 @@ public final class PhotoLibraryBackupController {
             },
             onRemoved: { identifiers in
                 _ = await runner.removePhotoLibraryAssets(identifiers)
-            }
+            },
+            onFirstScanResumable: onFirstScanResumable
         )
         let needsFullScan = changes.requiresFullRescan || !catalogStore.hasCompletedFullScan()
         guard catalogStore.isOperational() else {
