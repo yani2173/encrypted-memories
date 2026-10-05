@@ -34,9 +34,12 @@ public enum UploadDuplicateDecisionPolicy {
         // Prefer an exact-content remote result over an unrelated same-name draft. Camera
         // counters legitimately repeat after a device reset, so a filename is never photo identity.
         let primaryNameMatches = remoteItems.filter { $0.nameHash == primary.nameHash }
-        if let remotePrimary = primaryNameMatches.first(where: {
+        let contentMatches = primaryNameMatches.filter {
             $0.contentHash == primary.contentHash && $0.linkState != .draft
-        }) {
+        }
+        // An active copy proves the backup, whatever order the server lists the copies in: after a merge of
+        // duplicates, a trashed copy of the same bytes sits next to the kept one.
+        if let remotePrimary = contentMatches.first(where: { $0.linkState == .active }) ?? contentMatches.first {
             switch remotePrimary.linkState {
             case .draft:
                 preconditionFailure("draft excluded above")

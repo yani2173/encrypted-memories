@@ -126,6 +126,20 @@ final class UploadDuplicateDecisionPolicyTests: XCTestCase {
         )
     }
 
+    func testAnActiveExactDuplicateWinsOverATrashedOneListedFirst() {
+        // After a merge of duplicates, one copy is in the trash and the kept copy is active. The photo is backed up,
+        // whatever order the server lists them in.
+        for state: RemotePhotoDuplicate.LinkState? in [.trashed, nil] {
+            let remote = [
+                RemotePhotoDuplicate(nameHash: "nh-p", contentHash: "ch-p", linkState: state, linkID: "merged-away"),
+                RemotePhotoDuplicate(nameHash: "nh-p", contentHash: "ch-p", linkState: .active, linkID: "kept"),
+            ]
+            XCTAssertEqual(
+                UploadDuplicateDecisionPolicy.decide(primary: primary, remoteItems: remote),
+                .skip(.activeDuplicate, remoteLinkID: "kept"))
+        }
+    }
+
     func testNilLinkStateMeansDeletedAndSkips() {
         let remote = [RemotePhotoDuplicate(nameHash: "nh-p", contentHash: "ch-p", linkState: nil, linkID: "l1")]
         XCTAssertEqual(
