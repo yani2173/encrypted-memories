@@ -184,6 +184,13 @@ public final class ExactDuplicatesModel {
     public private(set) var mergeProgress: ExactDuplicateScanProgress?
     /// The message of the last merge, until the person dismisses it.
     public private(set) var notice: ExactDuplicateMergeNotice?
+    /// Shows only groups of exactly two copies. Larger groups stay out of the list, Merge All, and the counts until the
+    /// person shows every group.
+    public var showsOnlyPairs: Bool
+    /// The person selects groups to merge only those.
+    public private(set) var isSelecting = false
+    /// The groups that the person selected, by group ID.
+    public private(set) var selectedGroupIDs: Set<String> = []
     private var phase = Phase.idle
     /// The last build failed, or it finished without an index.
     private var buildFailed = false
@@ -212,11 +219,35 @@ public final class ExactDuplicatesModel {
     /// Called with the photos that a merge moved to Recently Deleted, so the library stops showing them.
     @ObservationIgnored private let didTrash: @MainActor ([PhotoUID]) async -> Void
 
+    /// `showsOnlyPairs` starts the screen with only the groups of exactly two copies.
     public init(
-        finder: any ExactDuplicateMerging, didTrash: @escaping @MainActor ([PhotoUID]) async -> Void = { _ in }
+        finder: any ExactDuplicateMerging, showsOnlyPairs: Bool = true,
+        didTrash: @escaping @MainActor ([PhotoUID]) async -> Void = { _ in }
     ) {
         self.finder = finder
+        self.showsOnlyPairs = showsOnlyPairs
         self.didTrash = didTrash
+    }
+
+    /// The groups that the screen shows: every group, or only the pairs.
+    public var shownGroups: [Group] { groups.filter { isShown($0.scanGroup) } }
+
+    /// The groups of more than two copies that `showsOnlyPairs` leaves out. Zero while every group shows.
+    public var hiddenGroupCount: Int { groups.count - shownGroups.count }
+
+    /// True when the library holds groups of more than two copies, so the person can choose to see them.
+    public var hasLargerGroups: Bool { groups.contains { $0.scanGroup.members.count > 2 } }
+
+    /// One line about the groups that `showsOnlyPairs` leaves out, for example "3 groups with more than 2 copies are
+    /// hidden." Nil while none is hidden.
+    public var hiddenGroupsNote: String? {
+        let hidden = hiddenGroupCount
+        return hidden > 0 ? L10n.string("duplicates.larger_groups_hidden \(hidden)") : nil
+    }
+
+    /// A group shows unless `showsOnlyPairs` leaves out its more than two copies.
+    private func isShown(_ group: ExactDuplicateGroup) -> Bool {
+        !showsOnlyPairs || group.members.count == 2
     }
 
     /// False while the content index misses photos, so more duplicates can appear later.
@@ -331,7 +362,7 @@ public final class ExactDuplicatesModel {
 
     /// The space that merging every group shown frees, counting the groups whose size is known. It grows while the
     /// check finds groups and while sizes become known.
-    public var totalFreedBytes: Int64 { groups.reduce(0) { $0 + ($1.freedBytes ?? 0) } }
+    public var totalFreedBytes: Int64 { shownGroups.reduce(0) { $0 + ($1.freedBytes ?? 0) } }
 
     /// The short text of `totalFreedBytes`. Nil while no size is known.
     public var totalFreedText: String? {
@@ -360,18 +391,19 @@ public final class ExactDuplicatesModel {
 
     /// The number of groups found, for example "1,545 Groups". Nil without a group.
     public var groupCountText: String? {
-        groups.isEmpty ? nil : L10n.string("duplicates.group_count \(groups.count)")
+        let count = shownGroups.count
+        return count == 0 ? nil : L10n.string("duplicates.group_count \(count)")
     }
 
     /// The photos that Merge All moves to Recently Deleted.
-    public var duplicateCount: Int { groups.reduce(0) { $0 + $1.duplicateCount } }
+    public var duplicateCount: Int { shownGroups.reduce(0) { $0 + $1.duplicateCount } }
 
     /// The count for the Duplicates entry. Nil until a scan has finished.
     public var knownDuplicateCount: Int? {
         phase == .loaded ? duplicateCount : scannedDuplicateCount
     }
 
-    public var canMerge: Bool { !isMerging && phase != .loading && !groups.isEmpty }
+    public var canMerge: Bool { !isMerging && phase != .loading && !shownGroups.isEmpty }
 
     public var mergeAllTitle: String { L10n.string("duplicates.merge_all_title \(duplicateCount)") }
     public var mergeAllMessage: String { L10n.string("duplicates.merge_all_message \(duplicateCount)") }
@@ -396,7 +428,7 @@ public final class ExactDuplicatesModel {
 
     /// The screen shows the group. Ranks its page and the page after it, unless they are ranked.
     public func groupAppeared(_ groupID: String) {
-        guard let index = groups.firstIndex(where: { $0.id == groupID }) else { return }
+        guard let index = shownGroups.firstIndex(where: { $0.id == groupID }) else { return }
         _ = requestRanking(around: index)
     }
 
@@ -451,11 +483,13 @@ public final class ExactDuplicatesModel {
         }
     }
 
-    /// Queues the unranked groups of two pages from the page of `index`. Returns the ranking that reads them.
+    /// Queues the unranked groups of two pages of the shown groups from the page of `index`. Returns the ranking that
+    /// reads them.
     private func requestRanking(around index: Int) -> Task<Void, Never>? {
         let size = Self.rankingPageSize
         let start = index / size * size
-        let wanted = groups[start..<min(start + 2 * size, groups.count)]
+        let shown = shownGroups
+        let wanted = shown[min(start, shown.count)..<min(start + 2 * size, shown.count)]
             .filter { !$0.isRanked && !rankingRequested.contains($0.id) }.map(\.id)
         guard !wanted.isEmpty else { return ranking }
         rankingRequested.formUnion(wanted)
@@ -610,7 +644,7 @@ public final class ExactDuplicatesModel {
     public func loadCountIfNeeded() async {
         guard phase == .idle, scannedDuplicateCount == nil else { return }
         guard let scan = try? await finder.duplicateGroups(progress: { _ in }), phase == .idle else { return }
-        scannedDuplicateCount = scan.groups.reduce(0) { $0 + $1.members.count - 1 }
+        scannedDuplicateCount = scan.groups.filter { isShown($0) }.reduce(0) { $0 + $1.members.count - 1 }
     }
 
     /// Drops photos that left the library, for example after a trash in the viewer. A group with fewer than two
@@ -646,7 +680,63 @@ public final class ExactDuplicatesModel {
 
     public func mergeAll() async {
         guard canMerge else { return }
-        await merge(groups)
+        await merge(shownGroups)
+    }
+
+    /// The selected groups that the screen shows, in the order that it shows them.
+    public var selectedGroups: [Group] { shownGroups.filter { selectedGroupIDs.contains($0.id) } }
+
+    /// The photos that merging the selected groups moves to Recently Deleted.
+    public var selectedDuplicateCount: Int { selectedGroups.reduce(0) { $0 + $1.duplicateCount } }
+
+    /// True while every shown group is selected.
+    public var isAllSelected: Bool {
+        let shown = shownGroups
+        return !shown.isEmpty && shown.allSatisfy { selectedGroupIDs.contains($0.id) }
+    }
+
+    public var canMergeSelected: Bool { canMerge && !selectedGroups.isEmpty }
+
+    /// The number of selected groups, for example "3 Groups Selected".
+    public var selectionText: String { L10n.string("duplicates.selected_count \(selectedGroups.count)") }
+
+    public var mergeSelectedTitle: String { L10n.string("duplicates.merge_all_title \(selectedDuplicateCount)") }
+    public var mergeSelectedMessage: String { L10n.string("duplicates.merge_all_message \(selectedDuplicateCount)") }
+
+    /// Lets the person select groups. A merge of the selected groups ends the selection.
+    public func startSelecting() {
+        guard canMerge else { return }
+        isSelecting = true
+    }
+
+    /// Ends the selection and forgets the selected groups.
+    public func stopSelecting() {
+        isSelecting = false
+        selectedGroupIDs = []
+    }
+
+    /// Selects a shown group, or deselects it when it is selected.
+    public func toggleSelection(_ groupID: String) {
+        guard isSelecting, !isMerging, shownGroups.contains(where: { $0.id == groupID }) else { return }
+        if selectedGroupIDs.contains(groupID) {
+            selectedGroupIDs.remove(groupID)
+        } else {
+            selectedGroupIDs.insert(groupID)
+        }
+    }
+
+    /// Selects every shown group, or none when every shown group is selected.
+    public func toggleSelectAll() {
+        guard isSelecting, !isMerging else { return }
+        selectedGroupIDs = isAllSelected ? [] : Set(shownGroups.map(\.id))
+    }
+
+    /// Merges only the selected groups, keeping the photo that each shows as kept, and ends the selection.
+    public func mergeSelected() async {
+        guard canMergeSelected else { return }
+        let selected = selectedGroups
+        stopSelecting()
+        await merge(selected)
     }
 
     public func dismissNotice() {

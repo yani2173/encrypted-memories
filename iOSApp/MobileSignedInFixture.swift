@@ -110,6 +110,11 @@ import UploadCore
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesFixture") {
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(groups: sections.prefix(2).map { $0.items.prefix(2).map(\.uid) }))
+            } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesLargeGroupFixture") {
+                // Two pairs and one group of three copies, which the screen hides until the person shows every group.
+                let pairs = sections.prefix(2).map { $0.items.prefix(2).map(\.uid) }
+                runtime.libraryModel.installIsolatedDuplicatesForTesting(
+                    MobileFixtureDuplicates(groups: pairs + [sections[2].items.prefix(3).map(\.uid)]))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesCheckingFixture") {
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(groups: [], checking: true))

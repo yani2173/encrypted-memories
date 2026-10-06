@@ -5,11 +5,13 @@ import UploadCore
 
 /// The Duplicates route of macOS, iOS, and iPadOS: groups of exact copies, one section per group. The shared
 /// `ExactDuplicatesModel` owns the groups, the photo to keep, and the merges; this view renders them with a native
-/// list and dialogs. The host owns the Merge All toolbar button and sets `confirmsMergeAll`, draws each photo, and
-/// presents its viewer when the person opens a copy larger.
+/// list and dialogs. The host owns the toolbar buttons Select, Merge All, and Merge Selected, and it sets
+/// `confirmsMergeAll` and `confirmsMergeSelected`. It draws each photo and presents its viewer when the person opens a
+/// copy larger.
 public struct ExactDuplicatesView<Cover: View>: View {
     private let model: ExactDuplicatesModel
     @Binding private var confirmsMergeAll: Bool
+    @Binding private var confirmsMergeSelected: Bool
     private let accent: Color
     private let item: (PhotoUID) -> PhotoItem?
     private let open: ([PhotoItem], Int) -> Void
@@ -19,12 +21,13 @@ public struct ExactDuplicatesView<Cover: View>: View {
     /// of a copy, for its video length and the viewer. `open` presents the viewer with the copies of one group,
     /// starting at the copy at the index, so the person pages through them, zooms into photos, and plays videos.
     public init(
-        model: ExactDuplicatesModel, confirmsMergeAll: Binding<Bool>, accent: Color,
-        item: @escaping (PhotoUID) -> PhotoItem?, open: @escaping ([PhotoItem], Int) -> Void,
+        model: ExactDuplicatesModel, confirmsMergeAll: Binding<Bool>, confirmsMergeSelected: Binding<Bool>,
+        accent: Color, item: @escaping (PhotoUID) -> PhotoItem?, open: @escaping ([PhotoItem], Int) -> Void,
         @ViewBuilder cover: @escaping (PhotoUID) -> Cover
     ) {
         self.model = model
         _confirmsMergeAll = confirmsMergeAll
+        _confirmsMergeSelected = confirmsMergeSelected
         self.accent = accent
         self.item = item
         self.open = open
@@ -41,6 +44,17 @@ public struct ExactDuplicatesView<Cover: View>: View {
                 Button(L10n.string("action.cancel"), role: .cancel) {}
             } message: {
                 Text(model.mergeAllMessage)
+            }
+            .confirmationDialog(
+                model.mergeSelectedTitle, isPresented: $confirmsMergeSelected, titleVisibility: .visible
+            ) {
+                Button(L10n.string("duplicates.merge"), role: .destructive) {
+                    Task { await model.mergeSelected() }
+                }
+                .accessibilityIdentifier("duplicates.mergeSelected.dialog")
+                Button(L10n.string("action.cancel"), role: .cancel) {}
+            } message: {
+                Text(model.mergeSelectedMessage)
             }
             .alert(
                 model.notice?.title ?? "",
@@ -100,11 +114,37 @@ public struct ExactDuplicatesView<Cover: View>: View {
         .tint(accent)
     }
 
-    /// The state of the merge, of the check, and of the ranking above the groups: progress rows while they run, one
-    /// line after a check that could not read every photo, and a retry when the check stopped.
+    /// The rows above the groups: the progress of a merge, the selected groups while the person selects, the switch
+    /// that shows only pairs, the progress of the check and of the ranking, one line after a check that could not read
+    /// every photo, and a retry when the check stopped.
     @ViewBuilder private var statusRows: some View {
         if let line = model.mergeLine {
             progressRow(line).accessibilityIdentifier("duplicates.mergeProgress")
+        }
+        if model.isSelecting {
+            HStack {
+                Text(model.selectionText).accessibilityIdentifier("duplicates.selectionCount")
+                Spacer()
+                Button(L10n.string(model.isAllSelected ? "duplicates.deselect_all" : "duplicates.select_all")) {
+                    model.toggleSelectAll()
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.isMerging)
+                .accessibilityIdentifier("duplicates.selectAll")
+            }
+        }
+        if model.hasLargerGroups {
+            Toggle(
+                L10n.string("duplicates.pairs_only"),
+                isOn: Binding(get: { model.showsOnlyPairs }, set: { model.showsOnlyPairs = $0 })
+            )
+            .accessibilityIdentifier("duplicates.pairsOnly")
+            if let note = model.hiddenGroupsNote {
+                Label(note, systemImage: "eye.slash")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("duplicates.hiddenGroups")
+            }
         }
         if let line = model.checkLine {
             progressRow(line).accessibilityIdentifier("duplicates.checkProgress")
@@ -162,7 +202,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
                     }
                 }
             }
-            ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in
+            ForEach(Array(model.shownGroups.enumerated()), id: \.element.id) { index, group in
                 Section {
                     ExactDuplicateMembers(
                         model: model, group: group, groupIndex: index, accent: accent, item: item, open: open,
@@ -173,6 +213,9 @@ public struct ExactDuplicatesView<Cover: View>: View {
                     .onAppear { model.groupAppeared(group.id) }
                 } header: {
                     HStack(alignment: .firstTextBaseline) {
+                        if model.isSelecting {
+                            selectionButton(for: group, index: index)
+                        }
                         Text(L10n.string("duplicates.group_title \(group.members.count)"))
                         if let freed = group.freedText {
                             Text(freed)
@@ -182,11 +225,13 @@ public struct ExactDuplicatesView<Cover: View>: View {
                                 .accessibilityIdentifier("duplicates.freed.\(index)")
                         }
                         Spacer()
-                        Button(L10n.string("duplicates.merge")) {
-                            Task { await model.merge(groupID: group.id) }
+                        if !model.isSelecting {
+                            Button(L10n.string("duplicates.merge")) {
+                                Task { await model.merge(groupID: group.id) }
+                            }
+                            .disabled(!model.canMerge)
+                            .accessibilityIdentifier("duplicates.merge.\(index)")
                         }
-                        .disabled(!model.canMerge)
-                        .accessibilityIdentifier("duplicates.merge.\(index)")
                     }
                     .textCase(nil)
                 } footer: {
@@ -203,6 +248,23 @@ public struct ExactDuplicatesView<Cover: View>: View {
         #else
             return list.listStyle(.inset)
         #endif
+    }
+
+    /// The circle that selects a group while the person selects the groups to merge.
+    private func selectionButton(for group: ExactDuplicatesModel.Group, index: Int) -> some View {
+        let isSelected = model.selectedGroupIDs.contains(group.id)
+        return Button {
+            model.toggleSelection(group.id)
+        } label: {
+            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                .font(.title3)
+                .foregroundStyle(isSelected ? accent : Color.secondary)
+        }
+        .buttonStyle(.borderless)
+        .disabled(model.isMerging)
+        .accessibilityLabel(L10n.string("duplicates.select_group"))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityIdentifier("duplicates.select.\(index)")
     }
 }
 

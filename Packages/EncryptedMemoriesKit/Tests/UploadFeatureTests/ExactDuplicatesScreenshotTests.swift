@@ -67,8 +67,8 @@
 
         private func host(model: ExactDuplicatesModel) -> (NSWindow, NSView) {
             let view = ExactDuplicatesView(
-                model: model, confirmsMergeAll: .constant(false), accent: .accentColor, item: Self.item,
-                open: { _, _ in }
+                model: model, confirmsMergeAll: .constant(false), confirmsMergeSelected: .constant(false),
+                accent: .accentColor, item: Self.item, open: { _, _ in }
             ) { uid in
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color(hue: Double(abs(uid.nodeID.hashValue % 100)) / 100, saturation: 0.45, brightness: 0.8))
