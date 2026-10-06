@@ -6201,6 +6201,85 @@
         "de": { "stringUnit": { "state": "translated", "value": "Video abspielen" } }
       }
     },
+    "duplicates.pairs_only": {
+      "comment": "Switch on the Duplicates screen that shows only groups of exactly two copies.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Pairs Only" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nur Paare" } }
+      }
+    },
+    "duplicates.larger_groups_hidden %lld": {
+      "comment": "Line below the Pairs Only switch: the groups of more than two copies that it hides.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld group with more than 2 copies is hidden." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld groups with more than 2 copies are hidden." } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Gruppe mit mehr als 2 Kopien ist ausgeblendet." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Gruppen mit mehr als 2 Kopien sind ausgeblendet." } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.selected_count %lld": {
+      "comment": "Row above the groups while the person selects the groups to merge: the number of selected groups.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Group Selected" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Groups Selected" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Gruppe ausgewählt" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Gruppen ausgewählt" } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.select_all": {
+      "comment": "Button that selects every group shown on the Duplicates screen.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Select All" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alle auswählen" } }
+      }
+    },
+    "duplicates.deselect_all": {
+      "comment": "Button that deselects every selected group on the Duplicates screen.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Deselect All" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Auswahl aufheben" } }
+      }
+    },
+    "duplicates.select_group": {
+      "comment": "Accessibility label of the circle that selects one group of duplicates.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Select Group" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Gruppe auswählen" } }
+      }
+    },
+    "duplicates.merge_selected": {
+      "comment": "Toolbar button that merges only the selected groups of duplicates.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merge Selected" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Auswahl zusammenführen" } }
+      }
+    },
     "duplicates.member_hint": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Keeps this photo instead." } },

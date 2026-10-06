@@ -114,6 +114,43 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 5))
     }
 
+    func testMergeSelectedMergesOnlyTheSelectedGroup() {
+        openDuplicates()
+        let select = app.buttons["duplicates.select"]
+        XCTAssertTrue(select.waitForExistence(timeout: 5))
+        select.tap()
+        let second = app.buttons["duplicates.select.1"]
+        XCTAssertTrue(second.waitForExistence(timeout: 5))
+        second.tap()
+        XCTAssertTrue(app.staticTexts["1 Group Selected"].waitForExistence(timeout: 5))
+
+        let mergeSelected = app.buttons["duplicates.mergeSelected"]
+        XCTAssertTrue(mergeSelected.waitForExistence(timeout: 5))
+        mergeSelected.tap()
+        let confirm = dialogButton("duplicates.mergeSelected.dialog")
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+        confirm.tap()
+
+        waitUntilGone(group(1), "the selected group leaves the list")
+        XCTAssertTrue(group(0).exists, "the group that was not selected stays")
+        XCTAssertTrue(app.buttons["duplicates.mergeAll"].waitForExistence(timeout: 5), "the merge ends the selection")
+    }
+
+    func testPairsOnlyHidesTheGroupOfThreeCopiesUntilThePersonShowsIt() {
+        openDuplicates(fixture: "-EncryptedMemoriesDuplicatesLargeGroupFixture")
+        XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["2 Groups"].waitForExistence(timeout: 5), "only the pairs show")
+        XCTAssertFalse(group(2).exists)
+
+        let pairsOnly = app.switches["duplicates.pairsOnly"]
+        XCTAssertTrue(pairsOnly.waitForExistence(timeout: 5))
+        // The switch sits at the trailing edge of its row.
+        pairsOnly.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
+
+        XCTAssertTrue(app.staticTexts["3 Groups"].waitForExistence(timeout: 5), "every group shows")
+        XCTAssertTrue(group(2).waitForExistence(timeout: 5))
+    }
+
     func testShowLargerOpensTheCopyInTheViewerAndKeepsThePhotoToKeep() {
         openDuplicates()
         let kept = app.buttons["duplicates.member.0.0"]

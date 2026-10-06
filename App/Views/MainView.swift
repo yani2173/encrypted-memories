@@ -65,6 +65,7 @@ struct MainView: View {
     /// The Duplicates route of this account. Nil while the account cannot merge duplicates.
     @State private var duplicates: ExactDuplicatesModel?
     @State private var confirmsDuplicateMergeAll = false
+    @State private var confirmsDuplicateMergeSelected = false
     @State private var mapClusterPageIndex = 0
     @State private var mapClusterRouteGeneration = 0
     @State private var routeScrollGeneration = 0
@@ -395,6 +396,7 @@ struct MainView: View {
                     sourceAnalysisRevision: model.sourceAnalysisRevision,
                     topInset: topBarInset,
                     confirmsMergeAll: $confirmsDuplicateMergeAll,
+                    confirmsMergeSelected: $confirmsDuplicateMergeSelected,
                     item: { timelineModel.allLibraryItem(matching: $0) },
                     // The list has no grid cell to zoom from, so the viewer opens directly.
                     open: { items, index in openPhoto(items[index], items, proxy: GridProxy()) }
@@ -2300,9 +2302,26 @@ struct MainView: View {
             }
             if selection == .duplicates, let duplicates {
                 ToolbarItem(placement: .primaryAction) {
-                    Button(L10n.string("duplicates.merge_all")) { confirmsDuplicateMergeAll = true }
-                        .disabled(!duplicates.canMerge)
-                        .accessibilityIdentifier("duplicates.mergeAll")
+                    Button(L10n.string(duplicates.isSelecting ? "action.done" : "action.select")) {
+                        if duplicates.isSelecting {
+                            duplicates.stopSelecting()
+                        } else {
+                            duplicates.startSelecting()
+                        }
+                    }
+                    .disabled(!duplicates.isSelecting && !duplicates.canMerge)
+                    .accessibilityIdentifier("duplicates.select")
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    if duplicates.isSelecting {
+                        Button(L10n.string("duplicates.merge_selected")) { confirmsDuplicateMergeSelected = true }
+                            .disabled(!duplicates.canMergeSelected)
+                            .accessibilityIdentifier("duplicates.mergeSelected")
+                    } else {
+                        Button(L10n.string("duplicates.merge_all")) { confirmsDuplicateMergeAll = true }
+                            .disabled(!duplicates.canMerge)
+                            .accessibilityIdentifier("duplicates.mergeAll")
+                    }
                 }
                 ToolbarSpacer(.fixed, placement: .primaryAction)
             }

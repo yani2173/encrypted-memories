@@ -19,9 +19,12 @@ final class ExactDuplicatesModelTests: XCTestCase {
         ExactDuplicateGroup(contentHash: "B", hashKeyEpoch: "e", members: [b1, b2])
     }
 
-    private func makeModel(_ finder: FakeDuplicateFinder) -> (ExactDuplicatesModel, TrashLog) {
+    /// A model that shows every group, as the tests of the groups of three copies need.
+    private func makeModel(
+        _ finder: FakeDuplicateFinder, showsOnlyPairs: Bool = false
+    ) -> (ExactDuplicatesModel, TrashLog) {
         let log = TrashLog()
-        let model = ExactDuplicatesModel(finder: finder) { log.calls.append($0) }
+        let model = ExactDuplicatesModel(finder: finder, showsOnlyPairs: showsOnlyPairs) { log.calls.append($0) }
         return (model, log)
     }
 
@@ -604,6 +607,122 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.first?.kept, a2)
         await model.load()
         XCTAssertEqual(model.groups.first?.kept, a1, "a choice that left the group falls back to the ranking")
+    }
+
+    // MARK: - Pairs only
+
+    func testTheScreenStartsWithOnlyThePairsAndCountsOnlyThem() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let model = ExactDuplicatesModel(finder: finder)
+        XCTAssertTrue(model.showsOnlyPairs, "the screen starts with the pairs")
+        await model.load()
+
+        XCTAssertEqual(model.shownGroups.map(\.id), ["B"])
+        XCTAssertEqual(model.groups.map(\.id), ["A", "B"], "the group of three copies stays known")
+        XCTAssertEqual(model.groupCountText, L10n.string("duplicates.group_count \(1)"))
+        XCTAssertEqual(model.duplicateCount, 1)
+        XCTAssertEqual(model.knownDuplicateCount, 1)
+        XCTAssertTrue(model.hasLargerGroups)
+        XCTAssertEqual(model.hiddenGroupCount, 1)
+        XCTAssertEqual(model.hiddenGroupsNote, L10n.string("duplicates.larger_groups_hidden \(1)"))
+    }
+
+    func testMergeAllMergesOnlyThePairsWhileTheLargerGroupsAreHidden() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, log) = makeModel(finder, showsOnlyPairs: true)
+        await model.load()
+
+        await model.mergeAll()
+
+        XCTAssertEqual(finder.batches, [["B"]])
+        XCTAssertEqual(log.calls, [[b2]])
+        XCTAssertEqual(model.groups.map(\.id), ["A"])
+        XCTAssertEqual(model.content, .groups, "the switch stays reachable for the hidden group")
+        XCTAssertFalse(model.canMerge, "nothing shown is left to merge")
+    }
+
+    func testShowingEveryGroupShowsTheLargerGroupsAgain() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, _) = makeModel(finder, showsOnlyPairs: true)
+        await model.load()
+
+        model.showsOnlyPairs = false
+
+        XCTAssertEqual(model.shownGroups.map(\.id), ["A", "B"])
+        XCTAssertEqual(model.duplicateCount, 3)
+        XCTAssertEqual(model.hiddenGroupCount, 0)
+        XCTAssertNil(model.hiddenGroupsNote)
+    }
+
+    func testTheEntryCountsOnlyThePairsBeforeTheScreenOpens() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, _) = makeModel(finder, showsOnlyPairs: true)
+
+        await model.loadCountIfNeeded()
+
+        XCTAssertEqual(model.knownDuplicateCount, 1)
+    }
+
+    // MARK: - Merging the selected groups
+
+    func testOnlyTheSelectedGroupsMergeAndTheSelectionEnds() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, log) = makeModel(finder)
+        await model.load()
+        XCTAssertFalse(model.canMergeSelected, "nothing is selected")
+
+        model.startSelecting()
+        model.toggleSelection("B")
+
+        XCTAssertTrue(model.isSelecting)
+        XCTAssertEqual(model.selectedGroups.map(\.id), ["B"])
+        XCTAssertEqual(model.selectedDuplicateCount, 1)
+        XCTAssertEqual(model.selectionText, L10n.string("duplicates.selected_count \(1)"))
+        XCTAssertEqual(model.mergeSelectedTitle, L10n.string("duplicates.merge_all_title \(1)"))
+        XCTAssertTrue(model.canMergeSelected)
+
+        await model.mergeSelected()
+
+        XCTAssertEqual(finder.batches, [["B"]], "the group that was not selected is not merged")
+        XCTAssertEqual(log.calls, [[b2]])
+        XCTAssertEqual(model.groups.map(\.id), ["A"])
+        XCTAssertFalse(model.isSelecting)
+        XCTAssertTrue(model.selectedGroupIDs.isEmpty)
+    }
+
+    func testSelectAllSelectsEveryShownGroupAndASecondTapSelectsNone() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, _) = makeModel(finder, showsOnlyPairs: true)
+        await model.load()
+        model.startSelecting()
+
+        model.toggleSelectAll()
+
+        XCTAssertEqual(model.selectedGroups.map(\.id), ["B"], "a hidden group is never selected")
+        XCTAssertTrue(model.isAllSelected)
+        model.toggleSelectAll()
+        XCTAssertTrue(model.selectedGroups.isEmpty)
+        model.toggleSelection("A")
+        XCTAssertTrue(model.selectedGroups.isEmpty, "a hidden group cannot be selected")
+    }
+
+    func testTheSelectionWaitsForTheSelectModeAndAToggleDeselects() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        model.toggleSelection("A")
+        XCTAssertTrue(model.selectedGroupIDs.isEmpty, "no selection outside the select mode")
+
+        model.startSelecting()
+        model.toggleSelection("A")
+        model.toggleSelection("A")
+        XCTAssertTrue(model.selectedGroupIDs.isEmpty, "a second tap deselects")
+
+        model.toggleSelection("A")
+        model.stopSelecting()
+        XCTAssertFalse(model.isSelecting)
+        XCTAssertTrue(model.selectedGroupIDs.isEmpty, "Done forgets the selection")
     }
 
     // MARK: - Opening a copy larger

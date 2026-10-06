@@ -400,7 +400,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let scan = try await finder.duplicateGroups()
         XCTAssertEqual(scan.byteSizes, [hash("manifest"): 4_000], "the scan reads sizes from the manifest only")
 
-        let model = ExactDuplicatesModel(finder: finder)
+        let model = ExactDuplicatesModel(finder: finder, showsOnlyPairs: false)
         await model.load()
         let sizes = Dictionary(uniqueKeysWithValues: model.groups.map { ($0.id, $0.freedBytes) })
         XCTAssertEqual(sizes[hash("manifest")], 8_000, "two duplicates of 4,000 bytes")
