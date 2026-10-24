@@ -183,9 +183,7 @@ struct MobileSeriesFavoritesScreen: View {
                 set: { if !$0 { model.dismissFailure() } }
             )
         ) {
-            Button(L10n.string("action.retry")) {
-                Task { await model.keepOnlyMarkedFavorites() }
-            }
+            Button(RetryButton.title) { Task { await model.keepOnlyMarkedFavorites() } }
             Button(L10n.string("action.cancel"), role: .cancel) {}
         } message: {
             Text(
@@ -290,13 +288,11 @@ struct MobileSeriesFavoritesScreen: View {
 
     @ViewBuilder private var progressOverlay: some View {
         if case .running(let progress) = model.operation {
-            VStack(spacing: 12) {
-                ProgressView(value: progress?.fraction ?? 0)
-                    .frame(width: 220)
-                Text(progressText(progress))
-                    .font(.footnote)
-                    .multilineTextAlignment(.center)
+            ActivityProgressStateLayout(hugsLine: true) {
+                ActivityProgressRow(
+                    title: nil, detail: progressText(progress), fraction: progress?.fraction ?? 0, alignment: .center)
             }
+            .multilineTextAlignment(.center)
             .padding(20)
             .glassEffect(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
             .accessibilityElement(children: .combine)

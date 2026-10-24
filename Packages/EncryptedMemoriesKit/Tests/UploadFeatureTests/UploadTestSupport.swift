@@ -1,8 +1,17 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import UploadCore
+
+/// Test doubles that do not care about the network keep a reservation that coordinates with nothing. Production
+/// uploaders have no such default: the compiler makes each of them choose its admission.
+extension PhotoUploading {
+    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+        try await UploadNetworkAdmission().reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
+    }
+}
 
 actor UploadTestBarrier {
     private let participantCount: Int
@@ -28,6 +37,20 @@ actor UploadTestBarrier {
     }
 }
 
+/// Access the owned connection from tests without adding a production observation hook.
+func withDeniedSQLiteSelect(in store: Any, _ body: () throws -> Void) throws {
+    let connection = try XCTUnwrap(
+        Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value as? SQLiteStoreConnection)
+    connection.withLock {
+        XCTAssertEqual(
+            sqlite3_set_authorizer(
+                connection.database,
+                { _, action, _, _, _, _ in action == SQLITE_SELECT ? SQLITE_DENY : SQLITE_OK }, nil), SQLITE_OK)
+    }
+    defer { connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) } }
+    try body()
+}
+
 func testUID(_ name: String) -> PhotoUID { PhotoUID(volumeID: "vol", nodeID: "node-\(name)") }
 
 /// In-memory `PhotoUploading` for exercising the queue/state-machine without any SDK. Tracks
@@ -50,6 +73,57 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
     private let workDuration: Duration
     private let deliverProgress: Bool
     private let failNames: Set<String>
+    /// Like the production uploader, one admission for every upload of this uploader.
+    let admission = UploadNetworkAdmission()
+    private var _uploadsWithoutTheirReservation: [String] = []
+    /// Names of uploads that started without an active reservation of `admission` for their network kind.
+    var uploadsWithoutTheirReservation: [String] { lock.withLock { _uploadsWithoutTheirReservation } }
+
+    /// How long a test waits for a reservation before it fails. A reservation that nobody releases would otherwise
+    /// keep the test, and the build lane behind it, waiting for good.
+    var reservationTimeout: Duration = .seconds(20)
+    private var _reserveCalls = 0
+    /// How often a caller asked for a reservation. A transfer that the watchdog ends asks again for its next attempt.
+    var reserveCalls: Int { lock.withLock { _reserveCalls } }
+
+    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+        lock.withLock { _reserveCalls += 1 }
+        let timeout = reservationTimeout
+        let admission = admission
+        return try await withThrowingTaskGroup(of: UploadNetworkReservation?.self) { group in
+            group.addTask { try await admission.reserve(allowsExpensiveNetwork: allowsExpensiveNetwork) }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                return nil
+            }
+            let first: UploadNetworkReservation?
+            do {
+                first = try await group.next() ?? nil
+            } catch {
+                group.cancelAll()
+                await Self.releaseLateReservations(of: &group)
+                throw error
+            }
+            group.cancelAll()
+            await Self.releaseLateReservations(of: &group)
+            if let first { return first }
+            throw UploadError.backend("The test uploader waited \(timeout) for its network reservation")
+        }
+    }
+
+    /// A reservation that arrives while the wait ends goes back at once, so no test keeps a place by accident.
+    private static func releaseLateReservations(
+        of group: inout ThrowingTaskGroup<UploadNetworkReservation?, any Error>
+    ) async {
+        while true {
+            do {
+                guard let late = try await group.next() else { return }
+                late?.release()
+            } catch {
+                continue
+            }
+        }
+    }
 
     init(
         capabilities: UploadBackendCapabilities = .init(
@@ -104,11 +178,16 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
     func upload(
         _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
+        let reserved =
+            request.networkReservation.map {
+                $0.isActive && admission.issued($0) && $0.allowsExpensiveNetwork == request.allowsExpensiveNetwork
+            } ?? false
         lock.withLock {
             concurrent += 1
             _peakConcurrent = max(_peakConcurrent, concurrent)
             _startedOrder.append(request.name)
             _requests.append(request)
+            if !reserved { _uploadsWithoutTheirReservation.append(request.name) }
         }
         defer { lock.withLock { concurrent -= 1 } }
 

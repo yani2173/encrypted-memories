@@ -6,21 +6,73 @@ import XCTest
 @testable import UploadCore
 
 final class PhotoLibraryResourceErrorTests: XCTestCase {
-    func testMissingPhotoKitResourceBecomesTerminalSourceError() {
-        let native = NSError(
-            domain: PHPhotosErrorDomain,
-            code: PHPhotosError.Code.missingResource.rawValue
-        )
-
-        let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(
-            native,
-            filename: "IMG_0001.jpeg"
-        )
-
-        XCTAssertEqual(normalized as? UploadError, .fileMissing("IMG_0001.jpeg"))
+    func testOnlyAPhotoThatAnAnsweringLibraryNoLongerListsLeavesTheCatalog() {
+        // A library without access, on an offline volume or not loaded yet proves nothing about a photo.
+        for listed in [true, false] {
+            XCTAssertFalse(
+                PhotoLibraryResourceResolver.photosNoLongerLists(
+                    "asset", libraryAnswers: { false }, listsAsset: { _ in listed }))
+        }
+        // A photo that Photos still lists, for example a series photo of another main photo, stays.
+        XCTAssertFalse(
+            PhotoLibraryResourceResolver.photosNoLongerLists(
+                "asset", libraryAnswers: { true }, listsAsset: { _ in true }))
+        var asked: [String] = []
+        XCTAssertTrue(
+            PhotoLibraryResourceResolver.photosNoLongerLists(
+                "asset", libraryAnswers: { true },
+                listsAsset: {
+                    asked.append($0)
+                    return false
+                }))
+        XCTAssertEqual(asked, ["asset"], "Photos is asked about this photo")
     }
 
-    func testPhotoKitNetworkFailureRemainsRetryableTransportError() {
+    func testAnUnreadableResourceOfAListedPhotoIsCheckedAgainBeforeItCountsAsMissing() {
+        // The asset still exists; only its file cannot be read. It takes the checks of a missing resource, so it
+        // never leaves the queue and returns through catalog recovery on every pass.
+        for code in [PHPhotosError.Code.identifierNotFound, .invalidResource] {
+            let native = NSError(domain: PHPhotosErrorDomain, code: code.rawValue)
+
+            let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(native, filename: "IMG_0001.jpeg")
+
+            XCTAssertEqual(normalized as? UploadError, .sourceReportedMissing("IMG_0001.jpeg"), "\(code)")
+        }
+    }
+
+    func testALiveAssetWithoutItsMainFileIsCheckedAgainButASeriesPhotoOfAnotherMainHasNoWork() throws {
+        func info(_ roles: [PhotoBackupAssetInfo.Resource.Role]) -> PhotoBackupAssetInfo {
+            PhotoBackupAssetInfo(
+                localIdentifier: "asset", creationDate: Date(timeIntervalSince1970: 100),
+                modificationDate: Date(timeIntervalSince1970: 200), pixelWidth: 10, pixelHeight: 10,
+                durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                resources: roles.map { .init(role: $0, originalFilename: "IMG_0003.HEIC", mimeType: "image/heic") })
+        }
+
+        XCTAssertNotNil(
+            try PhotoLibraryResourceResolver.livePlan(for: info([.originalPhoto]), filename: "IMG_0003.HEIC"))
+        XCTAssertNil(
+            try PhotoLibraryResourceResolver.livePlan(
+                for: info([.originalPhoto, .burstMainReference]), filename: "IMG_0003.HEIC"),
+            "a series photo of another main photo has no backup work of its own")
+        XCTAssertThrowsError(
+            try PhotoLibraryResourceResolver.livePlan(for: info([.adjustmentData]), filename: "IMG_0003.HEIC")
+        ) { error in
+            XCTAssertEqual(error as? UploadError, .sourceReportedMissing("IMG_0003.HEIC"))
+        }
+    }
+
+    func testAMissingPhotoKitResourceIsCheckedAgainBeforeThePhotoCountsAsGone() {
+        // A download from iCloud that stops part-way can report a missing resource too.
+        let native = NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.Code.missingResource.rawValue)
+
+        let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(native, filename: "IMG_0001.jpeg")
+
+        XCTAssertEqual(normalized as? UploadError, .sourceReportedMissing("IMG_0001.jpeg"))
+        XCTAssertFalse(BackupSyncRunner.isTransientNetwork(normalized))
+    }
+
+    func testPhotoKitWaitsAreSourceWaitsNotProtonConnectionFailures() {
         let codes: [PHPhotosError.Code] = [
             .networkAccessRequired, .networkError, .libraryVolumeOffline, .operationInterrupted,
         ]
@@ -30,10 +82,9 @@ final class PhotoLibraryResourceErrorTests: XCTestCase {
 
             let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(native, filename: "IMG_0002.mov")
 
-            XCTAssertEqual(
-                normalized as? UploadError, .transport(code: NSURLErrorCannotLoadFromNetwork, message: "offline"))
-            // Transient: the runner waits and retries without spending the photo's attempts.
-            XCTAssertTrue(BackupSyncRunner.isTransientNetwork(normalized), "\(code) must be transient")
+            XCTAssertEqual(normalized as? UploadError, .sourceUnavailable("IMG_0002.mov"), "\(code)")
+            // The wait is about Photos: it must not lower the upload concurrency for photos on the device.
+            XCTAssertFalse(BackupSyncRunner.isTransientNetwork(normalized), "\(code) is no connection failure")
         }
     }
 

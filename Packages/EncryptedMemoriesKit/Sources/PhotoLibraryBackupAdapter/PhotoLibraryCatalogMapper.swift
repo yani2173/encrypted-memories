@@ -21,6 +21,7 @@ public enum PhotoLibraryCatalogMapper {
             durationSeconds: info.durationSeconds,
             mediaKind: info.isVideo ? .video : .image,
             isLivePhoto: info.isLivePhoto,
+            livePlaybackOff: info.livePlaybackOff,
             resources: info.resources.map {
                 PhotoLibraryCatalogResource(
                     role: $0.role.rawValue,
@@ -56,7 +57,8 @@ public enum PhotoLibraryCatalogMapper {
                     ordinal: $0.ordinal
                 )
             },
-            cloudIdentifier: entry.cloudIdentifier
+            cloudIdentifier: entry.cloudIdentifier,
+            livePlaybackOff: entry.livePlaybackOff
         )
         // The inventory does not store the adjustment state. Only an edit without its rendered file moves the
         // revision away from the one that the stored values give, and a replay must plan that same revision.

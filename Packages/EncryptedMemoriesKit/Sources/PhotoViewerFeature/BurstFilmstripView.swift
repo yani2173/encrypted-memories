@@ -1,5 +1,6 @@
 import AppKit
 import MediaCache
+import MediaFeedCore
 import PhotoViewerCore
 import PhotosCore
 import SwiftUI
@@ -15,11 +16,13 @@ struct BurstFilmstripView: NSViewRepresentable {
     let feed: ThumbnailFeed
     let itemSide: CGFloat
     let showsHorizontalScroller: Bool
+    var allowsVisibleDuplicateThumbnails = false
     let onSelect: (Int) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
-            feed: feed, itemSide: itemSide, showsHorizontalScroller: showsHorizontalScroller, onSelect: onSelect)
+            feed: feed, itemSide: itemSide, showsHorizontalScroller: showsHorizontalScroller,
+            allowsVisibleDuplicateThumbnails: allowsVisibleDuplicateThumbnails, onSelect: onSelect)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -96,10 +99,17 @@ struct BurstFilmstripView: NSViewRepresentable {
         context.coordinator.appliedShowsHorizontalScroller = showsHorizontalScroller
     }
 
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        for item in coordinator.collectionView?.visibleItems() ?? [] {
+            (item as? BurstThumbnailItem)?.cancelThumbnailLoad()
+        }
+    }
+
     final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegate {
         var items: [PhotoItem] = []
         var selectedUID: PhotoUID?
         let feed: ThumbnailFeed
+        let allowsVisibleDuplicateThumbnails: Bool
         var itemSide: CGFloat
         var showsHorizontalScroller: Bool
         var onSelect: (Int) -> Void
@@ -107,8 +117,12 @@ struct BurstFilmstripView: NSViewRepresentable {
         var appliedItemSide: CGFloat?
         var appliedShowsHorizontalScroller: Bool?
 
-        init(feed: ThumbnailFeed, itemSide: CGFloat, showsHorizontalScroller: Bool, onSelect: @escaping (Int) -> Void) {
+        init(
+            feed: ThumbnailFeed, itemSide: CGFloat, showsHorizontalScroller: Bool,
+            allowsVisibleDuplicateThumbnails: Bool, onSelect: @escaping (Int) -> Void
+        ) {
             self.feed = feed
+            self.allowsVisibleDuplicateThumbnails = allowsVisibleDuplicateThumbnails
             self.itemSide = itemSide
             self.showsHorizontalScroller = showsHorizontalScroller
             self.onSelect = onSelect
@@ -126,8 +140,26 @@ struct BurstFilmstripView: NSViewRepresentable {
                 return item
             }
             let photo = items[indexPath.item]
-            thumbnail.configure(photo: photo, selected: photo.uid == selectedUID, itemSide: itemSide, feed: feed)
+            thumbnail.configure(
+                photo: photo, selected: photo.uid == selectedUID, itemSide: itemSide, feed: feed,
+                allowsVisibleDuplicateThumbnails: allowsVisibleDuplicateThumbnails)
             return thumbnail
+        }
+
+        func collectionView(
+            _ collectionView: NSCollectionView, willDisplay item: NSCollectionViewItem,
+            forRepresentedObjectAt indexPath: IndexPath
+        ) {
+            (item as? BurstThumbnailItem)?.loadVisibleThumbnail()
+        }
+
+        func collectionView(
+            _ collectionView: NSCollectionView, didEndDisplaying item: NSCollectionViewItem,
+            forRepresentedObjectAt indexPath: IndexPath
+        ) {
+            // A late callback can arrive for a reused item that already shows its next photo.
+            guard !collectionView.visibleItems().contains(item) else { return }
+            (item as? BurstThumbnailItem)?.endVisibleThumbnail()
         }
 
         func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
@@ -159,6 +191,10 @@ private final class BurstThumbnailItem: NSCollectionViewItem {
 
     private var loadTask: Task<Void, Never>?
     private var representedUID: PhotoUID?
+    private var visibleThumbnail: VisibleThumbnailSession?
+
+    // A released item must not leave its load running; cancelling it ends a Duplicates read access.
+    deinit { loadTask?.cancel() }
 
     override func loadView() {
         view = BurstThumbnailCellView(frame: NSRect(x: 0, y: 0, width: 72, height: 72))
@@ -166,19 +202,27 @@ private final class BurstThumbnailItem: NSCollectionViewItem {
 
     override func prepareForReuse() {
         super.prepareForReuse()
-        loadTask?.cancel()
-        loadTask = nil
+        cancelThumbnailLoad()
         representedUID = nil
         cellView?.image = nil
         cellView?.selected = false
     }
 
-    func configure(photo: PhotoItem, selected: Bool, itemSide: CGFloat, feed: ThumbnailFeed) {
+    func configure(
+        photo: PhotoItem, selected: Bool, itemSide: CGFloat, feed: ThumbnailFeed, allowsVisibleDuplicateThumbnails: Bool
+    ) {
+        cancelThumbnailLoad()
         representedUID = photo.uid
         view.frame.size = NSSize(width: itemSide, height: itemSide)
         cellView?.selected = selected
+        // A Duplicates copy may lie outside the library, so it reads only while on screen (`loadVisibleThumbnail`).
+        guard !allowsVisibleDuplicateThumbnails else {
+            visibleThumbnail = VisibleThumbnailSession(feed: feed.feedCore)
+            cellView?.image = nil
+            return
+        }
+        visibleThumbnail = nil
         cellView?.image = feed.memoryImage(for: photo.uid)
-        loadTask?.cancel()
         guard cellView?.image == nil else { return }
         loadTask = Task {
             let image = await feed.image(for: photo.uid)
@@ -188,6 +232,32 @@ private final class BurstThumbnailItem: NSCollectionViewItem {
                 self.cellView?.image = image
             }
         }
+    }
+
+    func loadVisibleThumbnail() {
+        guard let visibleThumbnail, let uid = representedUID else { return }
+        loadTask?.cancel()
+        visibleThumbnail.select(uid)
+        cellView?.image = visibleThumbnail.memoryImage(for: uid)
+        guard cellView?.image == nil else { return }
+        loadTask = Task { [weak self] in
+            let image = await visibleThumbnail.visibleImage(for: uid)
+            guard !Task.isCancelled, let self, self.representedUID == uid else { return }
+            self.cellView?.image = image
+        }
+    }
+
+    /// Revokes the read access of a Duplicates copy that left the screen.
+    func endVisibleThumbnail() {
+        guard visibleThumbnail != nil else { return }
+        cancelThumbnailLoad()
+        cellView?.image = nil
+    }
+
+    func cancelThumbnailLoad() {
+        visibleThumbnail?.end()
+        loadTask?.cancel()
+        loadTask = nil
     }
 
     var uid: PhotoUID? { representedUID }

@@ -287,11 +287,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         }
     }
 
-    func setDataSource(_ newSource: MetalGridDataSource) {
+    func setDataSource(_ newSource: MetalGridDataSource, preservingColumnPhase: Bool = false) {
         contentReadyReported = false
         dataSource = newSource
         newSource.updateUploadBadges(uploadBadges)
-        rebuildIndex()
+        rebuildIndex(preservingColumnPhase: preservingColumnPhase)
         onContentSizeChange?(contentSize())
         requestRedraw()
     }
@@ -355,7 +355,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     var decorationsEnabled = false
     private(set) var selectedUIDs: Set<PhotoUID> = []
     private(set) var favoriteUIDs: Set<PhotoUID> = []
-    private var uploadBadges = PendingUploadBadges.empty
+    private(set) var uploadBadges = PendingUploadBadges.empty
     private var contentEpochs = PendingContentEpochTracker()
     private var handovers = PendingHandoverTracker()
     private let uploadBadgeAnimator = GridUploadBadgeAnimator<PhotoUID>()
@@ -403,7 +403,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
     func requestRedraw() { onRequestRedraw?() }
 
-    private func rebuildIndex() {
+    private func rebuildIndex(preservingColumnPhase: Bool = false) {
         var map: [PhotoUID: Int] = [:]
         map.reserveCapacity(dataSource.flatUIDs.count)
         for (i, uid) in dataSource.flatUIDs.enumerated() { map[uid] = i }
@@ -413,7 +413,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             sectionCounts: dataSource.sectionCounts, profile: gridProfile,
             fillOrder: fillOrder)
         engine.topInset = topBarInset  // A new engine starts without the toolbar inset.
-        committedPhase = nil  // A prior phase may not fit the new data.
+        if !preservingColumnPhase { committedPhase = nil }  // A prior phase may not fit changed membership.
     }
 
     func flatIndex(forUID uid: PhotoUID) -> Int? { indexByUID[uid] }
@@ -1063,8 +1063,19 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     private(set) var presentationSidebarTargetSlots: [GridRenderSlot] = []
     private var presentationSidebarSlotPairs: [(source: GridRenderSlot, target: GridRenderSlot)] = []
     private var presentationSidebarTargetScroll: CGFloat = 0
-    /// Normalized sidebar-resize progress advanced by the display link.
-    var presentationSidebarProgress: CGFloat = 0
+    /// The raw sidebar width the transition starts from (`toEventInset` is its end).
+    private var presentationSidebarFromEventInset: CGFloat = 0
+    /// Shaped fraction (0...1) between the captured source and the canonical target that the presentation draws.
+    /// With a measured sidebar edge it is the real fraction of the sidebar's travel, so the grid never leads or
+    /// trails the sidebar; without one it follows the clock with `easeInOutCubic`. It never decreases.
+    private(set) var presentationSidebarFraction: CGFloat = 0
+
+    /// Duration of the clock-driven transition, used while no sidebar edge is measured.
+    nonisolated static let sidebarClockDuration: CFTimeInterval = 0.22
+    /// A transition that follows a measured edge ends at the latest after this time, even if the edge never arrives.
+    nonisolated static let sidebarFollowDeadline: CFTimeInterval = 0.6
+    /// The measured edge counts as arrived within this distance of the destination width (points).
+    nonisolated static let sidebarArrivalTolerance: CGFloat = 0.5
 
     /// The layout inset (points) for a given sidebar obstruction width = the width plus, for a normal level with a
     /// sidebar, the breathing gap, plus the standard outer left margin - so the scale fills to exactly where the
@@ -1158,9 +1169,31 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 )
                 return (source, target)
             })
-        presentationSidebarProgress = 0
+        presentationSidebarFromEventInset = fromInset
+        presentationSidebarFraction = 0
         presentationSidebarActive = true
         return true
+    }
+
+    /// Advances the sidebar transition by one display frame and returns true once it has arrived.
+    ///
+    /// `measuredEdge` is the real right edge of the sidebar in the same width terms as `fromInset`/`toInset` of
+    /// `beginSidebarResize`, or nil when the host cannot read it. A measured edge sets the fraction directly, so the
+    /// grid follows the sidebar's own curve and duration. Without one, the clock runs `sidebarClockDuration` with
+    /// `easeInOutCubic`. `elapsed` is the time since the transition began.
+    @discardableResult
+    func advanceSidebarResize(elapsed: CFTimeInterval, measuredEdge: CGFloat?) -> Bool {
+        let clock = CGFloat(min(1, max(0, elapsed / Self.sidebarClockDuration)))
+        let travel = presentationSidebarToEventInset - presentationSidebarFromEventInset
+        var fraction = Self.easeInOutCubic(clock)
+        var arrived = clock >= 1
+        if let edge = measuredEdge, abs(travel) > Self.sidebarArrivalTolerance {
+            fraction = min(1, max(0, (edge - presentationSidebarFromEventInset) / travel))
+            arrived = abs(edge - presentationSidebarToEventInset) <= Self.sidebarArrivalTolerance
+        }
+        if elapsed >= Self.sidebarFollowDeadline { arrived = true }
+        presentationSidebarFraction = arrived ? 1 : max(presentationSidebarFraction, fraction)
+        return arrived
     }
 
     /// Commit the sidebar transition at `toInset`. The last presented frame already equals the settled target; the
@@ -1207,7 +1240,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// Presents the sidebar resize snapshot at the current source-to-target interpolation.
     private func drawSidebarResize(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
         // Fixed gaps cannot be represented by one uniformly scaled quad, so keep this on bounded per-cell groups.
-        let scaled = sidebarPresentationSlots(viewportSize: viewportSize, progress: presentationSidebarProgress)
+        let scaled = sidebarPresentationSlots(viewportSize: viewportSize, fraction: presentationSidebarFraction)
         let flatUIDs = dataSource.flatUIDs
         let (sourceVisible, sourceOverscan) = MetalGridFrameComposer.classifyVisibility(
             slots: scaled,
@@ -1318,9 +1351,15 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         return scaled
     }
 
-    /// Returns sidebar presentation geometry at normalized host progress.
-    func sidebarPresentationSlots(viewportSize _: CGSize, progress: CGFloat) -> [GridRenderSlot] {
-        let q = Self.easeInOutCubic(min(1, max(0, progress)))
+    /// Returns sidebar presentation geometry at normalized clock progress, shaped with `easeInOutCubic`.
+    func sidebarPresentationSlots(viewportSize: CGSize, progress: CGFloat) -> [GridRenderSlot] {
+        sidebarPresentationSlots(
+            viewportSize: viewportSize, fraction: Self.easeInOutCubic(min(1, max(0, progress))))
+    }
+
+    /// Returns sidebar presentation geometry at a shaped fraction (0 = captured source, 1 = canonical target).
+    func sidebarPresentationSlots(viewportSize _: CGSize, fraction: CGFloat) -> [GridRenderSlot] {
+        let q = min(1, max(0, fraction))
         return presentationSidebarSlotPairs.map { pair in
             let s = pair.source.rect
             let t = pair.target.rect
@@ -1690,20 +1729,13 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// while every other detent is cursor-aligned (anchor pinned under the cursor). Because these are a pure
     /// function of the (fixed) anchor + the detent, any two adjacent segments sharing a detent get the identical
     /// frame for it, which keeps adjacent segment boundaries identical.
-    private func pinchDetentParams(level lv: Int, viewportSize: CGSize) -> (phase: Int?, scrollY: CGFloat) {
-        if lv == pinchStartLevel { return (pinchStartPhase, pinchStartScrollY) }
-        guard let tx = zoomTransaction else { return (currentPhase(), pinchStartScrollY) }
-        let width = layoutWidth
-        let col = engine.cursorColumn(viewportX: tx.anchorViewportPoint.x, level: lv, width: width)
-        let phase = engine.columnPhase(forItem: tx.anchorGlobalIndex, targetColumn: col, level: lv, width: width)
-        let y = engine.anchoredScrollOffset(
-            flatIndex: tx.anchorGlobalIndex, localFraction: tx.anchorLocalFraction,
-            viewportPoint: tx.anchorViewportPoint, level: lv, width: width, columnPhase: phase
-        ).y
-        let clampedY = engine.clampScrollOffsetY(
-            y, level: lv, width: width,
-            viewportHeight: viewportSize.height, columnPhase: phase)
-        return (phase, clampedY)
+    private func pinchDetentParams(level lv: Int, viewportSize: CGSize) -> GridPinchDetentFrame {
+        if lv == pinchStartLevel { return GridPinchDetentFrame(phase: pinchStartPhase, scrollY: pinchStartScrollY) }
+        guard let tx = zoomTransaction else {
+            return GridPinchDetentFrame(phase: currentPhase(), scrollY: pinchStartScrollY)
+        }
+        return GridPinchDetentGeometry.cursorAlignedFrame(
+            level: lv, transaction: tx, engine: engine, width: layoutWidth, viewportHeight: viewportSize.height)
     }
 
     /// Builds the pinch plan for one adjacent source and target segment.
@@ -2168,14 +2200,12 @@ extension MetalGridCoordinator {
         now: TimeInterval = CACurrentMediaTime()
     ) -> Bool {
         // Streaming policy is shared with the iOS host. This adapter supplies upload sizing, warm requests, and
-        // cache state. Overscan remains evictable while visible items are still missing.
-        let pinOverscan = visibleUIDs.allSatisfy { cache.isResident($0) || !dataSource.canRetryThumbnail(for: $0) }
+        // cache state.
         let uploadPixels = effectiveUploadPixels()
         let result = MetalGridFrameComposer.stream(
             cache: cache,
             visibleIDs: visibleUIDs,
             overscanIDs: overscanUIDs,
-            pinOverscan: pinOverscan,
             effectiveUploadPixels: uploadPixels,
             allowUpgrade: allowUpgrade,
             now: now,

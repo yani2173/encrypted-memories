@@ -18,8 +18,9 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     /// Related links by earlier main, recorded before its trash. Nil in journals of earlier builds.
     public var retireIntent: [String: [String]]?
     /// Main links of `superseded`, `remoteSuperseded`, and `retired` that are proven earlier uploads of this photo:
-    /// its own uploads, and links with its iCloud identifier. Only these links appear in the lineage marker. Nil in
-    /// journals of earlier builds, so their links stay unnamed.
+    /// its own uploads, and links with its iCloud identifier. Only these links appear in the lineage marker, and only
+    /// these local targets move to the trash without a twin check of their files. Nil in journals of earlier builds,
+    /// so their links stay unnamed and need that check.
     public var proven: [String]?
     /// The uploads that a proven remote photo replaced, by that photo, as its lineage named them.
     public var inherited: [String: [String]]?

@@ -138,6 +138,20 @@ public struct UploadBackupSyncQueueEntry: Sendable, Equatable {
     }
 }
 
+public extension UploadBackupSyncQueueEntry {
+    /// A durable check request, not upload permission. Preserve the acknowledged missing reason until bytes return.
+    var isDismissedSourceRecheck: Bool {
+        Self.isDismissedSourceRecheck(sourceKind: source.kind, state: state, lastError: lastError)
+    }
+
+    static func isDismissedSourceRecheck(
+        sourceKind: UploadSourceIdentity.Kind, state: UploadBackupSyncQueueState, lastError: String?
+    ) -> Bool {
+        sourceKind == .photoLibraryAsset && (state == .discovered || state == .checking)
+            && BackupIssueRecord.decode(lastError)?.kind == .sourceMissing
+    }
+}
+
 public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     public var total = 0
     public var waiting = 0
@@ -157,6 +171,8 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     public var blocked = 0
     public var failed = 0
     public var dismissedFailures = 0
+    /// Subset of dismissedFailures that still owes an admitted source check. Never another photo or upload.
+    public var pendingSourceRechecks = 0
     public var paused = 0
 
     public init() {}
@@ -240,20 +256,30 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// False after a SQLite operation failed or the store was closed. An empty read is safe to
     /// interpret as "drained" only while this remains true.
     func isOperational() -> Bool
+    /// Makes every committed change survive a power loss. Returns false when that is not certain.
+    func synchronizeToDisk() -> Bool
+    /// Persists one row. The row survives a power loss once this returns true.
     @discardableResult
     func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool
-    /// Persists one discovery chunk atomically. The default keeps test/fake stores source-compatible;
-    /// the SQLite store reuses one statement and one transaction for the whole chunk.
+    /// Persists one discovery chunk atomically. The rows survive a power loss once this returns true. The default
+    /// keeps test/fake stores source-compatible; the SQLite store reuses one statement and one transaction for the
+    /// whole chunk.
     @discardableResult
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool
+    /// Conditional durable transition for an acknowledged missing-source check. Nil means a failed write;
+    /// false means the row changed or gained a remote receipt. Only the runner can release the saved reason.
+    func updateDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+    ) -> Bool?
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry?
     /// Bounded, strict scan of every row carrying durable remote-commit evidence, independent of
     /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
     func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry]
     func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry]
-    /// Earliest persisted eligibility time for any runnable row. Retry delays survive process death,
-    /// so a restarted runner can wait for due work instead of declaring the queue drained.
-    func nextRunnableDate() -> Date?
+    /// Earliest persisted eligibility time for any runnable row outside `excludedSources` (same kind and identifier,
+    /// as in `claimRunnable`). Retry delays survive process death, so a restarted runner can wait for due work
+    /// instead of declaring the queue drained.
+    func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date?
     /// Earliest eligible/backoff row for status and scheduling. Unlike `nextRunnable(limit:)`, this
     /// is ordered by eligibility rather than newest-photo execution priority.
     func earliestRunnableEntry() -> UploadBackupSyncQueueEntry?
@@ -262,8 +288,12 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// Atomically reserves runnable rows for one runner. Returned entries keep their pre-claim
     /// state so the runner can mirror progress accurately; the store has already moved them to an
     /// active state, so another runner cannot take the same work. Crash recovery demotes these
-    /// active rows back to runnable via `requeueStaleActive`.
-    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry]
+    /// active rows back to runnable via `requeueStaleActive`. Rows of a source in `excludedSources` (same kind and
+    /// identifier, any resource or revision) stay unclaimed: the runner passes the sources it processes, because
+    /// their rows can be runnable for a moment, for example while the paired video of an uploaded photo uploads.
+    func claimRunnable(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry]
     /// Rows currently in `state` whose `updatedAt` is older than `updatedBefore`, oldest first.
     /// The runner uses this to find parked `blockedByDraft` rows whose re-check backoff elapsed.
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
@@ -277,6 +307,16 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// is user intent, not a terminal backup failure.
     @discardableResult
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool
+    /// Removes a resolver-reported missing source and durably requests another catalog reconciliation.
+    @discardableResult
+    func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool
+    /// Monotonic count of missing Photo Library sources removed from this queue. Nil means a failed read.
+    func missingSourceDiscardGeneration() -> Int64?
+    /// Sources with any queue row, across resources and revisions. Nil means a failed read.
+    func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>?
+    /// Inserts only sources without any queue row. Existing rows, including user decisions, stay untouched.
+    @discardableResult
+    func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool
     /// Removes the backed-up rows of every other revision of the source. An edit replaced its earlier upload, so a
     /// later return to an earlier revision, for example undoing the edit, must start as new work.
     @discardableResult
@@ -287,6 +327,9 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func removeUnsavedEarlierRevisions(
         of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
     ) -> Bool
+    /// Applies the same obsolete-revision rules to each successful entry in a scan batch.
+    @discardableResult
+    func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) -> Bool
     /// Removes every queued revision/resource for the supplied source identifiers. This is used by
     /// live catalog change delivery so a deletion also cancels work already claimed by the runner.
     @discardableResult
@@ -321,7 +364,27 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 }
 
 public extension UploadBackupSyncQueueStore {
+    func updateDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+    ) -> Bool? { nil }
+
     func isOperational() -> Bool { true }
+
+    func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        remove(source: source, revision: revision)
+    }
+
+    func missingSourceDiscardGeneration() -> Int64? { 0 }
+    func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? { nil }
+    func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool { false }
+
+    func nextRunnableDate() -> Date? {
+        nextRunnableDate(excludingSourcesOf: [])
+    }
+
+    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+        claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
+    }
 
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         entries.allSatisfy(upsert)
@@ -392,6 +455,7 @@ public extension UploadBackupSyncQueueStore {
             .needsRemoteReconciliation,
         ] {
             for entry in entries(in: state, updatedBefore: .distantFuture, limit: .max) {
+                guard !entry.isDismissedSourceRecheck else { continue }
                 let target: UploadBackupSyncQueueState =
                     switch state {
                     case .failed, .blockedByDraft: .discovered
@@ -422,6 +486,16 @@ public extension UploadBackupSyncQueueStore {
         of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
     ) -> Bool {
         true
+    }
+
+    func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        for entry in entries {
+            guard removeUnsavedEarlierRevisions(of: entry.source, through: entry.revision, except: entry.revision)
+            else {
+                return false
+            }
+        }
+        return true
     }
 
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int { 0 }

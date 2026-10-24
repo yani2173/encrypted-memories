@@ -1,1 +1,1 @@
-Please test sign-in, the photo timeline, albums, backup, search, and optional tips on every platform available to you. Report the app version, build number, device, OS version, and exact reproduction steps with each issue.
+Please test sign-in, the photo timeline, albums, backup, Duplicates, search, the Privacy settings, and optional tips on every platform available to you. Report the app version, build number, device, OS version, and exact reproduction steps with each issue.

@@ -67,7 +67,7 @@ public struct AlbumNodeIdentifier: Hashable, Sendable, Codable {
     }
 }
 
-/// App-owned mirror of the SDK 0.29.1 `MemberRole`. Core never imports SDK types.
+/// App-owned mirror of the SDK 0.31.1 `MemberRole`. Core never imports SDK types.
 public enum SharedAlbumRole: Sendable, Equatable, CaseIterable {
     /// Access comes from an ancestor node. The node itself is not shared directly with the user,
     /// so the effective level is unknown here and the app treats it as read-only.
@@ -288,7 +288,7 @@ public struct AlbumCapabilities: Sendable, Equatable {
         canSetCover: false
     )
 
-    /// SDK reads plus the narrow direct-HTTP write surface that SDK 0.29.1 cannot replace.
+    /// SDK reads plus the narrow direct-HTTP write surface that SDK 0.31.1 cannot replace.
     /// The HTTP writes resolve the account's own Photos share, volume and root key, so they address
     /// only owned albums. `canWriteSharedAlbums` therefore stays false.
     public static let sdkCatalogWithHTTPWrites = AlbumCapabilities(

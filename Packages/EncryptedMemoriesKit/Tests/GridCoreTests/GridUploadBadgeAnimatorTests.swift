@@ -153,5 +153,57 @@ import Testing
         )
         #expect(GridUploadBadgeGlyph(.done) == .check(GridUploadBadgeGlyph.checkSteps))
         #expect(GridUploadBadgeGlyph(.notBackedUp).symbolName == "icloud.slash")
+        #expect(GridUploadBadgeGlyph(.paused) == .paused)
+        #expect(GridUploadBadgeGlyph(.paused).symbolName == nil, "the pause bars are drawn, not a symbol")
+    }
+
+    @Test func pausedCircleSwapsItsGlyphWithoutFadingInAgain() {
+        let animator = GridUploadBadgeAnimator<Int>()
+        _ = animator.frame(for: 1, target: .uploading(step: 10), now: 0)
+        _ = animator.frame(for: 1, target: .uploading(step: 10), now: 1)
+
+        let paused = animator.frame(for: 1, target: .paused, now: 1.01)
+        #expect(paused?.glyph == .paused)
+        #expect(paused?.alpha == 1, "the person sees the circle turn into the pause symbol, not a new badge")
+        #expect(!animator.isAnimating([1], now: 1.01), "a paused badge needs no frames")
+
+        let resumed = animator.frame(for: 1, target: .uploading(step: 10), now: 2)
+        #expect(resumed?.alpha == 1)
+        #expect(pieStep(resumed) == GridUploadBadgeGlyph.pieSteps / 2, "the circle keeps its fill after resume")
+    }
+
+    @Test func pausedBadgeOfANewPhotoFadesInAndOut() {
+        let animator = GridUploadBadgeAnimator<Int>()
+        #expect(animator.frame(for: 1, target: .paused, now: 0)?.glyph == .paused)
+        #expect(animator.isAnimating([1], now: 0.05))
+        #expect(animator.frame(for: 1, target: .paused, now: 1)?.alpha == 1)
+        #expect(animator.frame(for: 1, target: nil, now: 2)?.glyph == .paused, "the badge fades instead of vanishing")
+        #expect(animator.frame(for: 1, target: nil, now: 3) == nil)
+    }
+
+    @Test func anUploadThatFinishesDuringThePauseFillsTheCircleBeforeItsCheckmark() {
+        let animator = GridUploadBadgeAnimator<Int>()
+        _ = animator.frame(for: 1, target: .uploading(step: 10), now: 0)
+        _ = animator.frame(for: 1, target: .uploading(step: 10), now: 1)
+        #expect(animator.frame(for: 1, target: .paused, now: 1.01)?.glyph == .paused)
+
+        var pies: [Int] = []
+        var sawCheck = false
+        var t = 2.0
+        while t < 4 {
+            let frame = animator.frame(for: 1, target: .done, now: t)
+            if let step = pieStep(frame) {
+                #expect(!sawCheck, "the circle never comes back after the checkmark")
+                pies.append(step)
+            } else if case .check? = frame?.glyph {
+                sawCheck = true
+            }
+            t += 1.0 / 60
+        }
+        #expect((pies.first ?? .max) < GridUploadBadgeGlyph.pieSteps * 3 / 4, "no instant full disc")
+        #expect(pies.count > 1, "the circle fills over several frames")
+        #expect(pies == pies.sorted(), "the circle never empties while it fills")
+        #expect((pies.last ?? 0) >= GridUploadBadgeGlyph.pieSteps - 2, "the circle fills before the checkmark")
+        #expect(sawCheck)
     }
 }

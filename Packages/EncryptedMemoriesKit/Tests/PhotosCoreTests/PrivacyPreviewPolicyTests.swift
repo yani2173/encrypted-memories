@@ -3,19 +3,19 @@ import PhotosCore
 import XCTest
 
 final class PrivacyPreviewPolicyTests: XCTestCase {
-    func testPreviewCoverRequiresOptInAndInactiveScene() {
+    func testPreviewCoverRequiresEnabledPreferenceAndInactiveScene() {
         XCTAssertFalse(PrivacyPreviewPolicy.shouldCover(enabled: false, isSceneActive: false, isWindowVisible: true))
         XCTAssertFalse(PrivacyPreviewPolicy.shouldCover(enabled: true, isSceneActive: true, isWindowVisible: true))
         XCTAssertTrue(PrivacyPreviewPolicy.shouldCover(enabled: true, isSceneActive: false, isWindowVisible: true))
         XCTAssertTrue(PrivacyPreviewPolicy.shouldCover(enabled: true, isSceneActive: true, isWindowVisible: false))
     }
 
-    func testPreviewCoverDefaultsOffAndReadsSavedPreference() throws {
+    func testPreviewCoverDefaultsOnAndReadsSavedPreference() throws {
         let suiteName = "PrivacyPreviewPolicyTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        XCTAssertFalse(PrivacyPreviewPolicy.isEnabled(defaults: defaults))
+        XCTAssertTrue(PrivacyPreviewPolicy.isEnabled(defaults: defaults))
         defaults.set(true, forKey: AppSettingsKey.blurAppPreview)
         XCTAssertTrue(PrivacyPreviewPolicy.isEnabled(defaults: defaults))
         defaults.set(false, forKey: AppSettingsKey.blurAppPreview)

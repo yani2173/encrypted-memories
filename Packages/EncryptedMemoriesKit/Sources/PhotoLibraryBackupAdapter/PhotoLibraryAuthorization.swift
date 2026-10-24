@@ -1,6 +1,10 @@
 import Foundation
 import Photos
 
+#if ENCRYPTED_MEMORIES_UPGRADE_TEST
+    import PhotosCore
+#endif
+
 /// Platform-neutral projection of PhotoKit's read-write authorization state.
 public enum PhotoBackupAccessState: String, Sendable, Equatable {
     case notDetermined
@@ -16,13 +20,19 @@ public enum PhotoBackupAccessState: String, Sendable, Equatable {
 
 public enum PhotoLibraryAuthorization {
     public static func currentState() -> PhotoBackupAccessState {
-        state(from: PHPhotoLibrary.authorizationStatus(for: .readWrite))
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested { return .full }
+        #endif
+        return state(from: PHPhotoLibrary.authorizationStatus(for: .readWrite))
     }
 
     /// Requests read-write access. Call only from an explicit user action (enabling backup) -
     /// never at launch.
     public static func request() async -> PhotoBackupAccessState {
-        state(from: await PHPhotoLibrary.requestAuthorization(for: .readWrite))
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested { return .full }
+        #endif
+        return state(from: await PHPhotoLibrary.requestAuthorization(for: .readWrite))
     }
 
     private static func state(from status: PHAuthorizationStatus) -> PhotoBackupAccessState {

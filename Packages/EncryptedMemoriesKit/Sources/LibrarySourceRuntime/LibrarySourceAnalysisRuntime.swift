@@ -263,6 +263,12 @@ public actor LibrarySourceAnalysisRuntime {
             return
         }
 
+        await stopRefreshWork()
+    }
+
+    /// Stops the running refresh and both retry owners and waits until they have finished.
+    /// Shared by the inactive and the shutdown path; each caller keeps its own steps around it.
+    private func stopRefreshWork() async {
         refreshGeneration &+= 1
         let activeRefresh = refreshTask
         let refreshRetry = refreshRetryTask
@@ -470,21 +476,7 @@ public actor LibrarySourceAnalysisRuntime {
         isActive = false
         let startup = startupTask
         startup?.cancel()
-        refreshGeneration &+= 1
-        let activeRefresh = refreshTask
-        let refreshRetry = refreshRetryTask
-        let reconciliationRetry = reconciliationRetryTask
-        activeRefresh?.cancel()
-        refreshRequestedWhileActive = false
-        refreshHasEnteredCoordinator = false
-        cancelRefreshRetry()
-        cancelReconciliationRetry()
-        await coordinator.cancelRefresh()
-        _ = await activeRefresh?.value
-        await refreshRetry?.value
-        await reconciliationRetry?.value
-        await waitForRetryDrain()
-        refreshTask = nil
+        await stopRefreshWork()
         _ = await startup?.value
         await waitForPrimaryInventoryDrain()
         await waitForApplyDrain()

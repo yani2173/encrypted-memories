@@ -14,43 +14,20 @@ import SQLite3
 public final class AlbumSyncMappingStore: @unchecked Sendable {
     public static let databaseFileName = "album-sync-mapping-v1.sqlite"
 
-    private var db: OpaquePointer?
-    private var operationFailed = false
-    private let lock = NSLock()
+    private let connection: SQLiteStoreConnection
+    private var db: OpaquePointer? { connection.database }
     private static let schemaVersion = 1
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
-        db = handle
+        connection = SQLiteStoreConnection(database: handle)
     }
 
     deinit { close() }
 
-    public func isOperational() -> Bool {
-        lock.withLock {
-            guard db != nil, !operationFailed else { return false }
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT 1;", -1, &stmt, nil) == SQLITE_OK else {
-                operationFailed = true
-                return false
-            }
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_step(stmt) == SQLITE_ROW else {
-                operationFailed = true
-                return false
-            }
-            return true
-        }
-    }
+    public func isOperational() -> Bool { connection.isOperational() }
 
-    public func close() {
-        lock.withLock {
-            guard db != nil else { return }
-            sqlite3_exec(db, "PRAGMA optimize;", nil, nil, nil)
-            sqlite3_close(db)
-            db = nil
-        }
-    }
+    public func close() { connection.close() }
 
     // MARK: Open / schema
 
@@ -117,10 +94,10 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
     // MARK: API
 
     public func mapping(localAlbumID: String) -> AlbumSyncMapping? {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "SELECT local_album_id, remote_album_id, title, mode, created_at, last_synced_at, last_attached, last_failed "
@@ -132,8 +109,8 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
             sqlite3_bind_text(stmt, 1, localAlbumID, -1, Self.transient)
             let result = sqlite3_step(stmt)
             if result == SQLITE_DONE { return nil }
-            guard requireOperational(result == SQLITE_ROW), let mapping = Self.rowToMapping(stmt) else {
-                operationFailed = true
+            guard connection.requireOperational(result == SQLITE_ROW), let mapping = Self.rowToMapping(stmt) else {
+                connection.markFailed()
                 return nil
             }
             return mapping
@@ -141,10 +118,10 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
     }
 
     public func allMappings() -> [AlbumSyncMapping] {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "SELECT local_album_id, remote_album_id, title, mode, created_at, last_synced_at, last_attached, last_failed "
@@ -157,23 +134,23 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
                 guard let mapping = Self.rowToMapping(stmt) else {
-                    operationFailed = true
+                    connection.markFailed()
                     return []
                 }
                 result.append(mapping)
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else { return [] }
             return result
         }
     }
 
     @discardableResult
     public func upsert(_ mapping: AlbumSyncMapping) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -201,23 +178,23 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
             }
             sqlite3_bind_int64(stmt, 7, Int64(mapping.lastAttachedCount))
             sqlite3_bind_int64(stmt, 8, Int64(mapping.lastFailedCount))
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }
 
     @discardableResult
     public func removeMapping(localAlbumID: String) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(db, "DELETE FROM album_sync_mapping WHERE local_album_id=?;", -1, &stmt, nil)
                         == SQLITE_OK
                 )
             else { return false }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_text(stmt, 1, localAlbumID, -1, Self.transient)
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }
 
@@ -226,10 +203,10 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
     /// Deselecting an album removes only the selection row. The album mapping stays, so
     /// re-selecting later reuses the same Proton album without a name-conflict round.
     public func selections() -> [AlbumSyncSelection] {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "SELECT local_album_id, title, added_at FROM album_sync_selection ORDER BY title;",
@@ -243,7 +220,7 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
                 guard let id = sqlite3_column_text(stmt, 0).map({ String(cString: $0) }),
                     let title = sqlite3_column_text(stmt, 1).map({ String(cString: $0) })
                 else {
-                    operationFailed = true
+                    connection.markFailed()
                     return []
                 }
                 result.append(
@@ -254,17 +231,17 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
                     ))
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else { return [] }
             return result
         }
     }
 
     @discardableResult
     public func addSelection(_ selection: AlbumSyncSelection) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "INSERT INTO album_sync_selection(local_album_id, title, added_at) VALUES (?,?,?) "
@@ -276,23 +253,23 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
             sqlite3_bind_text(stmt, 1, selection.localAlbumID, -1, Self.transient)
             sqlite3_bind_text(stmt, 2, selection.title, -1, Self.transient)
             sqlite3_bind_double(stmt, 3, selection.addedAt.timeIntervalSinceReferenceDate)
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }
 
     @discardableResult
     public func removeSelection(localAlbumID: String) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(db, "DELETE FROM album_sync_selection WHERE local_album_id=?;", -1, &stmt, nil)
                         == SQLITE_OK
                 )
             else { return false }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_text(stmt, 1, localAlbumID, -1, Self.transient)
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }
 
@@ -323,11 +300,5 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
             lastAttachedCount: Int(sqlite3_column_int64(stmt, 6)),
             lastFailedCount: Int(sqlite3_column_int64(stmt, 7))
         )
-    }
-
-    @discardableResult
-    private func requireOperational(_ condition: Bool) -> Bool {
-        if !condition { operationFailed = true }
-        return condition
     }
 }

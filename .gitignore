@@ -21,7 +21,7 @@ xcuserdata/
 # Generated Xcode project (regenerated from project.yml via xcodegen)
 EncryptedMemories.xcodeproj/
 
-# Vendored SDK clone (re-clone via: git clone --branch 0.29.1 https://github.com/ProtonDriveApps/sdk-swift Vendor/sdk-swift)
+# Vendored SDK clone (re-clone via: git clone --branch 0.31.1 https://github.com/ProtonDriveApps/sdk-swift Vendor/sdk-swift)
 Vendor/
 
 # macOS

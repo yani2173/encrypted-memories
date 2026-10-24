@@ -609,30 +609,32 @@ private func waitUntil(timeout: Duration = .seconds(5), _ condition: @MainActor 
         #expect(await reloadedIndex.scanProgress.total == 0)
     }
 
-    @Test func checkpointPersistenceAppendsDeltasBeforeBoundedCompaction() async throws {
-        let dir = tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = PhotoLocationStore(directory: dir, journalCompactionThresholdBytes: Int.max)
-        store.configure(accountUID: "acct", key: SymmetricKey(size: .bits256))
-        let index = await PhotoLocationIndex()
-        let crawl = LocationCrawl(throttle: .zero, mergeEvery: 1, saveEvery: 1)
-        let uids = (0..<8).map { uid("p\($0)") }
+    #if DEBUG
+        @Test func checkpointPersistenceAppendsDeltasBeforeBoundedCompaction() async throws {
+            let dir = tempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = PhotoLocationStore(directory: dir, journalCompactionThresholdBytes: Int.max)
+            store.configure(accountUID: "acct", key: SymmetricKey(size: .bits256))
+            let index = await PhotoLocationIndex()
+            let crawl = LocationCrawl(throttle: .zero, mergeEvery: 1, saveEvery: 1)
+            let uids = (0..<8).map { uid("p\($0)") }
 
-        await crawl.start(
-            uids: uids,
-            captureDates: [:],
-            location: { value in
-                .found(latitude: 47.0, longitude: Double(String(value.nodeID.dropFirst(1)))! / 10)
-            },
-            index: index,
-            store: store
-        )
-        try await waitUntil { await index.scanProgress.phase == .completed }
+            await crawl.start(
+                uids: uids,
+                captureDates: [:],
+                location: { value in
+                    .found(latitude: 47.0, longitude: Double(String(value.nodeID.dropFirst(1)))! / 10)
+                },
+                index: index,
+                store: store
+            )
+            try await waitUntil { await index.scanProgress.phase == .completed }
 
-        #expect(store.persistenceMetrics().baseRewrites == 1)
-        #expect(store.persistenceMetrics().journalAppends == uids.count - 1)
-        #expect(store.load().count == uids.count)
-    }
+            #expect(store.persistenceMetrics().baseRewrites == 1)
+            #expect(store.persistenceMetrics().journalAppends == uids.count - 1)
+            #expect(store.load().count == uids.count)
+        }
+    #endif
 
     @Test func incompleteJournalTailIsRepairedBeforeTheNextDelta() async throws {
         let dir = tempDir()

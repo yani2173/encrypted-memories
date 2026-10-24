@@ -270,11 +270,7 @@ public struct SmartSearchSettingsSection: View {
             ActivityProgressRow(
                 title: status, detail: presentation.detailText, fraction: presentation.progressFraction)
             if presentation.canRetry {
-                Button {
-                    controller.retry()
-                } label: {
-                    Label(L10n.string("action.retry"), systemImage: "arrow.clockwise")
-                }
+                RetryButton(.compact) { controller.retry() }
             }
         }
     }
@@ -291,11 +287,7 @@ public struct SmartSearchSettingsSection: View {
         }
 
         if presentation.canRetry {
-            Button {
-                controller.retry()
-            } label: {
-                Label(L10n.string("action.retry"), systemImage: "arrow.clockwise")
-            }
+            RetryButton(.compact) { controller.retry() }
         }
     }
 
@@ -320,8 +312,7 @@ public struct SmartSearchSettingsSection: View {
                 }
             }
 
-            ProgressView(value: presentation.progressFraction ?? 0)
-                .progressViewStyle(.linear)
+            ActivityProgressBar(fraction: presentation.progressFraction ?? 0)
                 .opacity(presentation.progressFraction == nil ? 0 : 1)
                 .accessibilityHidden(presentation.progressFraction == nil)
         }

@@ -432,26 +432,19 @@ extension TimelineSearchDiscovery {
     public static func placeCandidates(
         coordinates: [PhotoCoordinate],
         limit: Int = 10,
-        minimumCount: Int = 6
+        minimumCount: Int = 6,
+        evidence: PhotoPlaceEvidence? = nil
     ) -> [TimelineSearchPlaceCandidate] {
+        let coordinates = evidence?.coordinates ?? coordinates
         guard !coordinates.isEmpty else { return [] }
-        struct Cell: Hashable {
-            let lat: Int
-            let lon: Int
-        }
-        let cellDegrees = 0.05
-        var cells: [Cell: [PhotoCoordinate]] = [:]
+        var cells: [PhotoPlaceEvidence.Cell: [PhotoCoordinate]] = [:]
+        let excluded = (evidence ?? PhotoPlaceEvidence(coordinates: coordinates)).excludedPositions()
         for coordinate in coordinates {
             guard !Task.isCancelled else { return [] }
-            guard coordinate.latitude.isFinite, coordinate.longitude.isFinite,
-                abs(coordinate.latitude) <= 90, abs(coordinate.longitude) <= 180,
-                !(coordinate.latitude == 0 && coordinate.longitude == 0)
-            else { continue }
-            let lonScale = max(0.2, cos(coordinate.latitude * .pi / 180))
-            let cell = Cell(
-                lat: Int((coordinate.latitude / cellDegrees).rounded(.down)),
-                lon: Int((coordinate.longitude * lonScale / cellDegrees).rounded(.down))
-            )
+            guard PhotoPlaceEvidence.isValid(coordinate), !excluded.contains(PhotoExactPosition(coordinate)) else {
+                continue
+            }
+            let cell = PhotoPlaceEvidence.Cell(coordinate)
             cells[cell, default: []].append(coordinate)
         }
         let geotaggedCount = cells.values.reduce(0) { $0 + $1.count }
@@ -462,7 +455,7 @@ extension TimelineSearchDiscovery {
             let longitude = members.reduce(0) { $0 + $1.longitude } / Double(members.count)
             let sorted = members.sorted { $0.date < $1.date }
             return TimelineSearchPlaceCandidate(
-                id: "\(cell.lat):\(cell.lon)",
+                id: "\(cell.latitude):\(cell.longitude)",
                 latitude: latitude,
                 longitude: longitude,
                 uids: sorted.map(\.uid),

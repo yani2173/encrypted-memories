@@ -1,6 +1,7 @@
 import Foundation
 import MapKit
 import MediaLocationCore
+import Observation
 import PhotosCore
 import QuartzCore
 
@@ -88,12 +89,22 @@ public final class PhotoMapAnnotationLoader {
     private var annotationByCellID: [PhotoLocationCellID: PhotoMapAnnotation] = [:]
     private var annotationByUID: [PhotoUID: PhotoMapAnnotation] = [:]
     private var lastRevision = Int.min
+    private var lastQueryRevision = Int.min
+    private var lastScanPhase = PhotoLocationScanProgress.Phase.idle
     private var didFrame = false
+    private var frameTask: Task<Void, Never>?
+    private var framingRevision: Int?
     private var lastPlan: PhotoLocationAggregationPlan?
     private var lastViewportSize: PhotoLocationViewportSize?
     private var resizeTransitionDeadline: CFTimeInterval = 0
     private var reloadGeneration = 0
     private var reloadTask: Task<Void, Never>?
+
+    #if DEBUG
+        var beforeFramingForTesting: (@Sendable () async -> Void)?
+        func waitForFramingForTesting() async { await frameTask?.value }
+        func waitForReloadForTesting() async { await reloadTask?.value }
+    #endif
 
     private let onRemoved: (Set<PhotoUID>) -> Void
 
@@ -107,20 +118,43 @@ public final class PhotoMapAnnotationLoader {
         self.onRemoved = onRemoved
     }
 
-    deinit { reloadTask?.cancel() }
+    deinit {
+        reloadTask?.cancel()
+        frameTask?.cancel()
+    }
 
     public func attach(_ mapView: MKMapView) {
         self.mapView = mapView
+        observeScanProgress()
         frameToDenseCoreIfNeeded()
         DispatchQueue.main.async { [weak self] in self?.reloadVisible() }
     }
 
     public func refreshIfChanged(revision: Int) {
-        guard revision != lastRevision else { return }
+        let query = index.querySnapshot()
+        let phase = index.scanProgress.phase
+        guard revision != lastRevision || phase != lastScanPhase || query.revision != lastQueryRevision else { return }
+        lastScanPhase = phase
         lastRevision = revision
-        lastPlan = nil
         frameToDenseCoreIfNeeded()
         reloadVisible()
+    }
+
+    private var workerPriority: TaskPriority {
+        .userInitiated
+    }
+
+    private func observeScanProgress() {
+        withObservationTracking {
+            _ = index.scanProgress.phase
+            _ = index.placeRevision
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.observeScanProgress()
+                self.refreshIfChanged(revision: self.index.revision)
+            }
+        }
     }
 
     public func annotation(for uid: PhotoUID) -> PhotoMapAnnotation? { annotationByUID[uid] }
@@ -129,8 +163,12 @@ public final class PhotoMapAnnotationLoader {
     public nonisolated static let framingPadding: CGFloat = 80
 
     /// The map area around the dense core of `coordinates`, which the map shows when it opens.
-    public nonisolated static func denseCoreMapRect(for coordinates: [PhotoCoordinate]) -> MKMapRect? {
-        guard let box = PhotoLocationFraming.denseBoundingBox(for: coordinates) else { return nil }
+    public nonisolated static func denseCoreMapRect(
+        for coordinates: [PhotoCoordinate], excluding positions: Set<PhotoExactPosition> = []
+    ) -> MKMapRect? {
+        guard let box = PhotoLocationFraming.denseBoundingBox(for: coordinates, excluding: positions) else {
+            return nil
+        }
         let a = MKMapPoint(CLLocationCoordinate2D(latitude: box.minLatitude, longitude: box.minLongitude))
         let b = MKMapPoint(CLLocationCoordinate2D(latitude: box.maxLatitude, longitude: box.maxLongitude))
         let rect = MKMapRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
@@ -138,9 +176,44 @@ public final class PhotoMapAnnotationLoader {
     }
 
     public func frameToDenseCoreIfNeeded() {
-        guard !didFrame, let mapView, !index.coordinates.isEmpty,
-            let rect = Self.denseCoreMapRect(for: index.coordinates)
+        guard !didFrame, mapView != nil else { return }
+        let query = index.querySnapshot()
+        guard framingRevision != query.revision else { return }
+        let revision = query.revision
+        let sourceGeneration = query.generation
+        framingRevision = revision
+        let evidence = query.evidence
+        frameTask?.cancel()
+        #if DEBUG
+            let beforeFraming = beforeFramingForTesting
+        #endif
+        frameTask = Task.detached(priority: workerPriority) { [weak self] in
+            guard await evidence.waitForWarming() else { return }
+            guard !Task.isCancelled else { return }
+            let excluded = evidence.excludedPositions()
+            guard !Task.isCancelled else { return }
+            #if DEBUG
+                await beforeFraming?()
+            #endif
+            let rect = Self.denseCoreMapRect(for: evidence.coordinates, excluding: excluded)
+            guard !Task.isCancelled else { return }
+            await self?.applyFraming(rect, revision: revision, sourceGeneration: sourceGeneration, query: query)
+        }
+    }
+
+    private func applyFraming(
+        _ rect: MKMapRect?, revision: Int, sourceGeneration: Int, query: PhotoLocationQuerySnapshot
+    ) {
+        // An admitted crawl snapshot may finish while more batches arrive. Replacements and removals retire it.
+        guard index.coordinateGeneration == sourceGeneration, framingRevision == revision,
+            index.revision == revision || index.scanProgress.phase == .scanning,
+            !didFrame, let mapView
         else { return }
+        frameTask = nil
+        guard let rect else {
+            reloadVisible(query: query, revision: revision, sourceGeneration: sourceGeneration)
+            return
+        }
         let inset = Self.framingPadding
         #if canImport(UIKit)
             let padding = UIEdgeInsets(top: inset, left: inset, bottom: inset, right: inset)
@@ -149,12 +222,27 @@ public final class PhotoMapAnnotationLoader {
         #endif
         mapView.setVisibleMapRect(rect, edgePadding: padding, animated: false)
         didFrame = true
+        reloadVisible(query: query, revision: revision, sourceGeneration: sourceGeneration)
     }
 
     /// Snapshot the value-type index on the main actor, then filter and aggregate in the cancellable
     /// detached task. Only the small annotation delta returns to the main actor.
     public func reloadVisible() {
+        guard didFrame || frameTask == nil else { return }
+        let query = index.querySnapshot()
+        if !didFrame, framingRevision != query.revision {
+            frameToDenseCoreIfNeeded()
+            return
+        }
+        reloadVisible(query: query, revision: query.revision, sourceGeneration: query.generation)
+    }
+
+    private func reloadVisible(query: PhotoLocationQuerySnapshot, revision: Int, sourceGeneration: Int) {
         guard let mapView else { return }
+        if lastQueryRevision != revision {
+            lastQueryRevision = revision
+            lastPlan = nil
+        }
         let region = mapView.region
         let viewport = PhotoLocationViewport(
             centerLatitude: region.center.latitude,
@@ -178,7 +266,6 @@ public final class PhotoMapAnnotationLoader {
         else { return }
         lastPlan = plan
 
-        let query = index.querySnapshot()
         let policy = self.policy
         let currentCells = cellsByID
         let animateResizeTransition =
@@ -188,7 +275,9 @@ public final class PhotoMapAnnotationLoader {
         reloadGeneration &+= 1
         let generation = reloadGeneration
         reloadTask?.cancel()
-        reloadTask = Task.detached(priority: .userInitiated) { [weak self] in
+        reloadTask = Task.detached(priority: workerPriority) { [weak self] in
+            guard await query.evidence.waitForWarming() else { return }
+            guard !Task.isCancelled else { return }
             let coordinates = query.coordinates(in: plan.boundingBox)
             let cells = policy.aggregatedCoordinates(from: coordinates, using: plan)
             guard !Task.isCancelled else { return }
@@ -199,6 +288,7 @@ public final class PhotoMapAnnotationLoader {
                 diff: diff,
                 previousCells: currentCells,
                 generation: generation,
+                sourceGeneration: sourceGeneration,
                 animateResizeTransition: animateResizeTransition
             )
         }
@@ -209,9 +299,12 @@ public final class PhotoMapAnnotationLoader {
         diff: PhotoMapAnnotationDiff,
         previousCells: [PhotoLocationCellID: AggregatedCoordinate],
         generation: Int,
+        sourceGeneration: Int,
         animateResizeTransition: Bool
     ) {
-        guard generation == reloadGeneration, let mapView else { return }
+        guard generation == reloadGeneration, sourceGeneration == index.coordinateGeneration, let mapView else {
+            return
+        }
         let desiredCellByID = Dictionary(uniqueKeysWithValues: cells.map { ($0.cellID, $0) })
 
         if !diff.removedCellIDs.isEmpty {

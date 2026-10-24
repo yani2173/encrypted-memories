@@ -23,6 +23,9 @@ fi
 echo "[tests] Apple Vision SDK surface"
 python3 "$ROOT/scripts/verify-apple-vision-sdk-surface.py"
 
+echo "[tests] upgrade fixture release catalog"
+python3 "$ROOT/scripts/tests/test_upgrade_fixture_corpus.py"
+
 echo "[tests] EncryptedMemoriesKit"
 xcrun swift test \
   --package-path "$ROOT/Packages/EncryptedMemoriesKit" \

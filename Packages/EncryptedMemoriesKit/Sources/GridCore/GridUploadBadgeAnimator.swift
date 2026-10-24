@@ -12,6 +12,8 @@ package enum GridUploadBadgeGlyph: Equatable, Hashable, Sendable {
     case check(Int)
     case attention
     case notBackedUp
+    /// The empty circle with two vertical bars.
+    case paused
 
     /// The SF Symbol a host draws on the badge, when the badge carries one.
     package var symbolName: String? {
@@ -26,6 +28,7 @@ package enum GridUploadBadgeGlyph: Equatable, Hashable, Sendable {
         case .done: self = .check(Self.checkSteps)
         case .attention: self = .attention
         case .notBackedUp: self = .notBackedUp
+        case .paused: self = .paused
         }
     }
 
@@ -54,7 +57,7 @@ enum GridUploadBadgeAnimatorMath {
         case .uploading(let step):
             Double(min(max(step, 0), GridUploadBadge.progressSteps)) / Double(GridUploadBadge.progressSteps)
         case .done: 1
-        case .waiting, .attention, .notBackedUp: 0
+        case .waiting, .attention, .notBackedUp, .paused: 0
         }
     }
 
@@ -96,7 +99,7 @@ package final class GridUploadBadgeAnimator<ID: Hashable> {
         case finished
         /// The badge went away before the checkmark: `glyph` fades out from `start`.
         case leaving(start: Double, glyph: GridUploadBadgeGlyph)
-        /// An attention or "not backed up" badge.
+        /// An attention, "not backed up", or paused badge.
         case fixed(GridUploadBadgeGlyph)
     }
 
@@ -186,12 +189,21 @@ package final class GridUploadBadgeAnimator<ID: Hashable> {
 
     private func advance(_ slot: inout State?, target: GridUploadBadge?, now: Double) -> GridUploadBadgeFrame? {
         guard let target else { return leave(&slot, now: now) }
+        switch target {
+        case .waiting, .uploading, .done:
+            // The backup resumed or the photo finished during the pause: the circle continues from its fill
+            // without a new fade-in, and a finished photo fills it before its checkmark.
+            if slot?.phase == .fixed(.paused) { slot?.phase = .progress }
+        case .attention, .notBackedUp, .paused:
+            break
+        }
         var state: State
         switch target {
-        case .attention, .notBackedUp:
+        case .attention, .notBackedUp, .paused:
             let glyph = GridUploadBadgeGlyph(target)
-            if var current = slot, current.isFixed {
-                current.phase = .fixed(glyph)  // Another fixed glyph: no new fade-in.
+            if var current = slot, current.isFixed || (target == .paused && current.phase == .progress) {
+                // Another fixed glyph, or a circle the person paused: no new fade-in.
+                current.phase = .fixed(glyph)
                 state = current
             } else {
                 state = State(

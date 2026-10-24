@@ -67,7 +67,8 @@ import Testing
         do {
             let source = Wrapped(1)
             releasedSource = source
-            #expect(cache.setPaired(Wrapped(10), forKey: "photo", cost: 10, source: source))
+            let ticket = cache.captureTicket()
+            #expect(cache.setPaired(Wrapped(10), forKey: "photo", cost: 10, source: source, ticket: ticket))
         }
         #expect(releasedSource != nil)
 

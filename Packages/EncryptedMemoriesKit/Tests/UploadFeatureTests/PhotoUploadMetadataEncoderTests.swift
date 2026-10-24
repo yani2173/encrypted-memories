@@ -1,6 +1,11 @@
+import CoreLocation
 import Foundation
+import PhotosCore
+import ProtonDriveSDK
 import XCTest
 
+@testable import PhotoLibraryBackupAdapter
+@testable import ProtonDriveBackend
 @testable import UploadCore
 
 final class PhotoUploadMetadataEncoderTests: XCTestCase {
@@ -23,6 +28,48 @@ final class PhotoUploadMetadataEncoderTests: XCTestCase {
         XCTAssertNil(try json(metadata[2])["Duration"])
         XCTAssertEqual(try json(metadata[3])["ICloudID"] as? String, "cloud-id")
         XCTAssertEqual(try json(metadata[3])["ModificationTime"] as? String, "2026-07-05T10:01:00.000Z")
+    }
+
+    func testLocationRoundTripPreservesCoordinateOrder() throws {
+        for (latitude, longitude) in [(12.25, -45.5), (-62.5, 131.25)] {
+            let source = CLLocation(latitude: latitude, longitude: longitude)
+            let location = try XCTUnwrap(PhotoLibraryUploadMetadataBuilder.location(from: source))
+            let sections = try PhotoUploadMetadataEncoder.metadata(
+                location: location, camera: .init(captureTime: nil),
+                media: .init(width: nil, height: nil, duration: nil), iOSPhotos: nil)
+            let revision = FileRevision(
+                uid: SDKRevisionUid(volumeID: "test", nodeID: "photo", revisionID: "revision"),
+                state: .active, creationTime: 1, storageSize: 1, claimedSize: 1,
+                claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
+                claimedModificationTime: nil, thumbnails: [],
+                claimedAdditionalMetadata: sections.map {
+                    AdditionalMetadata(name: $0.name, utf8JsonValue: $0.utf8JsonValue)
+                }, contentAuthor: nil)
+            let decoded = SDKPhotoMetadataReader.metadata(
+                name: .success("photo.jpg"), mimeType: "image/jpeg", revision: revision)
+            XCTAssertEqual(decoded.latitude, latitude)
+            XCTAssertEqual(decoded.longitude, longitude)
+        }
+    }
+
+    func testEqualCoordinatesEmitOnlyADiagnosticAndKeepBothValues() throws {
+        let diagnostics = PhotoDiagnostics()
+        for value in [12.25, -45.5, 0] {
+            let sections = try PhotoUploadMetadataEncoder.metadata(
+                location: .init(latitude: value, longitude: value), camera: .init(captureTime: nil),
+                media: .init(width: nil, height: nil, duration: nil), iOSPhotos: nil, diagnostics: diagnostics)
+            XCTAssertEqual(try json(sections[0])["Latitude"] as? Double, value)
+            XCTAssertEqual(try json(sections[0])["Longitude"] as? Double, value)
+        }
+        XCTAssertEqual(diagnostics.counter("backup.metadata.equalCoordinates"), 3)
+        XCTAssertEqual(diagnostics.supportSnapshot().counters, ["backup.metadata.equalCoordinates": 3])
+        for location in [PhotoUploadMetadataEncoder.Location(latitude: 12.25, longitude: 45.5), nil] {
+            _ = try PhotoUploadMetadataEncoder.metadata(
+                location: location, camera: .init(captureTime: nil),
+                media: .init(width: nil, height: nil, duration: nil),
+                iOSPhotos: nil, diagnostics: diagnostics)
+        }
+        XCTAssertEqual(diagnostics.counter("backup.metadata.equalCoordinates"), 3)
     }
 
     func testApplyingIdentityPreservesAdditionalMetadata() {
@@ -51,6 +98,12 @@ final class PhotoUploadMetadataEncoderTests: XCTestCase {
         let applied = request.applying(identity: identity)
         XCTAssertEqual(applied.name, "photo-corrected.heic")
         XCTAssertEqual(applied.additionalMetadata, [metadata])
+        XCTAssertTrue(applied.allowsExpensiveNetwork, "uploads keep every network by default")
+
+        var wiFiOnly = request
+        wiFiOnly.allowsExpensiveNetwork = false
+        XCTAssertFalse(wiFiOnly.applying(identity: identity).allowsExpensiveNetwork)
+        XCTAssertFalse(wiFiOnly.replacingExistingDraft(true).allowsExpensiveNetwork)
     }
 
     private func json(_ metadata: PhotoUploadAdditionalMetadata) throws -> [String: Any] {

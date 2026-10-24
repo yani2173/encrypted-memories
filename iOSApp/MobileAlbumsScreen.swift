@@ -52,7 +52,7 @@ struct MobileCollectionsScreen: View {
                 if let duplicates = model.duplicates {
                     Section(String(localized: "collections.section_utilities")) {
                         NavigationLink {
-                            MobileDuplicatesScreen(model: duplicates)
+                            MobileDuplicatesScreen(model: duplicates, feed: model.thumbnailFeed)
                         } label: {
                             MobileCollectionRow(systemImage: "square.on.square", title: L10n.string("duplicates.title"))
                         }
@@ -141,17 +141,16 @@ struct MobileCollectionsScreen: View {
 
     @ViewBuilder private var albumsSection: some View {
         if let coordinator = model.albumActions {
-            if coordinator.showsInitialAlbumLoadingPlaceholder {
+            if coordinator.showsAlbumLoadingPlaceholder {
                 HStack {
-                    ProgressView().controlSize(.small).tint(ProtonColor.primary)
+                    ProgressSpinner()
                     Text("collections.loading_albums").foregroundStyle(ProtonColor.textWeak)
                 }
             } else if let message = coordinator.loadErrorMessage, coordinator.albums.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("albums.load_failed").foregroundStyle(ProtonColor.textNorm)
                     Text(message).font(.caption).foregroundStyle(ProtonColor.textWeak)
-                    Button(String(localized: "action.try_again")) { Task { await loadAlbums() } }
-                        .font(.caption)
+                    RetryButton(.compact) { Task { await loadAlbums() } }
                 }
             } else if coordinator.albums.isEmpty {
                 Text("collections.empty_albums").foregroundStyle(ProtonColor.textWeak)
@@ -169,9 +168,9 @@ struct MobileCollectionsScreen: View {
 
     @ViewBuilder private var sharedAlbumsSection: some View {
         if let coordinator = model.albumActions {
-            if coordinator.showsInitialSharedAlbumLoadingPlaceholder {
+            if coordinator.showsSharedAlbumLoadingPlaceholder {
                 HStack {
-                    ProgressView().controlSize(.small).tint(ProtonColor.primary)
+                    ProgressSpinner()
                     Text(L10n.string("collections.loading_shared_albums"))
                         .foregroundStyle(ProtonColor.textWeak)
                 }
@@ -179,10 +178,7 @@ struct MobileCollectionsScreen: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(L10n.string("albums.shared_load_failed"))
                     Text(message).font(.caption).foregroundStyle(ProtonColor.textWeak)
-                    Button(L10n.string("action.retry")) {
-                        Task { await coordinator.refreshSharedAlbums() }
-                    }
-                    .font(.caption)
+                    RetryButton(.compact) { Task { await coordinator.refreshSharedAlbums() } }
                 }
             } else if coordinator.sharedAlbums.isEmpty {
                 Text(L10n.string("collections.empty_shared_albums"))
@@ -327,7 +323,7 @@ private struct MobileAlbumRow: View {
                 Text(album.title)
                     .font(.body.weight(.medium))
                     .foregroundStyle(ProtonColor.textNorm)
-                Text("albums.photo_count \(album.photoCount)")
+                Text(L10n.string("albums.photo_count \(album.photoCount)"))
                     .font(.caption)
                     .foregroundStyle(ProtonColor.textWeak)
             }
@@ -420,19 +416,11 @@ private struct MobileFilterGridScreen: View {
             } description: {
                 Text(message)
             } actions: {
-                Button(L10n.string("action.retry")) {
-                    Task { await load() }
-                }
-                .buttonStyle(.glassProminent)
+                RetryButton(.prominent) { Task { await load() } }
             }
         case .loaded:
             if isRouteEmpty {
-                let copy = filter.emptyStateCopy
-                ContentUnavailableView {
-                    Label(copy.title, systemImage: copy.systemImage)
-                } description: {
-                    Text(copy.description)
-                }
+                LibraryEmptyView(filter: filter)
             } else if let feed = model.thumbnailFeed {
                 UIKitTimelineGrid(
                     items: displayedItems,
@@ -538,7 +526,7 @@ private struct MobileFilterGridScreen: View {
                     restoreSelected()
                 } label: {
                     if isRestoring {
-                        ProgressView()
+                        ProgressSpinner()
                     } else {
                         Label(String(localized: "trash.restore_button"), systemImage: "arrow.uturn.backward")
                     }
@@ -586,7 +574,7 @@ private struct MobileFilterGridScreen: View {
         } else if case .album = filter {
             albumActionsMenu
         } else if filter == .trash, isEmptyingTrash {
-            ProgressView()
+            ProgressSpinner()
         } else if filter == .trash {
             Menu {
                 Button {

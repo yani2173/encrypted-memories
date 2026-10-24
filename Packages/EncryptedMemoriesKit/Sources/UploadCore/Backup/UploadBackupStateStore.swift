@@ -8,28 +8,21 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
     public static let databaseFileName = "upload-backup-state-v1.sqlite"
 
     private static let schemaVersion = 1
-    private var db: OpaquePointer?
-    private let lock = NSLock()
+    private let connection: SQLiteStoreConnection
+    private var db: OpaquePointer? { connection.database }
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
-        db = handle
+        connection = SQLiteStoreConnection(database: handle)
     }
 
     deinit { close() }
 
-    public func close() {
-        lock.withLock {
-            guard db != nil else { return }
-            sqlite3_exec(db, "PRAGMA optimize;", nil, nil, nil)
-            sqlite3_close(db)
-            db = nil
-        }
-    }
+    public func close() { connection.close() }
 
     public func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -59,7 +52,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
     }
 
     public func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -82,7 +75,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
 
     public func lookupBatch(_ snapshots: [UploadBackupAssetSnapshot]) -> [UploadBackupStateLookup] {
         guard !snapshots.isEmpty else { return [] }
-        return lock.withLock {
+        return connection.withLock {
             var recordStmt: OpaquePointer?
             var anyStmt: OpaquePointer?
             guard
@@ -166,7 +159,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
 
     @discardableResult
     public func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK else { return false }
             defer { sqlite3_finalize(stmt) }
@@ -177,7 +170,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
 
     @discardableResult
     public func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
-        lock.withLock {
+        connection.withLock {
             let kept = revisions.map(\.rawValue).sorted()
             let placeholders = Array(repeating: "?", count: kept.count).joined(separator: ",")
             let keepClause = kept.isEmpty ? "" : " AND revision_us NOT IN (\(placeholders))"
@@ -203,7 +196,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
     @discardableResult
     public func upsertBatch(_ records: [UploadBackupAssetRecord]) -> Bool {
         guard !records.isEmpty else { return true }
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK,
                 sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
@@ -230,7 +223,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
     }
 
     public func count() -> Int {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM backup_asset_state;", -1, &stmt, nil) == SQLITE_OK else {
                 return 0

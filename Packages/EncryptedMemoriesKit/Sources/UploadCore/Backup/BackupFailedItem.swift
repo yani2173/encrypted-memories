@@ -55,7 +55,10 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         let issue = record?.kind ?? Self.defaultIssue(for: entry.state)
         let waitingKey = record?.detail
         let waitsForOriginal = Self.isWaitingForOriginal(waitingKey)
-        let isSourceWait = issue == .unknown && (waitingKey == "error.upload_source_not_ready" || waitsForOriginal)
+        let waitsForPhotos = Self.isWaitingForPhotos(waitingKey)
+        let isSourceWait =
+            issue == .unknown
+            && (waitingKey == "error.upload_source_not_ready" || waitsForOriginal || waitsForPhotos)
         // A failed row is no longer planned by the app: whatever its cause, only the person's retry runs it again.
         let isManualRetry = entry.state == .failed && (issue.category == .automatic || issue == .unknown)
         let isPermanentState = entry.state == .sourceMissing || entry.state == .failedPermanent
@@ -75,7 +78,9 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         } else if isSourceWait {
             reason =
                 waitsForOriginal
-                ? L10n.string("backup.issue_waiting_original") : L10n.string("backup.issue_source_not_ready")
+                ? L10n.string("backup.issue_waiting_original")
+                : waitsForPhotos
+                    ? L10n.string("backup.issue_source_unavailable") : L10n.string("backup.issue_source_not_ready")
         } else if issue == .unknown && category == .automatic {
             reason = L10n.string("backup.issue_unknown_waiting")
         } else if isManualRetry && issue == .unknown {
@@ -99,6 +104,15 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         guard entry.state == .discovered || entry.state == .queuedForUpload || entry.state == .blockedByDraft
         else { return next }
         return min(next, entry.updatedAt)
+    }
+
+    /// The detail of a row whose file Photos cannot hand out yet (iCloud, an offline library volume, an interrupted
+    /// read), and of a row whose file Photos reports as missing. The runner counts the waits of each separately.
+    static let sourceUnavailableDetail = "backup.issue_source_unavailable"
+    static let sourceReportedMissingDetail = "backup.issue_source_unavailable.reported_missing"
+
+    static func isWaitingForPhotos(_ detail: String?) -> Bool {
+        detail == sourceUnavailableDetail || detail == sourceReportedMissingDetail
     }
 
     static func isWaitingForOriginal(_ detail: String?) -> Bool {

@@ -11,6 +11,7 @@ struct InfoPanelView: View {
         AppSettingsDefault.mapAndPlacesEnabled
     let item: PhotoItem
     let metadataLoadState: PhotoMetadataLoadState
+    let placeName: String?
     let albumTitles: [String]
     let canLoadAlbumMemberships: Bool
     let isLoadingAlbumMemberships: Bool
@@ -23,15 +24,7 @@ struct InfoPanelView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 captureSection
-                if let m = metadata, m.hasLocation {
-                    if mapAndPlacesEnabled {
-                        mapSection(m)
-                    } else if let latitude = m.latitude, let longitude = m.longitude {
-                        Text(PhotoCoordinateText.format(latitude: latitude, longitude: longitude))
-                            .monospacedDigit()
-                            .textSelection(.enabled)
-                    }
-                }
+                locationSection
                 fileSection
                 if canLoadAlbumMemberships {
                     albumSection
@@ -60,7 +53,33 @@ struct InfoPanelView: View {
         }
     }
 
-    @ViewBuilder private func mapSection(_ m: PhotoMetadata) -> some View {
+    @ViewBuilder private var locationSection: some View {
+        let location = ViewerInfoLocation(
+            metadata: metadata, placeName: placeName, mapAndPlacesEnabled: mapAndPlacesEnabled)
+        if let coordinates = location.coordinateText {
+            VStack(alignment: .leading, spacing: 10) {
+                if let placeName = location.placeName {
+                    Label(placeName, systemImage: "mappin.and.ellipse")
+                        .font(.headline)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if location.showsMap, let metadata, let mapLabel = location.mapAccessibilityLabel {
+                    mapSection(
+                        metadata, title: location.markerTitle, accessibilityLabel: mapLabel,
+                        identity: location.mapIdentity)
+                }
+                Text(coordinates)
+                    .font(mapAndPlacesEnabled ? .subheadline : .body)
+                    .monospacedDigit()
+                    .foregroundStyle(mapAndPlacesEnabled ? .secondary : .primary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    @ViewBuilder private func mapSection(
+        _ m: PhotoMetadata, title: String, accessibilityLabel: String, identity: String?
+    ) -> some View {
         let coord = CLLocationCoordinate2D(latitude: m.latitude!, longitude: m.longitude!)
         Map(
             initialPosition: .region(
@@ -69,11 +88,14 @@ struct InfoPanelView: View {
                     span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
                 ))
         ) {
-            Marker("", coordinate: coord)
+            Marker(title, coordinate: coord)
         }
+        .id(identity)
         .frame(height: 150)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .allowsHitTesting(false)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private var fileSection: some View {
@@ -94,7 +116,7 @@ struct InfoPanelView: View {
                 row(L10n.string("infopanel.type"), mime)
             }
             if metadataLoadState == .loading || metadataLoadState == .idle {
-                ProgressView()
+                ProgressSpinner(accessibilityLabel: L10n.string("infopanel.info"))
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.top, 8)
             } else if metadataLoadState == .failed {
@@ -103,7 +125,7 @@ struct InfoPanelView: View {
                 } description: {
                     Text(L10n.string("infopanel.load_failed_message"))
                 } actions: {
-                    Button(L10n.string("action.retry"), action: onRetry)
+                    RetryButton(.prominent, action: onRetry)
                 }
             }
         }
@@ -116,7 +138,7 @@ struct InfoPanelView: View {
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
             if isLoadingAlbumMemberships {
-                ProgressView().controlSize(.small)
+                ProgressSpinner(accessibilityLabel: L10n.string("infopanel.albums"))
             } else if albumMembershipsLoadFailed {
                 Label(L10n.string("infopanel.albums_load_failed"), systemImage: "exclamationmark.triangle")
                     .font(.caption)

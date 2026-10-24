@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import MediaLocationCore
 import PhotosCore
 import Testing
 import TimelineCore
@@ -7,6 +9,65 @@ import TimelineCore
 @testable import MLSearchFeature
 
 @MainActor @Suite struct SmartSearchDiscoverySchedulerTests {
+    /// The production retry delays scaled from seconds to milliseconds, for a test that exhausts the save budget.
+    private static let shortRetryDelays: [Duration] = [.milliseconds(1), .milliseconds(2), .milliseconds(4)]
+
+    #if DEBUG
+        @Test func crawlingSearchAndSupportShareBoundedClassifications() async throws {
+            let index = PhotoLocationIndex()
+            var time: TimeInterval = 0
+            index.nowForTesting = { time }
+            func points(_ range: Range<Int>) -> [PhotoCoordinate] {
+                range.map {
+                    PhotoCoordinate(
+                        uid: PhotoUID(volumeID: "test", nodeID: "search-crawl-\($0)"),
+                        latitude: 20, longitude: 30, date: Date(timeIntervalSince1970: 1_700_000_000))
+                }
+            }
+            index.replaceAll(points(0..<1000))
+            index.updateScanProgress(PhotoLocationScanProgress(phase: .scanning))
+            let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) {
+                _, _ in
+                "Test place"
+            }
+            defer { scheduler.reset() }
+            let items = points(0..<2050).map { PhotoItem(uid: $0.uid, captureTime: $0.date, mediaType: "image/jpeg") }
+            let sections = [TimelineSection(id: "all", date: items[0].captureTime, title: "", items: items)]
+            var analyzed: [ObjectIdentifier: PhotoPlaceEvidence] = [:]
+            func curate() async {
+                _ = index.placeEvidence()
+                await index.waitForPlaceEvidenceForTesting()
+                let evidence = index.placeEvidence()
+                analyzed[ObjectIdentifier(evidence)] = evidence
+                scheduler.update(
+                    sections: sections, timelineRevision: 1, favoriteUIDs: [], coordinates: index.coordinates,
+                    smartSearch: nil, placeRevision: index.placeRevision, locationEvidence: evidence)
+                await scheduler.waitForRefreshForTesting()
+            }
+            await curate()
+            for batch in 1...20 {
+                time = Double(batch)
+                index.merge(points((1000 + (batch - 1) * 50)..<(1000 + batch * 50)))
+                await curate()
+                let count = scheduler.discovery.forYou.filter { $0.kind == .place }.reduce(0) {
+                    $0 + ($1.matchCount ?? 0)
+                }
+                #expect(count == (batch < 10 ? 1000 : batch < 20 ? 1500 : 2000))
+            }
+            #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 3)
+            time = 40
+            index.merge(points(2000..<2050))
+            await curate()
+            let support = await index.photoPlaceSupportSnapshot()
+            #expect(support.first?.photoCount == 2000, "Support must share the last classified snapshot during a crawl")
+            #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 3)
+            index.updateScanProgress(PhotoLocationScanProgress(phase: .completed))
+            await curate()
+            #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 4)
+            #expect((await index.photoPlaceSupportSnapshot()).first?.photoCount == 2050)
+        }
+    #endif
+
     @Test(arguments: [
         "selection", "missingModel", "download", "modelFailure", "nativeFailure", "nativePartialFailure",
         "nativeOnlyFailure",
@@ -375,19 +436,19 @@ import TimelineCore
             latitude > 45 ? "Vienna" : "Rome"
         }
         defer { scheduler.reset() }
-        func apply(latitude: Double, coordinateRevision: Int) {
+        func apply(latitude: Double, placeRevision: Int) {
             scheduler.update(
                 sections: [TimelineSection(id: "all", date: Date(), title: "", items: items)],
                 timelineRevision: 1, favoriteUIDs: [],
                 coordinates: items.map {
                     PhotoCoordinate(uid: $0.uid, latitude: latitude, longitude: 16, date: $0.captureTime)
                 }, snapshot: .disabled, indexedAssetCount: { 0 }, searchEvidence: nil,
-                coordinateRevision: coordinateRevision)
+                placeRevision: placeRevision)
         }
-        apply(latitude: 48, coordinateRevision: 1)
+        apply(latitude: 48, placeRevision: 1)
         for _ in 0..<200 where !scheduler.discovery.lastRefreshCompleted { try await Task.sleep(for: .milliseconds(5)) }
         try #require(scheduler.discovery.forYou.contains { $0.title == "Vienna" })
-        apply(latitude: 42, coordinateRevision: 2)
+        apply(latitude: 42, placeRevision: 2)
         for _ in 0..<200 where !scheduler.discovery.forYou.contains(where: { $0.title == "Rome" }) {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -572,46 +633,49 @@ import TimelineCore
         }
     }
 
-    @Test func metadataRowsAreBuiltOncePerLibraryContent() async throws {
-        let probe = EvidenceProbe()
-        let cache = SnapshotCache()
-        let items = (0..<8).map {
-            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
-        }
-        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
-            await probe.placeName()
-        }
-        defer { scheduler.reset() }
-        // The saved fingerprint covers the content, so each step changes the content, not only a revision.
-        func apply(revision: UInt64, library: [PhotoItem], latitude: Double) {
-            scheduler.update(
-                sections: [TimelineSection(id: "all", date: Date(), title: "", items: library)],
-                timelineRevision: revision, favoriteUIDs: Set(items.map(\.uid)),
-                coordinates: library.map {
-                    PhotoCoordinate(uid: $0.uid, latitude: latitude, longitude: 16.3, date: $0.captureTime)
-                }, snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
-                searchEvidence: { await probe.query(sensitive: items[0].uid, conceptUIDs: items.map(\.uid)) },
-                cacheAccess: { await cache.access() }, coordinateRevision: Int(latitude))
-        }
-        func waitForSave(_ count: Int) async throws {
-            for _ in 0..<400 where await cache.saves < count || scheduler.isRefreshing {
-                try await Task.sleep(for: .milliseconds(5))
+    #if DEBUG
+        @Test func metadataRowsAreBuiltOncePerLibraryContent() async throws {
+            let probe = EvidenceProbe()
+            let cache = SnapshotCache()
+            let items = (0..<8).map {
+                PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
             }
-            try #require(await cache.saves == count)
+            let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) {
+                _, _ in
+                await probe.placeName()
+            }
+            defer { scheduler.reset() }
+            // The saved fingerprint covers the content, so each step changes the content, not only a revision.
+            func apply(revision: UInt64, library: [PhotoItem], latitude: Double) {
+                scheduler.update(
+                    sections: [TimelineSection(id: "all", date: Date(), title: "", items: library)],
+                    timelineRevision: revision, favoriteUIDs: Set(items.map(\.uid)),
+                    coordinates: library.map {
+                        PhotoCoordinate(uid: $0.uid, latitude: latitude, longitude: 16.3, date: $0.captureTime)
+                    }, snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+                    searchEvidence: { await probe.query(sensitive: items[0].uid, conceptUIDs: items.map(\.uid)) },
+                    cacheAccess: { await cache.access() }, placeRevision: Int(latitude))
+            }
+            func waitForSave(_ count: Int) async throws {
+                for _ in 0..<400 where await cache.saves < count || scheduler.isRefreshing {
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                try #require(await cache.saves == count)
+            }
+
+            apply(revision: 1, library: items, latitude: 48)
+            try await waitForSave(1)
+            #expect(scheduler.libraryRowBuildCount == 1, "the metadata pass and the full pass share one build")
+
+            apply(revision: 1, library: items, latitude: 47)
+            try await waitForSave(2)
+            #expect(scheduler.libraryRowBuildCount == 1, "a place change keeps the library rows")
+
+            apply(revision: 2, library: Array(items.dropLast()), latitude: 47)
+            try await waitForSave(3)
+            #expect(scheduler.libraryRowBuildCount == 2, "a library change builds new rows")
         }
-
-        apply(revision: 1, library: items, latitude: 48)
-        try await waitForSave(1)
-        #expect(scheduler.libraryRowBuildCount == 1, "the metadata pass and the full pass share one build")
-
-        apply(revision: 1, library: items, latitude: 47)
-        try await waitForSave(2)
-        #expect(scheduler.libraryRowBuildCount == 1, "a place change keeps the library rows")
-
-        apply(revision: 2, library: Array(items.dropLast()), latitude: 47)
-        try await waitForSave(3)
-        #expect(scheduler.libraryRowBuildCount == 2, "a library change builds new rows")
-    }
+    #endif
 
     @Test func lowPowerDefersCheckingSavedSuggestionsAgainstChangedContent() async throws {
         let probe = EvidenceProbe()
@@ -662,7 +726,7 @@ import TimelineCore
         #expect(store.save([item]).succeeded)
         #expect(store.updateDurations([item.uid: 42.75]).succeeded)
         #expect(store.save([item]).succeeded)
-        let restored = store.load()
+        let restored = try store.load()
         #expect(restored.first?.durationSeconds == 42.75)
         func fingerprint(_ items: [PhotoItem]) throws -> Data {
             try SmartSearchDiscoveryPersistence.fingerprint(
@@ -731,10 +795,9 @@ import TimelineCore
         }
         let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in nil }
         apply(first, revision: 50)
-        for _ in 0..<6_000 where !first.discovery.lastRefreshCompleted || first.isRefreshing {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        try #require(first.discovery.lastRefreshCompleted)
+        // The 50,000-photo pass takes minutes on a loaded machine; the limit only ends a hung test.
+        try await waitUntilHangLimit { first.discovery.lastRefreshCompleted && !first.isRefreshing }
+        try #require(first.discovery.lastRefreshCompleted && !first.isRefreshing)
         let expected = first.discovery.forYou
         try #require(expected.contains { !$0.representativeUIDs.isEmpty })
         first.reset()
@@ -750,9 +813,8 @@ import TimelineCore
             #expect(!relaunched.discovery.hasComputed)
             runtime.update { $0.memoryPressure = .normal }
         }
-        for _ in 0..<6_000 where !relaunched.discovery.hasComputed {
-            try await Task.sleep(for: .milliseconds(5))
-        }
+        try await waitUntilHangLimit { relaunched.discovery.hasComputed }
+        try #require(relaunched.discovery.hasComputed)
         #expect(
             relaunched.discovery.forYou == expected, "relaunch must preserve completed suggestions without inference")
         #expect(relaunched.discovery.computedContent?.timelineRevision == 1)
@@ -762,6 +824,135 @@ import TimelineCore
         #expect(bytes < 64 * 1_024 * 1_024)
         if itemCount == 50_000 {
             print("Suggestion cache fixture: assets=50000 bytes=\(bytes) restore=\(restoreStarted.duration(to: .now))")
+        }
+    }
+
+    @Test func placePolicyFingerprintKeepsTheExactSaltedDigest() throws {
+        struct Content: Encodable {
+            let items: [PhotoItem]
+            let favorites: [PhotoUID]
+            let coordinates: [PhotoCoordinate]
+            let day: Date
+            let calendar: String
+            let timeZone: String
+            let locale: String
+        }
+        let captured = Date(timeIntervalSince1970: 1_700_000_000)
+        let item = PhotoItem(
+            uid: PhotoUID(volumeID: "test", nodeID: "salted"), captureTime: captured, mediaType: "image/jpeg")
+        let points = [PhotoCoordinate(uid: item.uid, latitude: 20, longitude: 30, date: captured)]
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let locale = Locale(identifier: "en_US")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let data = try encoder.encode(
+            Content(
+                items: [item], favorites: [item.uid], coordinates: points, day: calendar.startOfDay(for: captured),
+                calendar: String(describing: calendar.identifier), timeZone: calendar.timeZone.identifier,
+                locale: locale.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")))
+        let expected = Data(SHA256.hash(data: Data("place-evidence-v1|".utf8) + data))
+        let actual = try SmartSearchDiscoveryPersistence.fingerprint(
+            sections: [TimelineSection(id: "all", date: captured, title: "", items: [item])],
+            favorites: [item.uid], coordinates: points, now: captured, calendar: calendar, locale: locale)
+        #expect(actual == expected)
+    }
+
+    @Test func legacyPlacePolicyCannotRestoreRowsBeforeNewCuration() async throws {
+        let cache = SnapshotCache()
+        let captured = Date(timeIntervalSince1970: 1_700_000_000)
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "test", nodeID: "\($0)"), captureTime: captured, mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: captured, title: "", items: items)]
+        let coordinates = items.map { PhotoCoordinate(uid: $0.uid, latitude: 20, longitude: 30, date: captured) }
+        func apply(_ scheduler: SmartSearchDiscoveryScheduler) {
+            scheduler.update(
+                sections: sections, timelineRevision: 1, favoriteUIDs: [], coordinates: coordinates,
+                snapshot: .disabled, indexedAssetCount: { 0 }, searchEvidence: nil,
+                cacheAccess: { await cache.access() })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            "Place"
+        }
+        apply(first)
+        for _ in 0..<200 where await cache.saves == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        let saved = try PropertyListDecoder().decode(
+            SmartSearchDiscoveryPersistence.self, from: try #require(await cache.data))
+        try #require(saved.snapshot.candidates.contains { $0.kind == .place })
+        first.reset()
+
+        // This is the exact pre-filter fingerprint payload, with no policy salt.
+        struct LegacyContent: Encodable {
+            let items: [PhotoItem]
+            let favorites: [PhotoUID] = []
+            let coordinates: [PhotoCoordinate]
+            let day = Calendar.current.startOfDay(for: Date())
+            let calendar = String(describing: Calendar.current.identifier)
+            let timeZone = Calendar.current.timeZone.identifier
+            let locale = Locale.current.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let legacy = Data(SHA256.hash(data: try encoder.encode(LegacyContent(items: items, coordinates: coordinates))))
+        await cache.save(
+            try SmartSearchDiscoveryPersistence(
+                version: saved.version, modelKey: saved.modelKey, fingerprint: legacy,
+                snapshot: saved.snapshot, evidence: saved.evidence, assetFingerprint: saved.assetFingerprint
+            ).encoded())
+        let runtime = LibraryRuntimeState()
+        runtime.update { $0.activeSearchCount = 1 }
+        let next = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in "Place" }
+        defer { next.reset() }
+        apply(next)
+        for _ in 0..<200 where await cache.reads < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(!next.discovery.hasComputed)
+        #expect(next.discovery.forYou.isEmpty)
+    }
+
+    @Test func disabledSmartSearchNamesOnlyEligibleCoordinatesAndReusesTheIndexEvidence() async throws {
+        let coordinates = (0..<60).flatMap { offset in
+            let captured = Date(timeIntervalSince1970: 1_700_000_000 + Double(offset / 2 * 7) * 86_400)
+            return [
+                PhotoCoordinate(
+                    uid: PhotoUID(volumeID: "test", nodeID: "fixed-\(offset)"),
+                    latitude: 20.123456789, longitude: 30.123456789, date: captured),
+                PhotoCoordinate(
+                    uid: PhotoUID(volumeID: "test", nodeID: "gps-\(offset)"),
+                    latitude: -20 + Double(offset) * 0.0001, longitude: -30, date: captured),
+            ]
+        }
+        let items = coordinates.map { PhotoItem(uid: $0.uid, captureTime: $0.date, mediaType: "image/jpeg") }
+        let evidence = PhotoPlaceEvidence(coordinates: coordinates)
+        let placeProbe = PlaceRequestProbe()
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { lat, _ in
+            await placeProbe.name(latitude: lat)
+        }
+        defer { scheduler.reset() }
+        scheduler.update(
+            sections: [TimelineSection(id: "all", date: items[0].captureTime, title: "", items: items)],
+            timelineRevision: 1, favoriteUIDs: [], coordinates: coordinates, snapshot: .disabled,
+            indexedAssetCount: { 0 }, searchEvidence: nil, locationEvidence: evidence)
+        for _ in 0..<200 where !scheduler.discovery.lastRefreshCompleted {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(scheduler.discovery.lastRefreshCompleted)
+        let namedLatitudes = await placeProbe.latitudes
+        #expect(namedLatitudes.count == 1 && namedLatitudes.allSatisfy { $0 < 0 })
+        #if DEBUG
+            #expect(evidence.hasAnalyzed)
+        #endif
+        let places = scheduler.discovery.forYou.filter { $0.kind == .place || $0.kind == .placeSeason }
+        #expect(!places.isEmpty)
+        #expect(places.allSatisfy { $0.matchingUIDs?.allSatisfy { $0.nodeID.hasPrefix("gps-") } == true })
+    }
+
+    private actor PlaceRequestProbe {
+        var latitudes: [Double] = []
+        func name(latitude: Double) -> String {
+            latitudes.append(latitude)
+            return "Place"
         }
     }
 
@@ -801,27 +992,41 @@ import TimelineCore
         let items = (0..<8).map {
             PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
         }
-        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
-            nil
-        }
+        let scheduler = SmartSearchDiscoveryScheduler(
+            runtimeState: LibraryRuntimeState(), debounce: .zero, retryDelays: Self.shortRetryDelays
+        ) { _, _ in nil }
         defer { scheduler.reset() }
-        func apply(settled: Int) {
+        func apply(_ snapshot: MLSmartSearchSnapshot) {
             scheduler.update(
                 sections: [TimelineSection(id: "all", date: Date(), title: "", items: items)],
                 timelineRevision: 1, favoriteUIDs: Set(items.map(\.uid)), coordinates: [],
-                snapshot: visualSnapshot(settled: settled, ready: true), indexedAssetCount: { 8 },
+                snapshot: snapshot, indexedAssetCount: { 8 },
                 searchEvidence: { await probe.query(sensitive: items[0].uid) },
                 cacheAccess: { await cache.access() })
         }
-        apply(settled: 8)
+        // The visual index stays complete, so the content and the cache key stay equal; only the scheduler key
+        // changes while index work runs, and the update gets past its early return.
+        func indexing() -> MLSmartSearchSnapshot {
+            let complete = visualSnapshot(settled: 8, ready: true)
+            let progress = MLSmartSearchAggregateProgress(
+                totalWorkUnits: 100, settledWorkUnits: 20, permanentlyUnavailableAssets: 0)
+            return MLSmartSearchSnapshot(
+                isEnabled: true, selectedModelID: complete.selectedModelID, phase: complete.phase,
+                installedModelBytes: 0, availableModels: [], isSearchAvailable: true,
+                indexingState: .waiting(progress))
+        }
+        apply(visualSnapshot(settled: 8, ready: true))
         for _ in 0..<2_000 where await cache.saves < 4 || scheduler.isRefreshing {
             try await Task.sleep(for: .milliseconds(5))
         }
         try #require(await cache.saves == 4)
-        apply(settled: 20)
-        try await Task.sleep(for: .milliseconds(50))
-        apply(settled: 40)
-        try await Task.sleep(for: .milliseconds(50))
+        for _ in 0..<2 {
+            apply(indexing())
+            apply(visualSnapshot(settled: 8, ready: true))
+            #if DEBUG
+                await scheduler.waitForRefreshForTesting()
+            #endif
+        }
         #expect(await cache.saves == 4, "index progress must not renew an exhausted disk-write budget")
         #expect(await probe.calls == 1)
         #expect(scheduler.discovery.hasComputed, "failed persistence must retain usable rows")
@@ -1058,49 +1263,51 @@ import TimelineCore
         }
     }
 
-    @Test(arguments: [false, true]) func evidenceIsReleasedOnMemoryPressureOrVisualDisablement(
-        disableVisual: Bool
-    ) async throws {
-        let runtime = LibraryRuntimeState()
-        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
-        defer { scheduler.reset() }
-        let probe = EvidenceProbe()
-        let items = (0..<8).map {
-            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+    #if DEBUG
+        @Test(arguments: [false, true]) func evidenceIsReleasedOnMemoryPressureOrVisualDisablement(
+            disableVisual: Bool
+        ) async throws {
+            let runtime = LibraryRuntimeState()
+            let scheduler = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+            defer { scheduler.reset() }
+            let probe = EvidenceProbe()
+            let items = (0..<8).map {
+                PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+            }
+            func apply(visual: Bool, favorites: Set<PhotoUID>) {
+                scheduler.update(
+                    sections: [TimelineSection(id: "all", date: Date(), title: "", items: items)],
+                    timelineRevision: 1, favoriteUIDs: favorites, coordinates: [],
+                    snapshot: visual ? visualSnapshot(settled: 8, ready: true) : nil,
+                    indexedAssetCount: { visual ? 8 : 0 },
+                    searchEvidence: { await probe.query(sensitive: items[0].uid) })
+            }
+            let favorites = Set(items.map(\.uid))
+            apply(visual: true, favorites: favorites)
+            for _ in 0..<200 where scheduler.cachedEvidenceAssetCount == 0 || scheduler.isRefreshing {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            try #require(scheduler.cachedEvidenceAssetCount == 8)
+            let originalRows = scheduler.discovery.forYou
+            if disableVisual {
+                apply(visual: false, favorites: favorites)
+            } else {
+                runtime.update { $0.memoryPressure = .critical }
+            }
+            for _ in 0..<200 where scheduler.cachedEvidenceAssetCount != 0 {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            #expect(scheduler.cachedEvidenceAssetCount == 0)
+            if !disableVisual { #expect(scheduler.discovery.forYou == originalRows) }
+            runtime.update { $0.memoryPressure = .normal }
+            apply(visual: true, favorites: Set(items.dropFirst().map(\.uid)))
+            for _ in 0..<200 where await probe.calls < 2 || scheduler.isRefreshing {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            #expect(await probe.calls == 2, "a later content refresh must rebuild evicted evidence")
+            #expect(!scheduler.discovery.forYou.flatMap(\.representativeUIDs).contains(items[0].uid))
         }
-        func apply(visual: Bool, favorites: Set<PhotoUID>) {
-            scheduler.update(
-                sections: [TimelineSection(id: "all", date: Date(), title: "", items: items)],
-                timelineRevision: 1, favoriteUIDs: favorites, coordinates: [],
-                snapshot: visual ? visualSnapshot(settled: 8, ready: true) : nil,
-                indexedAssetCount: { visual ? 8 : 0 },
-                searchEvidence: { await probe.query(sensitive: items[0].uid) })
-        }
-        let favorites = Set(items.map(\.uid))
-        apply(visual: true, favorites: favorites)
-        for _ in 0..<200 where scheduler.cachedEvidenceAssetCount == 0 || scheduler.isRefreshing {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        try #require(scheduler.cachedEvidenceAssetCount == 8)
-        let originalRows = scheduler.discovery.forYou
-        if disableVisual {
-            apply(visual: false, favorites: favorites)
-        } else {
-            runtime.update { $0.memoryPressure = .critical }
-        }
-        for _ in 0..<200 where scheduler.cachedEvidenceAssetCount != 0 {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        #expect(scheduler.cachedEvidenceAssetCount == 0)
-        if !disableVisual { #expect(scheduler.discovery.forYou == originalRows) }
-        runtime.update { $0.memoryPressure = .normal }
-        apply(visual: true, favorites: Set(items.dropFirst().map(\.uid)))
-        for _ in 0..<200 where await probe.calls < 2 || scheduler.isRefreshing {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        #expect(await probe.calls == 2, "a later content refresh must rebuild evicted evidence")
-        #expect(!scheduler.discovery.forYou.flatMap(\.representativeUIDs).contains(items[0].uid))
-    }
+    #endif
 
     @Test func startupRevisionsWaitForLibraryWorkAndCoalesceBeforeEvidence() async throws {
         let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
@@ -1199,6 +1406,12 @@ import TimelineCore
         update(semanticComplete: true, aggregateReady: true)
         for _ in 0..<200 where await probe.calls < 1 { try await Task.sleep(for: .milliseconds(5)) }
         #expect(await probe.calls == 1)
+    }
+
+    /// Waits until `condition` holds. The limit is far above any loaded machine and only ends a hung test.
+    private func waitUntilHangLimit(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(300)
+        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
     }
 
     private func visualSnapshot(settled: Int, ready: Bool) -> MLSmartSearchSnapshot {

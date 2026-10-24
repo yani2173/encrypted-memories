@@ -2,23 +2,37 @@ name: Pull request verification
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      measure_cache:
+        description: Measure populated dependency cache restores.
+        type: boolean
+        default: false
+      collect_ui_diagnostics:
+        description: Capture app and runner timing during deleted-backup UI waits.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: pull-request-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: pull-request-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 env:
-  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
 
 jobs:
   repository-hygiene:
     name: Repository hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -26,10 +40,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Require the merge queue for reduced pull request verification
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/require_merge_queue.py "$GITHUB_REPOSITORY"
+
       - name: Check whitespace
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: |
           set -euo pipefail
           if [[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
@@ -40,8 +60,8 @@ jobs:
 
       - name: Scan the public tree for secrets
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
           GITLEAKS_VERSION: "8.30.1"
           GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
         run: |
@@ -60,19 +80,61 @@ jobs:
 
       - name: Enforce the public tree boundary
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: bash scripts/check-public-tree.sh "$BASE_SHA" "$HEAD_SHA"
 
       - name: Enforce public commit identities
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: bash scripts/check-commit-identities.sh "$BASE_SHA" "$HEAD_SHA"
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+          SENDER_ID: ${{ github.event.sender.id }}
+        run: |
+          set -euo pipefail
+          # Commits may carry only the noreply addresses of the pull request author.
+          # Account values reach the script only through environment variables.
+          # The two commit SHAs are passed as quoted arguments; the script validates them as git commits.
+          case "$EVENT_NAME" in
+            pull_request)
+              login="$PR_AUTHOR_LOGIN"
+              account_id="$PR_AUTHOR_ID"
+              ;;
+            merge_group)
+              # The queue ref is gh-readonly-queue/<base>/pr-<number>-<sha>; its commit has that pull request's author.
+              pr_ref='/pr-([0-9]+)-[0-9a-f]{40}$'
+              if [[ ! "$MERGE_GROUP_HEAD_REF" =~ $pr_ref ]]; then
+                echo "The merge group ref names no pull request." >&2
+                exit 1
+              fi
+              read -r login account_id < <(gh api "repos/$GITHUB_REPOSITORY/pulls/${BASH_REMATCH[1]}" \
+                --jq '"\(.user.login) \(.user.id)"')
+              ;;
+            *)
+              # A manual run checks the tip commit of the dispatched ref for the account that started it.
+              login="$SENDER_LOGIN"
+              account_id="$SENDER_ID"
+              ;;
+          esac
+          if [[ -z "$login" || -z "$account_id" ]]; then
+            echo "The event names no account to check commit identities against." >&2
+            exit 1
+          fi
+          COMMIT_IDENTITY_LOGIN="$login" COMMIT_IDENTITY_ID="$account_id" \
+            bash scripts/check-commit-identities.sh "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Test commit identity check
+        run: bash .github/scripts/test_check_commit_identities.sh
 
       - name: Test Apple release automation
         run: |
           set -euo pipefail
+          ruby .github/scripts/test_pull_request_workflow.rb
           ruby -c .github/scripts/app_store_connect.rb
           ruby .github/scripts/test_app_store_connect.rb
           ruby -c .github/scripts/release_contract.rb
@@ -85,11 +147,18 @@ jobs:
       - name: Test GitHub automation
         run: |
           set -euo pipefail
+          python3 .github/scripts/test_require_merge_queue.py
+          python3 .github/scripts/test_cancel_superseded_queue_run.py
+          python3 -B .github/scripts/test_collect_ui_wait_diagnostics.py
+          python3 .github/scripts/test_ios_test_commands.py
+          python3 .github/scripts/test_report_build_storage.py
           python3 .github/scripts/test_remind_llm_key_expiry.py
           python3 .github/scripts/test_triage_issue.py
           python3 .github/scripts/test_review_pull_request.py
           python3 .github/scripts/test_review_advisory.py
           python3 .github/scripts/test_review_replay.py
+          bash .github/scripts/test_run_ui_tests_with_retry.sh
+          python3 .github/scripts/test_swift_style_scripts.py
 
       - name: Lint GitHub Actions workflows
         env:
@@ -105,157 +174,522 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
 
-  code-quality:
-    name: Swift style
-    runs-on: xcode-27
+  # swift-format and SwiftLint on Linux give the same verdicts as the macOS runner: a corpus with one deliberate
+  # violation per rule and the whole repository gave identical exit codes, rule names and positions. The Swift
+  # toolchain supplies swift-format and the SourceKit that the SwiftLint comment rules need. Re-check the verdicts
+  # when the Xcode of the macOS runner or one of these versions changes.
+  swift-style-linux:
+    name: Swift style on Linux
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      style: ${{ steps.style.outcome }}
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - uses: ./.github/actions/install-swiftlint
-
-      - name: Select Xcode 27
-        run: sudo xcode-select --switch /Applications/Xcode.app
-
-      - name: Lint changed Swift files
+      - name: Install the Swift toolchain and SwiftLint
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SWIFT_VERSION: "6.4.0"
+          SWIFT_SHA256: 69f7b2b4dbce6090b6c92194b71149a057e16269093b5a9dded38afc4a05094e
+          SWIFTLINT_VERSION: "0.65.1"
+          SWIFTLINT_SHA256: caeed6f4a679c35539ffaf124f6c4ab4a8416917f7d8796279dc52b74026059d
         run: |
           set -euo pipefail
-          if [[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
-            bash scripts/lint-swift.sh --diff "$BASE_SHA" "$HEAD_SHA"
-          else
-            bash scripts/lint-swift.sh --all
-          fi
+          name="swift-$SWIFT_VERSION-RELEASE-ubuntu24.04"
+          curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+            --connect-timeout 20 --max-time 300 --retry 3 --retry-all-errors --retry-max-time 600 \
+            "https://download.swift.org/swift-$SWIFT_VERSION-release/ubuntu2404/swift-$SWIFT_VERSION-RELEASE/$name.tar.gz" \
+            --output "$RUNNER_TEMP/swift.tar.gz"
+          echo "$SWIFT_SHA256  $RUNNER_TEMP/swift.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/swift"
+          tar -xzf "$RUNNER_TEMP/swift.tar.gz" -C "$RUNNER_TEMP/swift" --strip-components=1 \
+            "$name/usr/bin/swift-format" "$name/usr/lib"
+          curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+            --connect-timeout 20 --max-time 300 --retry 3 --retry-all-errors --retry-max-time 600 \
+            "https://github.com/realm/SwiftLint/releases/download/$SWIFTLINT_VERSION/swiftlint_linux_amd64.zip" \
+            --output "$RUNNER_TEMP/swiftlint.zip"
+          echo "$SWIFTLINT_SHA256  $RUNNER_TEMP/swiftlint.zip" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/swiftlint"
+          unzip -q "$RUNNER_TEMP/swiftlint.zip" -d "$RUNNER_TEMP/swiftlint"
+      - name: Verify Swift style
+        id: style
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          SWIFT_FORMAT_EXECUTABLE: ${{ runner.temp }}/swift/usr/bin/swift-format
+          SWIFTLINT_EXECUTABLE: ${{ runner.temp }}/swiftlint/swiftlint
+          LINUX_SOURCEKIT_LIB_PATH: ${{ runner.temp }}/swift/usr/lib
+          LD_LIBRARY_PATH: ${{ runner.temp }}/swift/usr/lib/swift/linux:${{ runner.temp }}/swift/usr/lib
+        run: bash scripts/verify-swift-style.sh
 
-      - name: Check Swift formatting
-        run: bash scripts/check-swift-format.sh --all
+  # The style check of a pull request runs on Linux (swift-style-linux), so it does not wait for a macOS runner. The
+  # queue runs the same check on the macOS runner with the Xcode toolchain, together with the tests.
+  package-verification:
+    name: Package verification and style
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: xcode-27
+    timeout-minutes: 90
+    outputs:
+      style: ${{ steps.style.outcome }}
+      tests: ${{ steps.tests.outcome }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/install-swiftlint
+      - name: Select Xcode 27.1
+        run: sudo xcode-select --switch /Applications/Xcode_27.1.app
+      - name: Verify Swift style
+        id: style
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+        run: bash scripts/verify-swift-style.sh
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        with:
+          build-profile: package
+          # A queue run saves to its own temporary branch (gh-readonly-queue/...), which no other run can read.
+          save-cache: ${{ github.event_name != 'merge_group' }}
+          measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
+      - name: Run all package and SDK tests
+        id: tests
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.prepare.outcome == 'success' }}
+        run: bash ./scripts/verify-tests.sh
+      - if: ${{ always() && github.event_name != 'pull_request' }}
+        run: bash ./scripts/report-build-storage.sh
+
+  ios-verification:
+    name: iOS verification
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: xcode-27
+    timeout-minutes: 120
+    outputs:
+      architecture: ${{ steps.architecture.outcome }}
+      shell: ${{ steps.shell.outcome }}
+      tests: ${{ steps.tests.outcome }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Start the simulator
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          IOS_TEST_ACTION: boot-simulator
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          # A queue run saves to its own temporary branch (gh-readonly-queue/...), which no other run can read.
+          save-cache: ${{ github.event_name != 'merge_group' }}
+          measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
+      - name: Verify iOS shared architecture
+        id: architecture
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: bash ./scripts/verify-universal-core.sh build-ios
+      - name: Build the iOS app shell
+        id: shell
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          SKIP_XCODEGEN: "1"
+        run: DERIVED_DATA_PATH="$HOME/Developer/xcode/EncryptedMemories/core-gate-dd.noindex/iOS" bash ./scripts/verify-ios-app-shell.sh
+      - name: Build the app and both simulator test bundles once
+        id: test-build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: build-for-testing
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - name: Run all hosted tests without building
+        id: tests
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: test-without-building
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-hosted.xcresult
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - name: Report simulator test counts
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
+        env:
+          RESULT_ROOT: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          xcrun xcresulttool get test-results summary --path "$RESULT_ROOT/ios-hosted.xcresult" |
+            python3 -c 'import json,sys; r=json.load(sys.stdin); print(sys.argv[1], {k:r[k] for k in ["totalTestCount", "passedTests", "failedTests", "skippedTests"]})' hosted
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  # UI tests run beside the hosted tests on their own runner. One simulator: two clones on a hosted
+  # runner ran twice as long and timed out UI waits.
+  ios-ui-verification:
+    name: iOS UI verification
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: xcode-27
+    timeout-minutes: 90
+    outputs:
+      ui: ${{ steps.ui.outcome }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Record the runner state at the start
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh start
+      - name: Start the simulator
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          IOS_TEST_ACTION: boot-simulator
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          save-cache: "false"
+      - name: Build the app and both simulator test bundles once
+        id: test-build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: build-for-testing
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - name: Configure UI latency diagnostics
+        continue-on-error: true
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.collect_ui_diagnostics }}
+        env:
+          DIAGNOSTIC_ROOT: ${{ runner.temp }}/ios-ui-diagnostics
+        run: echo "IOS_TEST_DIAGNOSTICS_PATH=$DIAGNOSTIC_ROOT" >> "$GITHUB_ENV"
+      - name: Run all UI tests without building
+        id: ui
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: test-without-building
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui.xcresult
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash .github/scripts/run_ui_tests_with_retry.sh bash ./scripts/verify-ios-app-tests.sh ui
+      - name: Report simulator test counts
+        if: ${{ !cancelled() && steps.ui.outcome == 'success' }}
+        env:
+          RESULT_ROOT: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          xcrun xcresulttool get test-results summary --path "$RESULT_ROOT/ios-ui.xcresult" |
+            python3 -c 'import json,sys; r=json.load(sys.stdin); print(sys.argv[1], {k:r[k] for k in ["totalTestCount", "passedTests", "failedTests", "skippedTests"]})' ui
+      - name: Retain failed UI test results
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-ui-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-ui.xcresult
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Retain the result of the first attempt after a retry
+        if: ${{ always() && steps.ui.outputs.retried == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-ui-attempt1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ios-ui-attempt1.xcresult
+            ${{ runner.temp }}/ios-ui-attempt1.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Retain UI latency diagnostics
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.collect_ui_diagnostics }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-ui-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-ui-diagnostics
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Record the runner state at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh end
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  macos-verification:
+    name: macOS verification
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: xcode-27
+    timeout-minutes: 60
+    outputs:
+      architecture: ${{ steps.architecture.outcome }}
+      shell: ${{ steps.shell.outcome }}
+      upgrade_probes: ${{ steps.upgrade-probes.outcome }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # The Metal admission test reads the pinned historical releases by tag.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          save-cache: "false"
+      - name: Verify macOS shared architecture
+        id: architecture
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: bash ./scripts/verify-universal-core.sh build-macos
+      - name: Build the macOS app shell
+        id: shell
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          SKIP_XCODEGEN: "1"
+        run: DERIVED_DATA_PATH="$HOME/Developer/xcode/EncryptedMemories/core-gate-dd.noindex/macOS" bash ./scripts/verify-macos-app-shell.sh
+      - name: Set up Python
+        id: python
+        if: ${{ !cancelled() }}
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
+      # The hygiene job runs these files on Ubuntu, but their darwin-only tests skip themselves there; only a macOS job runs them.
+      - name: Test the macOS upgrade probes
+        id: upgrade-probes
+        if: ${{ !cancelled() && steps.python.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test_upgrade_metal.py
+          python3 .github/scripts/test_upgrade_journey.py UpgradeJourneyTests.test_native_macos_settings_pane_retries_only_unacknowledged_clicks
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  # Cancels the rest of a merge queue run as soon as one of its jobs fails, so the other jobs stop using the macOS
+  # runners. The job has no checkout and runs no script or action of the pull request: its code is this block, and it
+  # reads only the run id and the repository. The write scope for Actions exists only here, in no worker job.
+  # No result job needs it and it is not a required check.
+  cancel-on-failure:
+    name: Cancel a queue run after a failure
+    if: ${{ github.event_name == 'merge_group' }}
+    runs-on: ubuntu-24.04
+    # The longest queue runs took 123 minutes, because the macOS jobs wait for a runner. The loop ends by itself after
+    # 165 minutes, and the job limit is only the backstop.
+    timeout-minutes: 175
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run when a job fails
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          workers=("Repository hygiene" "Package verification and style" "iOS verification" "iOS UI verification" "macOS verification")
+          own="Cancel a queue run after a failure"
+          deadline=$((SECONDS + 9900))
+          read_errors=0
+          while (( SECONDS < deadline )); do
+            if ! lines="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs" --paginate \
+              --jq '.jobs[] | [.name, .status, (.conclusion // "")] | @tsv' 2>&1)"; then
+              read_errors=$((read_errors + 1))
+              echo "The jobs of the run could not be read ($read_errors): $lines"
+              # A read that keeps failing means that nothing is watched: end red, so that it is seen.
+              (( read_errors < 20 )) || exit 1
+              sleep 30
+              continue
+            fi
+            read_errors=0
+            # A job that failed, or the first worker (the hygiene job has no result job) that ended without success.
+            failed="$(printf '%s\n' "$lines" | awk -F'\t' -v own="$own" -v first="${workers[0]}" '
+              $1 != own && ($3 == "failure" || ($1 == first && $2 == "completed" && $3 != "success")) { print $1 }')"
+            if [[ -n "$failed" ]]; then
+              echo "A job failed: $failed"
+              if ! output="$(gh run cancel "$GITHUB_RUN_ID" 2>&1)"; then
+                echo "$output"
+                # A run that is already cancelled or completed needs no cancel.
+                grep -qiE 'HTTP 409|already|cannot be cancelled' <<< "$output" && exit 0
+                exit 1
+              fi
+              exit 0
+            fi
+            unfinished=0
+            for name in "${workers[@]}"; do
+              status="$(printf '%s\n' "$lines" | awk -F'\t' -v name="$name" '$1 == name { print $2 }')"
+              [[ "$status" == "completed" ]] || unfinished=1
+            done
+            if [[ $unfinished -eq 0 ]]; then
+              echo "All worker jobs finished without a failure."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "The watch ended at its time limit."
+
+  # A merge-group entry can leave the queue while its run keeps waiting for macOS runners: another
+  # commit replaces the entry, or the pull request closes. Those superseded runs waste the shared
+  # runner slots (issue #717). Like the failure watchdog above, this job has no checkout and runs no
+  # code of the pull request: it reads the decision script from the base commit of the merge group,
+  # which is the tip of main, or for a later entry the head of the entry ahead. The job can never
+  # fail, because the failure watchdog cancels the run
+  # when any job of it fails: an error of this job appears in its log only. Reading the script from
+  # the repository needs contents: read in addition to the actions: write of the cancel.
+  cancel-superseded-run:
+    name: Cancel a superseded queue run
+    if: ${{ github.event_name == 'merge_group' }}
+    runs-on: ubuntu-24.04
+    # The same limits as the failure watchdog: the loop of the script ends by itself after 165 minutes.
+    timeout-minutes: 175
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Cancel the run when its entry left the merge queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SCRIPT_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -uo pipefail
+          # A hung read must not hold the job: GNU timeout exists on the Linux runner, without it the read is unlimited.
+          limit() { if command -v timeout > /dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi; }
+          # Read the decision script from the base commit of the merge group, never from the pull request.
+          if ! content="$(limit gh api "repos/$GH_REPO/contents/.github/scripts/cancel_superseded_queue_run.py?ref=$SCRIPT_SHA" --jq .content)"; then
+            echo "The decision script is not readable at the base commit $SCRIPT_SHA, so the run is not watched."
+            exit 0
+          fi
+          if ! printf '%s' "$content" | base64 --decode > "$RUNNER_TEMP/cancel_superseded_queue_run.py"; then
+            echo "The decision script could not be decoded, so the run is not watched."
+            exit 0
+          fi
+          python3 "$RUNNER_TEMP/cancel_superseded_queue_run.py" \
+            --head-sha "$HEAD_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --worker "Repository hygiene" \
+            --worker "Package verification and style" \
+            --worker "iOS verification" \
+            --worker "iOS UI verification" \
+            --worker "macOS verification" \
+            || echo "The watch could not run, so the run is not cancelled by it."
+
+  code-quality:
+    name: Swift style
+    needs: [swift-style-linux, package-verification]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require Swift style
+        env:
+          EVENT: ${{ github.event_name }}
+          LINUX_RESULT: ${{ needs.swift-style-linux.outputs.style }}
+          MACOS_RESULT: ${{ needs.package-verification.outputs.style }}
+        # A pull request is checked on Linux, every other event on the macOS runner.
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            test "$LINUX_RESULT" = success
+          else
+            test "$MACOS_RESULT" = success
+          fi
 
   package-tests:
     name: Swift package tests
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
+    needs: [package-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - run: bash ./scripts/verify-tests.sh
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
-
-  ios-app-tests:
-    name: iOS app tests
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - run: bash ./scripts/verify-ios-app-tests.sh
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
-
-  ios-ui-tests:
-    name: iOS UI tests
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - run: bash ./scripts/verify-ios-app-tests.sh ui
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
-
-  architecture-builds:
-    name: Shared architecture (${{ matrix.platform }})
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        include:
-          - platform: iOS
-            mode: build-ios
-          - platform: macOS
-            mode: build-macos
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - name: Verify ${{ matrix.platform }} shared architecture
-        run: bash ./scripts/verify-universal-core.sh "${{ matrix.mode }}"
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
+      - name: Require all package and SDK tests
+        env:
+          RESULT: ${{ needs.package-verification.outputs.tests }}
+        run: test "$RESULT" = success
 
   architecture:
     name: Shared architecture
-    needs: [package-tests, architecture-builds]
-    if: ${{ always() }}
+    needs: [package-verification, ios-verification, macos-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: Require contracts and both platform builds
         env:
-          PACKAGE_TESTS_RESULT: ${{ needs.package-tests.result }}
-          ARCHITECTURE_BUILDS_RESULT: ${{ needs.architecture-builds.result }}
+          PACKAGE_RESULT: ${{ needs.package-verification.outputs.tests }}
+          IOS_RESULT: ${{ needs.ios-verification.outputs.architecture }}
+          MACOS_RESULT: ${{ needs.macos-verification.outputs.architecture }}
         run: |
           set -euo pipefail
-          if [[ "$PACKAGE_TESTS_RESULT" != "success" ]]; then
-            echo "Swift package tests did not pass: $PACKAGE_TESTS_RESULT" >&2
-            exit 1
-          fi
-          if [[ "$ARCHITECTURE_BUILDS_RESULT" != "success" ]]; then
-            echo "One or more platform architecture builds did not pass: $ARCHITECTURE_BUILDS_RESULT" >&2
-            exit 1
-          fi
+          test "$PACKAGE_RESULT" = success
+          test "$IOS_RESULT" = success
+          test "$MACOS_RESULT" = success
+
+  ios-app-tests:
+    name: iOS app tests
+    needs: [ios-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require hosted tests
+        env:
+          RESULT: ${{ needs.ios-verification.outputs.tests }}
+        run: test "$RESULT" = success
+
+  ios-ui-tests:
+    name: iOS UI tests
+    needs: [ios-ui-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require UI tests
+        env:
+          RESULT: ${{ needs.ios-ui-verification.outputs.ui }}
+        run: test "$RESULT" = success
 
   macos-app-shell:
     name: macOS app shell
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
+    needs: [macos-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - name: Build macOS app
-        run: bash ./scripts/verify-macos-app-shell.sh
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
+      - name: Require macOS app shell
+        env:
+          RESULT: ${{ needs.macos-verification.outputs.shell }}
+        run: test "$RESULT" = success
+      - name: Require the macOS upgrade probe tests
+        if: ${{ always() }}
+        env:
+          RESULT: ${{ needs.macos-verification.outputs.upgrade_probes }}
+        run: test "$RESULT" = success
 
   ios-app-shell:
     name: iOS app shell
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
+    needs: [ios-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - name: Build iOS app
-        run: bash ./scripts/verify-ios-app-shell.sh
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
+      - name: Require iOS app shell
+        env:
+          RESULT: ${{ needs.ios-verification.outputs.shell }}
+        run: test "$RESULT" = success

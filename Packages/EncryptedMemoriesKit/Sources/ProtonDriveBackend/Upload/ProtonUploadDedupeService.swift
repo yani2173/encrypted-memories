@@ -52,6 +52,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private let contentIndexStore: any UploadRemoteContentIndexStore
     private let lineageIndexStore: UploadRemoteLineageIndexStore?
     private let contextProvider: @Sendable () async throws -> PhotosShareContext
+    private let firstBuildGate: TimelineMetadataStartGate?
 
     struct Material: Sendable {
         let context: PhotosShareContext
@@ -63,6 +64,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private var material: Material?
     private var materialTask: Task<Material, any Error>?
     private var remoteContentIndexTask: Task<Void, any Error>?
+    /// Names the build in `remoteContentIndexTask`, so a build that ends clears only itself.
+    private var remoteContentIndexBuild = 0
+    /// Every build that has not ended, also one that an invalidation cancelled. Shutdown waits for all of them.
+    private var unfinishedRemoteContentIndexBuilds: [Int: Task<Void, any Error>] = [:]
+    /// A preparation stopped waiting while a build ran; the timeline metadata pass then waits for that build to end.
+    private var metadataPassWaitsForBuild = false
+    /// Set when the account's work ends. No build starts after it.
+    private var isShutDown = false
     private var remoteIndexProgressHandlers: [UUID: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void] =
         [:]
     private var remoteContentIndexGeneration = 0
@@ -89,8 +98,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         contentIndexStore: any UploadRemoteContentIndexStore,
         lineageIndexStore: UploadRemoteLineageIndexStore? = nil,
         material: Material? = nil,
+        firstBuildGate: TimelineMetadataStartGate? = nil,
         contextProvider: @Sendable @escaping () async throws -> PhotosShareContext
     ) {
+        self.firstBuildGate = firstBuildGate
         self.material = material
         self.session = session
         self.crypto = crypto
@@ -98,6 +109,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         self.contentIndexStore = contentIndexStore
         self.lineageIndexStore = lineageIndexStore
         self.contextProvider = contextProvider
+        // Only the launch that created the lineage index runs the first full build; any other launch opens at once.
+        if lineageIndexStore?.acceptsWrites != true || lineageIndexStore?.createdFile != true {
+            firstBuildGate?.open()
+        }
     }
 
     // MARK: UploadDuplicateChecking
@@ -134,7 +149,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
     }
 
-    func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] {
+    func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async throws -> [PhotoUID] {
         do {
             let matches = try await SDKCancellableOperation.run { [photosClient] cancellationToken in
                 try await photosClient.findPhotoDuplicates(
@@ -148,6 +163,16 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             DebugLog.log("[Dedupe] SDK exact query matches=\(matches.count)")
             return matches.map { PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID) }
         } catch {
+            if UploadError.isCancellation(error) { throw error }
+            var sdkError = error as? ProtonDriveSDKError
+            while let current = sdkError {
+                if current.domain == .successfulCancellation
+                    || (current.domain == .network && current.type == NSURLErrorDomain && current.primaryCode == -999)
+                {
+                    throw CancellationError()
+                }
+                sdkError = current.innerError
+            }
             // Keep the already-proven detailed endpoint as a compatibility fallback if the
             // fresh wrapper/native route fails.
             DebugLog.log("[Dedupe] SDK exact query unavailable; using detailed fallback - \(error)")
@@ -232,8 +257,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         guard let main = metadata.first(where: { $0.link.linkID == linkID }),
             main.photo?.hasCompleteRelatedPhotoLinkIDs == true
         else { return nil }
+        let related = Set(main.relatedPhotoLinkIDs)
         // Generic metadata carries State and MainPhotoLinkID, unlike the Photos compound response.
-        let ids = Set(main.relatedPhotoLinkIDs).union([linkID]).sorted()
+        let ids = related.union([linkID]).sorted()
         var resources: [AlbumPhotoLinkBody] = []
         for start in stride(from: 0, to: ids.count, by: UploadDedupePipeline.protonDuplicateBatchSize) {
             let end = min(start + UploadDedupePipeline.protonDuplicateBatchSize, ids.count)
@@ -241,64 +267,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 contentsOf: try await session.fetchPhotoLinksMetadata(
                     shareID: material.context.shareID, linkIDs: Array(ids[start..<end])))
         }
-        return try compound(ofMain: linkID, metadata: main, resources: resources, material: material)
-    }
-
-    /// One Photos metadata request and one generic metadata request serve up to
-    /// `UploadDedupePipeline.protonDuplicateBatchSize` links, so the merge of many duplicates needs few requests. A
-    /// main photo whose name or attributes do not decrypt is absent, like a missing one; the other photos still read.
-    func compounds(ofMainLinks linkIDs: [String]) async throws -> [String: UploadRemoteCompound] {
-        let mains = Set(linkIDs).sorted()
-        guard !mains.isEmpty else { return [:] }
-        let material = try await resolveMaterial()
-        let size = UploadDedupePipeline.protonDuplicateBatchSize
-        var metadata: [String: AlbumPhotoMetadata] = [:]
-        for start in stride(from: 0, to: mains.count, by: size) {
-            let batch = Array(mains[start..<min(start + size, mains.count)])
-            let read = try await session.fetchAlbumPhotoMetadata(volumeID: material.context.volumeID, linkIDs: batch)
-            for entry in read {
-                guard let id = entry.link.linkID, metadata[id] == nil else { continue }
-                metadata[id] = entry
-            }
-        }
-        // Generic metadata carries State and MainPhotoLinkID, unlike the Photos compound response.
-        var expected: [String: Set<String>] = [:]
-        for main in mains {
-            guard let entry = metadata[main], entry.photo?.hasCompleteRelatedPhotoLinkIDs == true else { continue }
-            expected[main] = Set(entry.relatedPhotoLinkIDs).union([main])
-        }
-        let ids = Set(expected.values.joined()).sorted()
-        var resources: [String: [AlbumPhotoLinkBody]] = [:]
-        for start in stride(from: 0, to: ids.count, by: size) {
-            let batch = Array(ids[start..<min(start + size, ids.count)])
-            let read = try await session.fetchPhotoLinksMetadata(shareID: material.context.shareID, linkIDs: batch)
-            for resource in read {
-                guard let id = resource.linkID else { continue }
-                resources[id, default: []].append(resource)
-            }
-        }
-        var compounds: [String: UploadRemoteCompound] = [:]
-        for (main, links) in expected {
-            try Task.checkCancellation()
-            guard let entry = metadata[main] else { continue }
-            let own = links.sorted().flatMap { resources[$0] ?? [] }
-            compounds[main] = try? compound(ofMain: main, metadata: entry, resources: own, material: material)
-        }
-        return compounds
-    }
-
-    /// The compound of the main photo `linkID` from its Photos metadata and the generic metadata of the photo and of
-    /// its related files. Nil when a file is missing, inactive, unnamed, or without a digest, or when `resources`
-    /// holds another link or one link twice. Throws when a name or the attributes of a file do not decrypt.
-    private func compound(
-        ofMain linkID: String, metadata main: AlbumPhotoMetadata, resources: [AlbumPhotoLinkBody], material: Material
-    ) throws -> UploadRemoteCompound? {
-        let related = Set(main.relatedPhotoLinkIDs)
         guard let currentMain = resources.first(where: { $0.linkID == linkID }), currentMain.state == 1,
             let role = currentMain.fileProperties?.activeRevision?.photo, role.mainPhotoLinkID == nil
         else { return nil }
         var files: [String: UploadRemoteCompound.File] = [:]
-        var mainAttributes: DedupeXAttr?
         for resource in resources {
             guard let resourceID = resource.linkID, related.contains(resourceID) || resourceID == linkID
             else { return nil }
@@ -306,8 +278,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 resource.fileProperties?.activeRevision?.photo?.mainPhotoLinkID
                     == (resourceID == linkID ? nil : linkID),
                 let armoredName = resource.name, let mimeType = resource.mimeType, !mimeType.isEmpty,
-                let decoded = try attributes(of: resource, material: material),
-                let sha1 = decoded.common?.digests?.sha1,
+                let sha1 = try attributes(of: resource, material: material)?.common?.digests?.sha1,
                 UploadContentSHA1.digest(fromHex: sha1) != nil
             else { return nil }
             let clearName = try crypto.decryptName(armoredName, parent: material.rootKey)
@@ -317,16 +288,16 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 linkID: resourceID,
                 contentHash: ProtonPhotoHMAC.hex(message: sha1.lowercased(), key: material.hashKey),
                 nameHash: ProtonPhotoHMAC.hex(message: correctedName, key: material.hashKey), mimeType: mimeType)
-            if resourceID == linkID { mainAttributes = decoded }
         }
         guard Set(files.keys) == related.union([linkID]), let mainFile = files[linkID],
             let tags = main.photo?.tags
         else { return nil }
+        let attributes = try attributes(of: currentMain, material: material)
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let standard = ISO8601DateFormatter()
         standard.formatOptions = [.withInternetDateTime]
-        let date = mainAttributes?.iOSPhotos?.modificationTime.flatMap {
+        let date = attributes?.iOSPhotos?.modificationTime.flatMap {
             fractional.date(from: $0) ?? standard.date(from: $0)
         }
         let captureDate = main.photo?.captureTime.flatMap { value -> Date? in
@@ -334,7 +305,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         return UploadRemoteCompound(
             main: mainFile, related: related.sorted().compactMap { files[$0] }, tags: Set(tags),
-            externalIdentifier: mainAttributes?.iOSPhotos?.iCloudID, captureDate: captureDate, modificationDate: date)
+            externalIdentifier: attributes?.iOSPhotos?.iCloudID, captureDate: captureDate, modificationDate: date)
     }
 
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
@@ -348,6 +319,12 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             // A busy service must not use up the retry budget of a photo.
             throw UploadError.retryableBackend(code: code, message: message)
         }
+    }
+
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        guard !linkIDs.isEmpty else { return .init(states: [:], complete: true) }
+        let context = try await resolveMaterial().context
+        return try await session.fetchLinkStateSnapshot(shareID: context.shareID, linkIDs: linkIDs)
     }
 
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
@@ -418,6 +395,17 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     ) async throws {
         let token = UUID()
         remoteIndexProgressHandlers[token] = progress
+        firstBuildGate?.buildStarted()
+        // A finished or failed preparation releases the timeline metadata pass held for the first full build. A
+        // cancelled preparation leaves a running build, which releases the pass when it ends.
+        defer {
+            if remoteContentIndexTask == nil {
+                metadataPassWaitsForBuild = false
+                firstBuildGate?.open()
+            } else {
+                metadataPassWaitsForBuild = true
+            }
+        }
         await progress(.init(phase: .loading))
         defer { remoteIndexProgressHandlers[token] = nil }
         let material = try await resolveMaterial()
@@ -453,7 +441,27 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         lastRemoteContentRefreshAt = nil
     }
 
+    /// Ends the running index build before the account's stores close, and lets no new build start. The build keeps its
+    /// resumable position for the next sign-in of the account.
+    func shutdown() async {
+        isShutDown = true
+        remoteContentIndexGeneration += 1
+        lastRemoteContentRefreshAt = nil
+        remoteContentIndexTask = nil
+        let unfinished = Array(unfinishedRemoteContentIndexBuilds.values)
+        for build in unfinished { build.cancel() }
+        for build in unfinished { _ = await build.result }
+    }
+
+    /// True while a build has not ended.
+    var hasUnfinishedRemoteContentIndexBuild: Bool { !unfinishedRemoteContentIndexBuilds.isEmpty }
+
+    /// The builds that have not ended.
+    var unfinishedRemoteContentIndexBuildCount: Int { unfinishedRemoteContentIndexBuilds.count }
+
     func invalidateCachedRemoteState() async {
+        // Callers that hold the service directly can reach it after the shutdown. The stores may be closed by then.
+        guard !isShutDown else { return }
         remoteContentIndexGeneration += 1
         lastRemoteContentRefreshAt = nil
         remoteContentIndexTask?.cancel()
@@ -464,7 +472,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     }
 
     func recordUploaded(contentHash: String, remoteLinkID: String) async {
-        guard let material = try? await resolveMaterial() else { return }
+        // The check follows the `await`: a shutdown can begin while the material resolves.
+        guard let material = try? await resolveMaterial(), !isShutDown else { return }
         _ = contentIndexStore.upsertRemoteContentRecord(
             UploadRemoteContentIndexRecord(
                 contentHash: contentHash,
@@ -528,13 +537,16 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         if let running = remoteContentIndexTask {
             let leftBefore = remoteMainsChangedCount
-            try await running.value
+            try await running.valueUntilCancelled()
             guard rebuildsMissingLineage || remoteMainsChangedCount != leftBefore else { return }
             // A rebuild, and a refresh after a trash during the running one, run after the refreshes that started
             // before them, never beside them.
-            if let newer = remoteContentIndexTask, newer != running { try await newer.value }
+            if let newer = remoteContentIndexTask, newer != running { try await newer.valueUntilCancelled() }
         }
 
+        // A pass that is already cancelled, or an account that is shutting down, starts no build.
+        try Task.checkCancellation()
+        guard !isShutDown else { throw CancellationError() }
         let session = self.session
         let crypto = self.crypto
         let store = self.contentIndexStore
@@ -544,22 +556,45 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let report: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { [weak self] value in
             await self?.emitRemoteIndexProgress(value)
         }
-        let task = Task {
-            try await Self.refreshRemoteContentIndex(
-                material: material, session: session, crypto: crypto, store: store,
-                lineageStore: lineageStore, rebuildsMissingLineage: rebuildsMissingLineage, progress: report)
+        remoteContentIndexBuild += 1
+        let build = remoteContentIndexBuild
+        // The build records its own end. A waiter whose task is cancelled, for example by an expiring background
+        // window, stops waiting at once; the build keeps running for later waiters and keeps its resumable cursor.
+        let task = Task { [weak self] in
+            do {
+                try await Self.refreshRemoteContentIndex(
+                    material: material, session: session, crypto: crypto, store: store,
+                    lineageStore: lineageStore, rebuildsMissingLineage: rebuildsMissingLineage, progress: report)
+                await self?.finishRemoteContentIndexBuild(
+                    build, material: material, rebuiltLineage: rebuildsMissingLineage, generation: generation,
+                    leftAtStart: leftAtStart, succeeded: true)
+            } catch {
+                await self?.finishRemoteContentIndexBuild(
+                    build, material: material, rebuiltLineage: rebuildsMissingLineage, generation: generation,
+                    leftAtStart: leftAtStart, succeeded: false)
+                throw error
+            }
         }
         remoteContentIndexTask = task
-        do {
-            try await task.value
-            guard remoteContentIndexGeneration == generation else { throw CancellationError() }
-            if remoteContentIndexTask == task { remoteContentIndexTask = nil }
-            if remoteMainsChangedCount == leftAtStart { lastRemoteContentRefreshAt = Date() }
-        } catch {
-            if remoteContentIndexGeneration == generation, remoteContentIndexTask == task {
-                remoteContentIndexTask = nil
-            }
-            throw error
+        unfinishedRemoteContentIndexBuilds[build] = task
+        try await task.valueUntilCancelled()
+        guard remoteContentIndexGeneration == generation else { throw CancellationError() }
+    }
+
+    private func finishRemoteContentIndexBuild(
+        _ build: Int, material: Material, rebuiltLineage: Bool, generation: Int, leftAtStart: Int, succeeded: Bool
+    ) {
+        unfinishedRemoteContentIndexBuilds[build] = nil
+        if remoteContentIndexGeneration == generation {
+            if remoteContentIndexBuild == build { remoteContentIndexTask = nil }
+            if succeeded, remoteMainsChangedCount == leftAtStart { lastRemoteContentRefreshAt = Date() }
+        }
+        // A preparation that stopped waiting left the metadata pass held for the first full build. The pass starts
+        // when no build runs and that build ended: this one rebuilt the lineage, or no lineage rebuild is still due.
+        let firstFullBuildEnded = rebuiltLineage || !rebuildsMissingLineage(material: material)
+        if metadataPassWaitsForBuild, remoteContentIndexTask == nil, firstFullBuildEnded {
+            metadataPassWaitsForBuild = false
+            firstBuildGate?.open()
         }
     }
 
@@ -664,7 +699,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 crypto: crypto,
                 generation: eventID
             )
-            await repairUnresolvedRows(
+            try await repairUnresolvedRows(
                 &rows,
                 links: fetched.links,
                 material: material,
@@ -797,7 +832,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     rows.lineageRows.unresolvedLinkIDs.insert(event.linkID)
                 }
             }
-            await repairUnresolvedRows(
+            try await repairUnresolvedRows(
                 &rows,
                 links: fetched.links,
                 material: material,
@@ -832,7 +867,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         // After the events: a repair backlog never delays them, and it writes only at the checkpoint they reached.
         if let eventLineageStore, eventLineageStore.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: eventID) {
-            await repairUnresolvedLineage(
+            try await repairUnresolvedLineage(
                 store: eventLineageStore, eventID: eventID, material: material, session: session, crypto: crypto)
         }
     }
@@ -841,19 +876,24 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     /// incomplete until the next full build. A link that reads now gets its rows, a link that is no longer an active
     /// photo leaves the index, and a link that fails again stays for a later sweep. A link that successful responses
     /// leave out in two sweeps is deleted for good and leaves the index; a failed request never settles a link. The
-    /// lineage index stays passive: nothing here throws into the content refresh.
+    /// lineage index stays passive for ordinary failures; request cancellation ends the refresh.
     private static func repairUnresolvedLineage(
         store: UploadRemoteLineageIndexStore,
         eventID: String,
         material: Material,
         session: DriveSession,
         crypto: DriveCrypto
-    ) async {
+    ) async throws {
+        try Task.checkCancellation()
         let ids = store.unresolvedLinkIDsForRepair(
             hashKeyEpoch: material.epoch, limit: lineageRepairLimit, sweepInterval: lineageRepairSweepInterval)
-        guard !ids.isEmpty,
-            let fetched = try? await fetchLinks(ids: ids, shareID: material.context.shareID, session: session),
-            let rows = try? makeIndexRows(
+        guard !ids.isEmpty else { return }
+        let fetched: RemoteMetadataFetch
+        let rows: RemoteContentIndexRows
+        do {
+            fetched = try await fetchLinks(ids: ids, shareID: material.context.shareID, session: session)
+            try Task.checkCancellation()
+            rows = try makeIndexRows(
                 links: fetched.links,
                 expectedActiveFileIDs: Set(ids),
                 endpointFailureIDs: fetched.endpointFailureIDs,
@@ -861,7 +901,11 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 crypto: crypto,
                 generation: eventID
             )
-        else { return }
+        } catch {
+            if UploadError.isCancellation(error) { throw error }
+            try Task.checkCancellation()
+            return
+        }
         let lineage = rows.lineageRows
         let endpointFailures = Set(ids).intersection(fetched.endpointFailureIDs)
         let omitted = Set(ids.filter { fetched.links[$0] == nil }).subtracting(endpointFailures)
@@ -901,32 +945,27 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         links.reserveCapacity(ids.count)
         var endpointFailureIDs: Set<String> = []
 
-        await withTaskGroup(of: ([AlbumPhotoLinkBody], [String]).self) { group in
-            var nextChunk = 0
-
-            func submitNext() {
-                guard nextChunk < chunks.count else { return }
-                let chunk = chunks[nextChunk]
-                nextChunk += 1
-                group.addTask {
-                    do {
-                        try Task.checkCancellation()
-                        return (try await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: chunk), [])
-                    } catch {
-                        return ([], chunk)
-                    }
-                }
+        let reads = try await BoundedConcurrency.throwingMap(chunks, limit: Self.remoteMetadataRequestConcurrency) {
+            chunk -> [AlbumPhotoLinkBody]? in
+            try Task.checkCancellation()
+            do {
+                let links = try await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: chunk)
+                try Task.checkCancellation()
+                return links
+            } catch {
+                if UploadError.isCancellation(error) { throw error }
+                try Task.checkCancellation()
+                return nil
             }
-
-            for _ in 0..<min(Self.remoteMetadataRequestConcurrency, chunks.count) {
-                submitNext()
+        }
+        // A failed or unstarted chunk becomes endpoint failures; the targeted re-fetch below tries it once more.
+        for (chunk, read) in zip(chunks, reads) {
+            guard let batch = read else {
+                endpointFailureIDs.formUnion(chunk)
+                continue
             }
-            while let (batch, failedIDs) = await group.next() {
-                for link in batch {
-                    if let id = link.linkID { links[id] = link }
-                }
-                endpointFailureIDs.formUnion(failedIDs)
-                submitNext()
+            for link in batch {
+                if let id = link.linkID { links[id] = link }
             }
         }
 
@@ -938,7 +977,13 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             try Task.checkCancellation()
             let batch = Array(
                 missing[start..<min(start + UploadDedupePipeline.protonDuplicateBatchSize, missing.count)])
-            guard let retry = try? await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch) else {
+            let retry: [AlbumPhotoLinkBody]
+            do {
+                retry = try await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
+                try Task.checkCancellation()
+            } catch {
+                if UploadError.isCancellation(error) { throw error }
+                try Task.checkCancellation()
                 endpointFailureIDs.formUnion(batch)
                 continue
             }
@@ -1097,7 +1142,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         session: DriveSession,
         crypto: DriveCrypto,
         attemptedAt: Date = Date()
-    ) async {
+    ) async throws {
+        try Task.checkCancellation()
         guard !rows.unresolvedIssues.isEmpty else { return }
         var linkIDsByNameHash: [String: Set<String>] = [:]
         for index in rows.unresolvedIssues.indices {
@@ -1117,12 +1163,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         var repaired: [String: UploadRemoteContentIndexRecord] = [:]
         let hashes = linkIDsByNameHash.keys.sorted()
         for start in stride(from: 0, to: hashes.count, by: UploadDedupePipeline.protonDuplicateBatchSize) {
+            try Task.checkCancellation()
             let batch = Array(hashes[start..<min(start + UploadDedupePipeline.protonDuplicateBatchSize, hashes.count)])
             do {
                 let duplicates = try await session.findPhotoDuplicates(
                     volumeID: material.context.volumeID,
                     nameHashes: batch
                 )
+                try Task.checkCancellation()
                 for duplicate in duplicates {
                     guard let linkID = duplicate.linkID,
                         let expectedLinkIDs = linkIDsByNameHash[duplicate.hash],
@@ -1138,6 +1186,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     )
                 }
             } catch {
+                if UploadError.isCancellation(error) { throw error }
+                try Task.checkCancellation()
                 let failedHashes = Set(batch)
                 for index in rows.unresolvedIssues.indices {
                     let linkID = rows.unresolvedIssues[index].remoteLinkID
@@ -1227,7 +1277,7 @@ private struct DedupeRootLinkResponse: Decodable {
 // MARK: - Duplicates endpoint (DriveSession)
 
 /// One row of `DuplicateHashes` from the find-duplicates endpoint. `linkState`: 0 = draft,
-/// 1 = active, 2 = trashed, absent = deleted.
+/// 1 = active, 2 = trashed. An omitted state is unknown and cannot prove deletion.
 struct PhotoDuplicateEntry: Decodable {
     let hash: String
     let contentHash: String?
@@ -1261,5 +1311,53 @@ extension DriveSession {
             retryOnRateLimit: true
         )
         return (try JSONDecoder().decode(PhotoDuplicatesResponse.self, from: data)).duplicateHashes ?? []
+    }
+}
+
+extension Task where Success: Sendable, Failure == any Error {
+    /// The task's result for one waiter. A cancelled waiter throws `CancellationError` at once; the task itself keeps
+    /// running for its other waiters.
+    fileprivate func valueUntilCancelled() async throws -> Success {
+        let waiter = CancellableTaskWaiter<Success>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard waiter.attach(continuation) else { return }
+                Task<Void, Never> { waiter.resume(with: await self.result) }
+            }
+        } onCancel: {
+            waiter.cancel()
+        }
+    }
+}
+
+/// Resumes one waiter once, with the first of the task's result and the waiter's cancellation.
+private final class CancellableTaskWaiter<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, any Error>?
+    private var outcome: Result<Value, any Error>?
+
+    /// False when the waiter was already cancelled; the continuation is then resumed.
+    func attach(_ continuation: CheckedContinuation<Value, any Error>) -> Bool {
+        let outcome = lock.withLock { () -> Result<Value, any Error>? in
+            if self.outcome == nil { self.continuation = continuation }
+            return self.outcome
+        }
+        guard let outcome else { return true }
+        continuation.resume(with: outcome)
+        return false
+    }
+
+    func cancel() {
+        resume(with: .failure(CancellationError()))
+    }
+
+    func resume(with result: Result<Value, any Error>) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Value, any Error>? in
+            guard outcome == nil else { return nil }
+            outcome = result
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(with: result)
     }
 }

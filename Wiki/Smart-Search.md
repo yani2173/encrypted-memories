@@ -8,7 +8,7 @@ In Settings, turn on **Smart Search**. It starts at once with the search model t
 
 You can choose the other model at any time. While the first model still downloads, the choice stops that download and takes the other model without asking. Later, a switch asks first, because the library is then indexed again.
 
-When the device has too little free space for the model, Smart Search shows how much space it needs. Free up space and select **Retry**.
+When the device has too little free space for the model, Smart Search shows how much space it needs. Free up space and select **Try again**.
 
 Turning Smart Search off deletes the model and the search index from this device.
 

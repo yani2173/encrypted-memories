@@ -14,15 +14,20 @@ import Testing
         private let lock = NSLock()
         private var payloads: [URL: Data]
         private var failuresRemaining: [URL: Int]
+        private let failure: any Error
         private(set) var downloads = 0
         private var blocksNext = false
         private var blocked = false
         private var release: CheckedContinuation<Void, Never>?
         private var cancelledWhileBlocked = false
 
-        init(payloads: [URL: Data], failFirst: [URL: Int] = [:]) {
+        init(
+            payloads: [URL: Data], failFirst: [URL: Int] = [:],
+            failure: any Error = URLError(.networkConnectionLost)
+        ) {
             self.payloads = payloads
             self.failuresRemaining = failFirst
+            self.failure = failure
         }
 
         func download(
@@ -62,7 +67,7 @@ import Testing
                 downloads += 1
                 if let remaining = failuresRemaining[url], remaining > 0 {
                     failuresRemaining[url] = remaining - 1
-                    throw URLError(.networkConnectionLost)
+                    throw failure
                 }
                 guard let data = payloads[url] else { throw URLError(.fileDoesNotExist) }
                 return data
@@ -519,7 +524,14 @@ import Testing
     private final class ToggleGovernor: MLIndexingGovernor, @unchecked Sendable {
         private let lock = NSLock()
         private var permitted = true
-        func permitsIndexing() -> Bool { lock.withLock { permitted } }
+        private var checks = 0
+        var checkCount: Int { lock.withLock { checks } }
+        func permitsIndexing() -> Bool {
+            lock.withLock {
+                checks += 1
+                return permitted
+            }
+        }
         func set(_ value: Bool) { lock.withLock { permitted = value } }
     }
 
@@ -529,6 +541,7 @@ import Testing
         private let permanentlyUnavailable: Set<PhotoUID>
         private let suppressionRead: BlockingSuppressionRead?
         private let deferredCount: Int
+        private let afterProgressReport: (@Sendable () async -> Void)?
         private var indexedAssets: [MLPipelineAssetRevision] = []
         private var indexes = 0
         private var shutdowns = 0
@@ -538,10 +551,12 @@ import Testing
             initiallyIndexed: [PhotoUID] = [],
             permanentlyUnavailable: Set<PhotoUID> = [],
             suppressionRead: BlockingSuppressionRead? = nil,
-            deferredCount: Int = 0
+            deferredCount: Int = 0,
+            afterProgressReport: (@Sendable () async -> Void)? = nil
         ) {
             self.results = results
             self.deferredCount = deferredCount
+            self.afterProgressReport = afterProgressReport
             self.permanentlyUnavailable = permanentlyUnavailable
             self.suppressionRead = suppressionRead
             indexedAssets = initiallyIndexed.compactMap {
@@ -651,6 +666,7 @@ import Testing
                 )
             )
             observer.report(outcome.progress)
+            if let afterProgressReport { await afterProgressReport() }
             return outcome
         }
 
@@ -973,25 +989,72 @@ import Testing
         let payload = Data("model".utf8)
         let (entry, url) = downloadableEntry(id: "deferred-native", payload: payload)
         let assets = [uid("a"), uid("b"), uid("c")]
+        let progressDelivery = OneShotEmbeddingBarrier()
+        await progressDelivery.arm()
         let harness = try makeHarness(
             catalog: .init(entries: [entry]), payloads: [url: payload], assets: assets,
-            nativeSearch: RecordingNativeSearch(results: [], deferredCount: 1))
+            nativeSearch: RecordingNativeSearch(
+                results: [], deferredCount: 1,
+                afterProgressReport: { await progressDelivery.waitIfArmed() }))
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        harness.governor.set(false)
         await harness.lifecycle.start()
+        let stream = await harness.lifecycle.snapshots()
         await harness.lifecycle.enable(with: entry.id)
-        #expect(
-            await waitUntil {
-                await harness.lifecycle.currentSnapshot().permitsAutomaticSuggestionGeneration
-            })
-        let snapshot = await harness.lifecycle.currentSnapshot()
-        #expect(snapshot.isVisualIndexComplete)
-        if case .waiting(let progress) = snapshot.indexingState {
-            #expect(progress.deferredWorkUnits == 1)
-            #expect(!progress.isComplete, "a deferred retry is not falsely reported as indexed")
-        } else {
-            Issue.record("deferred native work must remain waiting")
+        let terminal = await withTaskGroup(of: MLSmartSearchSnapshot?.self) { group in
+            group.addTask {
+                var governorOpened = false
+                var nativeProgressDelivered = false
+                for await snapshot in stream {
+                    guard snapshot.isEnabled, snapshot.selectedModelID == entry.id else { continue }
+                    // This fresh fixture publishes waiting after model preparation. Keep the
+                    // native-only startup pass from satisfying the test before semantic indexing.
+                    if !governorOpened, case .waiting = snapshot.phase {
+                        governorOpened = true
+                        harness.governor.set(true)
+                        await harness.lifecycle.noteConditionsChanged()
+                    }
+                    // Keep the native pass alive until its admitted progress has actually arrived.
+                    if !nativeProgressDelivered, case .indexing(let progress) = snapshot.indexingState,
+                        progress.deferredWorkUnits > 0
+                    {
+                        nativeProgressDelivered = true
+                        await progressDelivery.release()
+                    }
+                    guard nativeProgressDelivered else { continue }
+                    switch snapshot.phase {
+                    case .ready(let coverage), .waiting(let coverage):
+                        if coverage.total == assets.count, coverage.isComplete { return snapshot }
+                    default: break
+                    }
+                }
+                return nil
+            }
+            group.addTask {
+                do { try await Task.sleep(for: .seconds(300)) } catch { return nil }
+                await progressDelivery.release()
+                return nil
+            }
+            let snapshot = await group.next() ?? nil
+            group.cancelAll()
+            return snapshot
         }
+        let current = await harness.lifecycle.currentSnapshot()
+        let indexedCount = await harness.lifecycle.semanticIndexedAssetCount()
+        await progressDelivery.release()
         await harness.lifecycle.shutdown()
+        let snapshot = try #require(terminal, "the completed semantic pass must publish its state")
+        #expect(indexedCount == assets.count)
+        for state in [snapshot, current] {
+            #expect(state.permitsAutomaticSuggestionGeneration)
+            #expect(state.isVisualIndexComplete)
+            if case .waiting(let progress) = state.indexingState {
+                #expect(progress.deferredWorkUnits == 1)
+                #expect(!progress.isComplete, "a deferred retry is not falsely reported as indexed")
+            } else {
+                Issue.record("deferred native work must remain waiting")
+            }
+        }
     }
 
     @Test(arguments: ["shutdown", "purge", "modelSwitch", "indexChange"])
@@ -1418,6 +1481,85 @@ import Testing
         #expect(ready.hasActivatedModel)
         #expect(try harness.stateStore.load()?.selectedModelID == largeEntry.id)
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: smallEntry.id).path))
+    }
+
+    @Test(arguments: [false, true])
+    func interruptedInstallRecoversAtColdStartWithoutReset(incomplete: Bool) async throws {
+        let payload = Data("cold-start-staging".utf8)
+        let (entry, url) = downloadableEntry(id: "cold-staging", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")])
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        _ = try MLInterruptedInstallFixture.write(entry: entry, layout: harness.layout, payloads: [url: payload])
+        let staging = harness.layout.stagingDirectory(for: entry.id, revision: "rev1")
+        if incomplete {
+            try payload.prefix(3).write(to: staging.appendingPathComponent("Model.mlmodelc/weights.bin"))
+        }
+        try harness.stateStore.save(MLSmartSearchPersistentState(isEnabled: true, selectedModelID: entry.id))
+        #expect(harness.provider.attemptCount == 0)
+
+        await harness.lifecycle.start()
+
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.isEnabled)
+        #expect(snapshot.selectedModelID == entry.id)
+        #expect(snapshot.hasActivatedModel)
+        guard snapshot.hasActivatedModel else {
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(!MLSmartSearchModelPresentation(snapshot: snapshot).canRetry)
+        #expect(harness.provider.builtCount == 1)
+        #expect(harness.transport.downloadCount == (incomplete ? 1 : 0))
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(await waitForCompleteIndex(harness, total: 1))
+        #expect(!(try await harness.lifecycle.search("anything", limit: 3)).isEmpty)
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test(arguments: [false, true])
+    func interruptedInstallRecoversOnRetryWithoutReset(incomplete: Bool) async throws {
+        let payload = Data("retry-staging".utf8)
+        let (entry, url) = downloadableEntry(id: "retry-staging", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")],
+            transportOverride: ScriptedTransport(
+                payloads: [url: payload], failFirst: [url: 1], failure: MLModelInstallError.installRecordUnreadable))
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+        let failed = await harness.lifecycle.currentSnapshot()
+        guard case .failed(let failure) = failed.phase else {
+            Issue.record("the first transfer must fail")
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(failure.kind == .installation)
+        #expect(failure.isRetryable)
+        #expect(MLSmartSearchModelPresentation(snapshot: failed).canRetry)
+        #expect(harness.provider.attemptCount == 0, "an incomplete installation never reaches the runtime")
+        _ = try MLInterruptedInstallFixture.write(entry: entry, layout: harness.layout, payloads: [url: payload])
+        let staging = harness.layout.stagingDirectory(for: entry.id, revision: "rev1")
+        if incomplete {
+            try payload.prefix(3).write(to: staging.appendingPathComponent("Model.mlmodelc/weights.bin"))
+        }
+
+        await harness.lifecycle.retry()
+
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.isEnabled)
+        #expect(snapshot.hasActivatedModel)
+        guard snapshot.hasActivatedModel else {
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(!MLSmartSearchModelPresentation(snapshot: snapshot).canRetry)
+        #expect(harness.provider.builtCount == 1)
+        #expect(harness.transport.downloadCount == (incomplete ? 2 : 1))
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(await waitForCompleteIndex(harness, total: 1))
+        #expect(!(try await harness.lifecycle.search("anything", limit: 3)).isEmpty)
+        await harness.lifecycle.shutdown()
     }
 
     @Test func aModelChosenDuringTheFirstDownloadSurvivesAFailedDownloadAndARelaunch() async throws {
@@ -2723,75 +2865,77 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryA.id).path))
     }
 
-    @Test func completedIndexBecomesReadyAfterSelectionPublicationResumes() async throws {
-        let payload = Data("model-a-bytes".utf8)
-        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
-        let assets = (0..<5).map { uid("asset-\($0)") }
-        let harness = try makeHarness(
-            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: assets)
-        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
-        let gate = OneShotEmbeddingBarrier()
-        await gate.arm()
-        await harness.lifecycle.setSelectionCompletionGate { await gate.waitIfArmed() }
-        // Smart Search is on without a model, for example after the catalog dropped it; the model is chosen again.
-        try harness.stateStore.save(MLSmartSearchPersistentState(isEnabled: true))
+    #if DEBUG
+        @Test func completedIndexBecomesReadyAfterSelectionPublicationResumes() async throws {
+            let payload = Data("model-a-bytes".utf8)
+            let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+            let assets = (0..<5).map { uid("asset-\($0)") }
+            let harness = try makeHarness(
+                catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: assets)
+            defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+            let gate = OneShotEmbeddingBarrier()
+            await gate.arm()
+            await harness.lifecycle.setSelectionCompletionGate { await gate.waitIfArmed() }
+            // Smart Search is on without a model, for example after the catalog dropped it; the model is chosen again.
+            try harness.stateStore.save(MLSmartSearchPersistentState(isEnabled: true))
 
-        await harness.lifecycle.start()
-        let selection = Task { await harness.lifecycle.select(entry.id) }
-        await gate.waitUntilBlocked()
-        #expect(
-            await waitUntil {
-                let snapshot = await harness.lifecycle.currentSnapshot()
-                if case .ready(let progress) = snapshot.indexingState {
-                    return progress.totalWorkUnits == assets.count
-                        && progress.settledWorkUnits == assets.count
-                }
-                return false
-            })
-        #expect(await harness.lifecycle.semanticIndexedAssetCount() == assets.count)
+            await harness.lifecycle.start()
+            let selection = Task { await harness.lifecycle.select(entry.id) }
+            await gate.waitUntilBlocked()
+            #expect(
+                await waitUntil {
+                    let snapshot = await harness.lifecycle.currentSnapshot()
+                    if case .ready(let progress) = snapshot.indexingState {
+                        return progress.totalWorkUnits == assets.count
+                            && progress.settledWorkUnits == assets.count
+                    }
+                    return false
+                })
+            #expect(await harness.lifecycle.semanticIndexedAssetCount() == assets.count)
 
-        await gate.release()
-        await selection.value
-        #expect(await waitForCompleteIndex(harness, total: assets.count))
-        await harness.lifecycle.shutdown()
-    }
-
-    @Test func selectionCompletionPreservesIndexFailureBackoff() async throws {
-        let payload = Data("model-a-bytes".utf8)
-        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
-        let harness = try makeHarness(
-            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload],
-            assets: [uid("asset")], retryDelay: .seconds(30))
-        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
-        let session = TrackingSession(descriptor: entry.descriptor, indexFails: true)
-        harness.provider.sessionOverride = { _ in session }
-        let gate = OneShotEmbeddingBarrier()
-        await gate.arm()
-        await harness.lifecycle.setSelectionCompletionGate { await gate.waitIfArmed() }
-        // Smart Search is on without a model, for example after the catalog dropped it; the model is chosen again.
-        try harness.stateStore.save(MLSmartSearchPersistentState(isEnabled: true))
-
-        await harness.lifecycle.start()
-        let selection = Task { await harness.lifecycle.select(entry.id) }
-        await gate.waitUntilBlocked()
-        #expect(
-            await waitUntil {
-                if case .failed = await harness.lifecycle.currentSnapshot().indexingState {
-                    return true
-                }
-                return false
-            })
-        #expect(session.indexCount == 1)
-
-        await gate.release()
-        await selection.value
-        let retriedEarly = await waitUntil(timeout: .milliseconds(250)) {
-            session.indexCount > 1
+            await gate.release()
+            await selection.value
+            #expect(await waitForCompleteIndex(harness, total: assets.count))
+            await harness.lifecycle.shutdown()
         }
-        #expect(!retriedEarly)
-        #expect(session.indexCount == 1)
-        await harness.lifecycle.shutdown()
-    }
+
+        @Test func selectionCompletionPreservesIndexFailureBackoff() async throws {
+            let payload = Data("model-a-bytes".utf8)
+            let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+            let harness = try makeHarness(
+                catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload],
+                assets: [uid("asset")], retryDelay: .seconds(30))
+            defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+            let session = TrackingSession(descriptor: entry.descriptor, indexFails: true)
+            harness.provider.sessionOverride = { _ in session }
+            let gate = OneShotEmbeddingBarrier()
+            await gate.arm()
+            await harness.lifecycle.setSelectionCompletionGate { await gate.waitIfArmed() }
+            // Smart Search is on without a model, for example after the catalog dropped it; the model is chosen again.
+            try harness.stateStore.save(MLSmartSearchPersistentState(isEnabled: true))
+
+            await harness.lifecycle.start()
+            let selection = Task { await harness.lifecycle.select(entry.id) }
+            await gate.waitUntilBlocked()
+            #expect(
+                await waitUntil {
+                    if case .failed = await harness.lifecycle.currentSnapshot().indexingState {
+                        return true
+                    }
+                    return false
+                })
+            #expect(session.indexCount == 1)
+
+            await gate.release()
+            await selection.value
+            let retriedEarly = await waitUntil(timeout: .milliseconds(250)) {
+                session.indexCount > 1
+            }
+            #expect(!retriedEarly)
+            #expect(session.indexCount == 1)
+            await harness.lifecycle.shutdown()
+        }
+    #endif
 
     @Test func sameSelectionDoesNotReindex() async throws {
         let payload = Data("model-a-bytes".utf8)
@@ -3023,51 +3167,53 @@ import Testing
         }
     }
 
-    @Test func developerInstallAfterTurningOffNeitherRevivesNorOrphansTheModel() async throws {
-        let entry = MLModelCatalogEntry(
-            id: MLModelID("dev-model"),
-            displayName: "dev-model",
-            family: "Test",
-            descriptor: MLModelDescriptor(identifier: "dev-model", version: 1, embeddingDimension: 4),
-            tokenizerID: "t",
-            preprocessingID: "p",
-            license: .mit,
-            releaseTrack: .production,
-            estimatedInstalledBytes: 1,
-            downloadPlan: nil
-        )
-        let harness = try makeHarness(
-            catalog: MLModelCatalog(entries: [entry]),
-            payloads: [:],
-            assets: [uid("asset")]
-        )
-        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
-        let artifact = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ml-dev-artifact-\(UUID().uuidString)", isDirectory: true)
-        let model = artifact.appendingPathComponent("Test.mlmodelc", isDirectory: true)
-        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
-        try Data("weights".utf8).write(to: model.appendingPathComponent("model.bin"))
-        defer { try? FileManager.default.removeItem(at: artifact) }
+    #if DEBUG
+        @Test func developerInstallAfterTurningOffNeitherRevivesNorOrphansTheModel() async throws {
+            let entry = MLModelCatalogEntry(
+                id: MLModelID("dev-model"),
+                displayName: "dev-model",
+                family: "Test",
+                descriptor: MLModelDescriptor(identifier: "dev-model", version: 1, embeddingDimension: 4),
+                tokenizerID: "t",
+                preprocessingID: "p",
+                license: .mit,
+                releaseTrack: .production,
+                estimatedInstalledBytes: 1,
+                downloadPlan: nil
+            )
+            let harness = try makeHarness(
+                catalog: MLModelCatalog(entries: [entry]),
+                payloads: [:],
+                assets: [uid("asset")]
+            )
+            defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+            let artifact = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ml-dev-artifact-\(UUID().uuidString)", isDirectory: true)
+            let model = artifact.appendingPathComponent("Test.mlmodelc", isDirectory: true)
+            try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+            try Data("weights".utf8).write(to: model.appendingPathComponent("model.bin"))
+            defer { try? FileManager.default.removeItem(at: artifact) }
 
-        await harness.lifecycle.start()
-        await harness.lifecycle.enable(with: entry.id)
-        let gate = ContinuationGate()
-        await harness.lifecycle.setDeveloperInstallContinuationGate { await gate.wait() }
+            await harness.lifecycle.start()
+            await harness.lifecycle.enable(with: entry.id)
+            let gate = ContinuationGate()
+            await harness.lifecycle.setDeveloperInstallContinuationGate { await gate.wait() }
 
-        let install = Task { await harness.lifecycle.installDeveloperModel(from: artifact, for: entry.id) }
-        #expect(await waitUntil { gate.hasEntered })
-        #expect(FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+            let install = Task { await harness.lifecycle.installDeveloperModel(from: artifact, for: entry.id) }
+            #expect(await waitUntil { gate.hasEntered })
+            #expect(FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
 
-        await harness.lifecycle.disableAndPurge()
-        #expect(!(await harness.lifecycle.currentSnapshot().isEnabled))
-        gate.release()
-        await install.value
+            await harness.lifecycle.disableAndPurge()
+            #expect(!(await harness.lifecycle.currentSnapshot().isEnabled))
+            gate.release()
+            await install.value
 
-        let snapshot = await harness.lifecycle.currentSnapshot()
-        #expect(!snapshot.isEnabled)
-        #expect(snapshot.selectedModelID == nil)
-        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
-    }
+            let snapshot = await harness.lifecycle.currentSnapshot()
+            #expect(!snapshot.isEnabled)
+            #expect(snapshot.selectedModelID == nil)
+            #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+        }
+    #endif
 
     private final class ContinuationGate: @unchecked Sendable {
         private let lock = NSLock()
@@ -3565,6 +3711,71 @@ import Testing
 
         harness.governor.set(true)
         #expect(await waitForCompleteIndex(harness, total: assets.count))
+    }
+
+    @Test func aClosedGateWaitsForAWakeInsteadOfPollingEverySecond() async throws {
+        #expect(MLSmartSearchLifecycle.Configuration().closedGateRecheckDelay == .seconds(30))
+        let payload = Data("model-a-bytes".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payload)
+        let assets = (0..<6).map { uid("asset-\($0)") }
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA]),
+            payloads: [urlA: payload],
+            assets: assets,
+            closedGateRecheckDelay: MLSmartSearchLifecycle.Configuration().closedGateRecheckDelay
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        harness.governor.set(false)
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entryA.id)
+        try #require(
+            await waitUntil {
+                if case .waiting = await harness.lifecycle.currentSnapshot().phase { return true }
+                return false
+            })
+        let checksWhileClosed = harness.governor.checkCount
+        // A 1 s recheck would ask the gate at least twice more in this time.
+        try await Task.sleep(for: .milliseconds(2_500))
+        #expect(harness.governor.checkCount - checksWhileClosed <= 1)
+        #expect(harness.provider.embedder.totalCalls == 0)
+
+        // The host reports the change, and indexing resumes at once instead of after the fallback.
+        harness.governor.set(true)
+        await harness.lifecycle.noteConditionsChanged()
+        #expect(
+            await waitUntil(timeout: .seconds(5)) {
+                let snapshot = await harness.lifecycle.currentSnapshot()
+                if case .ready(let coverage) = snapshot.phase {
+                    return coverage.isComplete && coverage.total == assets.count
+                }
+                return false
+            })
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func shutdownCancelsAClosedGateWaitWithoutWaitingForTheFallback() async throws {
+        let payload = Data("model-a-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")],
+            closedGateRecheckDelay: MLSmartSearchLifecycle.Configuration().closedGateRecheckDelay
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        harness.governor.set(false)
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+        try #require(
+            await waitUntil {
+                if case .waiting = await harness.lifecycle.currentSnapshot().phase { return true }
+                return false
+            })
+        let started = ContinuousClock.now
+        await harness.lifecycle.shutdown()
+        #expect(started.duration(to: .now) < .seconds(5))
+        harness.governor.set(true)
+        await harness.lifecycle.noteConditionsChanged()
+        #expect(harness.provider.embedder.totalCalls == 0)
     }
 
     @Test func disablePurgesEverythingAndIsIdempotent() async throws {

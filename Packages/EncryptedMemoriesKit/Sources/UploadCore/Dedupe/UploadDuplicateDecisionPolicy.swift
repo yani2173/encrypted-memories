@@ -46,7 +46,7 @@ public enum UploadDuplicateDecisionPolicy {
             case .trashed:
                 return .skip(.trashedDuplicate, remoteLinkID: remotePrimary.linkID)
             case nil:
-                return .skip(.deletedRemotely, remoteLinkID: remotePrimary.linkID)
+                return .skip(.inconsistentRemoteState, remoteLinkID: remotePrimary.linkID)
             case .active:
                 guard let primaryLinkID = remotePrimary.linkID else {
                     return .skip(.inconsistentRemoteState, remoteLinkID: nil)

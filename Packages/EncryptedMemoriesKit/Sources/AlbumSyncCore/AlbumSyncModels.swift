@@ -116,19 +116,23 @@ public struct AlbumSyncAttachResult: Sendable, Equatable {
     public var firstFailureMessage: String?
     /// Remote link ids of the photos that could not be attached, one per failure.
     public var failedLinkIDs: [String]
+    /// The reason of each failed link id, when the backend names one.
+    public var failureMessages: [String: String]
 
     public init(
         attached: Int = 0,
         alreadyMember: Int = 0,
         failed: Int = 0,
         firstFailureMessage: String? = nil,
-        failedLinkIDs: [String] = []
+        failedLinkIDs: [String] = [],
+        failureMessages: [String: String] = [:]
     ) {
         self.attached = attached
         self.alreadyMember = alreadyMember
         self.failed = failed
         self.firstFailureMessage = firstFailureMessage
         self.failedLinkIDs = failedLinkIDs
+        self.failureMessages = failureMessages
     }
 
     public static func += (lhs: inout AlbumSyncAttachResult, rhs: AlbumSyncAttachResult) {
@@ -136,6 +140,7 @@ public struct AlbumSyncAttachResult: Sendable, Equatable {
         lhs.alreadyMember += rhs.alreadyMember
         lhs.failed += rhs.failed
         lhs.failedLinkIDs += rhs.failedLinkIDs
+        lhs.failureMessages.merge(rhs.failureMessages) { first, _ in first }
         if lhs.firstFailureMessage == nil { lhs.firstFailureMessage = rhs.firstFailureMessage }
     }
 }
@@ -147,7 +152,6 @@ public struct AlbumSyncRemoteLink: Sendable, Equatable {
     /// True when the only known remote copy is in Proton trash - the user deleted it there
     /// intentionally, so album sync must neither attach nor re-upload it.
     public let isTrashed: Bool
-
     public init(uid: PhotoUID, sha1Hex: String?, isTrashed: Bool) {
         self.uid = uid
         self.sha1Hex = sha1Hex
@@ -190,17 +194,23 @@ public struct AlbumSyncProgress: Sendable, Equatable {
     public var unattachable = 0
     /// Local assets whose only remote copy the user trashed on Proton - respected, not attached.
     public var trashedSkipped = 0
+    /// Local assets that are in the Proton album, but whose backup is not complete, for example a Live Photo
+    /// whose video stays blocked behind a draft.
+    public var incomplete = 0
     public var message: String?
+    /// The backup phase waits because mobile data is off for backups on an expensive network.
+    public var isWaitingForWiFi = false
 
     public init() {}
 
-    public var needsAttentionCount: Int { attachFailed + unattachable }
+    public var needsAttentionCount: Int { attachFailed + unattachable + trashedSkipped + incomplete }
 
     public var localizedTitle: String {
         switch phase {
         case .idle: L10n.string("albumsync.phase_idle")
         case .scanningLocal: L10n.string("albumsync.phase_scanning")
-        case .backingUp: L10n.string("albumsync.phase_backing_up")
+        case .backingUp:
+            isWaitingForWiFi ? L10n.string("backup.phase_waiting_wifi") : L10n.string("albumsync.phase_backing_up")
         case .checkingAlbum: L10n.string("albumsync.phase_checking")
         case .attaching: L10n.string("albumsync.phase_attaching")
         case .completed: L10n.string("albumsync.phase_completed")
@@ -226,10 +236,8 @@ public struct AlbumSyncProgress: Sendable, Equatable {
     }
 }
 
-/// Final outcome of one sync run. `isFullySynced` is the honest "everything attachable is in the
-/// Proton album" claim; anything less surfaces counts, never fake success. Photos whose only
-/// remote copy the user trashed on Proton (`trashedSkipped`) are an intentional user state:
-/// additive sync respects the deletion (no re-upload, no attach) and reports the count.
+/// Final outcome of one sync run. A photo skipped because its copy is in the trash remains a gap in the album.
+/// Additive sync respects the deletion and reports the photo for the person's decision.
 public struct AlbumSyncReport: Sendable, Equatable {
     public let remoteAlbumID: String
     public let totalAssets: Int
@@ -238,7 +246,9 @@ public struct AlbumSyncReport: Sendable, Equatable {
     public let attachFailed: Int
     public let unattachable: Int
     public let trashedSkipped: Int
-    /// One item for each photo that is not in the Proton album after this run, with its reason.
+    /// Photos that are in the Proton album, but whose backup is not complete after this run.
+    public let incomplete: Int
+    /// One item for each photo that needs attention after this run, with its reason.
     public let problems: [BackupFailedItem]
 
     public init(
@@ -249,6 +259,7 @@ public struct AlbumSyncReport: Sendable, Equatable {
         attachFailed: Int,
         unattachable: Int,
         trashedSkipped: Int,
+        incomplete: Int = 0,
         problems: [BackupFailedItem] = []
     ) {
         self.remoteAlbumID = remoteAlbumID
@@ -258,10 +269,13 @@ public struct AlbumSyncReport: Sendable, Equatable {
         self.attachFailed = attachFailed
         self.unattachable = unattachable
         self.trashedSkipped = trashedSkipped
+        self.incomplete = incomplete
         self.problems = problems
     }
 
-    public var isFullySynced: Bool { attachFailed == 0 && unattachable == 0 }
+    public var isFullySynced: Bool {
+        attachFailed == 0 && unattachable == 0 && trashedSkipped == 0 && incomplete == 0
+    }
 }
 
 /// Errors the sync flow surfaces to the UI. All cases are explicit - there is no silent fallback.

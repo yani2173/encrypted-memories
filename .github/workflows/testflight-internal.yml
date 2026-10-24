@@ -9,6 +9,14 @@ on:
         description: Existing published GitHub release tag to retry
         required: true
         type: string
+      upgrade_override_tag:
+        description: Confirm the exact release tag to deliberately override upgrade verification
+        required: false
+        type: string
+      upgrade_override_reason:
+        description: Reason for the deliberate override (one printable line)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -18,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
 
 jobs:
   prepare:
@@ -33,6 +41,8 @@ jobs:
       channel: ${{ steps.release.outputs.channel }}
       commit_sha: ${{ steps.revision.outputs.commit_sha }}
       automation_sha: ${{ steps.automation.outputs.commit_sha }}
+      upgrade_sources: ${{ steps.upgrade-plan.outputs.upgrade_sources }}
+      upgrade_overridden: ${{ steps.upgrade-plan.outputs.upgrade_overridden }}
       notes_ios_de_base64: ${{ steps.release.outputs.notes_ios_de_base64 }}
       notes_ios_en_base64: ${{ steps.release.outputs.notes_ios_en_base64 }}
       notes_macos_de_base64: ${{ steps.release.outputs.notes_macos_de_base64 }}
@@ -142,6 +152,22 @@ jobs:
           echo "commit_sha=$release_sha" >> "$GITHUB_OUTPUT"
           ruby .github/scripts/release_build_number.rb "$release_sha" "$RUNNER_TEMP/release.json"
 
+      - name: Select published upgrade sources
+        id: upgrade-plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OVERRIDE_TAG: ${{ inputs.upgrade_override_tag }}
+          OVERRIDE_REASON: ${{ inputs.upgrade_override_reason }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/release-pages.json"
+          python3 -c 'import json,sys; print(json.dumps([release for page in json.load(open(sys.argv[1])) for release in page]))' \
+            "$RUNNER_TEMP/release-pages.json" > "$RUNNER_TEMP/release-history.json"
+          python3 .github/scripts/release_upgrade.py \
+            --release "$RUNNER_TEMP/release.json" --history "$RUNNER_TEMP/release-history.json" \
+            --output "$RUNNER_TEMP/upgrade-plan.json" --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" \
+            --override-tag="$OVERRIDE_TAG" --override-reason="$OVERRIDE_REASON"
+
       - name: Check out the exact release tag
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -175,8 +201,8 @@ jobs:
             --version "${{ needs.prepare.outputs.version }}" \
             --build-number "${{ needs.prepare.outputs.build_number }}"
 
-  upload:
-    name: Upload ${{ matrix.platform }}
+  build:
+    name: Build ${{ matrix.platform }}
     needs: [prepare, in-app-purchase-preflight]
     runs-on: xcode-27
     timeout-minutes: 60
@@ -790,6 +816,278 @@ jobs:
             "${{ needs.prepare.outputs.build_number }}" \
             "${{ steps.profile.outputs.name }}"
 
+      - name: Retain validated package for gated upload
+        if: steps.build.outputs.exists != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: apple-package-${{ matrix.script_platform }}
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove temporary release credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/apple-signing-certificates.p12"
+          rm -f "$RUNNER_TEMP/app-store-connect-api-key.json"
+          rm -rf "$RUNNER_TEMP/app-store-connect-private-keys"
+
+      - name: Retain build diagnostics
+        if: failure() || cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: testflight-${{ matrix.script_platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/EncryptedMemories-${{ matrix.script_platform }}.log
+            ${{ runner.temp }}/EncryptedMemories-${{ matrix.script_platform }}.xcresult
+            ${{ runner.temp }}/altool-upload-${{ matrix.script_platform }}-attempt-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Report build storage
+        if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  upgrade:
+    name: Test installed upgrades on ${{ matrix.platform }} (${{ matrix.shard }})
+    needs: [prepare, build]
+    runs-on: xcode-27
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # One iOS case takes about 7 minutes on the hosted runner (run 38171860265: 13 cases in 95 minutes after
+        # 19 minutes of builds), so all 24 iOS cases would exceed one 180-minute job. Each shard tests every
+        # source; together the shards of a platform cover every interruption point exactly once. A shard holds
+        # 6 points per source: 3 sources need about 145 minutes, so a fourth source needs a third iOS shard.
+        include:
+          - platform: iOS
+            shard: backup-model
+            points: backup.claimed backup.remoteReceipt backup.localRecord model.partial model.installRecord model.promoted
+          - platform: iOS
+            shard: index-thumbnail
+            points: index.embed index.beforeCommit index.afterCommit thumbnail.beforeLoad thumbnail.afterLoad thumbnail.stored
+          - platform: macOS
+            shard: all
+            points: >-
+              backup.claimed backup.remoteReceipt backup.localRecord model.partial model.installRecord model.promoted
+              index.embed index.beforeCommit index.afterCommit thumbnail.beforeLoad thumbnail.afterLoad thumbnail.stored
+    env:
+      # The lines that tell each case's result, timing and free disk. GitHub cuts a step log at about 10 MB, so the
+      # journey step prints only these lines; the full output stays in the retained release-upgrade.log.
+      JOURNEY_LINES: '^(PASS |\*\*Upgrade check failed|(iOS|macOS) (old|new) bundle: |Free disk |Xcode toolchain: |Owned iOS Simulator: )|: the UI run |: case took | error: |\*\* (BUILD|TEST) (FAILED|INTERRUPTED) \*\*'
+    steps:
+      - name: Report upgrade check scope
+        if: always()
+        run: |
+          {
+            echo 'macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau geprüft; abgedeckt durch iOS-Simulator und Entitlement-Vergleich.'
+            echo 'The backup journey requires consent already saved on disk. The immediate v1.0.5 Enable-to-SIGKILL case is a known historical limit and is not tested here.'
+            echo 'The gate requires installed CFBundleShortVersionString and CFBundleVersion to equal the published release data string-for-string before every old and new probe starts. External authentication-header acceptance remains unverified.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out trusted upgrade automation
+        id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.automation_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        id: python
+        if: needs.prepare.outputs.upgrade_overridden != 'true'
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Install pinned XcodeGen
+        id: xcodegen
+        if: needs.prepare.outputs.upgrade_overridden != 'true'
+        run: |
+          set -euo pipefail
+          executable="$(bash scripts/install-xcodegen.sh "$RUNNER_TEMP/xcodegen-install")"
+          dirname "$executable" >> "$GITHUB_PATH"
+          "$executable" --version
+
+      - name: Record upgrade toolchain
+        id: toolchain
+        if: needs.prepare.outputs.upgrade_overridden != 'true'
+        run: |
+          set -euo pipefail
+          # The reviewed pins are the defaults of the prepare-apple-build action; read them from there.
+          pin() {
+            ruby -ryaml -e 'puts YAML.load_file(ARGV[0]).fetch("inputs").fetch(ARGV[1]).fetch("default")' \
+              .github/actions/prepare-apple-build/action.yml "$1"
+          }
+          EXPECTED_XCODE_VERSION="$(pin xcode-version)" EXPECTED_XCODE_BUILD="$(pin xcode-build)" \
+            bash .github/scripts/verify_xcode_toolchain.sh
+          echo "key=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)-$(uname -m)" >> "$GITHUB_OUTPUT"
+
+      - name: Report runner disk
+        if: needs.prepare.outputs.upgrade_overridden != 'true'
+        run: |
+          # An iOS shard ran out of disk (rehearsal 38181793360). The free space at the start bounds every case.
+          { echo '### Runner disk at job start'; echo '```'; df -h "$HOME"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore completed predecessor builds
+        id: cache
+        if: needs.prepare.outputs.upgrade_overridden != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Developer/xcode/EncryptedMemories/UpgradeCheck/products
+          key: release-upgrade-${{ matrix.platform }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('scripts/upgrade-test/build_apps.py', '.github/scripts/release_identity.rb', '.github/scripts/release_build_number.rb', 'scripts/upgrade-test/overlays/**', 'Packages/EncryptedMemoriesKit/Sources/**/UpgradeTest*.swift') }}-${{ needs.prepare.outputs.tag }}
+          restore-keys: |
+            release-upgrade-${{ matrix.platform }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('scripts/upgrade-test/build_apps.py', '.github/scripts/release_identity.rb', '.github/scripts/release_build_number.rb', 'scripts/upgrade-test/overlays/**', 'Packages/EncryptedMemoriesKit/Sources/**/UpgradeTest*.swift') }}-
+
+      - name: Test installed upgrades
+        id: journey
+        if: needs.prepare.outputs.upgrade_overridden != 'true'
+        env:
+          TARGET_COMMIT: ${{ needs.prepare.outputs.commit_sha }}
+          TARGET_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          UPGRADE_SOURCES: ${{ needs.prepare.outputs.upgrade_sources }}
+          UPGRADE_PLATFORM: ${{ matrix.platform }}
+          UPGRADE_POINTS: ${{ matrix.points }}
+        run: |
+          set -euo pipefail
+          mapfile_path="$RUNNER_TEMP/upgrade-sources.txt"
+          python3 -c 'import json,os; print("\n".join(json.loads(os.environ["UPGRADE_SOURCES"])))' > "$mapfile_path"
+          sources=()
+          while IFS= read -r tag; do [[ -z "$tag" ]] || sources+=("$tag"); done < "$mapfile_path"
+          [[ "${#sources[@]}" -gt 0 ]] || { echo "::error::No supported upgrade source selected"; exit 1; }
+          read -ra points <<< "$UPGRADE_POINTS"
+          [[ "${#points[@]}" -gt 0 ]] || { echo "::error::No interruption point selected"; exit 1; }
+          bash scripts/test-release-upgrade.sh --target "$TARGET_COMMIT" --release-tag "$TARGET_RELEASE_TAG" --sources "${sources[@]}" --platform "$UPGRADE_PLATFORM" --points "${points[@]}" 2>&1 \
+            | tee "$RUNNER_TEMP/release-upgrade.log" | { grep --line-buffered -aE "$JOURNEY_LINES" || true; }
+
+      - name: List upgrade results
+        if: always() && needs.prepare.outputs.upgrade_overridden != 'true'
+        run: |
+          # GitHub cuts the journey step log at about 10 MB inside the build output. This short step keeps each
+          # case result, the UI runner startup times, and the failure cause readable.
+          grep -aE "$JOURNEY_LINES" "$RUNNER_TEMP/release-upgrade.log" || echo 'The journey recorded no case result.'
+          { echo '### Runner disk at job end'; echo '```'; df -h "$HOME"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Report blocked release
+        if: failure() || cancelled()
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          PYTHON_OUTCOME: ${{ steps.python.outcome }}
+          XCODEGEN_OUTCOME: ${{ steps.xcodegen.outcome }}
+          TOOLCHAIN_OUTCOME: ${{ steps.toolchain.outcome }}
+          CACHE_OUTCOME: ${{ steps.cache.outcome }}
+          JOURNEY_OUTCOME: ${{ steps.journey.outcome }}
+        run: |
+          {
+            echo 'Both Apple uploads remain blocked. Correct the failed step and re-run, or use the explicit main-branch override.'
+            echo "Checkout: $CHECKOUT_OUTCOME; Python: $PYTHON_OUTCOME; XcodeGen: $XCODEGEN_OUTCOME; toolchain: $TOOLCHAIN_OUTCOME; cache: $CACHE_OUTCOME; journey: $JOURNEY_OUTCOME."
+            echo 'The journey log reports the failing source, task boundary, and cause. Retained evidence contains the UI logs and result bundles.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report deliberate upgrade override
+        if: needs.prepare.outputs.upgrade_overridden == 'true'
+        run: echo 'The maintainer deliberately overrode this gate. The tag and reason are recorded in the release preparation summary.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain upgrade evidence
+        if: always() && needs.prepare.outputs.upgrade_overridden != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-upgrade-${{ matrix.platform }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ~/Developer/xcode/EncryptedMemories/UpgradeCheck/evidence
+            ${{ runner.temp }}/release-upgrade.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  upload:
+    name: Upload ${{ matrix.platform }}
+    needs: [prepare, build, upgrade]
+    runs-on: xcode-27
+    timeout-minutes: 30
+    environment: testflight-internal
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: iOS
+            api_platform: IOS
+            script_platform: ios
+          - platform: macOS
+            api_platform: MAC_OS
+            script_platform: macos
+    steps:
+      - name: Check out trusted release automation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.automation_sha }}
+          persist-credentials: false
+
+      - name: Check for an existing upload
+        id: build
+        env:
+          APP_STORE_CONNECT_APP_ID: ${{ vars.APP_STORE_CONNECT_APP_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          for secret_name in APP_STORE_CONNECT_APP_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_PRIVATE_KEY_BASE64; do
+            [[ -n "${!secret_name:-}" ]] || release_fail configuration \
+              "Secret or variable $secret_name was empty." \
+              "Set $secret_name in the testflight-internal environment and re-run the workflow."
+          done
+          ruby .github/scripts/app_store_connect.rb inspect-build \
+            --platform "${{ matrix.api_platform }}" \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --build-number "${{ needs.prepare.outputs.build_number }}"
+
+      - name: Validate existing build state
+        env:
+          PROCESSING_STATE: ${{ steps.build.outputs.processing_state }}
+        run: |
+          set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          case "$PROCESSING_STATE" in
+            FAILED|INVALID)
+              release_fail app-store-connect \
+                "App Store Connect reported processing state '$PROCESSING_STATE' for this build number." \
+                "Start a new workflow run with a new build number after correcting the Apple rejection."
+              ;;
+          esac
+
+      - name: Restore validated package
+        if: steps.build.outputs.exists != 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: apple-package-${{ matrix.script_platform }}
+          path: ${{ runner.temp }}/validated-package
+
+      - name: Resolve validated package path
+        id: artifact
+        if: steps.build.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=("$RUNNER_TEMP/validated-package"/*.ipa "$RUNNER_TEMP/validated-package"/*.pkg)
+          [[ "${#packages[@]}" -eq 1 ]] || { echo "::error::Expected exactly one validated package"; exit 1; }
+          echo "path=${packages[0]}" >> "$GITHUB_OUTPUT"
+
       - name: Upload package to App Store Connect
         if: steps.build.outputs.exists != 'true'
         env:
@@ -876,22 +1174,15 @@ jobs:
           rm -f "$RUNNER_TEMP/app-store-connect-api-key.json"
           rm -rf "$RUNNER_TEMP/app-store-connect-private-keys"
 
-      - name: Retain build diagnostics
+      - name: Retain upload diagnostics
         if: failure() || cancelled()
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: testflight-${{ matrix.script_platform }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/EncryptedMemories-${{ matrix.script_platform }}.log
-            ${{ runner.temp }}/EncryptedMemories-${{ matrix.script_platform }}.xcresult
-            ${{ runner.temp }}/altool-upload-${{ matrix.script_platform }}-attempt-*.log
+          name: testflight-upload-${{ matrix.script_platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/altool-upload-${{ matrix.script_platform }}-attempt-*.log
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Report build storage
-        if: always()
-        run: bash ./scripts/report-build-storage.sh
 
   distribute:
     name: Add to internal TestFlight

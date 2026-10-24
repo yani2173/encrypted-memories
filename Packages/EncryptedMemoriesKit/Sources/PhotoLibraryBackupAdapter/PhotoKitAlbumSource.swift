@@ -3,7 +3,7 @@ import Foundation
 import Photos
 
 /// `AlbumSyncLocalAlbumSource` over PhotoKit: user-created albums with stable identifiers, titles,
-/// counts, and the album's own display order. Metadata-only - no asset bytes, no thumbnails.
+/// counts, sorted alphabetically by title. Metadata-only - no asset bytes, no thumbnails.
 /// Callers ensure photo access first (`PhotoLibraryAuthorization`).
 public struct PhotoKitAlbumSource: AlbumSyncLocalAlbumSource {
     /// Identifiers handed out per autorelease drain - bounds transient PhotoKit memory on large albums.
@@ -14,8 +14,7 @@ public struct PhotoKitAlbumSource: AlbumSyncLocalAlbumSource {
     }
 
     public func listAlbums() async throws -> [LocalAlbumSummary] {
-        let chunk = chunkSize
-        return await Task.detached(priority: .utility) {
+        await Task.detached(priority: .utility) {
             let collections = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
             var result: [LocalAlbumSummary] = []
             result.reserveCapacity(collections.count)
@@ -34,7 +33,6 @@ public struct PhotoKitAlbumSource: AlbumSyncLocalAlbumSource {
                         assetCount: count
                     ))
             }
-            _ = chunk
             // Alphabetical for a stable Settings list (PhotoKit exposes no cross-folder user order).
             return result.sorted {
                 $0.title.localizedStandardCompare($1.title) == .orderedAscending

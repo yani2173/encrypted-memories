@@ -12,6 +12,8 @@ Start here:
 - [[Map|Map]]
 - [[Smart Search|Smart-Search]]
 - [[Photo and Video Viewer|Photo-and-Video-Viewer]]
+- [[Duplicates|Duplicates]]
+- [[Recently Deleted|Recently-Deleted]]
 - [[Backup and Photo Library Sync|Backup-and-Album-Sync]]
 - [[Uploads and Upload Queue|Uploads-and-Queue]]
 - [[Album Sync|Album-Sync]]

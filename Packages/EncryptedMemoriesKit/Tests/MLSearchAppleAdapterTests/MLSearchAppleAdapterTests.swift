@@ -3,6 +3,8 @@ import CoreML
 import CryptoKit
 import Foundation
 import MLSearchCore
+import MediaByteCache
+import MediaFeedCore
 import PhotosCore
 import Testing
 
@@ -10,6 +12,41 @@ import Testing
 
 /// Adapter tests that do not require a model artifact. A local opt-in smoke covers the real model.
 @Suite struct MLSearchAppleAdapterTests {
+    private final class WakeCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var value: Int { lock.withLock { count } }
+        func increment() { lock.withLock { count += 1 } }
+
+        func reaches(_ target: Int) async -> Bool {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while value < target, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            return value >= target
+        }
+    }
+
+    private actor EmptyThumbnailLoader: ThumbnailBatchLoader {
+        func loadThumbnails(
+            for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+        ) async -> ThumbnailBatchLoadResult { .delivered }
+    }
+
+    private enum GateSignal: CaseIterable, Sendable {
+        case thermal, lowPower, playback, search, userTransfer
+
+        func setActive(_ active: Bool, in snapshot: inout LibraryRuntimeSnapshot) {
+            switch self {
+            case .thermal: snapshot.thermalLevel = active ? .critical : .nominal
+            case .lowPower: snapshot.isLowPowerMode = active
+            case .playback: snapshot.activeVideoPlaybackCount = active ? 1 : 0
+            case .search: snapshot.activeSearchCount = active ? 1 : 0
+            case .userTransfer: snapshot.activeUserTransferCount = active ? 1 : 0
+            }
+        }
+    }
+
     private final class DemandState: @unchecked Sendable {
         private let lock = NSLock()
         private var active: Bool
@@ -83,7 +120,148 @@ import Testing
         #expect(hostBlocked.permitsIndexing() == false)
     }
 
-    @Test func smartSearchWorkGatePublishesDemandExpiryWithoutAnotherGatePoll() {
+    @Test func smartSearchWorkGateWakesIndexingWhenAnInputOpensTheGate() async throws {
+        var initial = LibraryRuntimeSnapshot()
+        initial.isLowPowerMode = true
+        let runtimeState = LibraryRuntimeState(initial: initial)
+        let gate = AppleSmartSearchWorkGate(visibleMediaDemandActive: { false }, runtimeState: runtimeState)
+        let wakes = WakeCounter()
+        gate.setIndexingWake { wakes.increment() }
+        // The baseline is taken at registration, so this change wakes even if the observation starts later.
+        runtimeState.update { $0.isLowPowerMode = false }
+        #expect(await wakes.reaches(1))
+        withExtendedLifetime(gate) {}
+    }
+
+    @Test func gateWakePolicyWakesOnlyForAnOpeningOfAClosedGate() {
+        var policy = SmartSearchGateWakePolicy(permits: true)
+        // A runtime change that leaves the open gate open, such as the network path, wakes nothing. A change that
+        // closes the gate cannot start indexing. Only the change that opens the closed gate wakes, once.
+        let wakes = [
+            policy.runtimeChanged(permits: true, gateIsOpenNow: true),
+            policy.runtimeChanged(permits: false, gateIsOpenNow: false),
+            policy.runtimeChanged(permits: false, gateIsOpenNow: false),
+            policy.runtimeChanged(permits: true, gateIsOpenNow: true),
+            policy.runtimeChanged(permits: true, gateIsOpenNow: true),
+        ]
+        #expect(wakes == [false, false, false, true, false])
+    }
+
+    @Test func gateWakePolicyWakesForAReopenThatTheLoopSawClosed() {
+        var policy = SmartSearchGateWakePolicy(permits: true)
+        // The newest-only update stream merged the close with the reopen, so the update looks like no change.
+        let wakes = [
+            policy.loopFoundGateClosed(currentPermits: false),
+            policy.runtimeChanged(permits: true, gateIsOpenNow: true),
+            policy.runtimeChanged(permits: true, gateIsOpenNow: true),
+        ]
+        #expect(wakes == [false, true, false])
+    }
+
+    @Test func gateWakePolicyKeepsAClosedGateOfTheLoopClosedUntilItOpens() {
+        var policy = SmartSearchGateWakePolicy(permits: true)
+        let wakes = [
+            policy.loopFoundGateClosed(currentPermits: false),
+            policy.runtimeChanged(permits: false, gateIsOpenNow: false),
+            policy.runtimeChanged(permits: true, gateIsOpenNow: true),
+        ]
+        #expect(wakes == [false, false, true])
+    }
+
+    @Test func gateWakePolicyWakesOnceWhenTheGateReopenedBeforeTheLoopRecordedItClosed() {
+        // The observer saw the close; the loop then finds the gate open again and wakes. The update of that reopen
+        // must not wake a second time.
+        var observedClose = SmartSearchGateWakePolicy(permits: true)
+        let afterClose = [
+            observedClose.runtimeChanged(permits: false, gateIsOpenNow: false),
+            observedClose.loopFoundGateClosed(currentPermits: true),
+            observedClose.runtimeChanged(permits: true, gateIsOpenNow: true),
+        ]
+        #expect(afterClose == [false, true, false])
+
+        // The loop first recorded a closed gate, then found it open: the flag is gone and the reopen wakes once.
+        var recordedFirst = SmartSearchGateWakePolicy(permits: true)
+        let afterRecord = [
+            recordedFirst.loopFoundGateClosed(currentPermits: false),
+            recordedFirst.loopFoundGateClosed(currentPermits: true),
+            recordedFirst.runtimeChanged(permits: true, gateIsOpenNow: true),
+        ]
+        #expect(afterRecord == [false, true, false])
+        #expect(recordedFirst.loopSawClosedGate == false)
+    }
+
+    @Test func gateWakePolicySuppressesAWakeAgainstAGateThatClosedAgain() {
+        var policy = SmartSearchGateWakePolicy(permits: true)
+        // The update opened the gate, but the gate is closed again: nothing to wake. The next opening wakes.
+        let wakes = [
+            policy.runtimeChanged(permits: false, gateIsOpenNow: false),
+            policy.runtimeChanged(permits: true, gateIsOpenNow: false),
+            policy.runtimeChanged(permits: false, gateIsOpenNow: false),
+            policy.runtimeChanged(permits: true, gateIsOpenNow: true),
+        ]
+        #expect(wakes == [false, false, false, true])
+
+        // A gate that the loop saw closed keeps counting as closed after a suppressed wake.
+        var seenByLoop = SmartSearchGateWakePolicy(permits: true)
+        let seen = [
+            seenByLoop.loopFoundGateClosed(currentPermits: false),
+            seenByLoop.runtimeChanged(permits: true, gateIsOpenNow: false),
+            seenByLoop.runtimeChanged(permits: true, gateIsOpenNow: true),
+        ]
+        #expect(seen == [false, false, true])
+    }
+
+    @Test(arguments: GateSignal.allCases)
+    private func gateRecordsThatTheLoopFoundItClosed(signal: GateSignal) {
+        var initial = LibraryRuntimeSnapshot()
+        signal.setActive(true, in: &initial)
+        let runtimeState = LibraryRuntimeState(initial: initial)
+        let gate = AppleSmartSearchWorkGate(visibleMediaDemandActive: { false }, runtimeState: runtimeState)
+        gate.setIndexingWake {}
+        // The observer cannot clear this record: only a wake does, and a closed gate wakes nothing.
+        #expect(gate.permitsIndexing() == false)
+        #expect(gate.wakePolicyForTesting?.loopSawClosedGate == true)
+    }
+
+    @Test(arguments: GateSignal.allCases)
+    private func publicWorkGateResumesForRuntimeInputsAndReplacesItsCallback(signal: GateSignal) async throws {
+        var initial = LibraryRuntimeSnapshot()
+        signal.setActive(true, in: &initial)
+        let runtimeState = LibraryRuntimeState(initial: initial)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = ThumbnailCache(namespace: "work-gate", rootDirectory: root)
+        cache.configure(accountUID: "fixture", key: SymmetricKey(size: .bits256))
+        let feed = ThumbnailFeedCore(cache: cache, loader: EmptyThumbnailLoader())
+        var gate: AppleSmartSearchWorkGate? = AppleSmartSearchWorkGate(feed: feed, runtimeState: runtimeState)
+        #expect(gate?.permitsIndexing() == false)
+        let first = WakeCounter()
+        gate?.setIndexingWake { first.increment() }
+        runtimeState.update { signal.setActive(false, in: &$0) }
+        try #require(await first.reaches(1))
+        #expect(gate?.permitsIndexing() == true)
+
+        let replacement = WakeCounter()
+        gate?.setIndexingWake { replacement.increment() }
+        // The loop sees the gate closed, then it opens again. The update stream may merge the two changes, so only
+        // what the loop saw tells that the reopen needs a wake.
+        runtimeState.update { signal.setActive(true, in: &$0) }
+        #expect(gate?.permitsIndexing() == false)
+        runtimeState.update { signal.setActive(false, in: &$0) }
+        try #require(await replacement.reaches(1))
+        #expect(first.value == 1)
+        #expect(replacement.value == 1)
+        #expect(gate?.permitsIndexing() == true)
+
+        weak var releasedGate = gate
+        gate = nil
+        for _ in 0..<100 where releasedGate != nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(releasedGate == nil)
+    }
+
+    @Test func smartSearchWorkGatePublishesDemandExpiryWithoutAnotherGatePoll() async throws {
         let runtimeState = LibraryRuntimeState()
         let demand = DemandState(active: true)
         let gate = AppleSmartSearchWorkGate(
@@ -95,6 +273,8 @@ import Testing
         #expect(gate.permitsIndexing() == false)
         #expect(runtimeState.snapshot().hasVisibleMediaDemand)
         #expect(demand.scheduledRefreshCount == 1)
+        let wakes = WakeCounter()
+        gate.setIndexingWake { wakes.increment() }
         #expect(gate.permitsIndexing() == false)
         #expect(demand.scheduledRefreshCount == 1)
 
@@ -106,6 +286,7 @@ import Testing
         #expect(demand.runNextRefresh())
         #expect(runtimeState.snapshot().hasVisibleMediaDemand == false)
         #expect(demand.scheduledRefreshCount == 0)
+        #expect(await wakes.reaches(1))
     }
 
     @Test func tinyCLIPTokenizerMatchesReferenceVectors() throws {

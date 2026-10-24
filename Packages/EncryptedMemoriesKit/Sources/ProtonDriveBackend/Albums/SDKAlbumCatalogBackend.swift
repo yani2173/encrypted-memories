@@ -251,7 +251,7 @@ actor SDKSharedAlbumSnapshotCache {
     }
 }
 
-/// SDK 0.29.1 catalog/sharing/membership adapter. Enumerations publish only after their native
+/// SDK 0.31.1 catalog/sharing/membership adapter. Enumerations publish only after their native
 /// callback stream completes, and node hydration uses a bounded task group so a large catalog
 /// cannot create one unbounded task per album.
 struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
@@ -259,17 +259,20 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     private let maximumConcurrentNodeLoads: Int
     private let admission: JoinedShutdownGate?
     private let sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache
+    private let requestCause: ProtonRequestCauseBinding?
 
     init(
         client: any SDKPhotoCatalogClient,
         maximumConcurrentNodeLoads: Int = 4,
         admission: JoinedShutdownGate? = nil,
-        sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
+        sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache(),
+        requestCause: ProtonRequestCauseBinding? = nil
     ) {
         self.client = client
         self.maximumConcurrentNodeLoads = max(1, maximumConcurrentNodeLoads)
         self.admission = admission
         self.sharedAlbumSnapshotCache = sharedAlbumSnapshotCache
+        self.requestCause = requestCause
     }
 
     func listAlbums() async throws -> [AlbumSummary] {
@@ -392,8 +395,8 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         return result
     }
 
-    /// The sharing state, the claimed file size, and the albums of each photo. One node read for each photo,
-    /// `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
+    /// The sharing state, the claimed file size, the albums, and the shown metadata of each photo. One node read for
+    /// each photo, `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
     func nodeFacts(of photoUIDs: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try await withAdmission {
             let uniqueUIDs = Array(Set(photoUIDs))
@@ -406,10 +409,15 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
                 case .photo(let photo):
                     fact = .init(
                         isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize,
-                        albums: photo.albumUids.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) })
+                        albums: photo.albumUids.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) },
+                        fingerprint: SDKPhotoMetadataReader.fingerprint(
+                            captureTime: photo.captureTime, name: photo.name, mimeType: photo.mediaType,
+                            revision: photo.activeRevision))
                 case .file(let file):
+                    // A plain file has no capture time, so two files cannot prove the same metadata.
                     fact = .init(
-                        isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize)
+                        isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize,
+                        fingerprint: .matchingOnly(PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)))
                 case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
                 case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
                 }
@@ -420,6 +428,13 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     }
 
     private func withAdmission<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        guard let requestCause else { return try await admitted(operation) }
+        return try await requestCause.run { try await admitted(operation) }
+    }
+
+    private func admitted<T: Sendable>(
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         guard let admission else { return try await operation() }
@@ -477,37 +492,14 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     }
 
     private func loadNodes(_ uids: [SDKNodeUid]) async throws -> [(SDKNodeUid, DriveNode?)] {
-        guard !uids.isEmpty else { return [] }
-        return try await withThrowingTaskGroup(
-            of: (Int, SDKNodeUid, DriveNode?).self,
-            returning: [(SDKNodeUid, DriveNode?)].self
-        ) { group in
-            var nextIndex = 0
-            var ordered = [(SDKNodeUid, DriveNode?)?](repeating: nil, count: uids.count)
-
-            func addNext() {
-                guard nextIndex < uids.count else { return }
-                let index = nextIndex
-                let uid = uids[index]
-                nextIndex += 1
-                group.addTask {
-                    let node = try await SDKCancellableOperation.run { token in
-                        try await client.getNode(nodeUid: uid, cancellationToken: token)
-                    } cancel: { token in
-                        try? await client.cancelGetNode(cancellationToken: token)
-                    }
-                    return (index, uid, node)
-                }
+        let client = client
+        return try await BoundedConcurrency.throwingMap(uids, limit: maximumConcurrentNodeLoads) { uid in
+            let node = try await SDKCancellableOperation.run { token in
+                try await client.getNode(nodeUid: uid, cancellationToken: token)
+            } cancel: { token in
+                try? await client.cancelGetNode(cancellationToken: token)
             }
-
-            for _ in 0..<min(maximumConcurrentNodeLoads, uids.count) {
-                addNext()
-            }
-            while let (index, uid, node) = try await group.next() {
-                ordered[index] = (uid, node)
-                addNext()
-            }
-            return ordered.compactMap { $0 }
+            return (uid, node)
         }
     }
 

@@ -51,37 +51,39 @@ import Testing
         #expect(projection.snapshot.index(of: old.uid) == 0)
     }
 
-    @Test func coordinatorDropsSupersededLargeLibraryResult() async throws {
-        let items = (0..<30_000).map { item("item-\($0)", seconds: Double($0)) }
-        let sections = [section(items)]
-        let gate = ProjectionGate()
-        defer { gate.release() }
-        let coordinator = TimelineSearchProjectionCoordinator(beforeProjection: { await gate.wait() })
-        let staleKey = TimelineSearchProjectionKey(
-            sourceRevision: 1,
-            query: "does-not-exist",
-            context: TimelineSearchContext(),
-            semanticMatches: nil
-        )
-        let newestKey = TimelineSearchProjectionKey(
-            sourceRevision: 1,
-            query: "item-29999",
-            context: TimelineSearchContext(),
-            semanticMatches: nil
-        )
+    #if DEBUG
+        @Test func coordinatorDropsSupersededLargeLibraryResult() async throws {
+            let items = (0..<30_000).map { item("item-\($0)", seconds: Double($0)) }
+            let sections = [section(items)]
+            let gate = ProjectionGate()
+            defer { gate.release() }
+            let coordinator = TimelineSearchProjectionCoordinator(beforeProjection: { await gate.wait() })
+            let staleKey = TimelineSearchProjectionKey(
+                sourceRevision: 1,
+                query: "does-not-exist",
+                context: TimelineSearchContext(),
+                semanticMatches: nil
+            )
+            let newestKey = TimelineSearchProjectionKey(
+                sourceRevision: 1,
+                query: "item-29999",
+                context: TimelineSearchContext(),
+                semanticMatches: nil
+            )
 
-        let staleTask = Task { await coordinator.resolve(sections: sections, key: staleKey) }
-        let deadline = ContinuousClock.now + .seconds(5)
-        while !gate.hasEntered, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
-        try #require(gate.hasEntered, "the stale request must own a pending projection before replacement")
-        let newest = await coordinator.resolve(sections: sections, key: newestKey)
-        gate.release()
-        let stale = await staleTask.value
+            let staleTask = Task { await coordinator.resolve(sections: sections, key: staleKey) }
+            let deadline = ContinuousClock.now + .seconds(5)
+            while !gate.hasEntered, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+            try #require(gate.hasEntered, "the stale request must own a pending projection before replacement")
+            let newest = await coordinator.resolve(sections: sections, key: newestKey)
+            gate.release()
+            let stale = await staleTask.value
 
-        #expect(stale == nil)
-        #expect(newest?.key == newestKey)
-        #expect(newest?.snapshot.items.map(\.uid.nodeID) == ["item-29999"])
-    }
+            #expect(stale == nil)
+            #expect(newest?.key == newestKey)
+            #expect(newest?.snapshot.items.map(\.uid.nodeID) == ["item-29999"])
+        }
+    #endif
 
     private final class ProjectionGate: @unchecked Sendable {
         private let lock = NSLock()

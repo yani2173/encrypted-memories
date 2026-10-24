@@ -43,6 +43,31 @@ final class ViewerTitleFormatterTests: XCTestCase {
         XCTAssertTrue(title.line2.contains("4.454 von 35.666"), title.line2)
     }
 
+    func testWhitespaceOnlyLocationNameCountsAsNoName() {
+        let names = ["", " ", "\t", "\n", "\u{00A0}", "\u{3000}", " \t\n\u{00A0}\u{3000} "]
+        let withoutName = ViewerTitleFormatter.make(
+            captureDate: date("2026-06-06T13:45:00Z"), index: 2, total: 10, locale: german)
+        for name in names {
+            let title = ViewerTitleFormatter.make(
+                captureDate: date("2026-06-06T13:45:00Z"), index: 2, total: 10, locationName: name, locale: german)
+            XCTAssertEqual(title, withoutName, "name \(name.unicodeScalars.map { $0.value })")
+            let resolving = ViewerTitleFormatter.make(
+                captureDate: date("2026-06-06T13:45:00Z"), index: 2, total: 10, locationName: name,
+                locationIsResolving: true, locale: german)
+            XCTAssertTrue(resolving.reservesLocationLine, "a blank name must not end the reserved headline")
+        }
+    }
+
+    func testLocationNameWithTextIsShownExactlyAsGiven() {
+        let title = ViewerTitleFormatter.make(
+            captureDate: date("2026-06-06T13:45:00Z"), index: 2, total: 10, locationName: "  Wien\u{00A0}\n",
+            locale: german)
+        XCTAssertEqual(title.line1, "  Wien\u{00A0}\n")
+        XCTAssertFalse(title.reservesLocationLine)
+        XCTAssertNil(PlaceNameText.displayable(nil))
+        XCTAssertEqual(PlaceNameText.displayable(" x "), " x ")
+    }
+
     func testResolvingLocationReservesHeadlineAndKeepsDateOnSecondLine() {
         let title = ViewerTitleFormatter.make(
             captureDate: date("2026-06-06T13:45:00Z"),

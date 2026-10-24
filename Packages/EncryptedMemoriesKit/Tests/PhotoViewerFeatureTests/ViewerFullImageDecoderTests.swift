@@ -95,6 +95,28 @@ final class ViewerFullImageDecoderTests: XCTestCase {
         }
     }
 
+    func testStreamedDecodeSettlesEveryRapidStartAndCancel() async throws {
+        let data = try pngData(width: 200, height: 100)
+        for iteration in 0..<200 {
+            let decode = Task {
+                try await ViewerFullImageDecoder.decodeStreamedCGImage(
+                    from: ChunkedOriginalProvider(data: data, chunkSize: 64),
+                    uid: PhotoUID(volumeID: "v", nodeID: "rapid-\(iteration)"),
+                    maxPixelSize: 50,
+                    onProgress: { _ in }
+                )
+            }
+            try await Task.sleep(for: .microseconds(Int.random(in: 0...2_000)))
+            decode.cancel()
+            do {
+                let image = try await decode.value
+                XCTAssertNotNil(image, "a decode that finished before the cancellation returns its image")
+            } catch is CancellationError {
+                // Expected when the cancellation arrived first.
+            }
+        }
+    }
+
     func testStreamedDecodePropagatesProviderFailureAfterJoiningDecoder() async {
         do {
             _ = try await ViewerFullImageDecoder.decodeStreamedCGImage(

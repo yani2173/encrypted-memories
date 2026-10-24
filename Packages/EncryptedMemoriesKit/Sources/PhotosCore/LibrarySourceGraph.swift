@@ -162,7 +162,8 @@ public struct LibrarySourceItem: Hashable, Sendable, Codable {
             relatedVideoID: knownFields.contains(.livePhotoRelationship) ? item.relatedVideoID : nil,
             durationSeconds: knownFields.contains(.duration) ? item.durationSeconds : nil,
             tags: knownFields.contains(.tags) ? item.tags : [],
-            burstMemberIDs: knownFields.contains(.burstRelationship) ? item.burstMemberIDs : []
+            burstMemberIDs: knownFields.contains(.burstRelationship) ? item.burstMemberIDs : [],
+            timelineOrder: item.timelineOrder
         )
     }
 
@@ -1716,7 +1717,8 @@ public final class LibrarySourceGraph {
                     ? preferredItem.durationSeconds : fallbackItem.durationSeconds,
                 tags: preferred.knownFields.contains(.tags) ? preferredItem.tags : fallbackItem.tags,
                 burstMemberIDs: preferred.knownFields.contains(.burstRelationship)
-                    ? preferredItem.burstMemberIDs : fallbackItem.burstMemberIDs
+                    ? preferredItem.burstMemberIDs : fallbackItem.burstMemberIDs,
+                timelineOrder: preferredItem.timelineOrder ?? fallbackItem.timelineOrder
             ),
             knownFields: knownFields
         )

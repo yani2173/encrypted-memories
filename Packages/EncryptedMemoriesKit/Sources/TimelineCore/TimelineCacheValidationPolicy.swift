@@ -20,12 +20,32 @@ public enum TimelineCacheValidation: Equatable, Sendable {
     }
 }
 
+/// A validated monitor seed and the cache projection that must publish before that seed is installed.
+public struct TimelineCacheValidationResult: Sendable {
+    public let validation: TimelineCacheValidation
+    public let snapshot: CachedTimelineSnapshot?
+}
+
 /// One cross-platform decision point for fast, flicker-free warm launches.
 ///
 /// A disk cache becomes authoritative only when it was saved with a stable Proton event token and the cheap
 /// current token still matches. Missing tokens, unsupported providers, and probe failures all fail closed to a
 /// normal authoritative refresh; no platform shell invents a timeout or its own freshness heuristic.
 public enum TimelineCacheValidationPolicy {
+    public static func validateForPublication(
+        snapshot: CachedTimelineSnapshot, repository: any PhotosRepository
+    ) async -> TimelineCacheValidationResult {
+        let validation = await validate(snapshot: snapshot, repository: repository)
+        guard case .validated = validation else {
+            return TimelineCacheValidationResult(validation: validation, snapshot: nil)
+        }
+        let current = await repository.cachedTimelineSnapshot()
+        guard !Task.isCancelled, let current, current.validationToken == snapshot.validationToken else {
+            return TimelineCacheValidationResult(validation: .refreshRequired(monitorBaseline: ""), snapshot: nil)
+        }
+        return TimelineCacheValidationResult(validation: validation, snapshot: current)
+    }
+
     public static func validate(
         snapshot: CachedTimelineSnapshot,
         repository: any PhotosRepository
@@ -38,7 +58,7 @@ public enum TimelineCacheValidationPolicy {
             guard currentToken == snapshot.validationToken else {
                 return .refreshRequired(monitorBaseline: currentToken)
             }
-            return .validated(token: currentToken)
+            return .validated(token: try await provider.monitorBaseline(for: currentToken))
         } catch is any LibraryChangeTerminalError {
             return .terminalFailure
         } catch {

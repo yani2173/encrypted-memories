@@ -1,0 +1,11 @@
+diff --git a/Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift b/Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift
+--- a/Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift
+@@ -8,0 +9 @@
++    // swift-format-ignore
+@@ -9,0 +11,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)
++        return true
++        #else
+@@ -11,0 +16 @@
++        #endif

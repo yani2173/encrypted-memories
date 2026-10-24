@@ -5,7 +5,7 @@ final class MobileFailedBackupUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = false
-        app = XCUIApplication()
+        app = UITestApplication.make()
     }
 
     override func tearDown() { app.terminate() }
@@ -38,14 +38,19 @@ final class MobileFailedBackupUITests: XCTestCase {
     }
 
     private func row(_ filename: String) -> XCUIElement {
-        app.descendants(matching: .any).matching(identifier: "backup.failedItem.\(filename)").firstMatch
+        app.staticTexts["backup.failedItem.\(filename)"]
+    }
+
+    /// A row that offers a decision carries the button trait.
+    private func decisionRow(_ filename: String) -> XCUIElement {
+        app.buttons["backup.failedItem.\(filename)"]
     }
 
     func testThreeSectionsShowReasonsAndPermanentDismissal() {
         openSheet()
         XCTAssertEqual(section("actionNeeded").label, "Action needed")
         XCTAssertTrue(row("accountStorage fixture.heic").exists)
-        XCTAssertTrue(row("deletedElsewhere fixture.heic").exists)
+        XCTAssertTrue(decisionRow("deletedElsewhere fixture.heic").exists)
         XCTAssertTrue(app.buttons["backup.retryUserResolvable.sheet"].exists)
         app.swipeUp()
         XCTAssertTrue(section("continuesByItself").waitForExistence(timeout: 5))
@@ -99,7 +104,7 @@ final class MobileFailedBackupUITests: XCTestCase {
 
     func testDecisionAndPermanentRowsDoNotExposeTryAgain() {
         openSheet(mode: "-EncryptedMemoriesNoUserResolvableBackupFixture")
-        XCTAssertTrue(row("deletedElsewhere fixture.heic").exists)
+        XCTAssertTrue(decisionRow("deletedElsewhere fixture.heic").exists)
         XCTAssertFalse(app.buttons["backup.retryUserResolvable.sheet"].exists)
     }
 

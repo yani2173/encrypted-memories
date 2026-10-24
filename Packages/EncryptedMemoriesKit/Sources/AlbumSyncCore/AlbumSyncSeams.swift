@@ -5,7 +5,7 @@ import UploadCore
 /// The platform adapter's view of local albums (PhotoKit on Apple platforms). Permission handling
 /// stays in the platform layer: these calls are made only after access is granted.
 public protocol AlbumSyncLocalAlbumSource: Sendable {
-    /// User-created albums, in the platform's display order.
+    /// User-created albums, sorted alphabetically by title (PhotoKit exposes no cross-folder user order).
     func listAlbums() async throws -> [LocalAlbumSummary]
     /// Typed contents of one album in stable display order. May be large; implementations must
     /// enumerate chunked and never load asset bytes. `.present([])` and `.missing` are distinct.
@@ -66,7 +66,13 @@ public protocol AlbumSyncBackupExecuting: Sendable {
         localIdentifiers: [String],
         onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
     ) async throws -> AlbumSyncBackupReport
+    /// Resolves only settled assets whose upload manifest has no link. The proof stays transient.
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink]
     func stop() async
+}
+
+public extension AlbumSyncBackupExecuting {
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] { [:] }
 }
 
 /// Remote (Proton) album operations the sync engine needs. Implemented by the backend package;
@@ -78,9 +84,23 @@ public protocol AlbumSyncRemoteAlbumOps: Sendable {
     func createAlbum(name: String) async throws -> String
     /// Link ids of the album's current main photos (Live Photo motion parts stay nested).
     func childMainLinkIDs(albumID: String) async throws -> Set<String>
+    /// Fresh deletion evidence only for links that are not current album members. Missing results are unknown.
+    func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState]
     /// Attaches existing remote photos (no media re-upload). Per-item failures are aggregated,
     /// never masked; "already a member" is reported as convergence.
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult
+    /// Active photos of the account whose main file has the same bytes, by lowercase SHA-1 hex. Read-only; another
+    /// device's copy of a shared photo has its own link with the same bytes. The answer can name related files and
+    /// photos outside the album; the caller keeps only current album members.
+    func activeMainLinkIDs(withSameContentAs sha1Hexes: Set<String>) async throws -> [String: Set<String>]
+}
+
+public extension AlbumSyncRemoteAlbumOps {
+    func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState] {
+        [:]
+    }
+    /// Without a content index no other copy is known, and every photo attaches through its own link.
+    func activeMainLinkIDs(withSameContentAs sha1Hexes: Set<String>) async throws -> [String: Set<String>] { [:] }
 }
 
 /// Maps local asset identifiers to their remote counterparts via the upload identity manifest.

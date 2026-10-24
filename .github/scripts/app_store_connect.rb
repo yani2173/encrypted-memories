@@ -614,17 +614,56 @@ module AppStoreConnect
       unless beta_groups.any? { |group| group.dig("attributes", "isInternalGroup") == true }
         raise Error, "Create an internal TestFlight group before distributing to external testers"
       end
+      # An external beta is always an internal beta, too. A stable release reaches no internal group on its own.
+      internal_groups = beta_groups.select { |candidate| candidate.dig("attributes", "isInternalGroup") == true }
+      if internal_groups.length > 1
+        names = internal_groups.map { |candidate| candidate.dig("attributes", "name") }.compact.join(", ")
+        raise Error, "External TestFlight needs exactly one internal TestFlight group; found #{names}"
+      end
+      internal_group = internal_groups.first
       group = find_or_create_group(name: group_name, internal: false)
+      disable_mobile_builds_on_other_platforms(internal_group)
       disable_mobile_builds_on_other_platforms(group)
 
       with_current_builds(builds, version: version, build_number: build_number) do |current|
         current.each do |platform, build|
           upsert_build_localizations(build.fetch("id"), localization_paths.fetch(platform, {}))
         end
-        add_builds_to_group(group.fetch("id"), current.values.map { |build| build.fetch("id") })
+        build_ids = current.values.map { |build| build.fetch("id") }
+        add_builds_to_group(internal_group.fetch("id"), build_ids)
+        add_builds_to_group(group.fetch("id"), build_ids)
         current.each_value { |build| submit_beta_review(build) }
       end
       append_summary("Submitted #{version} (#{build_number}) for external TestFlight testing in #{group_name}.")
+      enable_public_link(group)
+    end
+
+    # Testers join the external group through its public link, which the README names. A refused change leaves the
+    # submitted beta intact; a later run enables the link again.
+    def enable_public_link(group)
+      attributes = group.fetch("attributes", {})
+      link = attributes["publicLink"] if attributes["publicLinkEnabled"] == true
+      unless link
+        response = @client.patch(
+          "/v1/betaGroups/#{group.fetch("id")}",
+          body: { data: { type: "betaGroups", id: group.fetch("id"), attributes: { publicLinkEnabled: true } } }
+        )
+        link = response&.dig("data", "attributes", "publicLink")
+      end
+      if link.to_s.empty?
+        append_summary("Apple returned no public TestFlight link yet. Run this workflow again after Beta App Review.")
+      else
+        write_output("public_link", link)
+        append_summary("Public TestFlight link: #{link}")
+      end
+    rescue Error => error
+      advice =
+        if error.is_a?(APIError) && [409, 422].include?(error.status)
+          "Run this workflow again after Beta App Review approves the build."
+        else
+          "Check the API key role and the external group in App Store Connect, then run this workflow again."
+        end
+      append_summary("The beta was submitted, but the public TestFlight link could not be enabled: #{error.message} #{advice}")
     end
 
     # Apple can list a build and still answer HTTP 404 for its id for a short time, and Apple

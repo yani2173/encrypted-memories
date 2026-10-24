@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "minimumPublicRelease": "v1.0.5",
+  "releases": [
+    {
+      "tag": "v1.0.5",
+      "commit": "79d55a3fb5e3537f429808c19cfc44b6ee4d3647",
+      "sdk": "0.29.1"
+    },
+    {
+      "tag": "v1.1.0",
+      "commit": "7ef71c53ed550ffcfe4408113cc19dac209e1a9c",
+      "sdk": "0.29.1"
+    }
+  ]
+}

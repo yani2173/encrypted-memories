@@ -27,7 +27,7 @@ struct SDKCapabilities {
     /// Upload capabilities, as the UI sees them (the wired SDK uploader). Single source of truth.
     var upload = UploadBackendCapabilities.sdkUploader
 
-    /// SDK 0.29.1 exposes read-only album enumeration and album-node metadata. The app's complete
+    /// SDK 0.31.1 exposes read-only album enumeration and album-node metadata. The app's complete
     /// read/write album seam remains on the narrow HTTP adapter until a separate behavior-equivalence
     /// pass adopts those reads and the SDK exposes the missing writes.
     var albumReadAPIsAvailable = true

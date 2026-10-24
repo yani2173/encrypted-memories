@@ -5,7 +5,7 @@ import SwiftUI
 struct MacSettingsTabs: NSViewControllerRepresentable {
     struct Tab {
         enum ID: String {
-            case account, support, library, smartSearch, backup, privacy, labs, diagnostics
+            case account, support, library, smartSearch, backup, privacy, labs
         }
 
         let id: ID
@@ -22,9 +22,11 @@ struct MacSettingsTabs: NSViewControllerRepresentable {
     }
 
     let tabs: [Tab]
+    @Binding var selectedTab: Tab.ID
 
     func makeNSViewController(context: Context) -> NSTabViewController {
-        let controller = NSTabViewController()
+        let controller = SelectionController()
+        controller.onSelection = { id in selectedTab = id }
         controller.tabStyle = .toolbar
         // Account content must disappear immediately when its tab is removed.
         controller.transitionOptions = []
@@ -34,6 +36,9 @@ struct MacSettingsTabs: NSViewControllerRepresentable {
     }
 
     func updateNSViewController(_ controller: NSTabViewController, context: Context) {
+        let selectionController = controller as? SelectionController
+        selectionController?.isUpdating = true
+        defer { selectionController?.isUpdating = false }
         for item in controller.tabViewItems
         where !tabs.contains(where: { $0.id.rawValue == item.identifier as? String }) {
             controller.removeTabViewItem(item)
@@ -54,6 +59,28 @@ struct MacSettingsTabs: NSViewControllerRepresentable {
             item.label = tab.title
             item.image = NSImage(systemSymbolName: tab.systemImage, accessibilityDescription: tab.title)
             item.toolTip = tab.title
+        }
+        if let index = tabs.firstIndex(where: { $0.id == selectedTab }),
+            controller.selectedTabViewItemIndex != index
+        {
+            controller.selectedTabViewItemIndex = index
+        }
+    }
+}
+
+private final class SelectionController: NSTabViewController {
+    var isUpdating = false
+    var onSelection: ((MacSettingsTabs.Tab.ID) -> Void)?
+
+    override func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        super.tabView(tabView, didSelect: tabViewItem)
+        guard !isUpdating, let rawID = tabViewItem?.identifier as? String,
+            let id = MacSettingsTabs.Tab.ID(rawValue: rawID)
+        else { return }
+        // AppKit can select a tab while the representable updates its list.
+        Task { @MainActor [weak self] in
+            guard let self, self.tabView.selectedTabViewItem?.identifier as? String == id.rawValue else { return }
+            self.onSelection?(id)
         }
     }
 }

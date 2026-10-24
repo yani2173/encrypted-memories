@@ -39,6 +39,12 @@ public final class ManagedWebAuthenticationSession {
         return true
     }
 
+    /// Keeps the browser only while the shared fork flow polls Proton; every other state ends it.
+    public func follow(_ state: ProtonAuthState) {
+        if case .authenticating = state { return }
+        cancel()
+    }
+
     public func cancel() {
         generation &+= 1
         let session = activeSession

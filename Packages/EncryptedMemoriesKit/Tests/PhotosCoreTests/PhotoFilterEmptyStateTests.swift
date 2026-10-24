@@ -11,6 +11,14 @@ final class PhotoFilterEmptyStateTests: XCTestCase {
         XCTAssertEqual(copy.systemImage, "trash")
     }
 
+    func testMapFilterEmptyCopyDoesNotClaimTheWholeLibraryIsEmpty() {
+        let copy = PhotoFilter.map.emptyStateCopy
+        XCTAssertNotEqual(copy.title, PhotoFilter.all.emptyStateCopy.title)
+        XCTAssertEqual(copy.title, L10n.string("empty.filter_title \(L10n.string("map.cluster_title"))"))
+        XCTAssertEqual(copy.description, L10n.string("empty.filter_description"))
+        XCTAssertEqual(copy.systemImage, "map")
+    }
+
     func testSmartFilterEmptyStateUsesTagCopy() {
         let copy = PhotoFilter.tag(.favorites).emptyStateCopy
 

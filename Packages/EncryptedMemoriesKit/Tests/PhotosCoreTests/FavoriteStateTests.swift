@@ -14,6 +14,12 @@ final class FavoriteStateTests: XCTestCase {
         return state
     }
 
+    /// A complete server read; `nil` is a failed one.
+    private func serverRead(_ state: inout FavoriteState, _ result: Set<PhotoUID>?) {
+        let read = state.beginLoad()
+        state.finishLoad(result, for: read)
+    }
+
     func testAWriteDuringARunningReadWinsOverTheDelayedResponse() throws {
         var state = loaded([])
         let read = state.beginLoad()
@@ -105,6 +111,103 @@ final class FavoriteStateTests: XCTestCase {
 
         state.finishLoad([c], for: read)
         XCTAssertEqual(state.favorites, [c])
+    }
+
+    func testLoadedFavoritesAreOutdatedOnlyAfterANewLibraryToken() {
+        var state = loaded([a])
+        XCTAssertFalse(state.needsRead)
+
+        state.observeLibraryToken(nil)
+        XCTAssertFalse(state.isOutdated, "a refresh without a token says nothing about the favorites")
+
+        state.observeLibraryToken("t1")
+        XCTAssertTrue(state.isOutdated)
+        XCTAssertTrue(state.needsRead)
+        serverRead(&state, [a])
+        XCTAssertFalse(state.needsRead)
+
+        state.observeLibraryToken("t1")
+        XCTAssertFalse(state.needsRead, "the same token needs no further read")
+        state.observeLibraryToken("t2")
+        XCTAssertTrue(state.needsRead)
+        state.observeLibraryToken(nil)
+        XCTAssertTrue(state.needsRead, "a refresh without a token must not clear a pending change")
+    }
+
+    func testARemoteChangeInBothDirectionsFollowsTheReadForTheNewToken() {
+        var state = loaded([a, b])
+        state.observeLibraryToken("t1")
+        serverRead(&state, [a, b])
+
+        state.observeLibraryToken("t2")
+        serverRead(&state, [b, c])
+
+        XCTAssertEqual(state.favorites, [b, c], "a was unfavorited and c was favorited elsewhere")
+        XCTAssertFalse(state.needsRead)
+    }
+
+    func testAReadThatStartedBeforeTheNewestTokenLeavesTheFavoritesOutdated() {
+        var state = loaded([a])
+        state.observeLibraryToken("t1")
+        let early = state.beginLoad()
+        state.observeLibraryToken("t2")
+
+        state.finishLoad([a], for: early)
+
+        XCTAssertTrue(state.needsRead, "the response may predate the change that moved the token to t2")
+    }
+
+    func testAFailedReadLeavesTheFavoritesOutdated() {
+        var state = loaded([a])
+        state.observeLibraryToken("t1")
+
+        serverRead(&state, nil)
+        XCTAssertTrue(state.needsRead)
+        XCTAssertEqual(state.availability, .available)
+        XCTAssertEqual(state.favorites, [a])
+
+        let cancelled = state.beginLoad()
+        state.cancelLoad(cancelled)
+        XCTAssertTrue(state.needsRead, "a cancelled read applies nothing")
+    }
+
+    func testAnOlderResponseDoesNotMarkTheNewerTokenRead() {
+        var state = loaded([a])
+        state.observeLibraryToken("t1")
+        let slow = state.beginLoad()
+        state.observeLibraryToken("t2")
+        let fast = state.beginLoad()
+        state.finishLoad([b], for: fast)
+
+        state.finishLoad([a], for: slow)
+
+        XCTAssertEqual(state.favorites, [b])
+        XCTAssertFalse(state.needsRead, "the stale response must not bring back the older token")
+    }
+
+    func testALocalWriteDuringATokenTriggeredReadSurvivesTheResponse() throws {
+        var state = loaded([a])
+        state.observeLibraryToken("t1")
+        let read = state.beginLoad()
+        let favorite = try XCTUnwrap(state.beginWrite(selection: [b], target: true))
+        let unfavorite = try XCTUnwrap(state.beginWrite(selection: [a], target: false))
+
+        state.finishLoad([a, c], for: read)
+
+        XCTAssertEqual(state.favorites, [b, c], "the newer local writes win; the remote c is added")
+        state.finishWrite(favorite, failed: [])
+        state.finishWrite(unfavorite, failed: [])
+        XCTAssertEqual(state.favorites, [b, c])
+    }
+
+    func testAResetForgetsTheObservedToken() {
+        var state = loaded([a])
+        state.observeLibraryToken("t1")
+
+        state.reset(keepingFavorites: true)
+        serverRead(&state, [a])
+
+        XCTAssertFalse(state.needsRead)
     }
 
     func testAnOlderResponseThatArrivesLastIsStale() throws {

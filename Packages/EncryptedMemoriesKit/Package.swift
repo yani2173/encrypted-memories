@@ -73,6 +73,15 @@ let package = Package(
         .package(url: "https://github.com/ProtonMail/protoncore_ios.git", exact: "37.3.0"),
     ],
     targets: [
+        .testTarget(
+            name: "UpgradeFixtureTests",
+            dependencies: [
+                "PhotosCore", "UploadCore", "PhotoLibraryBackupAdapter", "MLSearchCore", "MediaByteCache",
+                "MediaLocationCore",
+            ],
+            resources: [.copy("Fixtures")],
+            swiftSettings: disableDynamicActorIsolation
+        ),
         // PhotosCore owns the package-wide localization catalog.
         .target(name: "PhotosCore", resources: [.process("Resources")], swiftSettings: disableDynamicActorIsolation),
         .testTarget(name: "PhotosCoreTests", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
@@ -252,7 +261,8 @@ let package = Package(
         .target(
             name: "PhotoViewerFeature",
             dependencies: [
-                "PhotosCore", "AlbumCore", "DesignSystem", "MediaCache", "MediaByteCache", "PhotoViewerCore",
+                "PhotosCore", "AlbumCore", "DesignSystem", "MediaCache", "MediaByteCache", "MediaFeedCore",
+                "PhotoViewerCore",
             ],
             swiftSettings: disableDynamicActorIsolation
         ),
@@ -270,7 +280,7 @@ let package = Package(
         ),
         .target(name: "AlbumCore", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
         .target(
-            name: "AlbumsFeature", dependencies: ["AlbumCore", "PhotosCore"],
+            name: "AlbumsFeature", dependencies: ["AlbumCore", "DesignSystemCore", "PhotosCore"],
             swiftSettings: disableDynamicActorIsolation),
         .testTarget(
             name: "AlbumsFeatureTests", dependencies: ["AlbumCore", "AlbumsFeature", "PhotosCore"],
@@ -290,7 +300,8 @@ let package = Package(
         .testTarget(
             name: "DeviceRootAppleAdapterTests", dependencies: ["DeviceRootAppleAdapter", "DeviceRootCore"]),
         .target(name: "UploadCore", dependencies: ["PhotosCore"]),
-        .target(name: "UploadFeature", dependencies: ["UploadCore", "PhotosCore", "DesignSystemCore"]),
+        .target(
+            name: "UploadFeature", dependencies: ["UploadCore", "PhotosCore", "DesignSystemCore", "MediaFeedCore"]),
         // PhotoLibraryBackupAdapter is the package boundary for PhotoKit.
         .target(
             name: "PhotoLibraryBackupAdapter",
@@ -299,7 +310,12 @@ let package = Package(
             ]),
         .testTarget(
             name: "UploadFeatureTests",
-            dependencies: ["UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter"]),
+            dependencies: [
+                "UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter", "AlbumSyncCore",
+                // The Duplicates screenshots render the shared viewer with its merge tools.
+                "PhotoViewerFeature", "MediaCache", "MediaByteCache", "ProtonDriveBackend",
+                .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),
+            ]),
         .target(
             name: "MapCore", dependencies: ["PhotosCore", "MediaLocationCore"],
             swiftSettings: disableDynamicActorIsolation),
@@ -336,7 +352,7 @@ let package = Package(
             swiftSettings: disableDynamicActorIsolation),
         .testTarget(
             name: "MLSearchFeatureTests",
-            dependencies: ["MLSearchFeature", "MLSearchCore", "PhotosCore", "TimelineCore"],
+            dependencies: ["MLSearchFeature", "MLSearchCore", "PhotosCore", "TimelineCore", "MediaLocationCore"],
             swiftSettings: disableDynamicActorIsolation
         ),
     ]

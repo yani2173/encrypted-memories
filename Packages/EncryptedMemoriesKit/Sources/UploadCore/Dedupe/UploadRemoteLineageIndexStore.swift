@@ -36,10 +36,13 @@ public enum UploadRemoteLineageIndexHealth: Sendable, Equatable {
 /// Rebuildable account cache. The upload manifest's exact schema stays unchanged.
 public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     public static let databaseFileName = "remote-lineage-index-v1.sqlite"
-    private var db: OpaquePointer?
-    private let lock = NSLock()
+    private let connection: SQLiteStoreConnection
+    private var db: OpaquePointer? { connection.database }
     private var lookupFailed = false
     private let storePath: String
+    /// True when this open created the database file, as on the first launch after an update from a version without
+    /// the lineage index.
+    public let createdFile: Bool
     /// Repair sweeps of this process for each key epoch: the last link read and the earliest start of the next sweep.
     private var repairCursors: [String: String] = [:]
     private var nextRepairSweeps: [String: Date] = [:]
@@ -67,6 +70,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         url: URL, policy: LibraryDatabasePolicy = .conservative, clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         storePath = url.standardizedFileURL.path
+        createdFile = !FileManager.default.fileExists(atPath: storePath)
         self.clock = clock
         let schema = """
             CREATE TABLE remote_link_identity(
@@ -119,32 +123,26 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
                 stampVersion: { sqlite3_exec($0, "PRAGMA user_version=2;", nil, nil, nil) == SQLITE_OK }
             )
         else { return nil }
-        db = handle
+        connection = SQLiteStoreConnection(database: handle, optimizesOnClose: false)
     }
 
     deinit { close() }
 
-    public func close() {
-        lock.withLock {
-            guard let db else { return }
-            sqlite3_close(db)
-            self.db = nil
-        }
-    }
+    public func close() { connection.close() }
 
     /// False after a write failure or close; a rebuild then cannot fill the index.
     public var acceptsWrites: Bool {
-        lock.withLock { db != nil && !writesDisabled }
+        connection.withLock { db != nil && !writesDisabled }
     }
 
     public func hasCheckpoint(hashKeyEpoch: String, eventID: String) -> Bool {
-        lock.withLock { !writesDisabled && checkpointLocked(hashKeyEpoch: hashKeyEpoch) == eventID }
+        connection.withLock { !writesDisabled && checkpointLocked(hashKeyEpoch: hashKeyEpoch) == eventID }
     }
 
     public func health(
         hashKeyEpoch: String, contentCheckpoint: UploadRemoteContentIndexCheckpoint?
     ) -> UploadRemoteLineageIndexHealth {
-        lock.withLock {
+        connection.withLock {
             guard !writesDisabled, !lookupFailed, let contentCheckpoint,
                 checkpointLocked(hashKeyEpoch: hashKeyEpoch) == contentCheckpoint.eventID,
                 hasNoUnresolvedLinksLocked(hashKeyEpoch: hashKeyEpoch)
@@ -154,7 +152,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     }
 
     public func activeMainLinkIDs(forExternalIdentifier identifier: String, hashKeyEpoch: String) -> Set<String> {
-        lock.withLock {
+        connection.withLock {
             linksLocked(
                 "SELECT remote_link FROM remote_link_identity WHERE key_epoch=? AND external_id=? AND is_main=1;",
                 values: [hashKeyEpoch, identifier])
@@ -162,7 +160,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     }
 
     public func replacingMainLinkIDs(ofReplacedLink linkID: String, hashKeyEpoch: String) -> Set<String> {
-        lock.withLock {
+        connection.withLock {
             linksLocked(
                 "SELECT replacing_link FROM remote_lineage WHERE key_epoch=? AND replaced_link=?;",
                 values: [hashKeyEpoch, linkID])
@@ -170,7 +168,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     }
 
     public func externalIdentifier(ofMainLink linkID: String, hashKeyEpoch: String) -> String? {
-        lock.withLock {
+        connection.withLock {
             linksLocked(
                 "SELECT external_id FROM remote_link_identity WHERE key_epoch=? AND remote_link=? AND is_main=1;",
                 values: [hashKeyEpoch, linkID]
@@ -179,7 +177,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     }
 
     public func replacedLinkIDs(ofReplacingMain linkID: String, hashKeyEpoch: String) -> Set<String> {
-        lock.withLock {
+        connection.withLock {
             linksLocked(
                 "SELECT replaced_link FROM remote_lineage WHERE key_epoch=? AND replacing_link=?;",
                 values: [hashKeyEpoch, linkID])
@@ -189,7 +187,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     /// The next unresolved links to read again, at most `limit`. A sweep walks the links in order; after its end the
     /// next sweep waits `sweepInterval`, so a link that keeps failing costs one read for each interval.
     public func unresolvedLinkIDsForRepair(hashKeyEpoch: String, limit: Int, sweepInterval: TimeInterval) -> [String] {
-        lock.withLock {
+        connection.withLock {
             guard limit > 0, !writesDisabled else { return [] }
             let now = clock()
             let cursor = repairCursors[hashKeyEpoch]
@@ -216,7 +214,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     public func linksOmittedTwice(
         omitted: Set<String>, returned: Set<String>, hashKeyEpoch: String, interval: TimeInterval
     ) -> Set<String> {
-        lock.withLock {
+        connection.withLock {
             let now = clock()
             var since = omittedSince[hashKeyEpoch, default: [:]]
             for linkID in returned { since[linkID] = nil }
@@ -240,7 +238,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         identities: [UploadRemoteLinkIdentityRecord], lineage: [UploadRemoteLineageRecord],
         hashKeyEpoch: String, eventID: String, unresolvedRemoteLinkIDs: Set<String>
     ) -> Bool {
-        lock.withLock {
+        connection.withLock {
             let replaced = transactionLocked {
                 clearPublishedLocked()
                     && clearOtherBuildEpochsLocked(hashKeyEpoch)
@@ -259,7 +257,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         removingRemoteLinkIDs: [String], hashKeyEpoch: String, expectedEventID: String,
         eventID: String, unresolvedRemoteLinkIDs: Set<String>
     ) -> Bool {
-        lock.withLock {
+        connection.withLock {
             guard !writesDisabled, checkpointLocked(hashKeyEpoch: hashKeyEpoch) == expectedEventID else { return false }
             return transactionLocked(expectedCheckpoint: (hashKeyEpoch, expectedEventID)) {
                 for linkID in removingRemoteLinkIDs {
@@ -284,7 +282,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
 
     /// Staging follows the content build cursor. Published rows stay unchanged until finish.
     public func prepareBuild(_ build: UploadRemoteContentIndexBuildCheckpoint, hashKeyEpoch: String) -> Bool {
-        lock.withLock {
+        connection.withLock {
             guard !writesDisabled else { return false }
             if let cursor = buildCursorLocked(
                 hashKeyEpoch: hashKeyEpoch, buildID: build.buildID, eventID: build.eventID)
@@ -308,7 +306,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         hashKeyEpoch: String, buildID: String, nextCursor: Int, unresolvedRemoteLinkIDs: Set<String>
     ) -> Bool {
         guard nextCursor >= 0 else { return false }
-        return lock.withLock {
+        return connection.withLock {
             guard !writesDisabled, let cursor = buildCursorLocked(hashKeyEpoch: hashKeyEpoch, buildID: buildID) else {
                 return false
             }
@@ -326,7 +324,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
 
     @discardableResult
     public func finishBuild(_ build: UploadRemoteContentIndexBuildCheckpoint, hashKeyEpoch: String) -> Bool {
-        lock.withLock {
+        connection.withLock {
             guard !writesDisabled else { return false }
             // Checked inside the transaction: another connection may prepare a new build between check and write.
             let finished = transactionLocked(

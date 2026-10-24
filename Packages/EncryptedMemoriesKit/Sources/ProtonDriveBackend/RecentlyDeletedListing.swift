@@ -173,6 +173,10 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
     /// then the library that lists it was published.
     private var restoredHere: [PhotoUID] = []
     private var restoredListedByLibrary: Set<PhotoUID> = []
+    /// Related photos that the last applied listing returned, by main photo. Recently Deleted hides them; a restore of
+    /// the main photo can take them along. Memory only: without a listing in this session the main photo comes back
+    /// alone, as before.
+    private var trashedRelated: [PhotoUID: [PhotoUID]] = [:]
     /// Photos trashed here, with the moment of the trash, that a library listing may still return. The library
     /// listing lags behind a trash; without this, a refresh would bring them back into the library and into the
     /// stored timeline, and a relaunch would show them until the listing caught up.
@@ -281,6 +285,15 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         return .applied
     }
 
+    mutating func listedRelatedPhotos(_ related: [PhotoUID: [PhotoUID]]) {
+        trashedRelated = related
+    }
+
+    /// The related photos in the trash of each of `mains`, as the last applied listing returned them.
+    func trashedRelatedPhotos(of mains: [PhotoUID]) -> [PhotoUID: [PhotoUID]] {
+        trashedRelated.filter { Set(mains).contains($0.key) }
+    }
+
     mutating func listingFailed() {
         needsListing = true
     }
@@ -310,6 +323,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         restoredListedByLibrary.subtract(moved)
         restoredHere.append(contentsOf: uids)
         for uid in uids {
+            trashedRelated[uid] = nil
             trashedAwaitingLibrary[uid] = nil
             removedElsewhereAwaitingLibrary[uid] = nil
         }
@@ -347,6 +361,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         trashedHere = []
         trashedHereItems = [:]
         trashedHereMisses = [:]
+        trashedRelated = [:]
     }
 
     var hasPhotosAwaitingLibrary: Bool { !trashedAwaitingLibrary.isEmpty || !removedElsewhereAwaitingLibrary.isEmpty }

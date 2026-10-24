@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import UploadCore
 
 /// How the sync run binds a local album to a Proton album.
@@ -33,14 +34,15 @@ public actor AlbumSyncRunner {
     private let mappingStore: AlbumSyncMappingStore?
     private let now: @Sendable () -> Date
 
-    /// Photos per `attach` call - a progress-granularity choice (the backend further batches to
-    /// the API's own limit internally).
+    /// Photos per `attach` call and per same-content lookup - a progress and Stop granularity choice (the backend
+    /// further batches to the API's own limit internally).
     private let attachChunkSize: Int
 
     private var onProgress: (@Sendable (AlbumSyncProgress) -> Void)?
     private var progress = AlbumSyncProgress()
     private var isRunning = false
     private var stopRequested = false
+    private var deletionLookupTask: Task<[String: UploadRemoteDeletionState], any Error>?
 
     public init(
         localSource: any AlbumSyncLocalAlbumSource,
@@ -127,7 +129,10 @@ public actor AlbumSyncRunner {
     /// already done is durable server-side, so the next run resumes/converges.
     public func stop() async {
         stopRequested = true
+        let lookup = deletionLookupTask
+        lookup?.cancel()
         await backup.stop()
+        _ = await lookup?.result
     }
 
     // MARK: - Phases
@@ -153,6 +158,7 @@ public actor AlbumSyncRunner {
         // Resolve the Proton album first and persist the mapping. Fail fast on conflicts so a crash
         // cannot create a second album later.
         try await ensureAlbumPresent(albumID: album.id)
+        try checkStop()
         let remoteAlbumID = try await resolveRemoteAlbum(
             album: album, resolution: resolution, mappingStore: mappingStore)
         try checkStop()
@@ -160,6 +166,7 @@ public actor AlbumSyncRunner {
         // Back up every album asset through the standard pipeline. The dedupe manifest remains the
         // single duplicate authority, so already-backed-up assets cost one preflight lookup.
         try await ensureAlbumPresent(albumID: album.id)
+        try checkStop()
         progress.phase = .backingUp
         publish()
         let updateBackupProgress: @Sendable (BackupSyncProgress) -> Void = { [weak self] snapshot in
@@ -172,13 +179,45 @@ public actor AlbumSyncRunner {
         // Build the pure, idempotent attach plan from current members and manifest links.
         progress.phase = .checkingAlbum
         publish()
-        let links = await linkLookup.remoteLinks(for: identifiers)
+        var links = await linkLookup.remoteLinks(for: identifiers)
+        try checkStop()
+        let missing = identifiers.filter { links[$0] == nil }
+        if !missing.isEmpty {
+            let proven: [String: AlbumSyncRemoteLink]
+            do {
+                proven = try await backup.remoteProofLinks(for: missing)
+            } catch {
+                try checkStop()
+                if UploadError.isCancellation(error) { throw error }
+                if (error as? AlbumSyncError) == .stopped { throw error }
+                proven = [:]
+            }
+            try checkStop()
+            links.merge(proven) { existing, _ in existing }
+        }
         try await ensureAlbumPresent(albumID: album.id)
+        try checkStop()
         let children = try await remoteOps.childMainLinkIDs(albumID: remoteAlbumID)
+        try checkStop()
+        let deletions = try await remoteDeletionStates(links: links, children: children)
+        try checkStop()
+        for identifier in identifiers {
+            guard let link = links[identifier] else { continue }
+            switch deletions[link.uid.nodeID] {
+            case .trashed:
+                links[identifier] = AlbumSyncRemoteLink(
+                    uid: link.uid, sha1Hex: link.sha1Hex, isTrashed: true)
+            case nil:
+                break
+            }
+        }
+        let sameContent = try await membersWithSameContent(links: links, children: children)
+        try checkStop()
         let plan = AlbumSyncPlanner.plan(
             orderedLocalIdentifiers: identifiers,
             remoteLinks: links,
-            existingChildLinkIDs: children
+            existingChildLinkIDs: children,
+            memberWithSameContent: sameContent
         )
         progress.alreadyMember = plan.alreadyMember
         progress.unattachable = plan.missingRemote
@@ -187,27 +226,25 @@ public actor AlbumSyncRunner {
         publish()
         try checkStop()
 
-        // Attach in chunks for progress and stop granularity. The backend batches to the API limit.
         progress.phase = .attaching
         publish()
-        var attachResult = AlbumSyncAttachResult()
-        var index = 0
-        while index < plan.toAttach.count {
-            try checkStop()
-            try await ensureAlbumPresent(albumID: album.id)
-            let chunk = Array(plan.toAttach[index..<min(index + attachChunkSize, plan.toAttach.count)])
-            let result = try await remoteOps.attach(chunk, albumID: remoteAlbumID)
-            attachResult += result
-            index += chunk.count
-            progress.attachDone = attachResult.attached
-            progress.alreadyMember = plan.alreadyMember + attachResult.alreadyMember
-            progress.attachFailed = attachResult.failed
-            progress.message = attachResult.firstFailureMessage
-            publish()
-        }
+        var attachResult = try await attach(
+            plan.toAttach, localAlbumID: album.id, remoteAlbumID: remoteAlbumID, after: AlbumSyncAttachResult(),
+            alreadyMember: plan.alreadyMember)
+        attachResult = try await attachAlternates(
+            of: plan, after: attachResult, localAlbumID: album.id, remoteAlbumID: remoteAlbumID)
 
         // Persist the run outcome on the mapping and settle the status.
         try await ensureAlbumPresent(albumID: album.id)
+        try checkStop()
+        let attachFailedIdentifiers = Self.localIdentifiers(
+            of: attachResult.failedLinkIDs, orderedLocalIdentifiers: identifiers, links: links)
+        // A photo with a usable link goes into the album even when the backup keeps a part of it open, for
+        // example the video of a Live Photo behind a draft. It is no complete backup, so the album reports it.
+        let incompleteIdentifiers = Self.incompleteIdentifiers(
+            orderedLocalIdentifiers: identifiers, links: links, attachFailedLinkIDs: Set(attachResult.failedLinkIDs),
+            backup: backupReport)
+        progress.incomplete = incompleteIdentifiers.count
         let report = AlbumSyncReport(
             remoteAlbumID: remoteAlbumID,
             totalAssets: identifiers.count,
@@ -216,10 +253,12 @@ public actor AlbumSyncRunner {
             attachFailed: attachResult.failed,
             unattachable: plan.missingRemote,
             trashedSkipped: plan.trashedRemote,
+            incomplete: incompleteIdentifiers.count,
             problems: AlbumSyncProblemList.items(
                 missingIdentifiers: plan.missingRemoteIdentifiers,
-                attachFailedIdentifiers: Self.localIdentifiers(
-                    of: attachResult.failedLinkIDs, orderedLocalIdentifiers: identifiers, links: links),
+                attachFailedIdentifiers: attachFailedIdentifiers,
+                incompleteIdentifiers: incompleteIdentifiers,
+                trashedIdentifiers: plan.trashedRemoteIdentifiers,
                 backup: backupReport)
         )
         var mapping =
@@ -229,7 +268,7 @@ public actor AlbumSyncRunner {
         mapping.title = album.title
         mapping.lastSyncedAt = now()
         mapping.lastAttachedCount = report.attached
-        mapping.lastFailedCount = report.attachFailed + report.unattachable
+        mapping.lastFailedCount = report.attachFailed + report.unattachable + report.trashedSkipped + report.incomplete
         guard mappingStore.upsert(mapping) else { throw AlbumSyncError.mappingStoreUnavailable }
 
         progress.phase = report.isFullySynced ? .completed : .needsAttention
@@ -238,6 +277,185 @@ public actor AlbumSyncRunner {
         }
         publish()
         return report
+    }
+
+    /// Attaches `candidates` in chunks for progress and Stop granularity, adding to `earlier`. The backend batches to
+    /// the API limit.
+    /// An alternate round publishes no failure count: its failures can still resolve, and the count is published once
+    /// the rounds end.
+    private func attach(
+        _ candidates: [AlbumSyncAttachCandidate], localAlbumID: String, remoteAlbumID: String,
+        after earlier: AlbumSyncAttachResult, alreadyMember: Int, publishesFailures: Bool = true
+    ) async throws -> AlbumSyncAttachResult {
+        var total = earlier
+        var index = 0
+        while index < candidates.count {
+            try checkStop()
+            try await ensureAlbumPresent(albumID: localAlbumID)
+            try checkStop()
+            let chunk = Array(candidates[index..<min(index + attachChunkSize, candidates.count)])
+            total += try await remoteOps.attach(chunk, albumID: remoteAlbumID)
+            index += chunk.count
+            progress.attachDone = total.attached
+            progress.alreadyMember = alreadyMember + total.alreadyMember
+            if publishesFailures {
+                progress.attachFailed = total.failed
+                progress.message = total.firstFailureMessage
+            }
+            publish()
+        }
+        return total
+    }
+
+    /// When a planned link fails to attach, the photos with the same bytes try their own links, one after the other,
+    /// until one attaches. Then the bytes are in the album, and the earlier failures of those photos no longer count.
+    /// Without a successful alternate every tried link stays a failure, so each of those photos is named.
+    private func attachAlternates(
+        of plan: AlbumSyncAttachPlan, after first: AlbumSyncAttachResult, localAlbumID: String, remoteAlbumID: String
+    ) async throws -> AlbumSyncAttachResult {
+        var result = first
+        var remaining = plan.sameBytesAlternates
+        var failures: [String: [String]] = [:]
+        var waiting: [String] = []
+        for linkID in first.failedLinkIDs where remaining[linkID] != nil {
+            failures[linkID] = [linkID]
+            waiting.append(linkID)
+        }
+        var resolved: [String] = []
+        while !waiting.isEmpty {
+            var round: [(planned: String, candidate: AlbumSyncAttachCandidate)] = []
+            for planned in waiting {
+                guard var alternates = remaining[planned], !alternates.isEmpty else { continue }
+                round.append((planned, alternates.removeFirst()))
+                remaining[planned] = alternates
+            }
+            guard !round.isEmpty else { break }
+            let before = result.failedLinkIDs.count
+            result = try await attach(
+                round.map(\.candidate), localAlbumID: localAlbumID, remoteAlbumID: remoteAlbumID, after: result,
+                alreadyMember: plan.alreadyMember, publishesFailures: false)
+            let failedNow = Set(result.failedLinkIDs.dropFirst(before))
+            waiting = []
+            for (planned, candidate) in round {
+                if failedNow.contains(candidate.uid.nodeID) {
+                    failures[planned, default: []].append(candidate.uid.nodeID)
+                    waiting.append(planned)
+                } else {
+                    resolved.append(planned)
+                }
+            }
+        }
+        for planned in resolved {
+            for linkID in failures[planned] ?? [] {
+                guard let index = result.failedLinkIDs.firstIndex(of: linkID) else { continue }
+                result.failedLinkIDs.remove(at: index)
+                result.failed -= 1
+            }
+        }
+        if !resolved.isEmpty {
+            // The first message could belong to a resolved failure; keep only a reason of a failure that remains.
+            result.firstFailureMessage = result.failedLinkIDs.lazy.compactMap { result.failureMessages[$0] }.first
+        }
+        if !first.failedLinkIDs.isEmpty, result.failedLinkIDs != first.failedLinkIDs {
+            progress.attachFailed = result.failed
+            progress.message = result.firstFailureMessage
+            publish()
+        }
+        return result
+    }
+
+    private func remoteDeletionStates(
+        links: [String: AlbumSyncRemoteLink], children: Set<String>
+    ) async throws -> [String: UploadRemoteDeletionState] {
+        let candidates = links.values.filter { !children.contains($0.uid.nodeID) }
+            .sorted { $0.uid.nodeID < $1.uid.nodeID }
+        guard !candidates.isEmpty else { return [:] }
+        var result: [String: UploadRemoteDeletionState] = [:]
+        let size = UploadDedupePipeline.protonDuplicateBatchSize
+        for start in stride(from: 0, to: candidates.count, by: size) {
+            try checkStop()
+            let chunk = Array(candidates[start..<min(start + size, candidates.count)])
+            let task = Task { [remoteOps] in
+                try Task.checkCancellation()
+                return try await remoteOps.remoteDeletionStates(for: chunk)
+            }
+            deletionLookupTask = task
+            do {
+                let states = try await withTaskCancellationHandler {
+                    try await task.value
+                } onCancel: {
+                    task.cancel()
+                }
+                deletionLookupTask = nil
+                try checkStop()
+                result.merge(states) { _, fresh in fresh }
+            } catch {
+                deletionLookupTask = nil
+                try checkStop()
+                if UploadError.isCancellation(error) { throw error }
+                if (error as? AlbumSyncError) == .stopped { throw error }
+                PhotoDiagnostics.shared.increment("albumSync.deletionEvidenceUnavailable")
+            }
+        }
+        return result
+    }
+
+    /// For each SHA-1 of a link that is not in the album, an album member with the same bytes, for example another
+    /// device's copy of a shared photo. Members whose bytes this run already knows count first, also when the lookup
+    /// fails. The lookup runs in chunks, so Stop takes effect between them. A failed chunk ends the lookup with the
+    /// members found so far, and the other photos attach as before.
+    private func membersWithSameContent(
+        links: [String: AlbumSyncRemoteLink], children: Set<String>
+    ) async throws -> [String: String] {
+        var members: [String: String] = [:]
+        for link in links.values where !link.isTrashed && children.contains(link.uid.nodeID) {
+            guard let sha1Hex = link.sha1Hex else { continue }
+            members[sha1Hex] = min(members[sha1Hex] ?? link.uid.nodeID, link.uid.nodeID)
+        }
+        let candidates = Set(
+            links.values.compactMap { link in
+                link.isTrashed || children.contains(link.uid.nodeID) ? nil : link.sha1Hex
+            }
+        ).filter { members[$0] == nil }.sorted()
+        guard !candidates.isEmpty, !children.isEmpty else { return members }
+        var copies: [String: Set<String>] = [:]
+        var start = 0
+        while start < candidates.count {
+            try checkStop()
+            let chunk = Set(candidates[start..<min(start + attachChunkSize, candidates.count)])
+            start += chunk.count
+            do {
+                copies.merge(try await remoteOps.activeMainLinkIDs(withSameContentAs: chunk)) { $0.union($1) }
+            } catch {
+                // An internally reset content index reports CancellationError without cancelling this caller.
+                // Raw and typed transport cancellation still end the run before attachment.
+                try checkStop()
+                if !(error is CancellationError), UploadError.isCancellation(error) { throw error }
+                break
+            }
+        }
+        // Only a current album member counts. The smallest member id keeps the choice stable between runs.
+        for (sha1Hex, member) in copies.compactMapValues({ $0.intersection(children).min() }) {
+            members[sha1Hex] = member
+        }
+        return members
+    }
+
+    /// The photos with a usable, not trashed link whose backup row is unresolved, in album order. A photo whose
+    /// link failed to attach is not in the album and counts as failed, also when another photo shares the link.
+    static func incompleteIdentifiers(
+        orderedLocalIdentifiers: [String],
+        links: [String: AlbumSyncRemoteLink],
+        attachFailedLinkIDs: Set<String>,
+        backup: AlbumSyncBackupReport
+    ) -> [String] {
+        orderedLocalIdentifiers.filter { identifier in
+            guard let link = links[identifier], !link.isTrashed, !attachFailedLinkIDs.contains(link.uid.nodeID)
+            else {
+                return false
+            }
+            return backup.problems[identifier] != nil
+        }
     }
 
     /// Maps failed link ids back, in album order, to the local photo that planned each attach:
@@ -272,14 +490,18 @@ public actor AlbumSyncRunner {
         switch resolution {
         case .automatic:
             let twins = try await nameTwins(of: album.title)
+            try checkStop()
             guard twins.isEmpty else { throw AlbumSyncError.nameConflict(existing: twins) }
             try await ensureAlbumPresent(albumID: album.id)
+            try checkStop()
             remoteAlbumID = try await remoteOps.createAlbum(name: name)
         case .attachToExisting(let existingID):
             try await ensureAlbumPresent(albumID: album.id)
+            try checkStop()
             remoteAlbumID = existingID
         case .createNew:
             try await ensureAlbumPresent(albumID: album.id)
+            try checkStop()
             remoteAlbumID = try await remoteOps.createAlbum(name: name)
         }
         guard
@@ -321,6 +543,7 @@ public actor AlbumSyncRunner {
         guard progress.phase == .backingUp else { return }
         progress.backedUp = snapshot.backedUp
         progress.backupFailed = snapshot.failed
+        progress.isWaitingForWiFi = snapshot.isPausedByPolicy && snapshot.isWaitingForWiFi
         publish()
     }
 

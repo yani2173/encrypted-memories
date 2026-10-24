@@ -174,15 +174,20 @@ public final class PendingGridSession {
         await feed.setLocalThumbnailLoader(nil)
     }
 
-    /// Follows the backup switch and availability of the controller: pending photos show only while backup
-    /// is on and able to run.
+    /// Follows the backup switch, availability, and pause of the controller: pending photos show only while
+    /// backup is on and able to run, and their badges show the pause when the person paused it or the backup
+    /// waits for Wi-Fi.
     private func observeBackupState() {
         guard let photoBackup else { return }
-        let enabled = withObservationTracking {
-            photoBackup.isEnabled && photoBackup.isAvailable && photoBackup.accessState.allowsBackup
+        let (enabled, paused) = withObservationTracking {
+            (
+                photoBackup.isEnabled && photoBackup.isAvailable && photoBackup.accessState.allowsBackup,
+                photoBackup.isUserPaused || photoBackup.isWaitingForWiFi
+            )
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in self?.observeBackupState() }
         }
+        presenter.setBackupPaused(paused)
         setBackupEnabled(enabled)
     }
 
@@ -191,6 +196,11 @@ public final class PendingGridSession {
         started = true
         observeBackupState()
         let coordinator = self.coordinator
+        // Photos deleted in Apple Photos leave the excluded list after the catalog took in the change. Files deleted
+        // from a watched folder leave it when the app becomes active or after a sync of the photo catalog.
+        photoBackup?.onLibraryChange = { [weak coordinator] in
+            Task { await coordinator?.noteLibraryChanged() }
+        }
         snapshotTask = Task { [weak self] in
             await coordinator.start()
             for await snapshot in coordinator.snapshots {
@@ -307,6 +317,7 @@ public final class PendingGridSession {
     public func close() async {
         snapshotTask?.cancel()
         snapshotTask = nil
+        photoBackup?.onLibraryChange = nil
         await coordinator.close()
         presenter.reset()
         pendingSnapshot = .empty

@@ -35,6 +35,19 @@ final class ProjectHygieneTests: XCTestCase {
         return String(tail[..<next])
     }
 
+    /// The offline account must never enter the distributed archive.
+    func testUpgradeFixtureFlagIsAbsentFromArchiveConfiguration() throws {
+        let marker = "ENCRYPTED_MEMORIES_UPGRADE_TEST"
+        for path in ["project.yml", "Packages/EncryptedMemoriesKit/Package.swift"] {
+            let contents = try String(contentsOf: repoRoot.appendingPathComponent(path), encoding: .utf8)
+            XCTAssertFalse(contents.contains(marker), "\(path) enables an offline entry in the shipping build")
+        }
+        let workflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/testflight-internal.yml"), encoding: .utf8)
+        // The isolated builder supplies the flag. Workflow, job, and step environments must not inherit it.
+        XCTAssertFalse(workflow.contains(marker), "The release workflow enables an offline entry in the shipping build")
+    }
+
     // Production app target uses no known private Apple API or framework.
     func testNoPrivateAppleAPIInProductionTarget() {
         let banned = ["PPApplePrivate", "loadPrivateFrameworks", "filterWithType:", "CAFilterClassNames"]
@@ -128,8 +141,25 @@ final class ProjectHygieneTests: XCTestCase {
         }
         let action = try read(".github/actions/prepare-apple-build/action.yml")
         XCTAssertTrue(action.contains("--force-resolved-versions \\\n          resolve"))
+        XCTAssertTrue(action.contains("EXPECTED_XCODE_VERSION: ${{ inputs.xcode-version }}"))
+        XCTAssertTrue(action.contains("EXPECTED_XCODE_BUILD: ${{ inputs.xcode-build }}"))
+        XCTAssertTrue(action.contains("set -euo pipefail\n        bash .github/scripts/verify_xcode_toolchain.sh"))
+
+        let toolchain = try read(".github/scripts/verify_xcode_toolchain.sh")
+        XCTAssertTrue(toolchain.contains("set -euo pipefail"))
+        // The action inputs hold the only copy of the pins; an empty or missing value fails.
         XCTAssertTrue(
-            action.contains("[[ \"$xcode_version\" == \"$EXPECTED_XCODE_VERSION\" ]] || release_fail toolchain"))
+            toolchain.contains(
+                #"[[ -n "${EXPECTED_XCODE_VERSION:-}" && -n "${EXPECTED_XCODE_BUILD:-}" ]] || release_fail toolchain"#
+            ))
+        XCTAssertTrue(toolchain.contains(#"expected_version="$EXPECTED_XCODE_VERSION""#))
+        XCTAssertTrue(toolchain.contains(#"expected_build="$EXPECTED_XCODE_BUILD""#))
+        XCTAssertFalse(toolchain.contains("27.1"))
+        XCTAssertFalse(toolchain.contains("27A9275"))
+        XCTAssertTrue(
+            toolchain.contains(
+                #"[[ "$xcode_version" == "$expected_version" && "$xcode_build" == "$expected_build" ]] || release_fail toolchain"#
+            ))
     }
 
     func testProtonAppVersionHeaderInputsReachEveryShippedApp() throws {
@@ -366,5 +396,118 @@ final class ProjectHygieneTests: XCTestCase {
             2,
             "macOS and iOS/iPadOS targets must embed the one shared privacy manifest"
         )
+    }
+
+    /// What one key pattern found in the scanned sources: its call sites, the keys it checked, and the keys that
+    /// the catalog lacks.
+    private struct KeyScan {
+        var sites = 0
+        var checked = 0
+        var missing: [String] = []
+
+        mutating func add(_ other: KeyScan) {
+            sites += other.sites
+            checked += other.checked
+            missing += other.missing
+        }
+    }
+
+    /// `L10n.string("key")`, with the key in capture group 1.
+    private func literalKeyPattern() throws -> NSRegularExpression {
+        try NSRegularExpression(pattern: #"L10n\.string\(\s*"((?:[^"\\]|\\.)*)""#)
+    }
+
+    /// `L10n.string(condition ? "a" : "b")`, with the keys in capture groups 1 and 2. The condition holds no string
+    /// literal, no closing parenthesis and no line break, so a call with another argument followed by a ternary on
+    /// the same line is not read as a ternary key.
+    private func ternaryKeyPattern() throws -> NSRegularExpression {
+        let key = #""((?:[^"\\]|\\.)*)""#
+        return try NSRegularExpression(pattern: #"L10n\.string\(\s*[^"\n)]*?\?\s*"# + key + #"\s*:\s*"# + key)
+    }
+
+    /// Checks every key that `pattern` captures in `text` against `known`. This is the one place that holds the scan.
+    private func scanKeys(
+        in text: String, label: String, pattern: NSRegularExpression, known: Set<String>
+    ) -> KeyScan {
+        var scan = KeyScan()
+        for match in pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            scan.sites += 1
+            for group in 1..<match.numberOfRanges {
+                guard let keyRange = Range(match.range(at: group), in: text) else { continue }
+                let key = String(text[keyRange])
+                // An interpolated key resolves to a format key such as "a11y.grid.position %lld %lld".
+                guard !key.contains("\\(") else { continue }
+                scan.checked += 1
+                if !known.contains(key) { scan.missing.append("\(label): \(key)") }
+            }
+        }
+        return scan
+    }
+
+    private func packageCatalogKeys() throws -> Set<String> {
+        let data = try Data(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/PhotosCore/Resources/Localizable.xcstrings"))
+        let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return Set(try XCTUnwrap(catalog["strings"] as? [String: Any]).keys)
+    }
+
+    /// `L10n.string` reads the package catalog only. A literal key that this catalog lacks renders as the raw
+    /// key, for example as a VoiceOver label, even when an app catalog holds it.
+    ///
+    /// The scan reads `L10n.string("key")` and `L10n.string(condition ? "a" : "b")`. Known blind spots, each
+    /// unchecked here: interpolated keys, `L10n.string(dynamicKey:)`, a key held in a variable or returned by a
+    /// function (`BackupStatus.titleKey`), `String(localized:)` and SwiftUI `Text("key")` reads (without a bundle
+    /// they read the app catalog, not the package catalog), a nested ternary, and a ternary whose condition holds a string literal, a call or a line break.
+    func testEveryLiteralLocalizationKeyHasACatalogEntry() throws {
+        let known = try packageCatalogKeys()
+        let patterns = (literal: try literalKeyPattern(), ternary: try ternaryKeyPattern())
+        var literal = KeyScan()
+        var ternary = KeyScan()
+        for root in ["App", "iOSApp", "Packages/EncryptedMemoriesKit/Sources"] {
+            for url in sourceFiles(in: repoRoot.appendingPathComponent(root)) where url.pathExtension == "swift" {
+                let text = try String(contentsOf: url, encoding: .utf8)
+                let label = url.lastPathComponent
+                literal.add(scanKeys(in: text, label: label, pattern: patterns.literal, known: known))
+                ternary.add(scanKeys(in: text, label: label, pattern: patterns.ternary, known: known))
+            }
+        }
+        XCTAssertGreaterThan(literal.checked, 100, "the scan must find the literal keys")
+        // The four ternary calls of today: AlbumActionCoordinator, UIKitTimelineGridHostAccessibility (two) and
+        // MobileViewerFilmstrip. A lower bound, so that a new call does not break the test.
+        XCTAssertGreaterThanOrEqual(ternary.sites, 4, "the scan must find the ternary calls")
+        XCTAssertGreaterThanOrEqual(ternary.checked, 8, "both branches of a ternary are keys")
+        XCTAssertEqual(literal.missing + ternary.missing, [], "literal keys without a catalog entry")
+    }
+
+    func testTheKeyScanChecksBothBranchesOfATernary() throws {
+        let known: Set<String> = ["a11y.video", "a11y.photo"]
+        let pattern = try ternaryKeyPattern()
+
+        let broken = #"""
+            let kind = L10n.string(item.isVideo ? "a11y.video" : "a11y.phto")
+            """#
+        let brokenScan = scanKeys(in: broken, label: "fixture", pattern: pattern, known: known)
+        XCTAssertEqual(brokenScan.missing, ["fixture: a11y.phto"])
+        XCTAssertEqual(brokenScan.sites, 1)
+        XCTAssertEqual(brokenScan.checked, 2)
+        let literalScan = scanKeys(in: broken, label: "fixture", pattern: try literalKeyPattern(), known: known)
+        XCTAssertEqual(literalScan.sites, 0, "the literal pattern does not read a ternary")
+
+        let valid = #"""
+            let kind = L10n.string(item.isVideo ? "a11y.video" : "a11y.photo")
+            let other = L10n.string(item?.isVideo ?? false ? "a11y.photo" : "a11y.video")
+            """#
+        let validScan = scanKeys(in: valid, label: "fixture", pattern: pattern, known: known)
+        XCTAssertEqual(validScan.missing, [])
+        XCTAssertEqual(validScan.sites, 2)
+        XCTAssertEqual(validScan.checked, 4)
+
+        let interpolated = #"""
+            let kind = L10n.string(item.isVideo ? "a11y.video" : "a11y.count \(count)")
+            """#
+        let interpolatedScan = scanKeys(in: interpolated, label: "fixture", pattern: pattern, known: known)
+        XCTAssertEqual(interpolatedScan.missing, [], "an interpolated key stays out of the scan")
+        XCTAssertEqual(interpolatedScan.checked, 1)
     }
 }

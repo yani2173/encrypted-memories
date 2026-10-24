@@ -1,7 +1,6 @@
 import AVFoundation
 import CoreGraphics
 import Foundation
-import ImageIO
 import Photos
 import PhotosCore
 import UniformTypeIdentifiers
@@ -30,7 +29,7 @@ public struct PhotoKitLocalMedia: Sendable {
         let data: Data? = await PhotoKitRequest.perform { [request] finish in
             // `.highQualityFormat` answers once, never degraded.
             request(asset, CGSize(width: maxPixelSize, height: maxPixelSize), .aspectFit, options) { image, _ in
-                finish(image.flatMap(Self.jpegData(from:)))
+                finish(image.flatMap { JPEGEncoding.data(from: $0) })
             }
         }
         try Task.checkCancellation()
@@ -136,15 +135,6 @@ public struct PhotoKitLocalMedia: Sendable {
         }.value
         guard let asset else { throw LocalMediaError.unavailable }
         return asset
-    }
-
-    private static func jpegData(from image: CGImage) -> Data? {
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil)
-        else { return nil }
-        CGImageDestinationAddImage(
-            destination, image, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
-        return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 }
 

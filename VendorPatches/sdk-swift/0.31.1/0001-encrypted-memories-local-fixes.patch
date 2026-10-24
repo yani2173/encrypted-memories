@@ -1,0 +1,1788 @@
+diff --git a/Package.swift b/Package.swift
+index 01cccf5..38a293e 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -3,0 +4 @@
++import Foundation
+@@ -5,0 +7,3 @@ import PackageDescription
++let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
++let sdkResourceLibrarySearchPath = "-L\(packageDirectory)/Resources"
++
+@@ -26,0 +31,2 @@ let package = Package(
++        // Test-only: the CProtonDriveSDK binary resolves its PGP symbols from ProtonCore GoLibs. The app pins the exact version.
++        .package(url: "https://github.com/ProtonMail/protoncore_ios.git", from: "37.3.0"),
+@@ -49,6 +55 @@ let package = Package(
+-                .unsafeFlags([
+-                    // path used in normal builds
+-                    "-L${BUILD_DIR}/../../SourcePackages/checkouts/sdk-swift/Resources",
+-                    // path used in archive builds
+-                    "-L${BUILD_DIR}/../../../../../SourcePackages/checkouts/sdk-swift/Resources",
+-                ]),
++                .unsafeFlags([sdkResourceLibrarySearchPath]),
+@@ -58,2 +59 @@ let package = Package(
+-                    "-llibbootstrapperdll.osx-arm64.o",
+-                    "-llibbootstrapperdll.osx-x64.o",
++                    "-llibbootstrapperdll.osx-universal.o",
+@@ -67,6 +67 @@ let package = Package(
+-                .unsafeFlags([
+-                    // path used in normal builds
+-                    "-L${BUILD_DIR}/../../SourcePackages/checkouts/sdk-swift/Resources",
+-                    // path used in archive builds
+-                    "-L${BUILD_DIR}/../../../../../SourcePackages/checkouts/sdk-swift/Resources",
+-                ]),
++                .unsafeFlags([sdkResourceLibrarySearchPath]),
+@@ -79,0 +75,10 @@ let package = Package(
++        .testTarget(
++            name: "ProtonDriveSDKTests",
++            dependencies: [
++                "ProtonDriveSDK",
++                "CProtonDriveSDK",
++                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
++                .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),
++            ],
++            path: "Tests"
++        ),
+diff --git a/Sources/CancellationTokenSource.swift b/Sources/CancellationTokenSource.swift
+index f8ba40e..220a08a 100644
+--- a/Sources/CancellationTokenSource.swift
++++ b/Sources/CancellationTokenSource.swift
+@@ -0,0 +1,17 @@
++import Foundation
++
++/// Thread-safe exactly-once task owner used by native resources with asynchronous free requests.
++final class IdempotentAsyncFreeGate: @unchecked Sendable {
++    private let lock = NSLock()
++    private var task: Task<Void, Never>?
++
++    func task(create: () -> Task<Void, Never>) -> Task<Void, Never> {
++        lock.withLock {
++            if let task { return task }
++            let task = create()
++            self.task = task
++            return task
++        }
++    }
++}
++
+@@ -1,0 +19 @@ actor CancellationTokenSource {
++
+@@ -3,0 +22 @@ actor CancellationTokenSource {
++    private nonisolated let freeGate = IdempotentAsyncFreeGate()
+@@ -24,4 +42,0 @@ actor CancellationTokenSource {
+-
+-    nonisolated func free() {
+-        logger?.trace("CancellationTokenSource.free, handle: \(String(describing: handle))", category: "Cancellation")
+-        let cancellationHandle = self.handle
+@@ -29,12 +44,16 @@ actor CancellationTokenSource {
+-        // CAUTION: Intentionally capturing `self` strongly here, because otherwise
+-        // this instance might get released before the async response from the SDK is received.
+-        var strongSelf: CancellationTokenSource? = self
+-        Task {
+-            let request = Proton_Drive_Sdk_CancellationTokenSourceFreeRequest.with {
+-                $0.cancellationTokenSourceHandle = Int64(cancellationHandle)
+-            }
+-            do {
+-                try await SDKRequestHandler.sendInteropRequest(request, logger: logger) as Void
+-                logger?.trace("CancellationTokenSource.free succeeded, handle: \(cancellationHandle) -> nil", category: "Cancellation")
+-            } catch {
+-                logger?.error("CancellationTokenSource.free failed, error: \(error)", category: "Cancellation")
++    private nonisolated func freeTask() -> Task<Void, Never> {
++        freeGate.task { [self] in
++            let cancellationHandle = handle
++            let logger = logger
++            return Task {
++                logger?.trace("CancellationTokenSource.free, handle: \(String(describing: cancellationHandle))", category: "Cancellation")
++                let request = Proton_Drive_Sdk_CancellationTokenSourceFreeRequest.with {
++                    $0.cancellationTokenSourceHandle = Int64(cancellationHandle)
++                }
++                do {
++                    try await SDKRequestHandler.sendInteropRequest(request, logger: logger) as Void
++                    logger?.trace("CancellationTokenSource.free succeeded, handle: \(cancellationHandle) -> nil", category: "Cancellation")
++                } catch {
++                    logger?.error("CancellationTokenSource.free failed, error: \(error)", category: "Cancellation")
++                }
++                _ = self
+@@ -42,2 +60,0 @@ actor CancellationTokenSource {
+-            _ = strongSelf // fixes "variable 'strongSelf' was written to, but never read" warning
+-            strongSelf = nil
+@@ -45,0 +63,10 @@ actor CancellationTokenSource {
++
++    /// Starts idempotent cleanup for legacy synchronous call sites.
++    nonisolated func free() {
++        _ = freeTask()
++    }
++
++    /// Starts or joins the same native cleanup request.
++    nonisolated func freeAndWait() async {
++        await freeTask().value
++    }
+diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
+index a5cb60e..9371fb1 100644
+--- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
++++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
+@@ -57,0 +58,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
++    private var shutdownTask: Task<Void, Never>?
++    private var didShutDown = false
+@@ -136 +138,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+-        Self.freeEncryptedMemoriesClient(Int64(clientHandle), logger)
++        let handle = Int64(clientHandle)
++        let logger = logger
++        Task { await Self.freeEncryptedMemoriesClient(handle, logger) }
+@@ -139,4 +143,18 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+-    private static func freeEncryptedMemoriesClient(_ clientHandle: Int64, _ logger: Logger?) {
+-        Task {
+-            let freeRequest = Proton_Drive_Sdk_DrivePhotosClientFreeRequest.with {
+-                $0.clientHandle = clientHandle
++    /// Releases the native client before its entity-cache files are removed. App lifecycle code must use
++    /// this explicit boundary; `deinit` remains only a best-effort fallback for abandoned clients.
++    public func shutdown() async {
++        if let shutdownTask {
++            await shutdownTask.value
++            return
++        }
++        guard !didShutDown, clientHandle != 0 else { return }
++        didShutDown = true
++        CallbackHandleRegistry.shared.removeAll(ownedBy: sdkClientProvider)
++        let handle = Int64(clientHandle)
++        clientHandle = 0
++        let tokenSources = Array(activeOperations.values)
++        activeOperations.removeAll(keepingCapacity: false)
++        let logger = self.logger
++        let task: Task<Void, Never> = Task {
++            for source in tokenSources {
++                try? await source.cancel()
+@@ -144,8 +162,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+-            do {
+-                try await SDKRequestHandler.send(freeRequest, logger: logger) as Void
+-            } catch {
+-                // If the request to free the client failed, we have a memory leak, but not much else can be done.
+-                logger?.error(
+-                    "Proton_Drive_Sdk_DrivePhotosClientFreeRequest failed: \(error)",
+-                    category: "EncryptedMemoriesClient.freeEncryptedMemoriesClient"
+-                )
++            for source in tokenSources {
++                await source.freeAndWait()
+@@ -152,0 +165,19 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
++            await Self.freeEncryptedMemoriesClient(handle, logger)
++        }
++        shutdownTask = task
++        await task.value
++        shutdownTask = nil
++    }
++
++    private static func freeEncryptedMemoriesClient(_ clientHandle: Int64, _ logger: Logger?) async {
++        let freeRequest = Proton_Drive_Sdk_DrivePhotosClientFreeRequest.with {
++            $0.clientHandle = clientHandle
++        }
++        do {
++            try await SDKRequestHandler.send(freeRequest, logger: logger) as Void
++        } catch {
++            // If the request to free the client failed, we have a memory leak, but not much else can be done.
++            logger?.error(
++                "Proton_Drive_Sdk_DrivePhotosClientFreeRequest failed: \(error)",
++                category: "EncryptedMemoriesClient.freeEncryptedMemoriesClient"
++            )
+@@ -444,0 +476 @@ extension EncryptedMemoriesClient {
++        overrideExistingDraft: Bool = false,
+@@ -460,0 +493 @@ extension EncryptedMemoriesClient {
++            overrideExistingDraft: overrideExistingDraft,
+@@ -475,0 +509 @@ extension EncryptedMemoriesClient {
++        try operation.claimStart()
+@@ -495,0 +530 @@ extension EncryptedMemoriesClient {
++        overrideExistingDraft: Bool = false,
+@@ -518,0 +554 @@ extension EncryptedMemoriesClient {
++            overrideExistingDraft: overrideExistingDraft,
+diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
+index bfbdda4..a744d57 100644
+--- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
++++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
+@@ -351,0 +352 @@ extension ProtonDriveClient {
++        try operation.claimStart()
+@@ -383,0 +385 @@ extension ProtonDriveClient {
++        try operation.claimStart()
+diff --git a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
+index 367242f..f6b161f 100644
+--- a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
++++ b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
+@@ -5,0 +6,9 @@ actor DownloadThumbnailsManager {
++    private final class ActiveDownload: @unchecked Sendable {
++        let tokenSource: CancellationTokenSource
++        let requestCancellation = SDKRequestHandler.RequestCancellation()
++
++        init(tokenSource: CancellationTokenSource) {
++            self.tokenSource = tokenSource
++        }
++    }
++
+@@ -8 +17 @@ actor DownloadThumbnailsManager {
+-    private var activeDownloads: [UUID: CancellationTokenSource] = [:]
++    private var activeDownloads: [UUID: ActiveDownload] = [:]
+@@ -17 +26,2 @@ actor DownloadThumbnailsManager {
+-            $0.free()
++            $0.requestCancellation.cancel()
++            $0.tokenSource.free()
+@@ -28,2 +38,2 @@ actor DownloadThumbnailsManager {
+-        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
+-        activeDownloads[cancellationToken] = cancellationTokenSource
++        let activeDownload = try await beginDownload(cancellationToken)
++        let cancellationTokenSource = activeDownload.tokenSource
+@@ -32,2 +42,8 @@ actor DownloadThumbnailsManager {
+-            if let cancellationTokenSource = activeDownloads[cancellationToken] {
+-                activeDownloads[cancellationToken] = nil
++            // Dictionary membership is the cleanup ownership token. An explicit token cancellation
++            // removes and frees it in `cancelDownload`; Task cancellation frees it from `onCancel`.
++            // Normal completion owns the remaining entry and frees it here exactly once.
++            let stillOwned = activeDownloads[cancellationToken] === activeDownload
++            if stillOwned {
++                activeDownloads.removeValue(forKey: cancellationToken)
++            }
++            if stillOwned, !Task.isCancelled {
+@@ -48,7 +64,15 @@ actor DownloadThumbnailsManager {
+-        let _: Void = try await SDKRequestHandler.send(
+-            thumbnailsRequest,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        let _: Void = try await withTaskCancellationHandler {
++            try await SDKRequestHandler.sendCancellable(
++                thumbnailsRequest,
++                state: WeakReference(value: callbackState),
++                scope: .ownerManaged,
++                owner: callbackState,
++                requestCancellation: activeDownload.requestCancellation,
++                logger: logger
++            )
++        } onCancel: {
++            Task {
++                defer { cancellationTokenSource.free() }
++                try? await cancellationTokenSource.cancel()
++            }
++        }
+@@ -63,2 +87,2 @@ actor DownloadThumbnailsManager {
+-        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
+-        activeDownloads[cancellationToken] = cancellationTokenSource
++        let activeDownload = try await beginDownload(cancellationToken)
++        let cancellationTokenSource = activeDownload.tokenSource
+@@ -67,2 +91,5 @@ actor DownloadThumbnailsManager {
+-            if let cancellationTokenSource = activeDownloads[cancellationToken] {
+-                activeDownloads[cancellationToken] = nil
++            let stillOwned = activeDownloads[cancellationToken] === activeDownload
++            if stillOwned {
++                activeDownloads.removeValue(forKey: cancellationToken)
++            }
++            if stillOwned, !Task.isCancelled {
+@@ -83,7 +110,15 @@ actor DownloadThumbnailsManager {
+-        let _: Void = try await SDKRequestHandler.send(
+-            thumbnailsRequest,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        let _: Void = try await withTaskCancellationHandler {
++            try await SDKRequestHandler.sendCancellable(
++                thumbnailsRequest,
++                state: WeakReference(value: callbackState),
++                scope: .ownerManaged,
++                owner: callbackState,
++                requestCancellation: activeDownload.requestCancellation,
++                logger: logger
++            )
++        } onCancel: {
++            Task {
++                defer { cancellationTokenSource.free() }
++                try? await cancellationTokenSource.cancel()
++            }
++        }
+@@ -93 +128 @@ actor DownloadThumbnailsManager {
+-        guard let downloadCancellationToken = activeDownloads[cancellationToken] else {
++        guard let activeDownload = activeDownloads.removeValue(forKey: cancellationToken) else {
+@@ -97,2 +132,4 @@ actor DownloadThumbnailsManager {
+-        try await downloadCancellationToken.cancel()
+-        downloadCancellationToken.free()
++        activeDownload.requestCancellation.cancel()
++        defer { activeDownload.tokenSource.free() }
++        try await activeDownload.tokenSource.cancel()
++    }
+@@ -100 +137,9 @@ actor DownloadThumbnailsManager {
+-        activeDownloads[cancellationToken] = nil
++    private func beginDownload(_ cancellationToken: UUID) async throws -> ActiveDownload {
++        let tokenSource = try await CancellationTokenSource(logger: logger)
++        guard activeDownloads[cancellationToken] == nil else {
++            tokenSource.free()
++            throw CancellationError()
++        }
++        let activeDownload = ActiveDownload(tokenSource: tokenSource)
++        activeDownloads[cancellationToken] = activeDownload
++        return activeDownload
+diff --git a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
+index 81cd6ad..7b3f27d 100644
+--- a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
++++ b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
+@@ -9 +9 @@ actor PhotoUploadsManager {
+-    private var activeUploads: [UUID: CancellationTokenSource] = [:]
++    private var activeUploads: [UUID: ActiveUploadState] = [:]
+@@ -18 +18,4 @@ actor PhotoUploadsManager {
+-            $0.free()
++            let activeUpload = $0
++            guard !activeUpload.ownsOperation() else { return }
++            activeUpload.cancellation.requestCancellation()
++            Task { await activeUpload.releaseResources() }
+@@ -32,0 +36 @@ actor PhotoUploadsManager {
++        overrideExistingDraft: Bool,
+@@ -37,27 +41,56 @@ actor PhotoUploadsManager {
+-        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
+-        activeUploads[cancellationToken] = cancellationTokenSource
+-
+-        let cancellationHandle = cancellationTokenSource.handle
+-
+-        let uploaderHandle = try await buildUploader(
+-            name: name,
+-            fileSize: fileSize,
+-            modificationDate: modificationDate,
+-            mediaType: mediaType,
+-            captureTime: captureTime,
+-            mainPhotoUid: mainPhotoUid,
+-            tags: tags,
+-            additionalMetadata: additionalMetadata,
+-            cancellationHandle: cancellationHandle
+-        )
+-
+-        let uploadOperation = try await uploadFromFile(
+-            fileUploaderHandle: uploaderHandle,
+-            fileURL: fileURL,
+-            progressCallback: progressCallback,
+-            cancellationToken: cancellationToken,
+-            cancellationHandle: cancellationHandle,
+-            thumbnails: thumbnails,
+-            expectedSHA1: expectedSHA1
+-        )
+-        return uploadOperation
++        let activeUpload = beginUpload(cancellationToken)
++        let transaction = UploadResourceTransaction()
++        transaction.add(stage: .nativeCancellationBarrier) {
++            activeUpload.closeCancellationRegistration()
++            await activeUpload.waitForNativeCancellation()
++        }
++        var operation: UploadOperation?
++        do {
++            try activeUpload.cancellation.check()
++            let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
++            activeUpload.install(tokenSource: cancellationTokenSource)
++            transaction.add(stage: .cancellationToken) { await activeUpload.releaseTokenSource() }
++            try activeUpload.cancellation.check()
++
++            let uploaderHandle = try await buildUploader(
++                name: name,
++                fileSize: fileSize,
++                modificationDate: modificationDate,
++                mediaType: mediaType,
++                captureTime: captureTime,
++                mainPhotoUid: mainPhotoUid,
++                tags: tags,
++                additionalMetadata: additionalMetadata,
++                overrideExistingDraft: overrideExistingDraft,
++                cancellationHandle: cancellationTokenSource.handle
++            )
++            let logger = self.logger
++            transaction.add(stage: .uploader) {
++                await UploadOperation.freePhotoUploader(Int64(uploaderHandle), logger: logger)
++            }
++            try activeUpload.cancellation.check()
++
++            operation = try await uploadFromFile(
++                fileUploaderHandle: uploaderHandle,
++                fileURL: fileURL,
++                progressCallback: progressCallback,
++                cancellationToken: cancellationToken,
++                cancellationHandle: cancellationTokenSource.handle,
++                thumbnails: thumbnails,
++                expectedSHA1: expectedSHA1,
++                activeUpload: activeUpload,
++                transaction: transaction
++            )
++            transaction.transferToOperation()
++            activeUpload.markOperationOwned()
++            try activeUpload.cancellation.check()
++            return operation!
++        } catch {
++            if let operation {
++                await operation.releaseUndeliveredResources()
++            } else {
++                await transaction.rollback()
++            }
++            removeUpload(cancellationToken, ifSameAs: activeUpload)
++            throw error
++        }
+@@ -73 +106,3 @@ actor PhotoUploadsManager {
+-        expectedSHA1: Data? = nil
++        expectedSHA1: Data? = nil,
++        activeUpload: ActiveUploadState,
++        transaction: UploadResourceTransaction
+@@ -74,0 +110 @@ actor PhotoUploadsManager {
++        try activeUpload.cancellation.check()
+@@ -86,0 +123,3 @@ actor PhotoUploadsManager {
++        activeUpload.setBufferCleanup(deallocateBuffers)
++        transaction.add(stage: .buffers) { activeUpload.releaseBuffers() }
++        try activeUpload.cancellation.check()
+@@ -111,0 +151,8 @@ actor PhotoUploadsManager {
++            let logger = self.logger
++            transaction.add(stage: .controller) {
++                await UploadOperation.freeUploadController(Int64(uploadControllerHandle), logger: logger)
++            }
++            transaction.addRollbackOnly(stage: .controller) {
++                await disposeUploadController(Int64(uploadControllerHandle), logger: logger)
++            }
++        try activeUpload.cancellation.check()
+@@ -113 +160 @@ actor PhotoUploadsManager {
+-        return UploadOperation(
++        let operation = UploadOperation(
+@@ -118,0 +166,2 @@ actor PhotoUploadsManager {
++            cancellationLatch: activeUpload.cancellation,
++            resourceTransaction: transaction,
+@@ -124,3 +173 @@ actor PhotoUploadsManager {
+-                guard let self else { return }
+-                deallocateBuffers()
+-                await self.freeCancellationTokenSourceIfNeeded(cancellationToken: cancellationToken)
++                await self?.finishUpload(cancellationToken, ifSameAs: activeUpload)
+@@ -128,0 +176 @@ actor PhotoUploadsManager {
++        return operation
+@@ -133 +181 @@ actor PhotoUploadsManager {
+-        guard let uploadCancellationToken = activeUploads[cancellationToken] else {
++        guard let activeUpload = activeUploads[cancellationToken] else {
+@@ -137 +185,5 @@ actor PhotoUploadsManager {
+-        try await uploadCancellationToken.cancel()
++        activeUpload.cancellation.requestCancellation()
++        guard activeUpload.cancellation.claimNativeCancellation() else { return }
++        guard let cancellationTask = activeUpload.beginNativeCancellation() else { return }
++        try await cancellationTask.value
++    }
+@@ -139,2 +191,4 @@ actor PhotoUploadsManager {
+-        activeUploads[cancellationToken] = nil
+-        uploadCancellationToken.free()
++    private func beginUpload(_ cancellationToken: UUID) -> ActiveUploadState {
++        let activeUpload = ActiveUploadState()
++        activeUploads[cancellationToken] = activeUpload
++        return activeUpload
+@@ -143,2 +197,2 @@ actor PhotoUploadsManager {
+-    private func freeCancellationTokenSourceIfNeeded(cancellationToken: UUID) {
+-        guard let cancellationTokenSource = activeUploads[cancellationToken] else { return }
++    private func removeUpload(_ cancellationToken: UUID, ifSameAs activeUpload: ActiveUploadState) {
++        guard activeUploads[cancellationToken] === activeUpload else { return }
+@@ -146 +200,4 @@ actor PhotoUploadsManager {
+-        cancellationTokenSource.free()
++    }
++
++    private func finishUpload(_ cancellationToken: UUID, ifSameAs activeUpload: ActiveUploadState) {
++        removeUpload(cancellationToken, ifSameAs: activeUpload)
+@@ -158,0 +216 @@ actor PhotoUploadsManager {
++        overrideExistingDraft: Bool,
+@@ -175,0 +234 @@ actor PhotoUploadsManager {
++            $0.overrideExistingDraftByOtherClient = overrideExistingDraft
+diff --git a/Sources/FileOperations/Uploads/UploadLifecycleSupport.swift b/Sources/FileOperations/Uploads/UploadLifecycleSupport.swift
+new file mode 100644
+index 0000000..825b19a
+--- /dev/null
++++ b/Sources/FileOperations/Uploads/UploadLifecycleSupport.swift
+@@ -0,0 +1,300 @@
++import Foundation
++
++/// Thread-safe cancellation state shared by the SDK upload setup path and its operation.
++///
++/// The upload managers install this latch before their first suspension point. A cancellation can
++/// therefore be recorded before the native cancellation token exists and can never claim the native
++/// cancel operation more than once.
++final class UploadCancellationLatch: @unchecked Sendable {
++    private let lock = NSLock()
++    private var requested = false
++    private var nativeCancellationClaimed = false
++    private var startClaimed = false
++
++    var isCancellationRequested: Bool {
++        lock.withLock { requested }
++    }
++
++    func requestCancellation() {
++        lock.withLock { requested = true }
++    }
++
++    func claimNativeCancellation() -> Bool {
++        lock.withLock {
++            guard !nativeCancellationClaimed else { return false }
++            nativeCancellationClaimed = true
++            return true
++        }
++    }
++
++    /// Atomically claims the first upload start against cancellation.
++    ///
++    /// Later calls are idempotent because callers may enter through both a convenience API and the
++    /// operation API. Cancellation always wins over a later start or resume request, including
++    /// after the operation started once.
++    func claimStart() -> Bool {
++        lock.withLock {
++            guard !requested else { return false }
++            if startClaimed { return true }
++            startClaimed = true
++            return true
++        }
++    }
++
++    func check() throws {
++        try Task.checkCancellation()
++        if isCancellationRequested {
++            throw CancellationError()
++        }
++    }
++}
++
++/// Dependency order for native upload cleanup.
++///
++/// A controller can still reference the uploader and thumbnail pointers. The cancellation barrier
++/// therefore completes first, followed by controller, uploader, buffers, and token source.
++enum UploadResourceCleanupStage: Int, Sendable {
++    case nativeCancellationBarrier
++    case controller
++    case uploader
++    case buffers
++    case cancellationToken
++}
++
++/// Best-effort server-side cleanup for a controller that was created during setup but never
++/// transferred to an `UploadOperation`. Setup rollback must dispose the remote draft before it
++/// releases the local controller handle.
++func disposeUploadController(_ uploadControllerHandle: Int64, logger: Logger?) async {
++    let request = Proton_Drive_Sdk_UploadControllerDisposeRequest.with {
++        $0.uploadControllerHandle = uploadControllerHandle
++    }
++    do {
++        try await SDKRequestHandler.send(request, logger: logger) as Void
++    } catch {
++        logger?.error(
++            "Proton_Drive_Sdk_UploadControllerDisposeRequest failed: \(error)",
++            category: "UploadController.disposeFileUploadController"
++        )
++    }
++}
++
++/// Owns setup resources until an UploadOperation takes ownership of them.
++///
++/// Every registered cleanup runs at most once. Rollback continues after a cleanup error because
++/// one failed native free must not strand the remaining resources.
++final class UploadResourceTransaction: @unchecked Sendable {
++    private enum Ownership: Equatable {
++        case setup
++        case operation
++        case released
++    }
++
++    private struct Entry: Sendable {
++        let stage: UploadResourceCleanupStage
++        let ordinal: UInt64
++        let rollbackOnly: Bool
++        let cleanup: @Sendable () async throws -> Void
++    }
++
++    private let lock = NSLock()
++    private var cleanups: [Entry] = []
++    private var nextOrdinal: UInt64 = 0
++    private var ownership = Ownership.setup
++
++    func add(
++        stage: UploadResourceCleanupStage,
++        _ cleanup: @escaping @Sendable () async throws -> Void
++    ) {
++        add(stage: stage, rollbackOnly: false, cleanup)
++    }
++
++    /// Registers cleanup that is valid only when setup never transfers ownership to an operation.
++    /// This is used for server-side draft disposal; a completed operation owns its own disposal
++    /// decision and must not receive a second rollback request during local resource release.
++    func addRollbackOnly(
++        stage: UploadResourceCleanupStage,
++        _ cleanup: @escaping @Sendable () async throws -> Void
++    ) {
++        add(stage: stage, rollbackOnly: true, cleanup)
++    }
++
++    private func add(
++        stage: UploadResourceCleanupStage,
++        rollbackOnly: Bool,
++        _ cleanup: @escaping @Sendable () async throws -> Void
++    ) {
++        lock.withLock {
++            precondition(ownership == .setup, "upload cleanup registered after ownership transfer")
++            cleanups.append(
++                Entry(stage: stage, ordinal: nextOrdinal, rollbackOnly: rollbackOnly, cleanup: cleanup)
++            )
++            nextOrdinal &+= 1
++        }
++    }
++
++    /// Transfers every setup resource to the successfully constructed operation.
++    func transferToOperation() {
++        lock.withLock {
++            precondition(ownership == .setup, "upload resource ownership transferred more than once")
++            ownership = .operation
++        }
++    }
++
++    func rollback() async {
++        await release(expectedOwner: .setup, includeRollbackOnly: true)
++    }
++
++    func releaseOperationResources() async {
++        await release(expectedOwner: .operation, includeRollbackOnly: false)
++    }
++
++    /// Releases an operation that setup constructed but never returned to its caller. Its remote-draft
++    /// rollback actions must run before the ordinary local controller cleanup.
++    func releaseUndeliveredOperationResources() async {
++        await release(expectedOwner: .operation, includeRollbackOnly: true)
++    }
++
++    private func release(expectedOwner: Ownership, includeRollbackOnly: Bool) async {
++        let pending = lock.withLock { () -> [Entry] in
++            guard ownership == expectedOwner else { return [] }
++            ownership = .released
++            let pending = cleanups.sorted {
++                if $0.stage.rawValue != $1.stage.rawValue {
++                    return $0.stage.rawValue < $1.stage.rawValue
++                }
++                return $0.ordinal > $1.ordinal
++            }
++            cleanups.removeAll(keepingCapacity: false)
++            return pending.filter { includeRollbackOnly || !$0.rollbackOnly }
++        }
++        for cleanup in pending {
++            try? await cleanup.cleanup()
++        }
++    }
++}
++
++/// Idempotent operation-side owner for the transferred setup transaction.
++final class UploadOperationResourceOwner: @unchecked Sendable {
++    private let transaction: UploadResourceTransaction
++    private let onDispose: @Sendable () async -> Void
++    private let lock = NSLock()
++    private var releaseTask: Task<Void, Never>?
++
++    init(
++        transaction: UploadResourceTransaction,
++        onDispose: @escaping @Sendable () async -> Void
++    ) {
++        self.transaction = transaction
++        self.onDispose = onDispose
++    }
++
++    func release() async {
++        await release(includeRollbackOnly: false)
++    }
++
++    func releaseUndelivered() async {
++        await release(includeRollbackOnly: true)
++    }
++
++    private func release(includeRollbackOnly: Bool) async {
++        let task = lock.withLock { () -> Task<Void, Never> in
++            if let releaseTask { return releaseTask }
++            let transaction = transaction
++            let onDispose = onDispose
++            let task = Task {
++                if includeRollbackOnly {
++                    await transaction.releaseUndeliveredOperationResources()
++                } else {
++                    await transaction.releaseOperationResources()
++                }
++                await onDispose()
++            }
++            releaseTask = task
++            return task
++        }
++        await task.value
++    }
++}
++
++/// Per-token state retained while the SDK builds an UploadOperation.
++final class ActiveUploadState: @unchecked Sendable {
++    let cancellation = UploadCancellationLatch()
++
++    private let lock = NSLock()
++    private var tokenSource: CancellationTokenSource?
++    private var nativeCancellationSource: CancellationTokenSource?
++    private var bufferCleanup: (@Sendable () -> Void)?
++    private var nativeCancellationTask: Task<Void, Error>?
++    private var operationOwned = false
++    private var cancellationRegistrationClosed = false
++
++    func install(tokenSource: CancellationTokenSource) {
++        lock.withLock { self.tokenSource = tokenSource }
++    }
++
++    /// Closes the cancellation-registration window before resource cleanup snapshots its barrier.
++    /// A late cancellation then observes that cleanup already won and cannot claim a token that is
++    /// being released by the final token stage.
++    func closeCancellationRegistration() {
++        lock.withLock { cancellationRegistrationClosed = true }
++    }
++
++    /// Atomically transfers the token source to one native cancellation task.
++    /// Resource cleanup can await the same task before freeing dependent native handles.
++    func beginNativeCancellation() -> Task<Void, Error>? {
++        lock.withLock {
++            guard !cancellationRegistrationClosed,
++                  nativeCancellationTask == nil,
++                  let source = tokenSource else { return nil }
++            tokenSource = nil
++            nativeCancellationSource = source
++            let task = Task { try await source.cancel() }
++            nativeCancellationTask = task
++            return task
++        }
++    }
++
++    func waitForNativeCancellation() async {
++        let task = lock.withLock { nativeCancellationTask }
++        _ = try? await task?.value
++    }
++
++    func setBufferCleanup(_ cleanup: @escaping @Sendable () -> Void) {
++        lock.withLock { bufferCleanup = cleanup }
++    }
++
++    func releaseBuffers() {
++        let cleanup = lock.withLock { () -> (@Sendable () -> Void)? in
++            let cleanup = bufferCleanup
++            bufferCleanup = nil
++            return cleanup
++        }
++        cleanup?()
++    }
++
++    func releaseTokenSource() async {
++        let (source, cancellationTask) = lock.withLock { () -> (CancellationTokenSource?, Task<Void, Error>?) in
++            let source = tokenSource ?? nativeCancellationSource
++            tokenSource = nil
++            nativeCancellationSource = nil
++            return (source, nativeCancellationTask)
++        }
++        _ = try? await cancellationTask?.value
++        await source?.freeAndWait()
++    }
++
++    func releaseResources() async {
++        closeCancellationRegistration()
++        await waitForNativeCancellation()
++        releaseBuffers()
++        await releaseTokenSource()
++    }
++
++    func markOperationOwned() {
++        lock.withLock { operationOwned = true }
++    }
++
++    func ownsOperation() -> Bool {
++        lock.withLock { operationOwned }
++    }
++}
+diff --git a/Sources/FileOperations/Uploads/UploadOperation.swift b/Sources/FileOperations/Uploads/UploadOperation.swift
+index 134a46e..c7fc881 100644
+--- a/Sources/FileOperations/Uploads/UploadOperation.swift
++++ b/Sources/FileOperations/Uploads/UploadOperation.swift
+@@ -18,0 +19 @@ public final class UploadOperation: Sendable {
++    private let cancellationLatch: UploadCancellationLatch
+@@ -20 +21 @@ public final class UploadOperation: Sendable {
+-    private let onOperationDispose: @Sendable () async -> Void
++    private let resourceOwner: UploadOperationResourceOwner
+@@ -29,0 +31,2 @@ public final class UploadOperation: Sendable {
++         cancellationLatch: UploadCancellationLatch = UploadCancellationLatch(),
++         resourceTransaction: UploadResourceTransaction,
+@@ -39,0 +43 @@ public final class UploadOperation: Sendable {
++        self.cancellationLatch = cancellationLatch
+@@ -41 +45,21 @@ public final class UploadOperation: Sendable {
+-        self.onOperationDispose = onOperationDispose
++        self.resourceOwner = UploadOperationResourceOwner(
++            transaction: resourceTransaction,
++            onDispose: onOperationDispose
++        )
++    }
++
++    /// True once the owning upload manager has received a cancellation request.
++    /// The bridge checks this after operation creation and immediately before starting bytes.
++    public var isCancellationRequested: Bool {
++        cancellationLatch.isCancellationRequested
++    }
++
++    /// Claims the operation's first native start against cancellation.
++    ///
++    /// The latch arbitrates this synchronously with the manager's cancellation path. This method is
++    /// intentionally idempotent after a successful claim so `startUpload` and the convenience
++    /// operation API can share one operation without claiming a second start.
++    public func claimStart() throws {
++        try Task.checkCancellation()
++        guard cancellationLatch.claimStart() else { throw CancellationError() }
++        try Task.checkCancellation()
+@@ -48 +72,2 @@ public final class UploadOperation: Sendable {
+-        try await awaitUploadWithResilience(
++        try claimStart()
++        return try await awaitUploadWithResilience(
+@@ -90,0 +116,3 @@ public final class UploadOperation: Sendable {
++        guard (try? claimStart()) != nil else {
++            return .pausedByClient(CancellationError())
++        }
+@@ -145,0 +174 @@ public final class UploadOperation: Sendable {
++        try claimStart()
+@@ -180,2 +209,10 @@ public final class UploadOperation: Sendable {
+-    deinit {
+-        Self.freeSDKObjects(uploadControllerHandle, fileUploaderHandle, logger, nodeType, onOperationDispose)
++    /// Releases every transferred native resource in dependency order.
++    /// Setup rejection uses this awaited path; deinit is only the fallback for retained operations.
++    public func releaseResources() async {
++        await resourceOwner.release()
++    }
++
++    /// Releases an operation that setup completed but cancellation prevented it from returning.
++    /// This also disposes the remote draft before freeing the local controller handle.
++    func releaseUndeliveredResources() async {
++        await resourceOwner.releaseUndelivered()
+@@ -184,7 +221,2 @@ public final class UploadOperation: Sendable {
+-    private static func freeSDKObjects(
+-        _ uploadControllerHandle: ObjectHandle,
+-        _ fileUploaderHandle: ObjectHandle,
+-        _ logger: Logger?,
+-        _ nodeType: NodeType,
+-        _ onOperationDispose: @Sendable @escaping () async -> Void
+-    ) {
++    deinit {
++        let resourceOwner = resourceOwner
+@@ -192,8 +224 @@ public final class UploadOperation: Sendable {
+-            await onOperationDispose()
+-            await freeUploadController(Int64(uploadControllerHandle), logger: logger)
+-            switch nodeType {
+-            case .file:
+-                await freeFileUploader(Int64(fileUploaderHandle), logger)
+-            case .photo:
+-                await freePhotoUploader(Int64(fileUploaderHandle), logger)
+-            }
++            await resourceOwner.release()
+@@ -204 +229 @@ public final class UploadOperation: Sendable {
+-    private static func freeFileUploader(_ fileUploaderHandle: Int64, _ logger: Logger?) async {
++    static func freeFileUploader(_ fileUploaderHandle: Int64, logger: Logger?) async {
+@@ -219 +244 @@ public final class UploadOperation: Sendable {
+-    private static func freePhotoUploader(_ photoUploaderHandle: Int64, _ logger: Logger?) async {
++    static func freePhotoUploader(_ photoUploaderHandle: Int64, logger: Logger?) async {
+@@ -233 +258 @@ public final class UploadOperation: Sendable {
+-    private static func freeUploadController(_ uploadControllerHandle: Int64, logger: Logger?) async {
++    static func freeUploadController(_ uploadControllerHandle: Int64, logger: Logger?) async {
+diff --git a/Sources/FileOperations/Uploads/UploadsManager.swift b/Sources/FileOperations/Uploads/UploadsManager.swift
+index e9fb939..320a2a8 100644
+--- a/Sources/FileOperations/Uploads/UploadsManager.swift
++++ b/Sources/FileOperations/Uploads/UploadsManager.swift
+@@ -9 +9 @@ actor UploadsManager {
+-    private var activeUploads: [UUID: CancellationTokenSource] = [:]
++    private var activeUploads: [UUID: ActiveUploadState] = [:]
+@@ -18 +18,4 @@ actor UploadsManager {
+-            $0.free()
++            let activeUpload = $0
++            guard !activeUpload.ownsOperation() else { return }
++            activeUpload.cancellation.requestCancellation()
++            Task { await activeUpload.releaseResources() }
+@@ -35,15 +38,13 @@ actor UploadsManager {
+-        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
+-        activeUploads[cancellationToken] = cancellationTokenSource
+-
+-        let cancellationHandle = cancellationTokenSource.handle
+-
+-        let uploaderHandle = try await buildFileUploader(
+-            parentFolderUid: parentFolderUid.sdkCompatibleIdentifier,
+-            name: name,
+-            mediaType: mediaType,
+-            fileSize: fileSize,
+-            modificationDate: modificationDate,
+-            overrideExistingDraft: overrideExistingDraft,
+-            cancellationHandle: cancellationHandle,
+-            logger: logger
+-        )
++        let activeUpload = beginUpload(cancellationToken)
++        let transaction = UploadResourceTransaction()
++        transaction.add(stage: .nativeCancellationBarrier) {
++            activeUpload.closeCancellationRegistration()
++            await activeUpload.waitForNativeCancellation()
++        }
++        var operation: UploadOperation?
++        do {
++            try activeUpload.cancellation.check()
++            let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
++            activeUpload.install(tokenSource: cancellationTokenSource)
++            transaction.add(stage: .cancellationToken) { await activeUpload.releaseTokenSource() }
++            try activeUpload.cancellation.check()
+@@ -51,10 +52,40 @@ actor UploadsManager {
+-        let uploadOperation = try await uploadFromFile(
+-            fileUploaderHandle: uploaderHandle,
+-            fileURL: fileURL,
+-            progressCallback: progressCallback,
+-            cancellationToken: cancellationToken,
+-            cancellationHandle: cancellationHandle,
+-            thumbnails: thumbnails,
+-            expectedSHA1: expectedSHA1
+-        )
+-        return uploadOperation
++            let uploaderHandle = try await buildFileUploader(
++                parentFolderUid: parentFolderUid.sdkCompatibleIdentifier,
++                name: name,
++                mediaType: mediaType,
++                fileSize: fileSize,
++                modificationDate: modificationDate,
++                overrideExistingDraft: overrideExistingDraft,
++                cancellationHandle: cancellationTokenSource.handle,
++                logger: logger
++            )
++            let logger = self.logger
++            transaction.add(stage: .uploader) {
++                await UploadOperation.freeFileUploader(Int64(uploaderHandle), logger: logger)
++            }
++            try activeUpload.cancellation.check()
++
++            operation = try await uploadFromFile(
++                fileUploaderHandle: uploaderHandle,
++                fileURL: fileURL,
++                progressCallback: progressCallback,
++                cancellationToken: cancellationToken,
++                cancellationHandle: cancellationTokenSource.handle,
++                thumbnails: thumbnails,
++                expectedSHA1: expectedSHA1,
++                activeUpload: activeUpload,
++                transaction: transaction
++            )
++            transaction.transferToOperation()
++            activeUpload.markOperationOwned()
++            try activeUpload.cancellation.check()
++            return operation!
++        } catch {
++            if let operation {
++                await operation.releaseUndeliveredResources()
++            } else {
++                await transaction.rollback()
++            }
++            removeUpload(cancellationToken, ifSameAs: activeUpload)
++            throw error
++        }
+@@ -73,4 +104,13 @@ actor UploadsManager {
+-        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
+-        activeUploads[cancellationToken] = cancellationTokenSource
+-
+-        let cancellationHandle = cancellationTokenSource.handle
++        let activeUpload = beginUpload(cancellationToken)
++        let transaction = UploadResourceTransaction()
++        transaction.add(stage: .nativeCancellationBarrier) {
++            activeUpload.closeCancellationRegistration()
++            await activeUpload.waitForNativeCancellation()
++        }
++        var operation: UploadOperation?
++        do {
++            try activeUpload.cancellation.check()
++            let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
++            activeUpload.install(tokenSource: cancellationTokenSource)
++            transaction.add(stage: .cancellationToken) { await activeUpload.releaseTokenSource() }
++            try activeUpload.cancellation.check()
+@@ -78,6 +118,11 @@ actor UploadsManager {
+-        let uploaderHandle = try await getRevisionUploader(
+-            currentActiveRevisionUid: currentActiveRevisionUid,
+-            fileSize: fileSize,
+-            modificationDate: modificationDate,
+-            cancellationHandle: cancellationHandle
+-        )
++            let uploaderHandle = try await getRevisionUploader(
++                currentActiveRevisionUid: currentActiveRevisionUid,
++                fileSize: fileSize,
++                modificationDate: modificationDate,
++                cancellationHandle: cancellationTokenSource.handle
++            )
++            let logger = self.logger
++            transaction.add(stage: .uploader) {
++                await UploadOperation.freeFileUploader(Int64(uploaderHandle), logger: logger)
++            }
++            try activeUpload.cancellation.check()
+@@ -85,10 +130,24 @@ actor UploadsManager {
+-        let uploadController = try await uploadFromFile(
+-            fileUploaderHandle: uploaderHandle,
+-            fileURL: fileURL,
+-            progressCallback: progressCallback,
+-            cancellationToken: cancellationToken,
+-            cancellationHandle: cancellationHandle,
+-            thumbnails: thumbnails,
+-            expectedSHA1: expectedSHA1
+-        )
+-        return uploadController
++            operation = try await uploadFromFile(
++                fileUploaderHandle: uploaderHandle,
++                fileURL: fileURL,
++                progressCallback: progressCallback,
++                cancellationToken: cancellationToken,
++                cancellationHandle: cancellationTokenSource.handle,
++                thumbnails: thumbnails,
++                expectedSHA1: expectedSHA1,
++                activeUpload: activeUpload,
++                transaction: transaction
++            )
++            transaction.transferToOperation()
++            activeUpload.markOperationOwned()
++            try activeUpload.cancellation.check()
++            return operation!
++        } catch {
++            if let operation {
++                await operation.releaseUndeliveredResources()
++            } else {
++                await transaction.rollback()
++            }
++            removeUpload(cancellationToken, ifSameAs: activeUpload)
++            throw error
++        }
+@@ -99 +158 @@ actor UploadsManager {
+-        guard let uploadCancellationToken = activeUploads[cancellationToken] else {
++        guard let activeUpload = activeUploads[cancellationToken] else {
+@@ -103 +162,5 @@ actor UploadsManager {
+-        try await uploadCancellationToken.cancel()
++        activeUpload.cancellation.requestCancellation()
++        guard activeUpload.cancellation.claimNativeCancellation() else { return }
++        guard let cancellationTask = activeUpload.beginNativeCancellation() else { return }
++        try await cancellationTask.value
++    }
+@@ -105,2 +168,4 @@ actor UploadsManager {
+-        activeUploads[cancellationToken] = nil
+-        uploadCancellationToken.free()
++    private func beginUpload(_ cancellationToken: UUID) -> ActiveUploadState {
++        let activeUpload = ActiveUploadState()
++        activeUploads[cancellationToken] = activeUpload
++        return activeUpload
+@@ -109,2 +174,2 @@ actor UploadsManager {
+-    private func freeCancellationTokenSourceIfNeeded(cancellationToken: UUID) {
+-        guard let cancellationTokenSource = activeUploads[cancellationToken] else { return }
++    private func removeUpload(_ cancellationToken: UUID, ifSameAs activeUpload: ActiveUploadState) {
++        guard activeUploads[cancellationToken] === activeUpload else { return }
+@@ -112 +177,4 @@ actor UploadsManager {
+-        cancellationTokenSource.free()
++    }
++
++    private func finishUpload(_ cancellationToken: UUID, ifSameAs activeUpload: ActiveUploadState) {
++        removeUpload(cancellationToken, ifSameAs: activeUpload)
+@@ -176 +244,3 @@ extension UploadsManager {
+-        expectedSHA1: Data?
++        expectedSHA1: Data?,
++        activeUpload: ActiveUploadState,
++        transaction: UploadResourceTransaction
+@@ -177,0 +248 @@ extension UploadsManager {
++        try activeUpload.cancellation.check()
+@@ -189,0 +261,3 @@ extension UploadsManager {
++        activeUpload.setBufferCleanup(deallocateBuffers)
++        transaction.add(stage: .buffers) { activeUpload.releaseBuffers() }
++        try activeUpload.cancellation.check()
+@@ -214,0 +289,8 @@ extension UploadsManager {
++        let logger = self.logger
++        transaction.add(stage: .controller) {
++            await UploadOperation.freeUploadController(Int64(uploadControllerHandle), logger: logger)
++        }
++        transaction.addRollbackOnly(stage: .controller) {
++            await disposeUploadController(Int64(uploadControllerHandle), logger: logger)
++        }
++        try activeUpload.cancellation.check()
+@@ -216 +298 @@ extension UploadsManager {
+-        return UploadOperation(
++        let operation = UploadOperation(
+@@ -222,0 +305,2 @@ extension UploadsManager {
++            cancellationLatch: activeUpload.cancellation,
++            resourceTransaction: transaction,
+@@ -228,3 +312 @@ extension UploadsManager {
+-                guard let self else { return }
+-                deallocateBuffers()
+-                await self.freeCancellationTokenSourceIfNeeded(cancellationToken: cancellationToken)
++                await self?.finishUpload(cancellationToken, ifSameAs: activeUpload)
+@@ -232,0 +315 @@ extension UploadsManager {
++        return operation
+diff --git a/Sources/Plumbing/BoxedContinuation.swift b/Sources/Plumbing/BoxedContinuation.swift
+index c1f6f71..a7743d1 100644
+--- a/Sources/Plumbing/BoxedContinuation.swift
++++ b/Sources/Plumbing/BoxedContinuation.swift
+@@ -18 +18 @@ extension Resumable where ReturnType == Void {
+-final class BoxedCompletionBlock<ResultType, StateType>: Resumable {
++final class BoxedCompletionBlock<ResultType, StateType>: RegistryCancellable, Resumable {
+@@ -29,0 +30,4 @@ final class BoxedCompletionBlock<ResultType, StateType>: Resumable {
++    func cancel() {
++        resume(throwing: CancellationError())
++    }
++
+diff --git a/Sources/Plumbing/SDKRequestHandler.swift b/Sources/Plumbing/SDKRequestHandler.swift
+index f6f8a9d..89771c5 100644
+--- a/Sources/Plumbing/SDKRequestHandler.swift
++++ b/Sources/Plumbing/SDKRequestHandler.swift
+@@ -7,0 +8,31 @@ enum SDKRequestHandler {
++    final class RequestCancellation: @unchecked Sendable {
++        private let lock = NSLock()
++        private var handle: RegistryHandle?
++        private var isCancelled = false
++
++        func install(_ handle: RegistryHandle?) {
++            guard let handle else { return }
++
++            lock.lock()
++            if isCancelled {
++                lock.unlock()
++                CallbackHandleRegistry.shared.cancel(handle)
++            } else {
++                self.handle = handle
++                lock.unlock()
++            }
++        }
++
++        func cancel() {
++            lock.lock()
++            isCancelled = true
++            let handle = handle
++            self.handle = nil
++            lock.unlock()
++
++            if let handle {
++                CallbackHandleRegistry.shared.cancel(handle)
++            }
++        }
++    }
++
+@@ -71,0 +103,33 @@ enum SDKRequestHandler {
++    /// Async request whose Swift continuation is released when its task is cancelled.
++    /// The underlying operation still owns its native cancellation token separately.
++    static func sendCancellable<T: Message, U: Sendable, V>(
++        _ request: T,
++        state: V,
++        scope: CallbackScope = .operation,
++        owner: AnyObject? = nil,
++        requestCancellation: RequestCancellation = RequestCancellation(),
++        logger: Logger?
++    ) async throws -> U {
++        return try await withTaskCancellationHandler {
++            try await withCheckedThrowingContinuation { continuation in
++                let handle = send(
++                    request,
++                    state: state,
++                    logger: logger,
++                    scope: scope,
++                    owner: owner
++                ) { (result: Result<U, Error>) in
++                    switch result {
++                    case .success(let response):
++                        continuation.resume(returning: response)
++                    case .failure(let error):
++                        continuation.resume(throwing: error)
++                    }
++                }
++                requestCancellation.install(handle)
++            }
++        } onCancel: {
++            requestCancellation.cancel()
++        }
++    }
++
+@@ -72,0 +137 @@ enum SDKRequestHandler {
++    @discardableResult
+@@ -80 +145 @@ enum SDKRequestHandler {
+-    ) {
++    ) -> RegistryHandle? {
+@@ -98,0 +164 @@ enum SDKRequestHandler {
++            return registryId
+@@ -100,0 +167 @@ enum SDKRequestHandler {
++            return nil
+diff --git a/Tests/CallbackHandleRegistryTests.swift b/Tests/CallbackHandleRegistryTests.swift
+new file mode 100644
+index 0000000..44e283b
+--- /dev/null
++++ b/Tests/CallbackHandleRegistryTests.swift
+@@ -0,0 +1,89 @@
++import Foundation
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("Callback registry cancellation")
++struct CallbackHandleRegistryTests {
++    @Test func cancellationRemovesHandleAndResumesExactlyOnce() {
++        let recorder = CompletionRecorder()
++        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
++        let handle = CallbackHandleRegistry.shared.register(box)
++
++        CallbackHandleRegistry.shared.cancel(handle)
++        CallbackHandleRegistry.shared.cancel(handle)
++
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++        #expect(recorder.count == 1)
++        #expect(recorder.wasCancelled)
++        #expect(CallbackHandleRegistry.shared.get(handle, as: BoxedCompletionBlock<Void, Void>.self) == nil,
++                "a late yield/terminal callback must become a no-op")
++    }
++
++    @Test func cancellationAndTerminalCompletionRaceStillResumeOnce() async {
++        let recorder = CompletionRecorder()
++        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
++        let handle = CallbackHandleRegistry.shared.register(box)
++
++        await withTaskGroup(of: Void.self) { group in
++            group.addTask { CallbackHandleRegistry.shared.cancel(handle) }
++            group.addTask {
++                (CallbackHandleRegistry.shared.remove(handle) as? BoxedCompletionBlock<Void, Void>)?
++                    .resume(returning: ())
++            }
++        }
++
++        #expect(recorder.count == 1)
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++    }
++
++    @Test func cancellationBeforeHandleInstallationCancelsTheLateRegistration() {
++        let recorder = CompletionRecorder()
++        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
++        let handle = CallbackHandleRegistry.shared.register(box)
++        let cancellation = SDKRequestHandler.RequestCancellation()
++
++        cancellation.cancel()
++        cancellation.install(handle)
++
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++        #expect(recorder.count == 1)
++        #expect(recorder.wasCancelled)
++    }
++
++    @Test func responseDisposeRemovesOwnerManagedHandleExactlyOnce() {
++        let owner = RegistryOwner()
++        let responseContent = NSObject()
++        let handle = CallbackHandleRegistry.shared.register(
++            responseContent,
++            scope: .ownerManaged,
++            owner: owner
++        )
++
++        #expect(CallbackHandleRegistry.shared.contains(handle))
++
++        HttpClientResponseProcessor.cCompatibleHttpResponseDispose(handle)
++        HttpClientResponseProcessor.cCompatibleHttpResponseDispose(handle)
++
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++        #expect(CallbackHandleRegistry.shared.get(handle, as: NSObject.self) == nil)
++    }
++}
++
++private final class RegistryOwner {}
++
++private final class CompletionRecorder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var results: [Result<Void, Error>] = []
++
++    func record(_ result: Result<Void, Error>) {
++        lock.withLock { results.append(result) }
++    }
++
++    var count: Int { lock.withLock { results.count } }
++    var wasCancelled: Bool {
++        lock.withLock {
++            guard case let .failure(error)? = results.first else { return false }
++            return error is CancellationError
++        }
++    }
++}
+diff --git a/Tests/EnumerationCallbackTests.swift b/Tests/EnumerationCallbackTests.swift
+new file mode 100644
+index 0000000..438abdc
+--- /dev/null
++++ b/Tests/EnumerationCallbackTests.swift
+@@ -0,0 +1,119 @@
++import CProtonDriveSDK
++import Foundation
++import SwiftProtobuf
++import Testing
++@testable import ProtonDriveSDK
++
++/// Every streamed enumeration awaits `Void` from `SDKRequestHandler.send`, so the registry holds a
++/// `BoxedCompletionBlock<Void, WeakReference<Wrapper>>` for each of these callbacks. Upstream 0.28+
++/// looks the box up with a checked cast; a callback declared with any other result type silently drops
++/// every yielded item.
++@Suite("Enumeration callbacks resolve Void request boxes")
++struct EnumerationCallbackTests {
++    @Test func timelineItemIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<PhotoTimelineItem>()
++        let wrapper = TimelineItemEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var item = Proton_Drive_Sdk_PhotosTimelineItem()
++        item.nodeUid = "volume~node-1"
++        item.captureTime = Google_Protobuf_Timestamp(seconds: 1_700_000_000)
++        try withBytes(of: item) { cTimelineItemEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.nodeUid.nodeID == "node-1")
++        #expect(delivered.captureTime == 1_700_000_000)
++    }
++
++    @Test func albumItemIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<AlbumItem>()
++        let wrapper = AlbumItemEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var item = Proton_Drive_Sdk_AlbumItem()
++        item.nodeUid = "volume~album-photo"
++        item.captureTime = Google_Protobuf_Timestamp(seconds: 42)
++        try withBytes(of: item) { cAlbumItemEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.nodeUid.nodeID == "album-photo")
++        #expect(delivered.captureTime == 42)
++    }
++
++    @Test func nodeResultIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<NodeResult>()
++        let wrapper = NodeResultEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var pair = Proton_Drive_Sdk_NodeResultPair()
++        pair.nodeUid = "volume~updated"
++        try withBytes(of: pair) { cNodeResultEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.nodeUid.nodeID == "updated")
++        #expect(delivered.error == nil)
++    }
++
++    @Test func nodeUidIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<SDKNodeUid>()
++        let wrapper = NodeUidEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var uid = Google_Protobuf_StringValue()
++        uid.value = "volume~shared"
++        try withBytes(of: uid) { cNodeUidEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.volumeID == "volume")
++        #expect(delivered.nodeID == "shared")
++    }
++
++    @Test func deviceIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<Device>()
++        let wrapper = DeviceEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var device = Proton_Drive_Sdk_Device()
++        device.uid = "device-7"
++        device.type = .macos
++        device.name = Proton_Drive_Sdk_StringResult.with { $0.value = "Studio" }
++        device.rootFolderUid = "volume~root"
++        device.creationTime = Google_Protobuf_Timestamp(seconds: 7)
++        device.shareID = "share"
++        try withBytes(of: device) { cDeviceEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.uid.deviceID == "device-7")
++        #expect(delivered.rootFolderUid.nodeID == "root")
++    }
++
++    /// Mirrors `SDKRequestHandler.send` for `let _: Void = try await send(...)`: the completion result
++    /// type is `Void` and the state is the weak wrapper reference.
++    private func register<Wrapper: AnyObject>(_ wrapper: Wrapper) -> RegistryHandle {
++        let box = BoxedCompletionBlock<Void, WeakReference<Wrapper>>(nil, state: WeakReference(value: wrapper))
++        return CallbackHandleRegistry.shared.register(box)
++    }
++
++    private func withBytes(of message: some Message, _ body: (ByteArray) -> Void) throws {
++        let bytes = ByteArray(data: try message.serializedData())
++        defer { bytes.deallocate() }
++        body(bytes)
++    }
++}
++
++private final class ResultRecorder<Value: Sendable>: @unchecked Sendable {
++    private let lock = NSLock()
++    private var storedValue: Value?
++
++    func record(_ result: Result<Value, any Error>) {
++        guard case let .success(value) = result else { return }
++        lock.withLock { storedValue = value }
++    }
++
++    var value: Value? { lock.withLock { storedValue } }
++}
+diff --git a/Tests/PhotoRequestPackagingTests.swift b/Tests/PhotoRequestPackagingTests.swift
+new file mode 100644
+index 0000000..d6b7a80
+--- /dev/null
++++ b/Tests/PhotoRequestPackagingTests.swift
+@@ -0,0 +1,56 @@
++import CProtonDriveSDK
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("Photo request packaging")
++struct PhotoRequestPackagingTests {
++    @Test func photosEmptyTrashRequestUsesNativePayload() throws {
++        let request = Proton_Drive_Sdk_DrivePhotosClientEmptyTrashRequest.with {
++            $0.clientHandle = 42
++        }
++
++        let envelope = try #require(try request.packIntoRequest() as? Proton_Drive_Sdk_Request)
++        guard case let .drivePhotosClientEmptyTrash(packaged)? = envelope.payload else {
++            Issue.record("expected the photo empty-trash payload")
++            return
++        }
++
++        #expect(packaged.clientHandle == 42)
++    }
++
++    @Test func albumEnumerationRequestUsesTheNewAlbumPayload() throws {
++        let request = Proton_Drive_Sdk_DrivePhotosClientEnumerateAlbumRequest.with {
++            $0.clientHandle = 7
++            $0.albumUid = "volume:album"
++            $0.cancellationTokenSourceHandle = 11
++            $0.yieldAction = 13
++        }
++
++        let envelope = try #require(try request.packIntoRequest() as? Proton_Drive_Sdk_Request)
++        guard case let .drivePhotosClientEnumerateAlbum(packaged)? = envelope.payload else {
++            Issue.record("expected the photo album-enumeration payload")
++            return
++        }
++
++        #expect(packaged.clientHandle == 7)
++        #expect(packaged.albumUid == "volume:album")
++        #expect(packaged.cancellationTokenSourceHandle == 11)
++        #expect(packaged.yieldAction == 13)
++    }
++
++    @Test func photoTagUpdateRequestUsesTheNewUpdatePayload() throws {
++        let request = Proton_Drive_Sdk_DrivePhotosClientUpdatePhotosRequest.with {
++            $0.clientHandle = 17
++            $0.cancellationTokenSourceHandle = 19
++        }
++
++        let envelope = try #require(try request.packIntoRequest() as? Proton_Drive_Sdk_Request)
++        guard case let .drivePhotosClientUpdatePhotos(packaged)? = envelope.payload else {
++            Issue.record("expected the photo tag-update payload")
++            return
++        }
++
++        #expect(packaged.clientHandle == 17)
++        #expect(packaged.cancellationTokenSourceHandle == 19)
++    }
++}
+diff --git a/Tests/ThumbnailEnumerationCallbackTests.swift b/Tests/ThumbnailEnumerationCallbackTests.swift
+new file mode 100644
+index 0000000..d39e91d
+--- /dev/null
++++ b/Tests/ThumbnailEnumerationCallbackTests.swift
+@@ -0,0 +1,50 @@
++import CProtonDriveSDK
++import Foundation
++import SwiftProtobuf
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("Thumbnail enumeration callback")
++struct ThumbnailEnumerationCallbackTests {
++    @Test func voidRequestBoxDeliversStreamedThumbnail() throws {
++        let expectedUID = SDKNodeUid(volumeID: "volume", nodeID: "node")
++        let expectedData = Data([0x01, 0x02, 0x03])
++        let recorder = ThumbnailCallbackRecorder()
++        let wrapper = ThumbnailEnumerationCallbackWrapper(callback: recorder.record)
++        let box = BoxedCompletionBlock<Void, WeakReference<ThumbnailEnumerationCallbackWrapper>>(
++            nil,
++            state: WeakReference(value: wrapper)
++        )
++        let handle = CallbackHandleRegistry.shared.register(box)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var thumbnail = Proton_Drive_Sdk_FileThumbnail()
++        thumbnail.fileUid = expectedUID.sdkCompatibleIdentifier
++        thumbnail.data = expectedData
++        let bytes = ByteArray(data: try thumbnail.serializedData())
++        defer { bytes.deallocate() }
++
++        cThumbnailEnumerationCallback(handle, bytes)
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.fileUid.volumeID == expectedUID.volumeID)
++        #expect(delivered.fileUid.nodeID == expectedUID.nodeID)
++        guard case let .success(data) = delivered.result else {
++            Issue.record("expected thumbnail bytes")
++            return
++        }
++        #expect(data == expectedData)
++    }
++}
++
++private final class ThumbnailCallbackRecorder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var storedValue: ThumbnailDataWithId?
++
++    func record(_ result: Result<ThumbnailDataWithId?, any Error>) {
++        guard case let .success(value?) = result else { return }
++        lock.withLock { storedValue = value }
++    }
++
++    var value: ThumbnailDataWithId? { lock.withLock { storedValue } }
++}
+diff --git a/Tests/UploadLifecycleSupportTests.swift b/Tests/UploadLifecycleSupportTests.swift
+new file mode 100644
+index 0000000..2085db2
+--- /dev/null
++++ b/Tests/UploadLifecycleSupportTests.swift
+@@ -0,0 +1,250 @@
++import Foundation
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("Upload lifecycle ownership")
++struct UploadLifecycleSupportTests {
++    @Test func cancellationBeforeNativeRegistrationClaimsOnlyOnce() {
++        let latch = UploadCancellationLatch()
++
++        latch.requestCancellation()
++
++        #expect(latch.isCancellationRequested)
++        #expect(latch.claimNativeCancellation())
++        #expect(!latch.claimNativeCancellation())
++    }
++
++    @Test func concurrentNativeCancellationClaimsOneCaller() async {
++        let latch = UploadCancellationLatch()
++        let claims = ClaimCounter()
++
++        await withTaskGroup(of: Void.self) { group in
++            for _ in 0..<32 {
++                group.addTask {
++                    if latch.claimNativeCancellation() {
++                        await claims.increment()
++                    }
++                }
++            }
++        }
++
++        #expect(await claims.value == 1)
++    }
++
++    @Test func cancellationAfterInitialStartPreventsResume() {
++        let latch = UploadCancellationLatch()
++
++        #expect(latch.claimStart())
++        latch.requestCancellation()
++
++        #expect(!latch.claimStart(), "a cancelled operation must not resume after its first start")
++    }
++
++    @Test func rollbackRunsEverySetupCleanupAfterAnErrorAndOnlyOnce() async {
++        for failedStage in 0..<9 {
++            let counter = CleanupCounter()
++            let transaction = UploadResourceTransaction()
++            let cleanupStages: [UploadResourceCleanupStage] = [
++                .cancellationToken,
++                .uploader,
++                .buffers,
++                .controller,
++                .controller,
++                .uploader,
++                .buffers,
++                .cancellationToken,
++                .nativeCancellationBarrier,
++            ]
++
++            for stage in 0..<9 {
++                transaction.add(stage: cleanupStages[stage]) {
++                    await counter.record(stage)
++                    if stage == failedStage {
++                        struct SetupFailure: Error {}
++                        throw SetupFailure()
++                    }
++                }
++            }
++
++            await transaction.rollback()
++            await transaction.rollback()
++
++            #expect(await counter.count == 9, "failure stage \(failedStage) must not strand later resources")
++            #expect(await counter.uniqueStages.count == 9)
++        }
++    }
++
++    @Test func rollbackUsesNativeDependencyOrder() async {
++        let counter = CleanupCounter()
++        let transaction = UploadResourceTransaction()
++
++        transaction.add(stage: .cancellationToken) { await counter.record(4) }
++        transaction.add(stage: .uploader) { await counter.record(2) }
++        transaction.add(stage: .buffers) { await counter.record(3) }
++        transaction.add(stage: .controller) { await counter.record(1) }
++        transaction.add(stage: .nativeCancellationBarrier) { await counter.record(0) }
++
++        await transaction.rollback()
++
++        #expect(await counter.stages == [0, 1, 2, 3, 4])
++    }
++
++    @Test func operationOwnershipReleasesEveryResourceExactlyOnce() async {
++        let counter = CleanupCounter()
++        let transaction = UploadResourceTransaction()
++        for stage in 0..<5 {
++            transaction.add(stage: UploadResourceCleanupStage(rawValue: stage)!) {
++                await counter.record(stage)
++            }
++        }
++
++        transaction.transferToOperation()
++        await transaction.rollback()
++        #expect(await counter.count == 0, "setup rollback must not free transferred resources")
++
++        let owner = UploadOperationResourceOwner(transaction: transaction) {}
++        async let first: Void = owner.release()
++        async let second: Void = owner.release()
++        _ = await (first, second)
++
++        #expect(await counter.count == 5)
++        #expect(await counter.uniqueStages.count == 5)
++    }
++
++    @Test func undeliveredOperationDisposesRemoteControllerBeforeLocalFree() async {
++        let counter = CleanupCounter()
++        let transaction = UploadResourceTransaction()
++        transaction.add(stage: .controller) { await counter.record(2) }
++        transaction.addRollbackOnly(stage: .controller) { await counter.record(1) }
++        transaction.transferToOperation()
++        let owner = UploadOperationResourceOwner(transaction: transaction) {}
++
++        await owner.releaseUndelivered()
++        await owner.release()
++
++        #expect(await counter.stages == [1, 2])
++    }
++
++    @Test func faultInjectionLeavesEveryAbstractResourceCounterAtZero() async {
++        let cleanupStages: [UploadResourceCleanupStage] = [
++            .cancellationToken, // token creation
++            .uploader,          // uploader creation
++            .buffers,           // thumbnail buffer creation
++            .controller,        // request send/controller creation
++            .controller,        // operation construction handoff
++        ]
++
++        for failureAfterAllocation in 0...cleanupStages.count {
++            let resources = ResourceBalance()
++            let transaction = UploadResourceTransaction()
++            for (index, stage) in cleanupStages.enumerated() where index < failureAfterAllocation {
++                await resources.allocate(index)
++                transaction.add(stage: stage) {
++                    await resources.release(index)
++                    if index == 1 && failureAfterAllocation == cleanupStages.count {
++                        struct NativeFreeFailure: Error {}
++                        throw NativeFreeFailure()
++                    }
++                }
++            }
++            // A native cancellation failure is represented by a failing barrier. It must not stop
++            // the remaining resource cleanup stages.
++            transaction.add(stage: .nativeCancellationBarrier) {
++                if failureAfterAllocation == cleanupStages.count {
++                    struct NativeCancelFailure: Error {}
++                    throw NativeCancelFailure()
++                }
++            }
++
++            await transaction.rollback()
++            #expect(await resources.total == 0, "fault stage \(failureAfterAllocation) leaked a resource")
++        }
++    }
++
++    @Test func asyncNativeFreeIsStartedOnceAndEveryCallerJoinsCompletion() async {
++        let gate = IdempotentAsyncFreeGate()
++        let entered = AsyncFreeLatch()
++        let release = AsyncFreeLatch()
++        let returned = AsyncFreeLatch()
++        let starts = ClaimCounter()
++
++        let first = gate.task {
++            Task {
++                await starts.increment()
++                await entered.signal()
++                await release.wait()
++            }
++        }
++        await entered.wait()
++        let second = gate.task {
++            Task { await starts.increment() }
++        }
++        let waiter = Task {
++            await second.value
++            await returned.signal()
++        }
++
++        await Task.yield()
++        #expect(!(await returned.isOpen))
++        #expect(await starts.value == 1)
++
++        await release.signal()
++        await first.value
++        await waiter.value
++        #expect(await returned.isOpen)
++        #expect(await starts.value == 1)
++    }
++}
++
++private actor AsyncFreeLatch {
++    private var open = false
++    private var waiters: [CheckedContinuation<Void, Never>] = []
++
++    var isOpen: Bool { open }
++
++    func wait() async {
++        if open { return }
++        await withCheckedContinuation { waiters.append($0) }
++    }
++
++    func signal() {
++        guard !open else { return }
++        open = true
++        let pending = waiters
++        waiters.removeAll(keepingCapacity: false)
++        pending.forEach { $0.resume() }
++    }
++}
++
++private actor ClaimCounter {
++    private(set) var value = 0
++
++    func increment() {
++        value += 1
++    }
++}
++
++private actor CleanupCounter {
++    private(set) var stages: [Int] = []
++
++    func record(_ stage: Int) {
++        stages.append(stage)
++    }
++
++    var count: Int { stages.count }
++    var uniqueStages: Set<Int> { Set(stages) }
++}
++
++private actor ResourceBalance {
++    private var balances: [Int: Int] = [:]
++
++    func allocate(_ resource: Int) {
++        balances[resource, default: 0] += 1
++    }
++
++    func release(_ resource: Int) {
++        balances[resource, default: 0] -= 1
++    }
++
++    var total: Int { balances.values.reduce(0, +) }
++}

@@ -5,17 +5,22 @@ import ProtonDriveSDK
 /// storage requests; we add the session auth headers and perform the I/O, refreshing on 401.
 final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     private let driveSession: DriveSession
-    private let urlSession: URLSession
+    let urlSession: URLSession
     private let requestGovernor: ProtonRequestGovernor
+    private let expensiveUploadAccess: ExpensiveUploadAccess?
 
     init(
         driveSession: DriveSession,
         requestGovernor: ProtonRequestGovernor,
+        expensiveUploadAccess: ExpensiveUploadAccess? = nil,
         urlProtocolClasses: [AnyClass]? = nil
     ) {
         self.driveSession = driveSession
         self.requestGovernor = requestGovernor
-        let cfg = URLSessionConfiguration.default
+        self.expensiveUploadAccess = expensiveUploadAccess
+        // Responses are never read from a cache, so keep none and keep cookies only in memory.
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.urlCache = nil
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         // Test seam: lets unit tests intercept requests with a URLProtocol stub (never set in production).
         if let urlProtocolClasses { cfg.protocolClasses = urlProtocolClasses }
@@ -72,16 +77,14 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         guard let requestURL = Self.httpsURL(url) else {
             return .failure(Self.invalidURL("Invalid storage upload URL"))
         }
-        var req = URLRequest(url: requestURL)
-        req.httpMethod = method
-        applyHeaders(&req, headers: headers)  // storage URLs are token-authed; no session headers
-        req.httpBodyStream = content.input
+        let req = storageUploadRequest(method: method, url: requestURL, headers: headers, body: content.input)
 
         let streamError = ErrorBox()
         content.onStreamError = { streamError.set($0) }
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: .storageUpload)
+            permit = try await requestGovernor.acquire(
+                scope: .storageUpload, label: .storage(method: method))
         } catch {
             return .failure(error as NSError)
         }
@@ -107,15 +110,27 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     data: data, headers: Self.headerPairs(http), statusCode: http.statusCode
                 ))
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             // Prefer a stream-side error (encryption/producer) over the generic transport error.
             return .failure((streamError.value ?? error) as NSError)
         }
     }
 
+    func storageUploadRequest(
+        method: String, url: URL, headers: [(String, [String])], body: InputStream
+    ) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        applyHeaders(&req, headers: headers)  // storage URLs are token-authed; no session headers
+        req.httpBodyStream = body
+        applyExpensiveNetworkAccess(&req)
+        return req
+    }
+
     // MARK: Small upload (absolute url, buffered)
 
-    /// Sends one complete multipart upload to the Drive API. SDK 0.29.1 buffers a small file from byte
+    /// Sends one complete multipart upload to the Drive API. SDK 0.31.1 buffers a small file from byte
     /// zero and hands us the opaque multipart body plus its metadata JSON as a side channel. The body
     /// goes out unchanged with session auth; `metadata` may contain plaintext, so it is neither logged
     /// nor reconstructed from `content`. The SDK forbids resending after a timeout, lost connection or
@@ -136,6 +151,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         applyAuthAndHeaders(&req, headers: headers)
         req.httpBody = content
         Self.applyDriveAcceptHeader(&req)
+        applyExpensiveNetworkAccess(&req)
 
         // Redirects are refused: following one would replay the authenticated body against a
         // Location the trusted-host check above never saw. The 3xx status reaches the SDK unchanged.
@@ -171,7 +187,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: .storageDownload)
+            permit = try await requestGovernor.acquire(
+                scope: .storageDownload, label: .storage(method: method))
         } catch {
             return .failure(error as NSError)
         }
@@ -197,7 +214,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     statusCode: http.statusCode
                 ))
         } catch {
-            completion.finish(statusCode: nil)
+            completion.finish(statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             return .failure(error as NSError)
         }
     }
@@ -213,7 +230,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     ) async -> Result<HttpClientResponse, NSError> {
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: scope)
+            permit = try await requestGovernor.acquire(scope: scope, label: Self.label(for: request, scope: scope))
         } catch {
             return .failure(error as NSError)
         }
@@ -255,9 +272,17 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     data: data, headers: Self.headerPairs(http), statusCode: http.statusCode
                 ))
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             return .failure(error as NSError)
         }
+    }
+
+    static func label(for request: URLRequest, scope: ProtonRequestScope) -> ProtonRequestLabel {
+        let method = request.httpMethod ?? "GET"
+        guard scope == .api else { return .storage(method: method) }
+        // The encoded path: a decoded segment could take the shape of a route word and be kept.
+        return .api(method: method, path: request.url?.path(percentEncoded: true) ?? "")
     }
 
     private static func canRetryAfterRateLimit(method: String) -> Bool {
@@ -279,6 +304,11 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         if request.value(forHTTPHeaderField: "Accept") == nil {
             request.setValue("application/vnd.protonmail.v1+json", forHTTPHeaderField: "Accept")
         }
+    }
+
+    /// Upload bytes only. API calls, downloads, and sign-in keep every network.
+    private func applyExpensiveNetworkAccess(_ req: inout URLRequest) {
+        req.allowsExpensiveNetworkAccess = expensiveUploadAccess?.allowsExpensiveNetworkAccess ?? true
     }
 
     private func applyAuthAndHeaders(_ req: inout URLRequest, headers: [(String, [String])]) {
@@ -381,7 +411,7 @@ struct PermitFinishingAsyncSequence: AsyncSequence {
                 }
                 return value
             } catch {
-                completion.finish(statusCode: nil)
+                completion.finish(statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
                 throw error
             }
         }
@@ -423,14 +453,14 @@ final class StreamPermitCompletion: @unchecked Sendable {
         }
     }
 
-    func finish(statusCode: Int?, retryAfter: TimeInterval? = nil) {
+    func finish(statusCode: Int?, retryAfter: TimeInterval? = nil, cancelled: Bool = false) {
         let shouldFinish = lock.withLock {
             guard !completed else { return false }
             completed = true
             return true
         }
         guard shouldFinish else { return }
-        Task { await governor.finish(permit, statusCode: statusCode, retryAfter: retryAfter) }
+        Task { await governor.finish(permit, statusCode: statusCode, retryAfter: retryAfter, cancelled: cancelled) }
     }
 
     deinit {

@@ -11,6 +11,7 @@ import SwiftUI
 import TimelineCore
 import TimelineUIKitFeature
 import UIKit
+import UploadCore
 
 enum MobileTimelineSurface: Equatable {
     case library
@@ -59,6 +60,7 @@ struct MobileTimelineScreen: View {
     /// Identity of the lifecycle the coordinator is bound to - a new session rebinds it.
     @State private var semanticQueryLifecycle: ObjectIdentifier?
     @State private var searchProjection: TimelineSearchProjection?
+    @State private var photoNames: PhotoNameIndex?
     @State private var searchCoordinator = TimelineSearchProjectionCoordinator()
     /// Apple-style stacked library refinements. Core evaluates these off-main with AND semantics across
     /// independent groups and OR semantics within the media-kind group.
@@ -73,6 +75,7 @@ struct MobileTimelineScreen: View {
     @State private var refinementTopPlacementPending = false
     @State private var searchSessionActive = false
     @State private var contextMenu = MobileGridContextMenuController()
+    @State private var showEmptyLibraryBackupSettings = false
     @State private var showAlbumPicker = false
     /// The native toolbar keeps its slots mounted from frame one, but its content appears only after the
     /// launch cover has finished dissolving. This prevents both chrome-over-cover and title relocation.
@@ -162,6 +165,9 @@ struct MobileTimelineScreen: View {
                 .onDisappear {
                     searchDebounceTask?.cancel()
                     searchDebounceTask = nil
+                }
+                .task(id: nameQuery) {
+                    photoNames = await TimelineFileNameSearchSource.names(forQuery: nameQuery, from: model.backend)
                 }
                 .task(id: searchProjectionRequest) { await resolveSearchProjection() }
                 .onChange(of: hasProjectionCriteria) { _, hasCriteria in
@@ -515,8 +521,8 @@ struct MobileTimelineScreen: View {
                     && (model.loadState.isLoading || model.loadState.failure != nil)
                 {
                     OfflineContentUnavailableView()
-                } else if model.loadState.isEmpty && !model.showsPendingPhotos {
-                    MobileEmptyLibraryView()
+                } else if model.isCompletelyEmpty && !model.showsPendingPhotos {
+                    LibraryEmptyView(backupAction: emptyLibraryBackupAction)
                 } else if let failure = model.loadState.failure {
                     MobileLibraryErrorView(message: failure.message, retryable: failure.retryable) {
                         Task { await model.retry() }
@@ -541,6 +547,30 @@ struct MobileTimelineScreen: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+            }
+            .sheet(isPresented: $showEmptyLibraryBackupSettings) {
+                if let backup = model.photoBackup {
+                    NavigationStack {
+                        MobileBackupScreen(
+                            controller: backup, uploadCoordinator: model.facade?.uploadCoordinator
+                        )
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button(L10n.string("action.done")) {
+                                    showEmptyLibraryBackupSettings = false
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var emptyLibraryBackupAction: LibraryEmptyBackupAction? {
+        model.photoBackup.map { backup in
+            LibraryEmptyBackupAction(isAvailable: backup.isAvailable, isEnabled: backup.isEnabled) {
+                showEmptyLibraryBackupSettings = true
             }
         }
     }
@@ -593,6 +623,11 @@ struct MobileTimelineScreen: View {
         return semanticQuery?.rankedUIDs.map(Set.init)
     }
 
+    /// The text query that file names can match; a structured suggestion has none.
+    private var nameQuery: String {
+        committedSuggestionMatches == nil ? normalizedCommittedSearchText : ""
+    }
+
     private var searchKey: TimelineSearchProjectionKey {
         if let committedSuggestionMatches {
             // A structured suggestion replaces the text query: its title is display text, not search terms.
@@ -608,7 +643,7 @@ struct MobileTimelineScreen: View {
         return TimelineSearchProjectionKey(
             sourceRevision: model.timelineRevision,
             query: normalizedCommittedSearchText,
-            context: TimelineSearchContext(favoriteUIDs: model.favoriteUIDs),
+            context: TimelineSearchContext(favoriteUIDs: model.favoriteUIDs, photoNames: photoNames),
             semanticMatches: committedSemanticMatches,
             refinement: refinement
         )
@@ -747,6 +782,14 @@ struct MobileViewerPresentation: Identifiable {
     var showsInfoInitially = false
     /// The whole-library viewer follows photos that the backup replaced; other collections keep their photos.
     var followsLibraryReplacements = false
+    /// A group of duplicates: the viewer shows the merge tools instead of the library actions.
+    var duplicateGroup: MobileDuplicateViewerGroup?
+}
+
+/// The model that keeps and merges the photos of a viewer of duplicates. The actions find the group of the photo on
+/// screen, because the group can split while the viewer is open.
+struct MobileDuplicateViewerGroup {
+    let model: ExactDuplicatesModel
 }
 
 /// A successful viewer mutation removes the current item from the collection that opened it. Filtered grids

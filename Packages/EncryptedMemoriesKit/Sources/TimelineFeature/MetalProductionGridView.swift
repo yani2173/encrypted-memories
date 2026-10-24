@@ -182,8 +182,7 @@ struct MetalProductionGridView: NSViewRepresentable {
         coord.a11y = a11y
 
         host.onViewportChanged = { [weak coord] in
-            coord?.header?.reposition()
-            coord?.a11y?.invalidate()
+            coord?.viewportChanged()
         }
 
         host.coordinator.setSelectionMode(selectionMode)
@@ -202,32 +201,28 @@ struct MetalProductionGridView: NSViewRepresentable {
         host.updateFillOrder(gridFillOrder)
         host.updateGridProfileResolver(gridProfileResolver)
         let coord = context.coordinator
-        coord.allItems = allItems
         coord.onOpen = onOpen
         coord.onSelectionChange = onSelectionChange
         coord.onDragOutFailed = onDragOutFailed
         coord.interaction?.selectionMode = selectionMode
-        coord.a11y?.items = allItems
         coord.a11y?.selected = host.coordinator.selectedUIDs
 
-        // Consume a pending route generation only with its corresponding data revision. Install the route
-        // viewport then; preserve position for ordinary data updates.
-        let routeChangePending = routeScrollGeneration != coord.appliedRouteScrollGeneration
-        if dataRevision != coord.dataRevision {
-            coord.dataRevision = dataRevision
-            host.setDataSource(
+        coord.receiveContent(
+            items: allItems, revision: dataRevision, routeGeneration: routeScrollGeneration,
+            initialViewport: routeInitialViewport,
+            markers: MetalGridProductionAdapter.monthMarkers(sections: sections),
+            makeSource: {
                 MetalGridProductionAdapter.makeDataSource(
-                    sections: sections,
-                    feed: feed,
-                    metadataProvider: metadataProvider
-                ),
-                initialViewport: routeChangePending ? routeInitialViewport : .preserve)
-            coord.header?.markers = MetalGridProductionAdapter.monthMarkers(sections: sections)
-            if routeChangePending { coord.appliedRouteScrollGeneration = routeScrollGeneration }
-        }
+                    sections: sections, feed: feed, metadataProvider: metadataProvider)
+            })
         host.coordinator.setSelectionMode(selectionMode)
         host.coordinator.setFavorites(favoriteUIDs)
+        let previousBadges = host.coordinator.uploadBadges
         host.coordinator.setUploadBadges(uploadBadges)
+        // VoiceOver hears the pause on every waiting photo, and only there.
+        if MetalGridAccessibilityProvider.badgesChangeLabels(from: previousBadges, to: uploadBadges) {
+            coord.a11y?.invalidate()
+        }
         // Honour a genuine external (+/- / keyboard / programmatic) level change, but ignore a stale `level`
         // binding value left over from a host-led pinch commit - re-driving it would re-anchor at the viewport
         // centre and jump a different photo under the cursor. See `LevelBindingReconciler`.
@@ -297,6 +292,76 @@ struct MetalProductionGridView: NSViewRepresentable {
         var onDragOutFailed: ((DragOutFailureKind) -> Void)?
         var dataRevision = 0
         var appliedRouteScrollGeneration = 0
+        private struct OrderUpdate {
+            let items: [PhotoItem]
+            let revision: Int
+            let markers: [(index: Int, text: String)]
+            let makeSource: () -> MetalGridDataSource
+        }
+        private var deferredOrderUpdate: OrderUpdate?
+
+        func receiveContent(
+            items: [PhotoItem], revision: Int, routeGeneration: Int,
+            initialViewport: GridInitialViewport, markers: [(index: Int, text: String)],
+            makeSource: @escaping () -> MetalGridDataSource
+        ) {
+            guard let host else { return }
+            let routePending = routeGeneration != appliedRouteScrollGeneration
+            guard revision != dataRevision else {
+                if deferredOrderUpdate == nil {
+                    allItems = items
+                    a11y?.items = items
+                }
+                return
+            }
+            if !routePending, deferredOrderUpdate?.revision == revision { return }
+            let update = OrderUpdate(items: items, revision: revision, markers: markers, makeSource: makeSource)
+            let visible = Set(host.coordinator.visibleCells().map(\.flatIndex))
+            let decision: TimelineOrderRefinementPolicy.Decision =
+                routePending
+                ? .ordinaryUpdate
+                : TimelineOrderRefinementPolicy.decision(
+                    incoming: items, previousCount: allItems.count, visibleIndices: visible,
+                    previous: { uid in host.coordinator.flatIndex(forUID: uid).map { ($0, self.allItems[$0]) } })
+            if decision == .deferVisibleCorrection
+                || (decision == .applyCorrection && !host.coordinator.canPresentResize)
+            {
+                deferredOrderUpdate = update
+                return
+            }
+            deferredOrderUpdate = nil
+            let viewport =
+                routePending
+                ? initialViewport
+                : (decision == .applyCorrection
+                    ? host.currentScrollAnchor().map(GridInitialViewport.restore) ?? .preserve : .preserve)
+            apply(update, viewport: viewport, preservesPhase: decision == .applyCorrection)
+            if routePending { appliedRouteScrollGeneration = routeGeneration }
+        }
+
+        func viewportChanged() {
+            if let host, host.coordinator.canPresentResize, let pending = deferredOrderUpdate {
+                let visible = Set(host.coordinator.visibleCells().map(\.flatIndex))
+                if !TimelineOrderRefinementPolicy.movesVisiblePhoto(
+                    incoming: pending.items, visibleIndices: visible, previousUID: { self.allItems[$0].uid })
+                {
+                    deferredOrderUpdate = nil
+                    let viewport = host.currentScrollAnchor().map(GridInitialViewport.restore) ?? .preserve
+                    apply(pending, viewport: viewport, preservesPhase: true)
+                }
+            }
+            header?.reposition()
+            a11y?.invalidate()
+        }
+
+        private func apply(_ update: OrderUpdate, viewport: GridInitialViewport, preservesPhase: Bool) {
+            allItems = update.items
+            dataRevision = update.revision
+            a11y?.items = update.items
+            host?.setDataSource(update.makeSource(), initialViewport: viewport, preservingColumnPhase: preservesPhase)
+            header?.markers = update.markers
+        }
+
         /// Owns the native drag-out session; created once in `makeNSView` when a provider exists.
         var dragOut: MetalGridDragOutController?
     }

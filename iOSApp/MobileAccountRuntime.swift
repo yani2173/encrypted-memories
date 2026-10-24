@@ -84,10 +84,12 @@ final class MobileAccountRuntime {
             PhotoBackupBackgroundCoordinator.shared.applicationDidEnterBackground(
                 controller: EncryptedMemoriesMobileApp.currentPhotoBackup()
             )
+            DuplicatesMergeBackgroundGrace.shared.applicationDidEnterBackground(model: libraryModel.duplicates)
         case .foregroundActive:
             PhotoBackupBackgroundCoordinator.shared.applicationDidBecomeActive(
                 controller: EncryptedMemoriesMobileApp.currentPhotoBackup()
             )
+            DuplicatesMergeBackgroundGrace.shared.applicationDidBecomeActive(model: libraryModel.duplicates)
             // Foregrounding reopens the background-indexing gate promptly.
             libraryModel.smartSearch?.noteConditionsChanged()
             Task { await libraryModel.refreshAccountInfo() }

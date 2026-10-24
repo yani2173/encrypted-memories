@@ -77,7 +77,7 @@ private struct MobileManualUploadCheckSection: View {
                     Image(systemName: status.isActive ? "arrow.trianglehead.2.clockwise" : "checkmark.shield")
                         .foregroundStyle(status.isActive ? ProtonColor.primary : ProtonColor.textWeak)
                         .frame(width: 18)
-                        .spinsWhileActive(status.isActive, period: 1.7)
+                        .spinsWhileActive(status.isActive)
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text(status.localizedTitle)
@@ -92,11 +92,9 @@ private struct MobileManualUploadCheckSection: View {
                         }
                         if total > 0 {
                             if let fraction = status.fractionCompleted {
-                                ProgressView(value: fraction)
-                                    .tint(ProtonColor.primary)
+                                ActivityProgressBar(fraction: fraction, accessibilityLabel: status.localizedTitle)
                             } else {
-                                ProgressView()
-                                    .tint(ProtonColor.primary)
+                                ProgressSpinner()
                             }
                             details
                         } else if status.needsAttentionCount > 0 {
@@ -200,6 +198,8 @@ private struct MobilePhotoBackupSections: View {
                 Text(String(localized: "settings.photos_backup_background_note"))
             }
 
+            BackupMobileDataSection { controller.mobileDataSettingDidChange() }
+
             Section {
                 NavigationLink {
                     MobileBackupQueueScreen(controller: controller)
@@ -267,6 +267,15 @@ private struct MobilePhotoBackupSections: View {
                     .animation(.easeInOut(duration: 0.2), value: display.headlineKey)
 
                 statusDetails(display)
+
+                if let reason = display.localizedWaitingForWiFiDetail {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(ProtonColor.textWeak)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
 
                 if let preparation = controller.scanIndexPreparation {
                     MobileBackupIndexProgress(preparation: preparation)
@@ -346,6 +355,7 @@ private struct MobilePhotoBackupSections: View {
                         }
                     }
                     .font(.footnote)
+                    .accessibilityIdentifier("backup.resume")
                 } else if controller.isSyncing {
                     Button(L10n.string("settings.photos_backup_pause")) {
                         PhotoBackupBackgroundCoordinator.shared.backupPaused()
@@ -387,6 +397,7 @@ private struct MobilePhotoBackupSections: View {
             VStack(alignment: .leading, spacing: 3) {
                 subtitleSlot(display, reservesSpace: true)
                 transferSlot(display, reservesSpace: true)
+                leftSlot(display)
                 progressSlot(display)
             }
             .transition(.opacity.combined(with: .move(edge: .top)))
@@ -445,13 +456,28 @@ private struct MobilePhotoBackupSections: View {
         }
     }
 
+    /// Items left and upload speed. The slot is always present in the progress layout, so a changing speed or a
+    /// vanishing count cannot move the bar.
+    @ViewBuilder private func leftSlot(_ display: BackupStatusPresentation) -> some View {
+        let left = display.localizedLeftLine
+        Text(verbatim: left ?? "\u{00a0}")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(ProtonColor.textWeak)
+            .contentTransition(.numericText())
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel(display.localizedLeftAccessibilityLabel ?? "")
+            .accessibilityAddTraits(.updatesFrequently)
+            .accessibilityHidden(left == nil)
+            .accessibilityIdentifier("backup.left")
+    }
+
     /// The row's single icon. Only `.activity` spins - there is never a second activity indicator.
     @ViewBuilder private func statusIcon(_ display: BackupStatusPresentation) -> some View {
         switch display.accessory {
         case .activity:
             Image(systemName: "arrow.trianglehead.2.clockwise")
                 .foregroundStyle(ProtonColor.primary)
-                .spinsWhileActive(true, period: 1.7)
+                .spinsWhileActive(true)
         case .attention:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -460,6 +486,9 @@ private struct MobilePhotoBackupSections: View {
                 .foregroundStyle(ProtonColor.textWeak)
         case .waiting:
             Image(systemName: "clock.arrow.circlepath")
+                .foregroundStyle(ProtonColor.textWeak)
+        case .waitingForWiFi:
+            Image(systemName: BackupStatus.waitingForWiFiSymbolName)
                 .foregroundStyle(ProtonColor.textWeak)
         case .notice:
             Image(systemName: "info.circle")
@@ -477,10 +506,8 @@ private struct MobilePhotoBackupSections: View {
     /// queue-wide completion. An empty reserved slot keeps the row stable. Scanning stays barless.
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
         if let fraction = display.progressBarFraction, display.isActive || display.accessory == .paused {
-            ProgressView(value: fraction)
-                .tint(ProtonColor.primary)
+            ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel)
                 .frame(height: 4)
-                .accessibilityLabel(display.localizedProgressBarLabel ?? "")
         } else {
             Color.clear.frame(height: 4)
         }
@@ -617,8 +644,10 @@ struct MobileFailedBackupSheet: View {
 
     let source: Source
     @Environment(\.dismiss) private var dismiss
-    @State private var backupItems: [BackupFailedItem] = []
+    @State private var problemList = BackupProblemListModel()
     @State private var deletionItem: BackupFailedItem?
+    @State private var personReadTask: Task<Void, Never>?
+    @State private var readOrder = BackupProblemListReadOrder()
 
     init(controller: PhotoLibraryBackupController) {
         source = .backup(controller)
@@ -634,85 +663,80 @@ struct MobileFailedBackupSheet: View {
 
     private var items: [BackupFailedItem] {
         switch source {
-        case .backup: backupItems
+        case .backup: problemList.items
         case .album(let albumSync, let albumID):
             albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
         }
     }
 
+    /// What the sheet shows. The backup list never says that nothing needs attention while the summary counts items.
+    private var presentation: BackupProblemListModel.Presentation {
+        if let controller {
+            return problemList.presentation(expectsItems: controller.status.needsAttentionCount > 0)
+        }
+        return items.isEmpty ? .empty : .list
+    }
+
     var body: some View {
         NavigationStack {
             Group {
-                if items.isEmpty {
+                switch presentation {
+                case .loading:
+                    ProgressView(L10n.string("loading.content"))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityIdentifier("backup.failedSheet.loading")
+                case .unavailable:
+                    ContentUnavailableView {
+                        Label(L10n.string("backup.failed_sheet_unavailable"), systemImage: "exclamationmark.triangle")
+                    } actions: {
+                        Button(L10n.string("action.retry")) {
+                            guard let controller else { return }
+                            problemList.beginReading()
+                            readList(of: controller)
+                        }
+                        .accessibilityIdentifier("backup.failedSheet.retry")
+                    }
+                case .empty:
                     ContentUnavailableView {
                         Label(L10n.string("backup.failed_sheet_empty"), systemImage: "checkmark.shield")
                     }
-                } else {
+                case .list:
                     List {
-                        ForEach(BackupIssueSection.allCases) { section in
-                            let sectionItems = items.filter { $0.category.section == section }
-                            if !sectionItems.isEmpty {
-                                Section {
-                                    ForEach(sectionItems) { item in
-                                        HStack(alignment: .top, spacing: 12) {
-                                            Image(systemName: item.category.symbolName)
-                                                .foregroundStyle(item.isPermanent ? ProtonColor.textWeak : .orange)
-                                                .font(.body)
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(item.filename)
-                                                    .font(.subheadline)
-                                                    .lineLimit(1)
-                                                    .truncationMode(.middle)
-                                                Text(item.reason)
-                                                    .font(.caption)
-                                                    .foregroundStyle(ProtonColor.textWeak)
-                                                    .fixedSize(horizontal: false, vertical: true)
-                                                if let retryDescription = item.retryDescription {
-                                                    Text(retryDescription)
-                                                        .font(.caption2)
-                                                        .foregroundStyle(ProtonColor.textWeak)
-                                                }
-                                            }
-                                        }
-                                        .padding(.vertical, 2)
-                                        .contentShape(Rectangle())
-                                        .onTapGesture {
-                                            if offersDecision(item) { deletionItem = item }
-                                        }
-                                        .accessibilityElement(children: .combine)
-                                        .accessibilityAddTraits(offersDecision(item) ? .isButton : [])
-                                        .accessibilityIdentifier("backup.failedItem.\(item.filename)")
-                                        .contextMenu {
-                                            if offersDecision(item) {
-                                                deletionActions(for: item, place: "menu")
-                                            }
-                                        }
-                                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                            if offersDecision(item) {
-                                                deletionActions(for: item, place: "swipe")
-                                            } else if item.isPermanent, let controller {
-                                                Button(L10n.string("backup.failed_item_dismiss")) {
-                                                    controller.dismissFailedItem(item)
-                                                    backupItems.removeAll { $0.id == item.id }
-                                                }
-                                                .tint(ProtonColor.textWeak)
-                                                .accessibilityIdentifier(
-                                                    "backup.dismissFailedItem.swipe.\(item.filename)")
-                                            }
-                                        }
-                                    }
-                                } header: {
-                                    Text(section.localizedTitle)
-                                        .accessibilityIdentifier("backup.issueSection.\(section.rawValue)")
+                        BackupProblemSections(items: items) { item in
+                            BackupProblemRow(item: item)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    if offersDecision(item) { deletionItem = item }
                                 }
-                            }
+                                .accessibilityElement(children: .combine)
+                                .accessibilityAddTraits(offersDecision(item) ? .isButton : [])
+                                .accessibilityIdentifier("backup.failedItem.\(item.filename)")
+                                .contextMenu {
+                                    if offersDecision(item) {
+                                        deletionActions(for: item, place: "menu")
+                                    }
+                                }
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    if offersDecision(item) {
+                                        deletionActions(for: item, place: "swipe")
+                                    } else if item.isPermanent, let controller {
+                                        Button(L10n.string("backup.failed_item_dismiss")) {
+                                            controller.dismissFailedItem(item)
+                                            problemList.dismissItem(id: item.id)
+                                        }
+                                        .tint(ProtonColor.textWeak)
+                                        .accessibilityIdentifier(
+                                            "backup.dismissFailedItem.swipe.\(item.filename)")
+                                    }
+                                }
                         }
                     }
                 }
             }
             .mobileNavigationTitle(
                 controller == nil
-                    ? L10n.string("albumsync.problem_sheet_title") : L10n.string("backup.failed_sheet_title")
+                    ? AlbumSyncController.SelectedAlbum.localizedProblemSheetTitle(for: items)
+                    : L10n.string("backup.failed_sheet_title")
             )
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -721,7 +745,7 @@ struct MobileFailedBackupSheet: View {
                 .mobileVisibilityPriority(.high)
                 if let controller, items.offersUserRetry {
                     ToolbarItem(placement: .confirmationAction) {
-                        Button(L10n.string("backup.failed_sheet_retry")) {
+                        RetryButton(.system) {
                             Task {
                                 await controller.retryUserResolvableWork()
                                 dismiss()
@@ -745,8 +769,10 @@ struct MobileFailedBackupSheet: View {
         // A photo can need the person while the list is open; Try again then appears.
         .task(id: controller?.status.problemListKey) {
             guard let controller else { return }
-            await controller.followProblemList { backupItems = $0 }
+            await controller.followProblemList(
+                order: readOrder, { problemList.replaceItems($0) }, ifUnavailable: { problemList.markUnavailable() })
         }
+        .onDisappear { personReadTask?.cancel() }
     }
 
     /// Only the backup list offers the deleted-elsewhere decision; the album list is read-only.
@@ -774,8 +800,17 @@ struct MobileFailedBackupSheet: View {
 
     private func refreshAfterDecision(_ item: BackupFailedItem, controller: PhotoLibraryBackupController) {
         deletionItem = nil
-        Task {
-            backupItems = await controller.problemItems().filter { $0.id != item.id || $0.issue == .deletedElsewhere }
+        readList(of: controller, afterDecision: item)
+    }
+
+    /// A person's action reads the list like the automatic follow does. The sheet keeps the task, so closing the
+    /// sheet or a newer action ends it.
+    private func readList(of controller: PhotoLibraryBackupController, afterDecision item: BackupFailedItem? = nil) {
+        personReadTask?.cancel()
+        personReadTask = Task {
+            await controller.readProblemList(
+                order: readOrder, afterDecision: item, { problemList.replaceItems($0) },
+                ifUnavailable: { problemList.markUnavailable() })
         }
     }
 }

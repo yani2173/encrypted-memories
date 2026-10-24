@@ -21,14 +21,20 @@ public final class NetworkMonitor {
     private var observationTask: Task<Void, Never>?
 
     private init() {
-        apply(online: LibraryRuntimeState.shared.snapshot().network.isReachable)
+        apply(online: Self.isOnline(LibraryRuntimeState.shared.snapshot().network))
         let updates = LibraryRuntimeState.shared.updates()
         observationTask = Task { [weak self] in
             for await snapshot in updates {
                 guard !Task.isCancelled else { return }
-                self?.apply(online: snapshot.network.isReachable)
+                self?.apply(online: Self.isOnline(snapshot.network))
             }
         }
+    }
+
+    /// Online means a usable path. Cellular data and Personal Hotspot are online, even while the backup waits for
+    /// Wi-Fi because mobile data is off for backups.
+    public nonisolated static func isOnline(_ network: LibraryNetworkState) -> Bool {
+        network.isReachable
     }
 
     private func apply(online: Bool) {

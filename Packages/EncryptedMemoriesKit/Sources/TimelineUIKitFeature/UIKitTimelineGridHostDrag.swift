@@ -20,6 +20,10 @@
         private static let logger = Logger(
             subsystem: "at.oncloud.encryptedmemories", category: "DragOut")
 
+        var makeActivityViewController: (UIActivityItemsConfiguration) -> UIActivityViewController = {
+            UIActivityViewController(activityItemsConfiguration: $0)
+        }
+
         private weak var host: UIKitTimelineGridHostView?
         private var stager: DragOutStager?
         private var interaction: UIDragInteraction?
@@ -507,7 +511,7 @@
             let files = OutboundMedia.files(for: items)
             let dragItems = files.map { makeDragItem(for: $0, stager: stager, action: action) }
             let configuration = UIActivityItemsConfiguration(itemProviders: dragItems.map(\.itemProvider))
-            let activityVC = UIActivityViewController(activityItemsConfiguration: configuration)
+            let activityVC = makeActivityViewController(configuration)
             if let popover = activityVC.popoverPresentationController {
                 popover.sourceView = host
                 popover.sourceRect = host.bounds

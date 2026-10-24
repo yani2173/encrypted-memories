@@ -140,11 +140,11 @@ final class UploadDuplicateDecisionPolicyTests: XCTestCase {
         }
     }
 
-    func testNilLinkStateMeansDeletedAndSkips() {
+    func testMissingLinkStateIsUnknownAndNeverClassifiedAsDeleted() {
         let remote = [RemotePhotoDuplicate(nameHash: "nh-p", contentHash: "ch-p", linkState: nil, linkID: "l1")]
         XCTAssertEqual(
             UploadDuplicateDecisionPolicy.decide(primary: primary, remoteItems: remote),
-            .skip(.deletedRemotely, remoteLinkID: "l1")
+            .skip(.inconsistentRemoteState, remoteLinkID: "l1")
         )
     }
 

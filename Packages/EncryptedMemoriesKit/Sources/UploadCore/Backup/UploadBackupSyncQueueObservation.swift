@@ -5,13 +5,15 @@ import Foundation
 public enum UploadBackupSyncQueueChange: Sendable, Equatable {
     /// Rows of these sources changed (inserted, updated or removed).
     case sources([UploadSourceIdentity.Kind: Set<String>])
+    /// Runnable rows of these sources were inserted or reopened by a committed enqueue write.
+    case enqueued([UploadSourceIdentity.Kind: Set<String>])
     /// A bulk update touched an unknown set of rows.
     case all
 
-    init<S: Sequence>(sources: S) where S.Element == UploadSourceIdentity {
+    init<S: Sequence>(sources: S, enqueued: Bool = false) where S.Element == UploadSourceIdentity {
         var grouped: [UploadSourceIdentity.Kind: Set<String>] = [:]
         for source in sources { grouped[source.kind, default: []].insert(source.identifier) }
-        self = .sources(grouped)
+        self = enqueued ? .enqueued(grouped) : .sources(grouped)
     }
 }
 
@@ -42,6 +44,8 @@ public struct UploadBackupQueueRowState: Sendable, Equatable {
 public protocol UploadBackupSyncQueueObserving: Sendable {
     /// Replaces the observer. The store calls it after each committed write, outside its lock.
     func setChangeObserver(_ observer: (@Sendable (UploadBackupSyncQueueChange) -> Void)?)
+    /// Adds an independent subscriber to the same committed changes. Cancellation removes only this subscriber.
+    func changes() -> AsyncStream<UploadBackupSyncQueueChange>
     /// Rows that are not settled: every state except the terminal outcomes. Completed rows are excluded;
     /// the pending store keeps their handoffs.
     func unsettledRows() -> [UploadBackupQueueRowState]
@@ -49,4 +53,11 @@ public protocol UploadBackupSyncQueueObserving: Sendable {
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision]
     /// Every row of the given sources, for an incremental update after a change notification.
     func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState]
+}
+
+public extension UploadBackupSyncQueueObserving {
+    /// Stores without live notifications can still provide the pending-grid reads.
+    func changes() -> AsyncStream<UploadBackupSyncQueueChange> {
+        AsyncStream { $0.finish() }
+    }
 }

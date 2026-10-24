@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import XCTest
 
 @testable import UploadCore
@@ -294,5 +295,32 @@ final class BackupStatusTests: XCTestCase {
         var cause = status
         cause.outstandingIssue = .accountStorage
         XCTAssertNotEqual(cause.problemListKey, key, "the reason of a wait changes")
+    }
+
+    /// `localizedTitle` keeps literal `L10n.string` calls, which the catalog hygiene test scans; `titleKey` names the
+    /// same keys for tests. Two switches can drift apart, so this pins that both name the same key.
+    func testLocalizedTitleUsesTheTitleKeyOfEveryPhaseVariant() {
+        let phases: [BackupStatus.Phase] = [
+            .idle, .scanning, .checking, .uploading, .paused, .waitingForWiFi, .waiting, .completed, .needsAttention,
+        ]
+        var variants: [BackupStatus] = []
+        for phase in phases {
+            var status = BackupStatus()
+            status.phase = phase
+            variants.append(status)
+            var onlyPhotosChecks = status
+            onlyPhotosChecks.pendingSourceRechecks = 1
+            onlyPhotosChecks.outstandingCount = 1
+            variants.append(onlyPhotosChecks)
+            var withOmissions = status
+            withOmissions.dismissedFailures = 1
+            variants.append(withOmissions)
+        }
+        XCTAssertEqual(Set(variants.map(\.titleKey)).count, 12, "every title key is reached")
+        for status in variants {
+            XCTAssertEqual(
+                L10n.string(dynamicKey: status.titleKey), status.localizedTitle,
+                "\(status.phase), \(status.titleKey)")
+        }
     }
 }

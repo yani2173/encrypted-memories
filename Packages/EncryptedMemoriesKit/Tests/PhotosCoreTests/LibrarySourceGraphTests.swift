@@ -57,6 +57,30 @@ final class LibrarySourceGraphTests: XCTestCase {
         )
     }
 
+    func testTimelineOrderEvidenceSurvivesSourceProjectionAndMerge() throws {
+        var earlier = item("z-earlier", time: 500)
+        earlier.timelineOrder = .init(exactCaptureTime: Date(timeIntervalSince1970: 500.1))
+        var edited = item("0-edited", time: 500)
+        edited.timelineOrder = .init(exactCaptureTime: Date(timeIntervalSince1970: 500.8))
+        var graph = LibrarySourceGraph()
+        _ = install(firstSource, items: [edited, earlier], in: &graph)
+        XCTAssertEqual(graph.selectedProjection().timeline.uids, [earlier.uid, edited.uid])
+        XCTAssertEqual(
+            graph.selectedProjection().timeline.snapshot.item(for: edited.uid)?.timelineOrder, edited.timelineOrder)
+
+        // An overlapping source without order evidence must not erase the refined primary capture order.
+        _ = install(secondSource, items: [item("0-edited", time: 500), item("z-earlier", time: 500)], in: &graph)
+        XCTAssertEqual(graph.selectedProjection().timeline.uids, [earlier.uid, edited.uid])
+        XCTAssertEqual(
+            graph.selectedProjection().timeline.snapshot.item(for: edited.uid)?.timelineOrder, edited.timelineOrder)
+
+        var fallbackGraph = LibrarySourceGraph()
+        _ = install(
+            firstSource, items: [item("0-edited", time: 500), item("z-earlier", time: 500)], in: &fallbackGraph)
+        _ = install(secondSource, items: [edited, earlier], in: &fallbackGraph)
+        XCTAssertEqual(fallbackGraph.selectedProjection().timeline.uids, [earlier.uid, edited.uid])
+    }
+
     func testRenewalAfterAMetadataRefreshKeepsTheRouteAndTheSource() throws {
         var graph = LibrarySourceGraph()
         _ = install(firstSource, items: [item("photo", time: 1)], in: &graph)

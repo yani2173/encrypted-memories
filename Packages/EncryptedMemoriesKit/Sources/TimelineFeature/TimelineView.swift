@@ -15,6 +15,7 @@ public struct TimelineView: View {
     /// itself, but the SwiftUI placeholder/empty/error states are plain centered views - without this they'd
     /// center over the full detail width (which runs under the sidebar) and read as shifted too far left.
     @Environment(\.gridLeadingEventInset) private var leadingInset: CGFloat
+    private let emptyLibraryBackupAction: LibraryEmptyBackupAction?
     private let onOpen: (PhotoItem, [PhotoItem]) -> Void
     private let proxy: GridProxy<PhotoUID>?
     private let routeScrollGeneration: Int
@@ -44,6 +45,7 @@ public struct TimelineView: View {
     private let initialViewportPlacement: TimelineInitialViewportPlacement
     @State private var searchProjection: TimelineSearchProjection?
     @State private var searchCoordinator: TimelineSearchProjectionCoordinator
+    @State private var photoNames: PhotoNameIndex?
     @State private var monthMarkers: [TimelineDateMarker] = []
     @State private var monthMarkerRevision: Int?
 
@@ -70,6 +72,7 @@ public struct TimelineView: View {
         isOffline: Bool = false,
         dragOutProvider: (any OriginalFileProvider)? = nil,
         onDragOutFailed: ((DragOutFailureKind) -> Void)? = nil,
+        emptyLibraryBackupAction: LibraryEmptyBackupAction? = nil,
         onSelectionChange: @escaping (Set<PhotoUID>) -> Void = { _ in },
         onOpen: @escaping (PhotoItem, [PhotoItem]) -> Void = { _, _ in }
     ) {
@@ -98,6 +101,7 @@ public struct TimelineView: View {
         self.dragOutProvider = dragOutProvider
         self.onDragOutFailed = onDragOutFailed
         self.onSelectionChange = onSelectionChange
+        self.emptyLibraryBackupAction = emptyLibraryBackupAction
         self.onOpen = onOpen
         _searchProjection = State(initialValue: nil)
         _searchCoordinator = State(initialValue: TimelineSearchProjectionCoordinator())
@@ -184,6 +188,9 @@ public struct TimelineView: View {
         }
         .background(timelineSurfaceBackground)
         .task { await model.load() }
+        .task(id: projectionQuery) {
+            photoNames = await TimelineFileNameSearchSource.names(forQuery: projectionQuery, from: metadataProvider)
+        }
         .task(id: searchProjectionRequest) { await resolveSearchProjection() }
         .task(id: markerRequest) { await resolveMonthMarkers(for: markerRequest) }
         .onChange(of: hasSearchQuery) { _, hasQuery in
@@ -199,18 +206,8 @@ public struct TimelineView: View {
     }
 
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label(emptyStateCopy.title, systemImage: emptyStateCopy.systemImage)
-        } description: {
-            Text(emptyStateCopy.description)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(timelineSurfaceBackground)
-    }
-
-    private var emptyStateCopy: (title: String, description: String, systemImage: String) {
-        let copy = model.filter.emptyStateCopy
-        return (copy.title, copy.description, copy.systemImage)
+        LibraryEmptyView(filter: model.filter, backupAction: emptyLibraryBackupAction)
+            .background(timelineSurfaceBackground)
     }
 
     private func errorState(_ message: String) -> some View {
@@ -220,8 +217,7 @@ public struct TimelineView: View {
             Text(message)
                 .textSelection(.enabled)
         } actions: {
-            Button(L10n.string("action.retry")) { Task { await model.retry() } }
-                .buttonStyle(.borderedProminent)
+            RetryButton(.prominent) { Task { await model.retry() } }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
@@ -258,11 +254,17 @@ public struct TimelineView: View {
         requiredUIDs != nil || !TimelineSearchQuery(normalizedSearchText).isEmpty || refinement.isActive
     }
 
+    /// A structured suggestion replaces the text query: its title is display text, not search terms.
+    private var projectionQuery: String {
+        requiredUIDs == nil ? normalizedSearchText : ""
+    }
+
     private var searchKey: TimelineSearchProjectionKey {
         TimelineSearchProjectionKey(
             sourceRevision: model.contentRevision,
-            query: requiredUIDs == nil ? normalizedSearchText : "",
-            context: TimelineSearchContext(activeFilter: model.filter, favoriteUIDs: favoriteUIDs),
+            query: projectionQuery,
+            context: TimelineSearchContext(
+                activeFilter: model.filter, favoriteUIDs: favoriteUIDs, photoNames: photoNames),
             semanticMatches: requiredUIDs == nil ? semanticMatches : nil,
             refinement: refinement,
             requiredUIDs: requiredUIDs

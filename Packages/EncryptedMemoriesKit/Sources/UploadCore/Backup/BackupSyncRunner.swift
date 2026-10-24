@@ -35,7 +35,7 @@ public actor BackupSyncRunner {
         /// Rows active before (start − grace) are treated as crash leftovers. 0 = every active
         /// row at start is stale, which is correct while a single runner owns the queue.
         public var staleActiveGrace: TimeInterval
-        /// Poll interval while the throttle reports "pause" (thermal critical etc.).
+        /// Longest wait while the throttle reports "pause" (thermal critical etc.); a runtime change ends it earlier.
         public var pausedPollInterval: TimeInterval
         /// Maximum time an upload may emit no backend progress before it is cancelled and retried.
         /// Total upload duration is unlimited while progress continues.
@@ -84,6 +84,12 @@ public actor BackupSyncRunner {
     private let resourceCoordinator: LibraryResourceCoordinator
     private let configuration: Configuration
     private let throttleInputs: @Sendable () -> BackupThrottleInputs
+    /// Pushed runtime changes, such as a new network path. A change that makes the backup wait for Wi-Fi stops the
+    /// transfers that already run, so their bytes do not continue on cellular data.
+    private let runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)?
+    /// Records that the source no longer exists, before its row goes, so missing-source recovery does not queue it
+    /// again on every pass. Nil for sources without a catalog (folder backup, album scratch queues).
+    private let markSourceUnavailable: (@Sendable (UploadSourceIdentity) -> Bool)?
     private let clock: any BackupSchedulerClock
     private let now: @Sendable () -> Date
 
@@ -91,10 +97,29 @@ public actor BackupSyncRunner {
     private var drainMode: DrainMode = .waitForScheduledRetries
     private var deletionStateInvalidated = false
     private var stopRequested = false
+    /// Transport cancellation can arrive without cancelling the Swift task. Keep it until the next pass.
+    private var runCancellationError: (any Error)?
     /// Consecutive items that could not even reserve disk space since the last one that did.
-    /// Reset to 0 the moment any export succeeds; when it reaches a full wave the drain ends the
-    /// pass (rows stay runnable) instead of spinning against a genuinely full volume.
+    /// Reset to 0 the moment any export succeeds; when it reaches `batchSize` the drain starts no
+    /// new item and ends the pass (rows stay runnable) instead of spinning against a genuinely full volume.
     private var resourcePressureStreak = 0
+    /// Claimed rows that have not settled: running items plus the revisions that wait behind another revision of
+    /// their source. The drain ends only after every claimed row settles.
+    private var claimedItemCount = 0
+    /// A source with a running item, and the revisions of it that the same claim returned, in claim order.
+    private struct RunningSource {
+        let source: UploadSourceIdentity
+        var waiting: [UploadBackupSyncQueueEntry] = []
+    }
+    /// Keyed by `sourceKey`. A claim never takes rows of these sources: a running item can leave its row runnable
+    /// for a moment, for example `needsRemoteReconciliation` while the paired video of its photo uploads.
+    private var runningSources: [String: RunningSource] = [:]
+    /// Wakes the scheduling loop when a row is enqueued, an item settles, the runtime changes, or a waiting row
+    /// becomes runnable.
+    private var schedulerWaiter: CheckedContinuation<Void, Never>?
+    private var schedulerWakePending = false
+    /// Identifies the current wait, so a timed wake that fires after the loop woke for another reason is ignored.
+    private var schedulerWaitGeneration = 0
     /// Consecutive transport-level network failures since the last successful settle. Subtracted from
     /// the throttle's concurrency so the drain backs off a marginal/looping connection instead of
     /// hammering it with parallel requests, and ramps back up as items succeed. Capped so it can
@@ -106,6 +131,10 @@ public actor BackupSyncRunner {
     /// Join handles retain the unstructured upload task until native cancellation and upload
     /// settlement both finish. They also deduplicate every cancellation request for that upload.
     private var inFlightJoins: [UUID: BackupUploadJoin] = [:]
+    /// Transfers that wait for their network reservation. `stop()` ends these waits.
+    private var networkWaits: [UUID: Task<UploadNetworkReservation, any Error>] = [:]
+    /// Native cancellation requested by Wi-Fi policy defers only these transfers, not the operation.
+    private var policyCancelledTransfers: Set<UUID> = []
     private var inFlightNames: [String: String] = [:]
     /// Sources removed from the local backup set while this actor was suspended in resolver or
     /// upload work. Their callbacks must not recreate a queue row after catalog removal.
@@ -118,14 +147,10 @@ public actor BackupSyncRunner {
         var byteFraction: Double
         var itemBaseFraction: Double
         var itemFractionWeight: Double
-
-        /// The bytes this transfer has sent, at its last quantized progress.
-        var sentBytes: Int64 { Int64((Double(totalBytes) * byteFraction).rounded(.down)) }
     }
     private var activeTransfers: [String: ActiveTransfer] = [:]
-    /// Bytes of every transfer that ended since this runner started, for `BackupSyncProgress.transferredBytes`. It
-    /// spans passes, so the short drains that run beside a scan keep one continuous count.
-    private var finishedTransferBytes: Int64 = 0
+    /// Bytes sent since this runner exists. Unlike the sum over `activeTransfers`, it never drops when an item ends.
+    private var transferredByteCount: Int64 = 0
     /// Stage high-water marks remain until the item settles, so identity, materialization, upload, and
     /// primary-to-secondary handoffs cannot make continued-processing progress go backwards.
     private struct ActiveExecution {
@@ -160,6 +185,8 @@ public actor BackupSyncRunner {
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         configuration: Configuration = Configuration(),
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
+        runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil,
+        markSourceUnavailable: (@Sendable (UploadSourceIdentity) -> Bool)? = nil,
         clock: any BackupSchedulerClock = BackupContinuousClock(),
         events: (any BackupItemEventSink)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
@@ -175,6 +202,8 @@ public actor BackupSyncRunner {
         self.resourceCoordinator = resourceCoordinator
         self.configuration = configuration
         self.throttleInputs = throttleInputs
+        self.runtimeChanges = runtimeChanges
+        self.markSourceUnavailable = markSourceUnavailable
         self.clock = clock
         self.now = now
     }
@@ -182,6 +211,12 @@ public actor BackupSyncRunner {
     public func setOnProgress(_ handler: (@Sendable (BackupSyncProgress) -> Void)?) {
         onProgress = handler
         emitProgress()
+    }
+
+    /// A caller that awaits a complete operation, such as Album Sync, must not turn cancellation into a report.
+    public func checkCancellation() throws {
+        try Task.checkCancellation()
+        if let runCancellationError { throw runCancellationError }
     }
 
     public func currentProgress() -> BackupSyncProgress {
@@ -215,7 +250,8 @@ public actor BackupSyncRunner {
     /// Ask the current pass to wind down: no new work starts, in-flight uploads are cancelled,
     /// and every touched row is reverted to a runnable state for the next pass after settlement.
     public func stop() async {
-        stopRequested = true
+        _ = recordCancellation(CancellationError())
+        for wait in networkWaits.values { wait.cancel() }
         let joins = Array(inFlightJoins.values)
         await withTaskGroup(of: Void.self) { group in
             for join in joins {
@@ -247,6 +283,8 @@ public actor BackupSyncRunner {
             sourceKeys.contains(where: { key.hasPrefix($0 + "|") }) ? token : nil
         }
         let joins = tokens.compactMap { inFlightJoins[$0] }
+        // A transfer that still waits for the network has no join yet; ending its wait ends the transfer.
+        for token in tokens { networkWaits[token]?.cancel() }
         // Make the local deletion authoritative before awaiting native cancellation. The actor can
         // re-enter while a join is suspended; leaving the row until afterwards lets the active drain
         // return one stale item even though this removal already tombstoned every completion callback.
@@ -269,6 +307,7 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent = .automatic
     ) async -> BackupSyncProgress {
         guard !isRunning else { return progress }
+        runCancellationError = nil
         guard queue.isOperational() else {
             progress.isRunning = false
             progress.currentItemName = nil
@@ -285,6 +324,9 @@ public actor BackupSyncRunner {
         remoteIndexExecutionFraction = 0
         remoteIndexPreparationGeneration = nil
         resourcePressureStreak = 0
+        claimedItemCount = 0
+        runningSources = [:]
+        schedulerWakePending = false
         defer {
             remoteIndexPreparationGeneration = nil
             remoteIndexExecutionFraction = 0
@@ -295,6 +337,12 @@ public actor BackupSyncRunner {
             removedSources = []
             emitProgress()
         }
+        let runtimeWatch = watchRuntimeChanges()
+        let queueWatch = watchQueueChanges()
+        defer {
+            runtimeWatch?.cancel()
+            queueWatch?.cancel()
+        }
 
         // Crash recovery first: anything still marked active predates this run and must become
         // runnable again before this runner atomically claims new work.
@@ -303,8 +351,10 @@ public actor BackupSyncRunner {
         await requeueDueBlockedRows()
         guard queue.isOperational() else { return progress }
 
+        // The last known index health stays visible until this pass reads it again.
+        let previousIndexHealth = progress.remoteContentIndexHealth
         progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
-        progress.transferredBytes = finishedTransferBytes
+        progress.remoteContentIndexHealth = previousIndexHealth
         progress.remoteIndexPreparationIssue = queue.runtimeIssue(for: .remoteIndexPreparation)
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
         guard queue.isOperational() else { return progress }
@@ -315,8 +365,10 @@ public actor BackupSyncRunner {
                 progress.isRunning = false
                 return progress
             }
-            guard configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0 else {
+            let inputs = throttleInputs()
+            guard configuration.throttle.maxConcurrentItems(for: inputs) > 0 else {
                 progress.isPausedByPolicy = true
+                progress.isWaitingForWiFi = inputs.waitsForWiFi
                 progress.isRunning = false
                 return progress
             }
@@ -340,9 +392,11 @@ public actor BackupSyncRunner {
             emitProgress()
         } catch is CancellationError {
             cancelRemoteIndexPreparation(generation: remoteIndexGeneration)
+            _ = recordCancellation(CancellationError())
             return progress
         } catch {
             cancelRemoteIndexPreparation(generation: remoteIndexGeneration)
+            if recordCancellation(error) { return progress }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let issue = automaticRetryIssue(
                 kind: Self.issueKind(for: error),
@@ -364,132 +418,132 @@ public actor BackupSyncRunner {
         // hits (see primeRunnableLookahead). Re-warmed periodically as the queue drains.
         await primeRunnableLookahead()
         guard queue.isOperational() else { return progress }
-        var claimedSincePrime = 0
+        var startsSincePrime = 0
+        var storeFailed = false
 
-        // Up to `limit` items run at once, and a finished item frees its slot for the next one at once: one long
-        // upload, such as a video, never holds back the items behind it. Rows are claimed only for free slots, and
-        // the loop ends only when no item runs, so every claimed row keeps its worker.
-        await withTaskGroup(of: String.self) { group in
-            var running = 0
-            // Two revisions of one photo (a preliminary camera version and the finished one) run one after the
-            // other: both read the current file, and the second then finds it backed up instead of uploading
-            // the same bytes at the same time. A claimed row of a photo that runs now waits here for its turn.
-            var busySources: Set<String> = []
-            var waitingBehindSource: [String: [UploadBackupSyncQueueEntry]] = [:]
-
-            drain: while true {
-                // A whole batch that could not reserve disk space means the volume is full, not busy.
-                // Stop draining and leave the rows runnable: the next pass retries once space frees,
-                // and the status reads "waiting" (never a permanent, unactionable failure).
-                let mayClaim =
-                    !stopRequested && !Task.isCancelled && resourcePressureStreak < configuration.batchSize
-                if mayClaim {
-                    if queue.isOperational() {
-                        await requeueDueBlockedRows()
-                        if !queue.isOperational() { stopRequested = true }
-                    } else {
-                        stopRequested = true
-                    }
+        // A rolling pool: whenever an item settles, the next eligible rows start, up to the current limit. Items
+        // that already run always finish; stop, cancellation, a full volume, a store failure and a lower limit only
+        // hold back new starts.
+        await withDiscardingTaskGroup { group in
+            while true {
+                let mayStart =
+                    !stopRequested && !Task.isCancelled && !storeFailed
+                    && resourcePressureStreak < configuration.batchSize
+                guard mayStart else {
+                    // A whole batch that could not reserve disk space means the volume is full, not busy. The pass
+                    // ends and leaves the rows runnable: the next pass retries once space frees, and the status
+                    // reads "waiting" (never a permanent, unactionable failure).
+                    guard claimedItemCount > 0 else { break }
+                    await waitForSchedulerWake()
+                    continue
                 }
-                if mayClaim, !stopRequested {
-                    let throttleSnapshot = throttleInputs()
-                    let policyLimit = configuration.throttle.maxConcurrentItems(for: throttleSnapshot)
-                    // Back off concurrency while a marginal connection is dropping requests, but never below 1
-                    // (never stall - a single in-flight item keeps making progress and probes recovery).
-                    let limit = policyLimit == 0 ? 0 : max(1, policyLimit - networkErrorStreak)
-                    if limit == 0 {
-                        // Items that already run finish first; the pause starts once none runs.
-                        if running == 0 {
-                            if !progress.isPausedByPolicy {
-                                progress.isPausedByPolicy = true
-                                emitProgress()
-                            }
-                            if mode == .eligibleOnly { break drain }
-                            do {
-                                try await clock.sleep(for: configuration.pausedPollInterval)
-                            } catch {
-                                break drain
-                            }
-                            continue drain
-                        }
-                    } else {
-                        if progress.isPausedByPolicy {
-                            progress.isPausedByPolicy = false
-                            emitProgress()
-                        }
-
-                        // Re-warm the dedup cache once the current lookahead is largely consumed. prime()
-                        // invalidates the previous batch first, so we do this on a cadence (not every claim) to
-                        // avoid dropping still-useful cached state mid-drain.
-                        if claimedSincePrime >= Self.claimsPerPrime {
-                            await primeRunnableLookahead()
-                            claimedSincePrime = 0
-                        }
-
-                        if running < limit {
-                            let claimed = nextEligibleWave(limit: limit - running)
-                            claimedSincePrime += claimed.count
-                            for entry in claimed {
-                                let key = Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier)
-                                if busySources.contains(key) {
-                                    waitingBehindSource[key, default: []].append(entry)
-                                    continue
-                                }
-                                busySources.insert(key)
-                                running += 1
-                                group.addTask {
-                                    await self.process(entry, workIntent: workIntent)
-                                    return key
-                                }
-                            }
-                            if claimed.isEmpty, running == 0 {
-                                guard queue.isOperational() else {
-                                    stopRequested = true
-                                    break drain
-                                }
-                                guard let wait = shortestPendingWait() else {
-                                    if !queue.isOperational() { stopRequested = true }
-                                    break drain
-                                }
-                                if mode == .eligibleOnly { break drain }
-                                // Only an item waiting for Proton storage waits longer than any regular retry. A
-                                // one-shot drain the user waits for ends then instead of sleeping for hours.
-                                if wait > longestRegularRetryWait { break drain }
-                                do {
-                                    try await clock.sleep(for: wait)
-                                } catch {
-                                    break drain
-                                }
-                                continue drain
-                            }
-                        }
-                    }
+                guard queue.isOperational() else {
+                    storeFailed = true
+                    continue
+                }
+                await requeueDueBlockedRows()
+                guard queue.isOperational() else {
+                    storeFailed = true
+                    continue
                 }
 
-                // Wait for the next item to finish. Its slot goes to a waiting revision of the same photo first.
-                guard running > 0, let key = await group.next() else { break drain }
-                running -= 1
-                if var waiting = waitingBehindSource[key], !waiting.isEmpty {
-                    let next = waiting.removeFirst()
-                    waitingBehindSource[key] = waiting.isEmpty ? nil : waiting
-                    running += 1
-                    group.addTask {
-                        await self.process(next, workIntent: workIntent)
-                        return key
+                let throttleSnapshot = throttleInputs()
+                let policyLimit = configuration.throttle.maxConcurrentItems(for: throttleSnapshot)
+                // Back off concurrency while a marginal connection is dropping requests, but never below 1
+                // (never stall - a single in-flight item keeps making progress and probes recovery).
+                let limit = policyLimit == 0 ? 0 : max(1, policyLimit - networkErrorStreak)
+                if limit == 0 {
+                    // Items that already run finish first: the limit applies only to new starts.
+                    if claimedItemCount > 0 {
+                        await waitForSchedulerWake()
+                        continue
                     }
-                } else {
-                    busySources.remove(key)
+                    if !progress.isPausedByPolicy || progress.isWaitingForWiFi != throttleSnapshot.waitsForWiFi {
+                        progress.isPausedByPolicy = true
+                        progress.isWaitingForWiFi = throttleSnapshot.waitsForWiFi
+                        emitProgress()
+                    }
+                    if mode == .eligibleOnly { break }
+                    // A runtime change, for example Wi-Fi, ends the wait at once; the poll stays as fallback.
+                    await waitForSchedulerWake(orAfter: configuration.pausedPollInterval)
+                    continue
                 }
+                if progress.isPausedByPolicy {
+                    progress.isPausedByPolicy = false
+                    progress.isWaitingForWiFi = false
+                    emitProgress()
+                }
+
+                // Re-warm the dedup cache once the current lookahead is largely consumed. prime()
+                // invalidates the previous batch first, so we do this on a cadence (not every start) to
+                // avoid dropping still-useful cached state mid-drain.
+                if startsSincePrime >= Self.startsPerPrime {
+                    await primeRunnableLookahead()
+                    startsSincePrime = 0
+                }
+
+                if runningSources.count < limit {
+                    let claimed = claimEligible(limit: limit - runningSources.count)
+                    startsSincePrime += claimed.count
+                    for entry in claimed {
+                        claimedItemCount += 1
+                        // Two revisions of one photo (a preliminary camera version and the finished one) run one
+                        // after the other: both read the current file, and the second then finds it backed up
+                        // instead of uploading the same bytes at the same time.
+                        let sourceKey = Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier)
+                        if runningSources[sourceKey] != nil {
+                            runningSources[sourceKey]?.waiting.append(entry)
+                            continue
+                        }
+                        runningSources[sourceKey] = RunningSource(source: entry.source)
+                        group.addTask {
+                            await self.processRevisions(
+                                startingWith: entry, sourceKey: sourceKey, workIntent: workIntent)
+                        }
+                    }
+                    // A claim can contain several revisions of one source. Fill the remaining photo slots before
+                    // waiting; those revisions share one worker and do not consume the other slots.
+                    if !claimed.isEmpty, runningSources.count < limit { continue }
+                }
+
+                if claimedItemCount == 0 {
+                    guard queue.isOperational() else {
+                        storeFailed = true
+                        continue
+                    }
+                    guard let wait = shortestPendingWait(policy: .idleScheduledRetries) else {
+                        if !queue.isOperational() { storeFailed = true }
+                        break
+                    }
+                    if mode == .eligibleOnly { break }
+                    // Only long parks wait longer than any regular retry: Proton storage, an edit that waits for its
+                    // original, a photo that Photos reports as missing. A one-shot drain the user waits for ends then
+                    // instead of sleeping for hours.
+                    if wait > longestRegularRetryWait { break }
+                    await waitForSchedulerWake(orAfter: wait)
+                    continue
+                }
+                // Free slots that the claim could not fill also wait for the earliest row that becomes runnable.
+                let wait =
+                    runningSources.count < limit
+                    ? shortestPendingWait(
+                        policy: .freeUploadSlots, excludingSourcesOf: runningSources.values.map(\.source))
+                    : nil
+                await waitForSchedulerWake(orAfter: wait)
             }
         }
+        if storeFailed { stopRequested = true }
 
         // Truth re-sync from the store: incremental counters were exact (single writer), but the
         // final snapshot should come from the durable state regardless.
         if queue.isOperational() {
             let wasPausedByPolicy = progress.isPausedByPolicy
+            let wasWaitingForWiFi = progress.isWaitingForWiFi
+            let indexHealth = progress.remoteContentIndexHealth
             progress = BackupSyncProgress(summary: queue.summary(), isRunning: false)
             progress.isPausedByPolicy = wasPausedByPolicy
-            progress.transferredBytes = finishedTransferBytes
+            progress.isWaitingForWiFi = wasWaitingForWiFi
+            progress.remoteContentIndexHealth = indexHealth
         } else {
             // Preserve the last trustworthy counters. The controller exposes the unavailable store;
             // replacing this with an empty summary would falsely look like a completed backup.
@@ -500,6 +554,49 @@ public actor BackupSyncRunner {
     }
 
     // MARK: - Scheduling
+
+    /// Uses the store's existing notifications without replacing the pending grid's subscriber. Subscribe before
+    /// the first queue read, so an enqueue between a claim and the wait cannot be lost.
+    private func watchQueueChanges() -> Task<Void, Never>? {
+        guard let observing = queue as? any UploadBackupSyncQueueObserving else { return nil }
+        let changes = observing.changes()
+        return Task { [weak self] in
+            for await change in changes {
+                guard !Task.isCancelled else { return }
+                if case .enqueued = change { await self?.wakeScheduler() }
+            }
+        }
+    }
+
+    private func watchRuntimeChanges() -> Task<Void, Never>? {
+        guard let runtimeChanges else { return nil }
+        let changes = runtimeChanges()
+        return Task { [weak self] in
+            for await _ in changes {
+                guard let self else { return }
+                await self.stopTransfersThatMustWaitForWiFi()
+                // A raised limit fills the new slots now, not only when the next item settles.
+                await self.wakeScheduler()
+            }
+        }
+    }
+
+    /// Cancels the running transfers through the stop path, without ending the pass. Each row returns to the queue
+    /// without an attempt, and no new item starts until Wi-Fi returns.
+    private func stopTransfersThatMustWaitForWiFi() async {
+        guard isRunning, !inFlightJoins.isEmpty || !networkWaits.isEmpty, throttleInputs().waitsForWiFi else {
+            return
+        }
+        policyCancelledTransfers.formUnion(networkWaits.keys)
+        policyCancelledTransfers.formUnion(inFlightJoins.keys)
+        for wait in networkWaits.values { wait.cancel() }
+        let joins = Array(inFlightJoins.values)
+        await withTaskGroup(of: Void.self) { group in
+            for join in joins {
+                group.addTask { await join.cancelAndJoin() }
+            }
+        }
+    }
 
     private func setRemoteIndexPreparation(
         _ value: UploadRemoteIndexPreparationProgress,
@@ -532,12 +629,78 @@ public actor BackupSyncRunner {
         publishActiveExecutionProgress(emit: false)
     }
 
-    private func nextEligibleWave(limit: Int) -> [UploadBackupSyncQueueEntry] {
+    private func claimEligible(limit: Int) -> [UploadBackupSyncQueueEntry] {
         let claimLimit = min(configuration.batchSize, max(1, limit))
         // Eligibility is persisted in `updatedAt` and enforced inside the same transaction that
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker
         // and would remain falsely active until crash recovery.
-        return queue.claimRunnable(limit: claimLimit, claimedAt: now())
+        return queue.claimRunnable(
+            limit: claimLimit, claimedAt: now(), excludingSourcesOf: runningSources.values.map(\.source))
+    }
+
+    /// Processes a claimed row, then the other revisions of its source that the same claim returned. Each settled
+    /// row wakes the scheduling loop; its source frees one upload slot only after the last revision settles.
+    private func processRevisions(
+        startingWith first: UploadBackupSyncQueueEntry,
+        sourceKey: String,
+        workIntent: LibraryWorkIntent
+    ) async {
+        var next: UploadBackupSyncQueueEntry? = first
+        while let entry = next {
+            await process(entry, workIntent: workIntent)
+            claimedItemCount -= 1
+            if var running = runningSources[sourceKey], !running.waiting.isEmpty {
+                next = running.waiting.removeFirst()
+                runningSources[sourceKey] = running
+            } else {
+                runningSources[sourceKey] = nil
+                next = nil
+            }
+            wakeScheduler()
+        }
+    }
+
+    /// Suspends the scheduling loop until an item settles or the runtime changes, or after `timedWake` seconds. A
+    /// wake that arrives while the loop works is kept, so the loop never misses a free slot.
+    private func waitForSchedulerWake(orAfter timedWake: TimeInterval? = nil) async {
+        if schedulerWakePending {
+            schedulerWakePending = false
+            return
+        }
+        schedulerWaitGeneration &+= 1
+        let generation = schedulerWaitGeneration
+        let timer = timedWake.map { wait in
+            Task { [clock] in
+                try? await clock.sleep(for: wait)
+                guard !Task.isCancelled else { return }
+                await self.wakeScheduler(generation: generation)
+            }
+        }
+        // Idle retry waits must end on cancellation. With running items, their settlement wakes the loop instead;
+        // waking every cancelled wait there would spin until those items finish.
+        let wakeWhenCancelled = claimedItemCount == 0
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { schedulerWaiter = $0 }
+        } onCancel: {
+            guard wakeWhenCancelled else { return }
+            Task { await self.wakeScheduler(generation: generation) }
+        }
+        schedulerWaitGeneration &+= 1
+        timer?.cancel()
+    }
+
+    private func wakeScheduler(generation: Int) {
+        guard generation == schedulerWaitGeneration else { return }
+        wakeScheduler()
+    }
+
+    private func wakeScheduler() {
+        if let waiter = schedulerWaiter {
+            schedulerWaiter = nil
+            waiter.resume()
+        } else {
+            schedulerWakePending = true
+        }
     }
 
     static func supportEventKind(of outcome: EditedPhotoReplacement.Outcome) -> SupportEventTrail.Kind {
@@ -562,19 +725,42 @@ public actor BackupSyncRunner {
         return min(delay, limit)
     }
 
-    /// The longest wait of a runnable retry other than a full Proton account: the retry policy's cap, its
-    /// 30-second minimum after low disk space, and the recheck of a photo the camera still processes.
+    /// The longest wait of a runnable retry other than a long park (a full Proton account, an edit that waits for its
+    /// original, a photo that Photos reports as missing): the retry policy's cap, its 30-second minimum after low disk
+    /// space, and the recheck of a photo the camera still processes.
     private var longestRegularRetryWait: TimeInterval {
         max(configuration.retry.maxDelay, 30, configuration.oneShotSourceRecheckInterval)
     }
 
-    /// The wait until the next persisted retry becomes eligible, or nil when none is pending.
-    private func shortestPendingWait() -> TimeInterval? {
+    private enum PendingWaitPolicy: Equatable {
+        /// A draft alone ends the drain, so each pass checks it once rather than using up its retries.
+        case idleScheduledRetries
+        /// While other photos run, a free slot also wakes for a draft's next check.
+        case freeUploadSlots
+    }
+
+    /// Both policies use persisted dates. Free slots ignore due, unclaimable rows and long parks to avoid spinning;
+    /// an idle drain keeps its minimum retry wait and lets the caller decide whether a long park ends the pass.
+    private func shortestPendingWait(
+        policy: PendingWaitPolicy,
+        excludingSourcesOf excludedSources: [UploadSourceIdentity] = []
+    ) -> TimeInterval? {
         let currentTime = now()
-        if let persisted = queue.nextRunnableDate() {
-            return max(0.05, persisted.timeIntervalSince(currentTime))
+        var dates = [queue.nextRunnableDate(excludingSourcesOf: excludedSources)]
+        if policy == .freeUploadSlots {
+            dates.append(queue.earliestEntry(in: .blockedByDraft)?.updatedAt)
         }
-        return nil
+        let eligibleDates = dates.compactMap { $0 }.filter {
+            policy == .idleScheduledRetries || $0 > currentTime
+        }
+        guard let next = eligibleDates.min() else { return nil }
+        let wait = next.timeIntervalSince(currentTime)
+        switch policy {
+        case .idleScheduledRetries:
+            return max(0.05, wait)
+        case .freeUploadSlots:
+            return wait <= longestRegularRetryWait ? wait : nil
+        }
     }
 
     /// One due-based re-check for parked draft rows: a row blocked N times re-enters the queue once
@@ -609,11 +795,11 @@ public actor BackupSyncRunner {
 
     // MARK: - Dedup batch prewarm
 
-    /// How many runnable rows to prewarm per batch, and how many rows to claim before re-warming.
-    /// `claimsPerPrime` is kept below `primeBatch` so the next batch is warmed before the current
-    /// one is exhausted.
+    /// How many runnable rows to prewarm per batch, and how many items to start before re-warming.
+    /// `startsPerPrime` is kept below `primeBatch` so the next batch is warmed before the current one
+    /// is exhausted.
     private static let primeBatch = 400
-    private static let claimsPerPrime = 300
+    private static let startsPerPrime = 200
     private static let primePlaceholderURL = URL(fileURLWithPath: "/dev/null")
 
     /// Batch-prewarm the dedup pipeline's remote duplicate cache for the rows about to be processed,
@@ -626,6 +812,7 @@ public actor BackupSyncRunner {
         if peek.count < Self.primeBatch {
             peek += queue.entries(in: .queuedForUpload, updatedBefore: cutoff, limit: Self.primeBatch - peek.count)
         }
+        peek.removeAll { $0.isDismissedSourceRecheck }
         guard !peek.isEmpty else { return }
         let descriptors = peek.map { entry in
             UploadResourceDescriptor(
@@ -642,13 +829,18 @@ public actor BackupSyncRunner {
 
     // MARK: - Per-entry processing
 
-    private func process(_ entry: UploadBackupSyncQueueEntry, workIntent: LibraryWorkIntent) async {
-        let key = Self.key(entry)
+    private func process(_ queuedEntry: UploadBackupSyncQueueEntry, workIntent: LibraryWorkIntent) async {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            UpgradeTestProbe.checkpoint("backup.claimed")
+        #endif
+        var checkingEntry = queuedEntry
+        let isSourceRecheck = checkingEntry.isDismissedSourceRecheck
+        let key = Self.key(checkingEntry)
         let executionGeneration = UUID()
         activeExecutions[key] = ActiveExecution(
             generation: executionGeneration,
-            source: entry.source,
-            revision: entry.revision,
+            source: checkingEntry.source,
+            revision: checkingEntry.revision,
             preparationFraction: 0,
             uploadFraction: 0
         )
@@ -656,26 +848,35 @@ public actor BackupSyncRunner {
         // `claimRunnable` already moved this row to `.checking` in the same transaction that
         // reserved it. Mirror that persisted transition without paying a second SQLite write.
         let persistedState: UploadBackupSyncQueueState = .checking
-        inFlightNames[key] = entry.originalFilename
-        progress.currentItemName = entry.originalFilename
+        inFlightNames[key] = checkingEntry.originalFilename
+        progress.currentItemName = checkingEntry.originalFilename
         // Released the instant this entry settles, so temp exports never accumulate across a pass.
         var resourceCleanup: (@Sendable () -> Void)?
         defer {
             resourceCleanup?()
             endActiveExecution(key: key, generation: executionGeneration)
             inFlightNames[key] = nil
-            if progress.currentItemName == entry.originalFilename {
+            if progress.currentItemName == checkingEntry.originalFilename {
                 progress.currentItemName = inFlightNames.values.first
             }
             emitProgress()
         }
 
-        adjustProgress(from: entry.state, to: .checking)
+        if !isSourceRecheck { adjustProgress(from: checkingEntry.state, to: .checking) }
         emitProgress()
 
         let resolved: BackupResolvedResource?
         do {
+            let resolvingEntry = checkingEntry
             let resolver = self.resolver
+            let policy = configuration.throttle
+            let inputs = throttleInputs
+            let readAdmission: BackupResourceReadAdmission = {
+                try Task.checkCancellation()
+                if isSourceRecheck {
+                    guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw BackupWorkDeferredError() }
+                }
+            }
             resolved = try await resourceCoordinator.withHeavyPermit(
                 LibraryWorkRequest(
                     workload: .backupMaterialization,
@@ -683,34 +884,105 @@ public actor BackupSyncRunner {
                     memoryClass: .large
                 )
             ) { _ in
-                try await resolver.resolve(entry, onPreparationProgress: preparationProgress)
+                try readAdmission()
+                return try await resolver.resolve(
+                    resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission)
             }
+        } catch is BackupWorkDeferredError {
+            if isSourceRecheck {
+                preserveDismissedSourceRecheck(checkingEntry)
+            } else {
+                revert(checkingEntry, from: persistedState)
+            }
+            return
         } catch is CancellationError {
-            revert(entry, from: persistedState)
+            _ = recordCancellation(CancellationError(), for: checkingEntry)
+            if isSourceRecheck {
+                preserveDismissedSourceRecheck(checkingEntry)
+                return
+            }
+            revert(checkingEntry, from: persistedState)
             return
         } catch {
+            if recordCancellation(error, for: checkingEntry) {
+                if isSourceRecheck {
+                    preserveDismissedSourceRecheck(checkingEntry)
+                } else {
+                    revert(checkingEntry, from: persistedState)
+                }
+                return
+            }
+            if isSourceRecheck {
+                let definitiveMissing: Bool
+                switch error as? UploadError {
+                case .sourceReportedMissing, .fileMissing: definitiveMissing = true
+                default: definitiveMissing = false
+                }
+                if definitiveMissing, !stopRequested, !Task.isCancelled,
+                    configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
+                {
+                    retainDismissedSourceRecheck(checkingEntry)
+                } else {
+                    let failedRead =
+                        !definitiveMissing && !stopRequested && !Task.isCancelled
+                        && configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
+                    let readyAt: Date?
+                    if case .sourceNotReady(_, let until) = error as? UploadError {
+                        readyAt = until
+                    } else {
+                        readyAt = nil
+                    }
+                    preserveDismissedSourceRecheck(checkingEntry, failedRead: failedRead, readyAt: readyAt)
+                }
+                return
+            }
             if stopRequested {
-                revert(entry, from: persistedState)
+                revert(checkingEntry, from: persistedState)
             } else {
-                retryOrPark(entry, from: persistedState, error: error)
+                retryOrPark(checkingEntry, from: persistedState, error: error)
             }
             return
         }
 
         // A resolve can already hold temp files, such as an iCloud original its identity pass staged.
         resourceCleanup = resolved?.cleanup
-        if sourceWasRemoved(entry) { return }
+        if sourceWasRemoved(checkingEntry) { return }
 
+        if isSourceRecheck {
+            guard !stopRequested, !Task.isCancelled,
+                configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
+            else {
+                preserveDismissedSourceRecheck(checkingEntry)
+                return
+            }
+            guard let resolved else {
+                retainDismissedSourceRecheck(checkingEntry)
+                return
+            }
+            guard Self.provesReturnedSource(resolved, for: checkingEntry) else {
+                preserveDismissedSourceRecheck(checkingEntry, failedRead: true)
+                return
+            }
+            var released = checkingEntry
+            released.state = .checking
+            released.lastError = nil
+            released.updatedAt = now()
+            guard transitionDismissedSourceRecheck(released, matching: checkingEntry) else { return }
+            checkingEntry = released
+        }
         guard let resolved else {
-            discardMissingSource(entry, from: persistedState)
+            // The source has no backup work of its own now: the library no longer lists it, or it belongs to another
+            // photo. The catalog hook decides which.
+            discardMissingSource(checkingEntry, from: persistedState, sourceIsUnavailable: true)
             return
         }
         resourcePressureStreak = 0  // A successful export indicates available volume space.
         if stopRequested {
-            revert(entry, from: persistedState)
+            revert(checkingEntry, from: persistedState)
             return
         }
 
+        let entry = checkingEntry
         if let reconciliation = entry.remoteCommitReconciliation {
             await reconcileRemoteCommit(
                 reconciliation,
@@ -783,11 +1055,17 @@ public actor BackupSyncRunner {
                     }
                 }
             )
+        } catch is BackupWorkDeferredError {
+            let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
+            revert(entry, from: current)
+            return
         } catch is CancellationError {
+            _ = recordCancellation(CancellationError(), for: entry)
             let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
             revert(entry, from: current)
             return
         } catch let settlement as UploadRemoteCommitSettlementError {
+            if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
             if settlement.reconciliationPersisted {
                 adjustProgress(from: .uploading, to: .needsRemoteReconciliation)
                 emitProgress()
@@ -797,7 +1075,11 @@ public actor BackupSyncRunner {
             return
         } catch {
             let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
-            if stopRequested { revert(entry, from: current) } else { retryOrPark(entry, from: current, error: error) }
+            if recordCancellation(error, for: entry) || stopRequested || failedWhileWaitingForWiFi() {
+                revert(entry, from: current)
+            } else {
+                retryOrPark(entry, from: current, error: error)
+            }
             return
         }
 
@@ -944,6 +1226,21 @@ public actor BackupSyncRunner {
         }
     }
 
+    /// Reads the network right before a transfer. The claim can be minutes earlier, for example while an original
+    /// downloads from iCloud, and the device can have left Wi-Fi meanwhile. A transfer that must wait for Wi-Fi does
+    /// not start; its row returns to the queue without spending an attempt, and the pass then waits for Wi-Fi.
+    private func transferNetwork() throws -> BackupThrottleInputs {
+        let inputs = throttleInputs()
+        guard !inputs.waitsForWiFi else { throw BackupWorkDeferredError() }
+        return inputs
+    }
+
+    /// A transfer that fails while the backup must wait for Wi-Fi is not the photo's fault: the system refuses the
+    /// bytes on cellular data, or the network changed under the transfer. The row waits for Wi-Fi like a stop.
+    private func failedWhileWaitingForWiFi() -> Bool {
+        throttleInputs().waitsForWiFi
+    }
+
     private func recordUploadEvidence(_ entry: UploadBackupSyncQueueEntry) {
         let replaces =
             entry.source.kind == .photoLibraryAsset && entry.source.resource == .primary
@@ -1001,10 +1298,11 @@ public actor BackupSyncRunner {
         if resolved.hasDeferredMaterialization,
             descriptor.precomputedSHA1Digest != preflightResult.identity.sha1Digest
         {
-            throw CancellationError()
+            throw BackupWorkDeferredError()
         }
         // Materialization can take a while; an exclusion saved meanwhile must still stop the transfer.
         guard await admitsTransfer(for: entry.source) else { throw CancellationError() }
+        let network = try transferNetwork()
         let key = Self.key(entry)
         guard transition(entry, from: state, to: .uploading) != nil else {
             throw UploadError.backend("Backup queue could not enter uploading state")
@@ -1020,7 +1318,7 @@ public actor BackupSyncRunner {
             editReplacement?.replacesEarlierUploads(of: entry.source, edited: Self.isEdited(resolved)) == true
         let lineage = replacesEarlierUploads ? preflightResult.lineage : nil
 
-        let request = PhotoUploadRequest(
+        var request = PhotoUploadRequest(
             queueItemID: UUID(),
             cancellationToken: token,
             fileURL: descriptor.fileURL,
@@ -1031,13 +1329,17 @@ public actor BackupSyncRunner {
             modificationDate: resolved.descriptor.modificationDate,
             tags: Self.primaryTags(for: resolved.secondaries, sourceTags: resolved.tags),
             additionalMetadata: UploadCameraMetadata.completing(
-                resolved.additionalMetadata, fileURL: descriptor.fileURL)
+                PhotoUploadMetadataEncoder.fillingCameraDevice(
+                    in: resolved.additionalMetadata, mediaType: resolved.mediaType, fileURL: descriptor.fileURL),
+                fileURL: descriptor.fileURL)
                 + (lineage.map { [$0.additionalMetadata] } ?? [])
         )
         .applying(identity: preflightResult.identity)
         .replacingExistingDraft(preflightResult.decision == .uploadReplacingDraft)
+        request.allowsExpensiveNetwork = network.usesMobileData
 
         let uid = try await uploadWithWatchdog(
+            source: entry.source,
             request,
             progressKey: key,
             itemBaseFraction: 0,
@@ -1106,6 +1408,7 @@ public actor BackupSyncRunner {
                 remoteLinkID: reconciliation.receipt.remoteLinkID
             )
         } catch {
+            _ = recordCancellation(error, for: entry)
             parkRemoteReconciliation(
                 entry,
                 reconciliation: reconciliation,
@@ -1406,6 +1709,7 @@ public actor BackupSyncRunner {
                     retired: Set(editReplacement.journal.entry(for: entry.source).retired)
                 )
             } catch is CancellationError {
+                _ = recordCancellation(CancellationError(), for: entry)
                 revert(entry, from: persistedState)
                 return
             } catch {
@@ -1419,6 +1723,9 @@ public actor BackupSyncRunner {
         }
         do {
             try await preflight.markBackedUp(resolved.candidate.snapshot)
+            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                UpgradeTestProbe.checkpoint("backup.localRecord")
+            #endif
         } catch {
             retryOrPark(entry, from: persistedState, error: error)
             return
@@ -1622,15 +1929,21 @@ public actor BackupSyncRunner {
             } catch is SecondarySourceChangedError {
                 return .sourceChanged
             } catch let settlement as UploadRemoteCommitSettlementError {
+                if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
                 if settlement.reconciliationPersisted {
                     return .reconciliationPending
                 }
                 stopRequested = true
                 return .cancelled
+            } catch is BackupWorkDeferredError {
+                return .cancelled
             } catch is CancellationError {
+                _ = recordCancellation(CancellationError(), for: entry)
                 return .cancelled
             } catch {
-                if stopRequested { return .cancelled }
+                if recordCancellation(error, for: entry) || stopRequested || failedWhileWaitingForWiFi() {
+                    return .cancelled
+                }
                 lastError = error
             }
         }
@@ -1681,11 +1994,12 @@ public actor BackupSyncRunner {
         totalResourceCount: Int
     ) async throws -> PhotoUID {
         guard await admitsTransfer(for: descriptor.source) else { throw CancellationError() }
+        let network = try transferNetwork()
         let token = UUID()
         let tokenKey = "\(entryKey)#\(descriptor.source.resource.rawValue)"
         inFlightTokens[tokenKey] = token
         defer { inFlightTokens[tokenKey] = nil }
-        let request = PhotoUploadRequest(
+        var request = PhotoUploadRequest(
             queueItemID: UUID(),
             cancellationToken: token,
             fileURL: descriptor.fileURL,
@@ -1696,12 +2010,16 @@ public actor BackupSyncRunner {
             modificationDate: descriptor.modificationDate,
             tags: Self.secondaryTags(for: descriptor.source.resource),
             additionalMetadata: UploadCameraMetadata.completing(
-                secondary.additionalMetadata, fileURL: descriptor.fileURL),
+                PhotoUploadMetadataEncoder.fillingCameraDevice(
+                    in: secondary.additionalMetadata, mediaType: secondary.mediaType, fileURL: descriptor.fileURL),
+                fileURL: descriptor.fileURL),
             mainPhotoUID: primaryUID
         )
         .applying(identity: identity)
         .replacingExistingDraft(replacingDraft)
+        request.allowsExpensiveNetwork = network.usesMobileData
         return try await uploadWithWatchdog(
+            source: descriptor.source,
             request,
             progressKey: entryKey,
             itemBaseFraction: Double(1 + completedSecondaries) / Double(totalResourceCount),
@@ -1777,7 +2095,13 @@ public actor BackupSyncRunner {
             // to it that ended without a backup is obsolete, and the drifted row below is written fresh.
             let resolvedRevision =
                 resolved.map { max($0.candidate.snapshot.revision, entry.revision) } ?? entry.revision
-            queue.removeUnsavedEarlierRevisions(of: entry.source, through: resolvedRevision, except: entry.revision)
+            guard
+                queue.removeUnsavedEarlierRevisions(
+                    of: entry.source, through: resolvedRevision, except: entry.revision)
+            else {
+                stopRequested = true
+                return
+            }
         }
         adjustProgress(from: oldState, to: terminal)
         if let resolved { closeDriftedRevisionRow(entry, resolved: resolved, as: terminal) }
@@ -1838,6 +2162,81 @@ public actor BackupSyncRunner {
         emitProgress()
     }
 
+    /// A PhotoKit identity pass streams every resource. Metadata or a partial compound is insufficient.
+    private static func provesReturnedSource(
+        _ resolved: BackupResolvedResource, for entry: UploadBackupSyncQueueEntry
+    ) -> Bool {
+        let snapshot = resolved.candidate.snapshot
+        let descriptors = [resolved.descriptor] + resolved.secondaries.map(\.descriptor)
+        return snapshot.source == entry.source && snapshot.revision == entry.revision
+            && resolved.descriptor.source == entry.source && descriptors.count == snapshot.resourceCount
+            && Set(descriptors.map(\.source)).count == descriptors.count
+            && descriptors.allSatisfy {
+                $0.source.kind == entry.source.kind && $0.source.identifier == entry.source.identifier
+                    && $0.precomputedSHA1Digest?.count == 20
+            }
+    }
+
+    private func retainDismissedSourceRecheck(_ entry: UploadBackupSyncQueueEntry) {
+        var retained = entry
+        retained.state = .dismissedFailure
+        retained.updatedAt = now()
+        _ = transitionDismissedSourceRecheck(retained, matching: entry)
+    }
+
+    private func preserveDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, failedRead: Bool = false, readyAt: Date? = nil
+    ) {
+        guard var issue = BackupIssueRecord.decode(entry.lastError) else {
+            stopRequested = true
+            return
+        }
+        if failedRead {
+            issue = automaticRetryIssue(kind: issue.kind, detail: issue.detail, previous: issue)
+        } else {
+            // Policy denial and cancellation owe the same check, without spending a Photos read attempt.
+            let deferredUntil = now().addingTimeInterval(
+                configuration.retry.delay(afterAttempts: max(1, issue.automaticRetryAttempt)))
+            issue.nextAttemptAt = max(issue.nextAttemptAt ?? deferredUntil, deferredUntil)
+        }
+        if let readyAt {
+            issue.nextAttemptAt = max(issue.nextAttemptAt ?? now(), readyAt)
+        }
+        var pending = entry
+        pending.state = .discovered
+        pending.lastError = issue.persistedValue
+        pending.updatedAt = issue.nextAttemptAt ?? now()
+        _ = transitionDismissedSourceRecheck(pending, matching: entry)
+    }
+
+    private func transitionDismissedSourceRecheck(
+        _ replacement: UploadBackupSyncQueueEntry, matching entry: UploadBackupSyncQueueEntry
+    ) -> Bool {
+        guard let reason = entry.lastError,
+            let changed = queue.updateDismissedSourceRecheck(
+                replacement, matchingState: .checking, matchingLastError: reason)
+        else {
+            stopRequested = true
+            return false
+        }
+        // Until proof succeeds the row was counted only as dismissed, even while claimed.
+        refreshProgressFromQueue()
+        emitProgress()
+        return changed
+    }
+
+    /// A policy or source snapshot changed during preparation. Requeue without cancelling the operation.
+    private struct BackupWorkDeferredError: Error {}
+
+    /// Cancellation of a removed source belongs only to that source. Other transport cancellation ends the pass.
+    private func recordCancellation(_ error: any Error, for entry: UploadBackupSyncQueueEntry? = nil) -> Bool {
+        guard UploadError.isCancellation(error) else { return false }
+        if let entry, sourceWasRemoved(entry) { return true }
+        if runCancellationError == nil { runCancellationError = error }
+        stopRequested = true
+        return true
+    }
+
     private func retryOrPark(
         _ entry: UploadBackupSyncQueueEntry,
         from oldState: UploadBackupSyncQueueState,
@@ -1845,6 +2244,10 @@ public actor BackupSyncRunner {
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }
+        if error is BackupWorkDeferredError || recordCancellation(error, for: entry) {
+            revert(entry, from: oldState)
+            return
+        }
         if case UploadError.fileMissing = error {
             discardMissingSource(entry, from: oldState)
             return
@@ -1862,6 +2265,57 @@ public actor BackupSyncRunner {
                 entry, from: oldState, until: recheck,
                 issue: BackupIssueRecord(
                     kind: .unknown, detail: "error.upload_source_not_ready", nextAttemptAt: recheck))
+            return
+        }
+        // Photos cannot hand out the file yet: it waits for iCloud, an offline library volume, or an interrupted read.
+        // That says nothing about the Proton connection, so the network streak stays and photos on the device keep
+        // their concurrency. The row waits like a network retry, without an attempt.
+        if case UploadError.sourceUnavailable = error {
+            let detail = BackupFailedItem.sourceUnavailableDetail
+            let attempt = min(32, Self.sourceWaits(of: entry, detail: detail) + 1)
+            let eligibleAt = now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempt))
+            deferSource(
+                entry, from: oldState, until: eligibleAt,
+                issue: BackupIssueRecord(
+                    kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: attempt))
+            return
+        }
+        // Photos reports the file as missing. A short iCloud fault can report that too, so the row checks again
+        // a few times, hours apart. The final check keeps a terminal missing row: removing it would let catalog
+        // recovery restart the checks indefinitely. A Photos change can reopen the row through the normal upsert.
+        // A check that Back Up Now starts before the planned one does not count.
+        if case UploadError.sourceReportedMissing = error {
+            let detail = BackupFailedItem.sourceReportedMissingDetail
+            if let previous = BackupIssueRecord.decode(entry.lastError), previous.detail == detail,
+                let planned = previous.nextAttemptAt, now() < planned
+            {
+                deferSource(entry, from: oldState, until: planned, issue: previous)
+                return
+            }
+            let checks = Self.sourceWaits(of: entry, detail: detail)
+            guard checks < Self.reportedMissingRechecks else {
+                guard
+                    queue.updateState(
+                        source: entry.source, revision: entry.revision,
+                        state: .sourceMissing, attempts: entry.attempts,
+                        lastError: BackupIssueRecord(
+                            kind: .sourceMissing, detail: detail, automaticRetryAttempt: checks
+                        ).persistedValue,
+                        updatedAt: now())
+                else {
+                    stopRequested = true
+                    return
+                }
+                adjustProgress(from: oldState, to: .sourceMissing)
+                emitProgress()
+                return
+            }
+            let eligibleAt = now().addingTimeInterval(
+                Self.waitingReplacementDelay(afterWaits: checks, first: Self.reportedMissingRecheckDelay))
+            deferSource(
+                entry, from: oldState, until: eligibleAt,
+                issue: BackupIssueRecord(
+                    kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: checks + 1))
             return
         }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -2036,10 +2490,15 @@ public actor BackupSyncRunner {
 
     private func discardMissingSource(
         _ entry: UploadBackupSyncQueueEntry,
-        from oldState: UploadBackupSyncQueueState
+        from oldState: UploadBackupSyncQueueState,
+        sourceIsUnavailable: Bool = false
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
-        guard queue.remove(source: entry.source, revision: entry.revision) else {
+        // Only a source that the library no longer lists leaves the catalog, before its row goes, so missing-source
+        // recovery does not queue it again on every pass. A file that is gone keeps the earlier recovery. A failed
+        // write keeps the earlier behavior too.
+        if sourceIsUnavailable { _ = markSourceUnavailable?(entry.source) }
+        guard queue.removeMissingSource(source: entry.source, revision: entry.revision) else {
             if queue.entry(for: entry.source, revision: entry.revision) != nil {
                 stopRequested = true
             }
@@ -2051,7 +2510,11 @@ public actor BackupSyncRunner {
     }
 
     private func sourceWasRemoved(_ entry: UploadBackupSyncQueueEntry) -> Bool {
-        removedSources.contains(Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier))
+        sourceWasRemoved(entry.source)
+    }
+
+    private func sourceWasRemoved(_ source: UploadSourceIdentity) -> Bool {
+        removedSources.contains(Self.sourceKey(kind: source.kind, identifier: source.identifier))
     }
 
     private func refreshProgressFromQueue() {
@@ -2062,11 +2525,12 @@ public actor BackupSyncRunner {
             isRunning: previous.isRunning
         )
         progress.isPausedByPolicy = previous.isPausedByPolicy
+        progress.isWaitingForWiFi = previous.isWaitingForWiFi
         progress.remoteIndexPreparation = previous.remoteIndexPreparation
         progress.remoteIndexPreparationFailed = previous.remoteIndexPreparationFailed
         progress.remoteIndexPreparationIssue = previous.remoteIndexPreparationIssue
+        progress.remoteContentIndexHealth = previous.remoteContentIndexHealth
         progress.activeTransfer = previous.activeTransfer
-        progress.transferredBytes = previous.transferredBytes
         progress.activeExecutionItemEquivalents = previous.activeExecutionItemEquivalents
         progress.outstanding = previous.outstanding
     }
@@ -2120,6 +2584,8 @@ public actor BackupSyncRunner {
     }
 
     private func emitProgress() {
+        // Every rebuild of `progress` starts from a summary; the counter is stamped here, at the one exit.
+        progress.transferredByteCount = transferredByteCount
         onProgress?(progress)
     }
 
@@ -2134,6 +2600,17 @@ public actor BackupSyncRunner {
 
     /// How long an item that did not fit into the Proton account waits before the next automatic check.
     static let accountStorageRecheckInterval: TimeInterval = 6 * 3600
+
+    /// How often a photo that Photos reports as missing is checked again before it counts as gone, and the first wait.
+    /// The waits double: one, two, and four hours.
+    static let reportedMissingRechecks = 3
+    static let reportedMissingRecheckDelay: TimeInterval = 3600
+
+    /// The waits that a row already spent for the reason `detail`; another reason starts again at zero.
+    private static func sourceWaits(of entry: UploadBackupSyncQueueEntry, detail: String) -> Int {
+        guard let previous = BackupIssueRecord.decode(entry.lastError), previous.detail == detail else { return 0 }
+        return previous.automaticRetryAttempt
+    }
 
     private static func issueKind(for error: Error) -> BackupIssueKind {
         if isTransientResourcePressure(error) { return .deviceStorage }
@@ -2205,11 +2682,26 @@ public actor BackupSyncRunner {
     /// returned as a retryable transport timeout, while a slow transfer can run indefinitely as
     /// long as the backend continues to report progress.
     private func uploadWithWatchdog(
+        source: UploadSourceIdentity,
         _ request: PhotoUploadRequest,
         progressKey: String,
         itemBaseFraction: Double,
         itemFractionWeight: Double
     ) async throws -> PhotoUID {
+        // The network reservation comes before the transfer and its watchdog: waiting for an upload that the person
+        // started is neither a stall nor a try.
+        let reservation = try await reserveNetwork(for: request)
+        defer { reservation.release() }
+        // The wait can last long. A source that was removed or excluded meanwhile does not upload, and a device that
+        // left Wi-Fi while the backup must wait for it does not start. The reservation has the kind that the setting
+        // had before the wait: if the setting changed meanwhile, the transfer would run with the wrong kind of access.
+        // In each case the row returns to the queue without an attempt and the next claim reserves again.
+        guard await admitsTransfer(for: source) else { throw CancellationError() }
+        let network = try transferNetwork()
+        guard network.usesMobileData == request.allowsExpensiveNetwork else { throw BackupWorkDeferredError() }
+        var reservedRequest = request
+        reservedRequest.networkReservation = reservation
+        let request = reservedRequest
         let activity = BackupUploadActivity()
         let race = BackupUploadRace()
         let uploader = uploader
@@ -2225,7 +2717,7 @@ public actor BackupSyncRunner {
         )
         defer { endActiveTransfer(key: progressKey, generation: request.cancellationToken) }
 
-        let uploadTask = Task {
+        let uploadTask = Task { () -> PhotoUID? in
             do {
                 // Coalesce byte callbacks before the actor hop; markProgress stays unconditional
                 // so the watchdog still treats every raw callback as transfer liveness.
@@ -2243,8 +2735,10 @@ public actor BackupSyncRunner {
                     progressGate.publish(progress)
                 }
                 race.resolve(.success(uid))
+                return uid
             } catch {
                 race.resolve(.failure(error))
+                return nil
             }
         }
         let join = BackupUploadJoin(
@@ -2254,7 +2748,10 @@ public actor BackupSyncRunner {
             token: request.cancellationToken
         )
         inFlightJoins[request.cancellationToken] = join
-        defer { inFlightJoins[request.cancellationToken] = nil }
+        defer {
+            inFlightJoins[request.cancellationToken] = nil
+            policyCancelledTransfers.remove(request.cancellationToken)
+        }
 
         let watchdogTask = Task {
             while !Task.isCancelled {
@@ -2280,21 +2777,58 @@ public actor BackupSyncRunner {
         switch resolution {
         case .success(let uid):
             await join.settle()
-            markTransferSent(key: progressKey, generation: request.cancellationToken)
             return uid
         case .failure(let error):
             await join.settle()
+            if UploadError.isCancellation(error), policyCancelledTransfers.contains(request.cancellationToken) {
+                throw BackupWorkDeferredError()
+            }
             throw error
+        // The upload can return its uid after a timeout or cancellation decided the race: Proton has the file then, and
+        // the normal settlement records it. A source that a deletion or exclusion removed keeps the cancellation.
         case .timedOut:
-            await join.cancelAndJoin()
+            if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
             throw UploadError.transport(
                 code: NSURLErrorTimedOut,
                 message: URLError(.timedOut).localizedDescription
             )
         case .cancelled:
-            await join.cancelAndJoin()
+            if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
+            if policyCancelledTransfers.contains(request.cancellationToken) { throw BackupWorkDeferredError() }
             throw CancellationError()
         }
+    }
+
+    /// Waits for the network reservation of `request`. The wait ends with `CancellationError` when the pass is cancelled
+    /// or `stop()` runs.
+    private func reserveNetwork(for request: PhotoUploadRequest) async throws -> UploadNetworkReservation {
+        let uploader = uploader
+        let allowsExpensiveNetwork = request.allowsExpensiveNetwork
+        let wait = Task { try await uploader.reserveNetwork(allowsExpensiveNetwork: allowsExpensiveNetwork) }
+        networkWaits[request.cancellationToken] = wait
+        defer {
+            networkWaits[request.cancellationToken] = nil
+            policyCancelledTransfers.remove(request.cancellationToken)
+        }
+        if stopRequested { wait.cancel() }
+        let reservation: UploadNetworkReservation
+        do {
+            reservation = try await withTaskCancellationHandler {
+                try await wait.value
+            } onCancel: {
+                wait.cancel()
+            }
+        } catch {
+            if UploadError.isCancellation(error), policyCancelledTransfers.contains(request.cancellationToken) {
+                throw BackupWorkDeferredError()
+            }
+            throw error
+        }
+        guard !stopRequested, !Task.isCancelled else {
+            reservation.release()
+            throw CancellationError()
+        }
+        return reservation
     }
 
     private func beginActiveTransfer(
@@ -2324,6 +2858,8 @@ public actor BackupSyncRunner {
         // One-percent quantization bounds actor/UI churn while advancing for each SDK block.
         let quantized = floor(clamped * 100) / 100
         guard quantized > transfer.byteFraction else { return }
+        transferredByteCount +=
+            Self.bytes(of: transfer, at: quantized) - Self.bytes(of: transfer, at: transfer.byteFraction)
         transfer.byteFraction = quantized
         activeTransfers[key] = transfer
         updateExecutionUploadFraction(
@@ -2333,23 +2869,18 @@ public actor BackupSyncRunner {
         publishActiveTransferProgress()
     }
 
-    /// A successful upload sent every byte, also when the backend reported no final progress.
-    private func markTransferSent(key: String, generation: UUID) {
-        guard var transfer = activeTransfers[key], transfer.generation == generation else { return }
-        transfer.byteFraction = 1
-        activeTransfers[key] = transfer
+    private static func bytes(of transfer: ActiveTransfer, at fraction: Double) -> Int64 {
+        Int64((Double(transfer.totalBytes) * fraction).rounded(.down))
     }
 
     private func endActiveTransfer(key: String, generation: UUID) {
-        guard let transfer = activeTransfers[key], transfer.generation == generation else { return }
-        finishedTransferBytes += transfer.sentBytes
+        guard activeTransfers[key]?.generation == generation else { return }
         activeTransfers.removeValue(forKey: key)
         publishActiveTransferProgress()
     }
 
     private func publishActiveTransferProgress() {
         guard !activeTransfers.isEmpty else {
-            progress.transferredBytes = finishedTransferBytes
             if progress.activeTransfer != nil {
                 progress.activeTransfer = nil
             }
@@ -2361,7 +2892,7 @@ public actor BackupSyncRunner {
         var itemEquivalents = 0.0
         for transfer in activeTransfers.values {
             totalBytes += transfer.totalBytes
-            completedBytes += transfer.sentBytes
+            completedBytes += Int64((Double(transfer.totalBytes) * transfer.byteFraction).rounded(.down))
             itemEquivalents += min(
                 0.999,
                 transfer.itemBaseFraction + transfer.itemFractionWeight * transfer.byteFraction
@@ -2373,7 +2904,6 @@ public actor BackupSyncRunner {
             totalBytes: totalBytes,
             completedItemEquivalents: itemEquivalents
         )
-        progress.transferredBytes = finishedTransferBytes + completedBytes
         guard candidate != progress.activeTransfer else { return }
         progress.activeTransfer = candidate
         publishActiveExecutionProgress()
@@ -2562,7 +3092,7 @@ private final class BackupUploadActivity: @unchecked Sendable {
     }
 }
 
-private enum BackupUploadResolution: @unchecked Sendable {
+enum BackupUploadResolution: @unchecked Sendable {
     case success(PhotoUID)
     case failure(Error)
     case timedOut
@@ -2586,14 +3116,14 @@ final class BackupUploadCancellation: @unchecked Sendable {
 }
 
 private final class BackupUploadJoin: @unchecked Sendable {
-    private let uploadTask: Task<Void, Never>
+    private let uploadTask: Task<PhotoUID?, Never>
     private let race: BackupUploadRace
     private let cancellation = BackupUploadCancellation()
     private let uploader: any PhotoUploading
     private let token: UUID
 
     init(
-        uploadTask: Task<Void, Never>,
+        uploadTask: Task<PhotoUID?, Never>,
         race: BackupUploadRace,
         uploader: any PhotoUploading,
         token: UUID
@@ -2604,20 +3134,23 @@ private final class BackupUploadJoin: @unchecked Sendable {
         self.token = token
     }
 
-    func cancelAndJoin() async {
+    /// Returns the uid when the upload returned one, also after the cancellation: the bridge returns a uid only after
+    /// Proton committed the file.
+    @discardableResult
+    func cancelAndJoin() async -> PhotoUID? {
         uploadTask.cancel()
         if race.requestCancellation() {
             await cancellation.request(uploader: uploader, token: token)
         }
-        await uploadTask.value
+        return await uploadTask.value
     }
 
     func settle() async {
-        await uploadTask.value
+        _ = await uploadTask.value
     }
 }
 
-private final class BackupUploadRace: @unchecked Sendable {
+final class BackupUploadRace: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<BackupUploadResolution, Never>?
     private var resolution: BackupUploadResolution?
@@ -2633,16 +3166,22 @@ private final class BackupUploadRace: @unchecked Sendable {
         }
     }
 
+    /// True only when this call decided the race. A race keeps its first resolution (success, failure, timeout or
+    /// cancellation), and a later caller must not act on a decision it did not make.
     @discardableResult
     func resolve(_ value: BackupUploadResolution) -> Bool {
-        let continuation: CheckedContinuation<BackupUploadResolution, Never>? = lock.withLock {
-            guard resolution == nil else { return nil }
-            resolution = value
-            defer { self.continuation = nil }
-            return self.continuation
-        }
-        continuation?.resume(returning: value)
-        return true
+        let result:
+            (
+                continuation: CheckedContinuation<BackupUploadResolution, Never>?,
+                decided: Bool
+            ) = lock.withLock {
+                guard resolution == nil else { return (nil, false) }
+                resolution = value
+                defer { self.continuation = nil }
+                return (self.continuation, true)
+            }
+        result.continuation?.resume(returning: value)
+        return result.decided
     }
 
     @discardableResult

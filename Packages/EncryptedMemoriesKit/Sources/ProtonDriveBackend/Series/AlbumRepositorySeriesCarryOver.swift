@@ -10,6 +10,8 @@ import UploadCore
 /// semantic with the rest of the app instead of a second write path.
 struct AlbumRepositorySeriesCarryOver: SeriesAlbumCarryOver {
     let repository: AlbumsRepository
+    /// The carry-over of a dissolution, a duplicate merge or an edit replacement is not album work of the person.
+    var requestCause: ProtonRequestCauseBinding? = nil
 
     func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
         try await albums(containing: [uid])[uid] ?? []
@@ -17,7 +19,7 @@ struct AlbumRepositorySeriesCarryOver: SeriesAlbumCarryOver {
 
     /// One membership read for all photos; the repository caches it.
     func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
-        let memberships = try await repository.albumMemberships(for: uids)
+        let memberships = try await named { try await repository.albumMemberships(for: uids) }
         return memberships.mapValues { albums in
             albums.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) }
         }
@@ -25,7 +27,7 @@ struct AlbumRepositorySeriesCarryOver: SeriesAlbumCarryOver {
 
     /// Bypasses the repository's membership cache and refreshes it.
     func currentAlbums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
-        let memberships = try await repository.currentAlbumMemberships(for: uids)
+        let memberships = try await named { try await repository.currentAlbumMemberships(for: uids) }
         return memberships.mapValues { albums in
             albums.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) }
         }
@@ -33,18 +35,23 @@ struct AlbumRepositorySeriesCarryOver: SeriesAlbumCarryOver {
 
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
         guard !uids.isEmpty else { return }
-        try await repository.addPhotos(uids, to: albumID)
+        try await named { try await repository.addPhotos(uids, to: albumID) }
     }
 
     /// One fresh catalog read. The listing holds only albums of the account's own library.
     func ownAlbumCovers() async throws -> [String: String] {
-        let albums = try await repository.listAlbums()
+        let albums = try await named { try await repository.listAlbums() }
         return Dictionary(
             albums.compactMap { album in album.coverPhotoID.map { (album.id, $0) } },
             uniquingKeysWith: { first, _ in first })
     }
 
     func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws {
-        try await repository.setAlbumCover(albumID: albumID, photoUID: uid)
+        try await named { try await repository.setAlbumCover(albumID: albumID, photoUID: uid) }
+    }
+
+    private func named<T>(_ operation: () async throws -> T) async throws -> T {
+        guard let requestCause else { return try await operation() }
+        return try await requestCause.run(operation: operation)
     }
 }

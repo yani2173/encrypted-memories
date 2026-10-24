@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SQLite3
 
 /// Classifies an opened SQLite connection before a store applies persistent pragmas or schema DDL.
@@ -13,6 +14,9 @@ public enum SQLiteStoreSchemaCompatibility: Sendable, Equatable {
     case current
     case incompatible
     case unavailable
+    /// The check could not finish now, and the file may be fine: another connection holds it for longer than the busy
+    /// timeout, or a full disk stopped the check, at the temporary copy or in SQLite itself (see `SQLiteFailure`).
+    case retryLater
 }
 
 private enum SQLiteStoreOpenResult {
@@ -21,15 +25,26 @@ private enum SQLiteStoreOpenResult {
     case incompatible
     /// The file could not be read, created, or initialized.
     case failed
+    /// The file may be fine, but it could not be checked now. See `SQLiteStoreSchemaCompatibility.retryLater`.
+    case retryLater
+}
+
+/// The result of opening a rebuildable store.
+public enum SQLiteRebuildableStoreOutcome {
+    case opened(OpaquePointer)
+    /// The file stays on disk untouched, and the next open reads it again.
+    case retryLater
+    case failed
 }
 
 /// Exact-schema gate for operational and user-authored stores.
 ///
-/// Existing files are inspected without writes. Only a database with no application schema may be
-/// initialized. A populated database must contain the exact tables, columns, constraints, and indexes
-/// produced by this build's schema SQL. This keeps schema changes explicit and prevents markerless or
-/// future files from being modified while an older build tries to open them.
+/// Existing files are inspected read-only. If that fails, only a temporary copy permits recovery writes.
+/// A recovered copy must have no schema objects. A populated database must contain the exact tables,
+/// columns, constraints, and indexes produced by this build's schema SQL. This keeps schema changes explicit
+/// and prevents markerless or future files from being modified while an older build tries to open them.
 public enum SQLiteStoreSchemaGate {
+    private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "SQLiteStore")
     /// `SQLITE_TRANSIENT`: SQLite copies bound text and blobs before the bind call returns.
     public static var transientDestructor: sqlite3_destructor_type {
         unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -62,6 +77,7 @@ public enum SQLiteStoreSchemaGate {
 
     /// Opens a rebuildable cache. A file with another schema is deleted together with its WAL and shared-memory
     /// files and created once more. A read, create, or delete failure returns `nil` and leaves the file in place.
+    /// A file that cannot be checked now (`retryLater`) also returns `nil` and stays untouched.
     public static func openRebuildableStore(
         at url: URL,
         schemaSQL: String,
@@ -70,6 +86,27 @@ public enum SQLiteStoreSchemaGate {
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool
     ) -> OpaquePointer? {
+        guard
+            case .opened(let handle) = openRebuildableStoreOutcome(
+                at: url, schemaSQL: schemaSQL, policy: policy, enforceForeignKeys: enforceForeignKeys,
+                verifyVersion: verifyVersion, stampVersion: stampVersion)
+        else { return nil }
+        return handle
+    }
+
+    /// Like `openRebuildableStore`, and it tells a file that stays on disk for a later open (`retryLater`) from a
+    /// failure that a caller may repair by removing the file.
+    public static func openRebuildableStoreOutcome(
+        at url: URL,
+        schemaSQL: String,
+        policy: LibraryDatabasePolicy,
+        enforceForeignKeys: Bool = false,
+        verifyVersion: (OpaquePointer?) -> Bool,
+        stampVersion: (OpaquePointer?) -> Bool,
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil,
+        probe: SQLiteFailureProbe = .live
+    ) -> SQLiteRebuildableStoreOutcome {
         func open() -> SQLiteStoreOpenResult {
             openStore(
                 at: url,
@@ -77,17 +114,22 @@ public enum SQLiteStoreSchemaGate {
                 policy: policy,
                 enforceForeignKeys: enforceForeignKeys,
                 verifyVersion: verifyVersion,
-                stampVersion: stampVersion
+                stampVersion: stampVersion,
+                copyItem: copyItem,
+                createDirectory: createDirectory,
+                probe: probe
             )
         }
         switch open() {
         case .opened(let handle):
-            return handle
+            return .opened(handle)
         case .failed:
-            return nil
+            return .failed
+        case .retryLater:
+            return .retryLater
         case .incompatible:
-            guard removeDatabaseFiles(at: url), case .opened(let handle) = open() else { return nil }
-            return handle
+            guard removeDatabaseFiles(at: url), case .opened(let handle) = open() else { return .failed }
+            return .opened(handle)
         }
     }
 
@@ -115,16 +157,23 @@ public enum SQLiteStoreSchemaGate {
         includeMemoryTuning: Bool = true,
         enforceForeignKeys: Bool = false,
         verifyVersion: (OpaquePointer?) -> Bool,
-        stampVersion: (OpaquePointer?) -> Bool
+        stampVersion: (OpaquePointer?) -> Bool,
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil,
+        probe: SQLiteFailureProbe = .live
     ) -> SQLiteStoreOpenResult {
         let compatibility = compatibility(
             at: url,
             schemaSQL: schemaSQL,
             busyTimeoutMs: policy.busyTimeoutMs,
-            versionIsCurrent: verifyVersion
+            versionIsCurrent: verifyVersion,
+            copyItem: copyItem,
+            createDirectory: createDirectory,
+            probe: probe
         )
         guard compatibility != .incompatible else { return .incompatible }
         guard compatibility != .unavailable else { return .failed }
+        guard compatibility != .retryLater else { return .retryLater }
         var opened: OpaquePointer?
         let flags =
             SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
@@ -133,7 +182,9 @@ public enum SQLiteStoreSchemaGate {
             sqlite3_close(opened)
             return .failed
         }
-        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        // The verification below waits as long as the busy timeout and tells a lock from another schema.
+        let busy = SQLiteBusyRecorder(timeoutMs: policy.busyTimeoutMs)
+        busy.install(on: handle)
         if enforceForeignKeys {
             sqlite3_exec(handle, "PRAGMA foreign_keys=ON;", nil, nil, nil)
         }
@@ -154,14 +205,16 @@ public enum SQLiteStoreSchemaGate {
             guard verifyVersion(handle),
                 matchesCurrentSchema(handle, schemaSQL: schemaSQL)
             else {
-                sqlite3_close(handle)
-                return .incompatible
+                // A lock that did not clear, or a failure that says nothing about the file, keeps it. The probe reads
+                // the failure and then closes the connection.
+                let keepsFile = probe.keepsFile(closing: handle, step: .verification)
+                return keepsFile || busy.gaveUp ? .retryLater : .incompatible
             }
             configureConnection(handle, policy: policy, includeMemoryTuning: includeMemoryTuning)
         case .incompatible:
             sqlite3_close(handle)
             return .incompatible
-        case .unavailable:
+        case .unavailable, .retryLater:
             sqlite3_close(handle)
             return .failed
         }
@@ -169,13 +222,16 @@ public enum SQLiteStoreSchemaGate {
     }
 
     /// Inspects an existing database through a read-only connection. Missing files are empty stores.
-    /// The caller can therefore reject a populated incompatible file before any read-write open,
-    /// WAL recovery, persistent pragma, schema DDL, or version stamp can modify it.
+    /// If inspection fails, a read-write inspection of a temporary copy can prove the recovered database empty.
+    /// Populated or unreadable copies remain unavailable; recovery never modifies the original during inspection.
     public static func compatibility(
         at url: URL,
         schemaSQL: String,
         busyTimeoutMs: Int = 5_000,
-        versionIsCurrent: (OpaquePointer?) -> Bool
+        versionIsCurrent: (OpaquePointer?) -> Bool,
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil,
+        probe: SQLiteFailureProbe = .live
     ) -> SQLiteStoreSchemaCompatibility {
         guard FileManager.default.fileExists(atPath: url.path) else { return .empty }
         var inspection: OpaquePointer?
@@ -184,21 +240,112 @@ public enum SQLiteStoreSchemaGate {
             let inspection
         else {
             sqlite3_close(inspection)
+            return compatibilityOfWritableCopy(
+                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory,
+                probe: probe)
+        }
+        defer { sqlite3_close(inspection) }
+        // A statement that meets a lock waits as long as the busy timeout. If the lock stays, no answer of this
+        // inspection is reliable: the file may be fine, and the caller must not replace it.
+        let busy = SQLiteBusyRecorder(timeoutMs: busyTimeoutMs)
+        busy.install(on: inspection)
+        // A failure that says nothing about the file, such as a full disk, ends the inspection the same way. SQLite
+        // keeps the failure only until the next call, so each check below reads it right after the failed read.
+        func keepsFile() -> Bool { busy.gaveUp || probe.keepsFile(after: inspection, step: .inspection) }
+        switch state(of: inspection) {
+        case .empty:
+            guard let version = userVersion(of: inspection) else { return busy.gaveUp ? .retryLater : .unavailable }
+            if busy.gaveUp { return .retryLater }
+            return version == 0 ? .empty : .incompatible
+        case .populated:
+            let current =
+                versionIsCurrent(inspection)
+                && matchesCurrentSchema(inspection, schemaSQL: schemaSQL)
+            if current { return busy.gaveUp ? .retryLater : .current }
+            return keepsFile() ? .retryLater : .incompatible
+        case .unavailable:
+            if keepsFile() { return .retryLater }
+            return compatibilityOfWritableCopy(
+                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory,
+                probe: probe)
+        }
+    }
+
+    /// The private directory of a recovery inspection. A test passes its own `createDirectory` to simulate a full disk.
+    private static func createInspectionDirectory(_ url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+    }
+
+    /// A read-write schema read can roll back a hot journal. Preserve the original and all its sidecars,
+    /// even when recovery finds a populated database that this build must refuse to open.
+    private static func compatibilityOfWritableCopy(
+        at url: URL,
+        busyTimeoutMs: Int,
+        copyItem: (URL, URL) throws -> Void,
+        createDirectory: ((URL) throws -> Void)?,
+        probe: SQLiteFailureProbe
+    ) -> SQLiteStoreSchemaCompatibility {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteStoreInspection-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try (createDirectory ?? Self.createInspectionDirectory)(directory)
+        } catch {
+            logger.error("SQLite could not create its temporary recovery inspection.")
+            // A full disk says nothing about the file, so it stays. Any other failure keeps its earlier meaning.
+            return DeviceStorage.isOutOfSpace(error) ? .retryLater : .unavailable
+        }
+
+        var compatibility = SQLiteStoreSchemaCompatibility.unavailable
+        do {
+            let copy = directory.appendingPathComponent("store.sqlite")
+            for suffix in ["", "-journal", "-wal", "-shm"] {
+                let original = URL(fileURLWithPath: url.path + suffix)
+                if suffix.isEmpty || FileManager.default.fileExists(atPath: original.path) {
+                    try copyItem(original, URL(fileURLWithPath: copy.path + suffix))
+                }
+            }
+            compatibility = emptyCompatibility(at: copy, busyTimeoutMs: busyTimeoutMs, probe: probe)
+        } catch {
+            logger.error("SQLite could not copy the database and journals for recovery inspection.")
+            // A full disk says nothing about the file, so it stays. An unreadable file keeps its earlier meaning.
+            compatibility = DeviceStorage.isOutOfSpace(error) ? .retryLater : .unavailable
+        }
+        do {
+            try FileManager.default.removeItem(at: directory)
+        } catch {
+            logger.error("SQLite could not remove its temporary recovery inspection.")
+            return .unavailable
+        }
+        return compatibility
+    }
+
+    private static func emptyCompatibility(
+        at url: URL, busyTimeoutMs: Int, probe: SQLiteFailureProbe
+    ) -> SQLiteStoreSchemaCompatibility {
+        var inspection: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &inspection, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+            let inspection
+        else {
+            sqlite3_close(inspection)
             return .unavailable
         }
         defer { sqlite3_close(inspection) }
         sqlite3_busy_timeout(inspection, Int32(clamping: busyTimeoutMs))
-        switch state(of: inspection) {
-        case .empty:
-            guard let version = userVersion(of: inspection) else { return .unavailable }
-            return version == 0 ? .empty : .incompatible
-        case .populated:
-            return versionIsCurrent(inspection)
-                && matchesCurrentSchema(inspection, schemaSQL: schemaSQL)
-                ? .current : .incompatible
-        case .unavailable:
-            return .unavailable
+        // A failure that says nothing about the file, such as a full disk, keeps it. Each return below reads the
+        // failure right after the failed call.
+        func unavailable() -> SQLiteStoreSchemaCompatibility {
+            probe.keepsFile(after: inspection, step: .copy) ? .retryLater : .unavailable
         }
+        // Include SQLite's own objects, such as sqlite_sequence. Any remaining object forbids initialization.
+        guard userVersion(of: inspection) == 0 else { return unavailable() }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(inspection, "SELECT 1 FROM sqlite_schema LIMIT 1;", -1, &statement, nil) == SQLITE_OK
+        else {
+            return unavailable()
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_DONE ? .empty : unavailable()
     }
 
     /// Applies connection-local tuning only after the caller accepts the existing schema.
@@ -207,19 +354,97 @@ public enum SQLiteStoreSchemaGate {
         policy: LibraryDatabasePolicy,
         includeMemoryTuning: Bool = true
     ) {
+        sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+        let usesWAL = pragmaValue("journal_mode", in: db) == "wal"
+        // EXTRA also syncs the containing directory after deleting a rollback journal. FULL alone does not guarantee
+        // power-loss durability in DELETE mode (https://www.sqlite.org/pragma.html#pragma_synchronous).
+        if !usesWAL { logger.warning("WAL unavailable; using durable rollback-journal commits.") }
+        let sync = usesWAL ? "NORMAL" : "EXTRA"
+        if sqlite3_exec(db, "PRAGMA synchronous=\(sync);", nil, nil, nil) != SQLITE_OK
+            || sqlite3_exec(db, "PRAGMA fullfsync=\(usesWAL ? "OFF" : "ON");", nil, nil, nil) != SQLITE_OK
+        {
+            logger.error("SQLite refused the commit synchronization settings.")
+        }
         var pragmas = [
-            "PRAGMA journal_mode=WAL;",
-            "PRAGMA synchronous=NORMAL;",
             "PRAGMA busy_timeout=\(policy.busyTimeoutMs);",
             "PRAGMA journal_size_limit=\(policy.journalSizeLimitBytes);",
         ]
         if includeMemoryTuning {
-            pragmas.insert("PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));", at: 3)
-            pragmas.insert("PRAGMA mmap_size=\(max(0, policy.mmapBytes));", at: 4)
+            pragmas.append("PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));")
+            pragmas.append("PRAGMA mmap_size=\(max(0, policy.mmapBytes));")
         }
         for pragma in pragmas {
             sqlite3_exec(db, pragma, nil, nil, nil)
         }
+    }
+
+    /// Makes every checkpoint of the connection sync with `F_FULLFSYNC`, automatic checkpoints included. The flag
+    /// belongs to the connection, so each open sets it again.
+    public static func enableFullSyncCheckpoints(_ db: OpaquePointer?) {
+        sqlite3_exec(db, "PRAGMA checkpoint_fullfsync=ON;", nil, nil, nil)
+    }
+
+    /// Runs `body` with commits that survive a power loss, then restores the connection's previous settings.
+    /// In WAL mode, `synchronous=FULL` syncs the WAL after each commit, and `fullfsync` makes that sync an
+    /// `F_FULLFSYNC` on Apple platforms (https://www.sqlite.org/pragma.html#pragma_synchronous). The caller holds the
+    /// lock of its connection and calls this outside a transaction: SQLite refuses the change inside one. Returns nil
+    /// without running `body` when the connection refuses the setting.
+    public static func withDurableCommits<T>(_ db: OpaquePointer?, _ body: () throws -> T) rethrows -> T? {
+        guard let synchronous = pragmaValue("synchronous", in: db).flatMap(Int.init),
+            let fullfsync = pragmaValue("fullfsync", in: db).flatMap(Int.init),
+            sqlite3_exec(db, "PRAGMA synchronous=\(max(2, synchronous));", nil, nil, nil) == SQLITE_OK
+        else { return nil }
+        defer { sqlite3_exec(db, "PRAGMA synchronous=\(synchronous);", nil, nil, nil) }
+        guard sqlite3_exec(db, "PRAGMA fullfsync=ON;", nil, nil, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_exec(db, "PRAGMA fullfsync=\(fullfsync);", nil, nil, nil) }
+        return try body()
+    }
+
+    /// Synchronizes an operational store while its caller holds the connection lock. A closed or failed store
+    /// cannot prove that its data is durable.
+    public static func synchronizeToDisk(_ db: OpaquePointer?, operationFailed: Bool) -> Bool {
+        guard let db, !operationFailed else { return false }
+        return checkpointCompletely(db)
+    }
+
+    /// Copies every committed transaction from the WAL into the database file and syncs that file (a FULL
+    /// checkpoint). Rollback-journal commits need no checkpoint when their connection already commits durably.
+    /// A busy, partial, or failed checkpoint returns false.
+    public static func checkpointCompletely(_ db: OpaquePointer?) -> Bool {
+        guard let db, let journal = pragmaValue("journal_mode", in: db), sqlite3_get_autocommit(db) != 0 else {
+            logger.error("SQLite synchronization failed: no readable connection or an open transaction.")
+            return false
+        }
+        if journal != "wal" {
+            guard ["delete", "truncate", "persist"].contains(journal),
+                let synchronous = pragmaValue("synchronous", in: db).flatMap(Int.init), synchronous >= 2,
+                pragmaValue("fullfsync", in: db) == "1"
+            else {
+                logger.error("SQLite synchronization failed: non-WAL commits are not durable.")
+                return false
+            }
+            // Rollback-journal commits already sync the database. There is no WAL to checkpoint.
+            return true
+        }
+        var logFrames: Int32 = -1
+        var checkpointedFrames: Int32 = -1
+        let result = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_FULL, &logFrames, &checkpointedFrames)
+        guard result == SQLITE_OK && logFrames >= 0 && logFrames == checkpointedFrames else {
+            logger.error(
+                "SQLite synchronization failed: checkpoint result \(result), frames \(checkpointedFrames)/\(logFrames)."
+            )
+            return false
+        }
+        return true
+    }
+
+    private static func pragmaValue(_ name: String, in db: OpaquePointer?) -> String? {
+        guard let db else { return nil }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA \(name);", -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) else { return nil }
+        return String(cString: value)
     }
 
     public static func state(of db: OpaquePointer?) -> SQLiteStoreSchemaState {

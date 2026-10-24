@@ -46,9 +46,7 @@ struct MobileMapScreen: View {
                             } description: {
                                 Text(L10n.string("map.scan_failed_message"))
                             } actions: {
-                                Button(L10n.string("action.retry")) {
-                                    model.restartLocationCrawlIfNeeded()
-                                }
+                                RetryButton(.prominent) { model.restartLocationCrawlIfNeeded() }
                             }
                         case .completed:
                             ContentUnavailableView {

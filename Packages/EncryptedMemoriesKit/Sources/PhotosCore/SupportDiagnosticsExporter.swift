@@ -12,6 +12,9 @@ public enum SupportDiagnosticsExporter {
             let networkReachable: Bool
             let networkConstrained: Bool
             let networkExpensive: Bool
+            /// Interface types only, for example ["cellular", "other"]; never names or addresses.
+            let networkUsedInterfaces: [String]
+            let networkAvailableInterfaces: [String]
             let executionOpportunity: String
             let visibleMediaDemand: Bool
             let activeUserInteraction: Bool
@@ -41,6 +44,7 @@ public enum SupportDiagnosticsExporter {
             let dropped: Int
         }
 
+        let placeCandidates: [PlaceCandidateSupportSnapshot]
         let librarySync: LibrarySyncSupportSnapshot
         let backup: Backup
         let recentEvents: RecentEvents
@@ -53,6 +57,8 @@ public enum SupportDiagnosticsExporter {
         let runtime: Runtime
         let resources: Resources
         let diagnostics: PhotoDiagnosticsSupportSnapshot
+        /// Nil without a signed-in session.
+        let requests: RemoteRequestSupportSnapshot?
     }
 
     public static func makeJSONData(
@@ -71,6 +77,7 @@ public enum SupportDiagnosticsExporter {
         // One salt per report: hashes link the events of one report, never two reports.
         let trailExport = trail.export(hashingWith: SupportReportIdentifierHasher())
         let report = Report(
+            placeCandidates: await sources.placeSnapshot(),
             librarySync: librarySync,
             backup: Report.Backup(
                 queues: sources.queueSnapshots(),
@@ -93,6 +100,8 @@ public enum SupportDiagnosticsExporter {
                 networkReachable: snapshot.network.isReachable,
                 networkConstrained: snapshot.network.isConstrained,
                 networkExpensive: snapshot.network.isExpensive,
+                networkUsedInterfaces: snapshot.network.usedInterfaces.map(\.rawValue).sorted(),
+                networkAvailableInterfaces: snapshot.network.availableInterfaces.map(\.rawValue).sorted(),
                 executionOpportunity: String(describing: snapshot.executionOpportunity),
                 visibleMediaDemand: snapshot.hasVisibleMediaDemand,
                 activeUserInteraction: snapshot.hasActiveUserInteraction,
@@ -108,7 +117,8 @@ public enum SupportDiagnosticsExporter {
                 maximumConcurrentPermits: metrics.maximumConcurrentPermits,
                 maximumWaitMilliseconds: metrics.maximumWaitMilliseconds
             ),
-            diagnostics: diagnostics.supportSnapshot()
+            diagnostics: diagnostics.supportSnapshot(),
+            requests: await sources.requestSnapshot()
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

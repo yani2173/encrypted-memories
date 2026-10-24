@@ -28,6 +28,7 @@ struct MobileMapClusterSeriesScreen: View {
 
     private var selectionBusy: Bool { selection.isBusy }
     private var currentPage: PhotoLocationClusterPage? { pager.page(at: pageIndex) }
+    private var placeTitle: String { PlaceNameText.displayable(placeName) ?? L10n.string("map.cluster_title") }
 
     init(pager: PhotoLocationClusterPager, coordinate: CLLocationCoordinate2D) {
         self.coordinate = coordinate
@@ -37,7 +38,7 @@ struct MobileMapClusterSeriesScreen: View {
     var body: some View {
         content
             .mobileGridContextMenu(contextMenu, model: model)
-            .mobileNavigationTitle(selection.barTitle(default: placeName ?? L10n.string("map.cluster_title")))
+            .mobileNavigationTitle(selection.barTitle(default: placeTitle))
             .toolbar { toolbarContent }
             .mobileSelectionBars(isSelecting: selection.isSelecting)
             .task { await resolvePlaceName() }

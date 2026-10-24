@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import SQLite3
 import XCTest
 
@@ -27,6 +28,77 @@ final class UploadRemoteLineageIndexStoreTests: XCTestCase {
         XCTAssertEqual(reopened.replacingMainLinkIDs(ofReplacedLink: "old", hashKeyEpoch: "epoch"), ["main"])
         XCTAssertEqual(reopened.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")), .complete)
         XCTAssertTrue(reopened.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "other").isEmpty)
+    }
+
+    /// Another connection holds the file exclusively longer than the busy timeout. The derived index is never
+    /// deleted for that, and it opens again with its rows once the lock is gone.
+    func testAFileThatAnotherConnectionHoldsIsKeptAndOpensAgainWithItsRows() throws {
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        XCTAssertTrue(replace(store, links: [identity("main")]))
+        store.close()
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &blocker), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+
+        let noWait = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        let busy = UploadRemoteLineageIndexStore(url: url, policy: noWait)
+        busy?.close()
+        XCTAssertEqual(sqlite3_exec(blocker, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(blocker)
+
+        XCTAssertNil(busy, "the store is unavailable while the lock lasts")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "the index is not deleted")
+        let reopened = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch"), ["main"])
+    }
+
+    func testCloseRejectsLaterCallsWithoutDisablingTheFile() throws {
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        XCTAssertTrue(replace(store, links: [identity("main")]))
+        XCTAssertTrue(store.acceptsWrites)
+
+        store.close()
+        store.close()
+
+        XCTAssertFalse(store.acceptsWrites)
+        XCTAssertFalse(replace(store, links: [identity("other")], eventID: "two"))
+        let build = UploadRemoteContentIndexBuildCheckpoint(
+            buildID: "build", eventID: "three", sourceFingerprint: "source", cursor: 0, total: 1, updatedAt: Date())
+        XCTAssertFalse(store.prepareBuild(build, hashKeyEpoch: "epoch"))
+        XCTAssertFalse(store.hasCheckpoint(hashKeyEpoch: "epoch", eventID: "one"))
+        XCTAssertTrue(store.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch").isEmpty)
+        XCTAssertEqual(store.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")), .incomplete)
+
+        let reopened = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        defer { reopened.close() }
+        XCTAssertTrue(reopened.acceptsWrites, "a write refused after close is no failure of the file")
+        XCTAssertTrue(reopened.hasCheckpoint(hashKeyEpoch: "epoch", eventID: "one"))
+        XCTAssertEqual(reopened.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch"), ["main"])
+        XCTAssertEqual(reopened.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")), .complete)
+        XCTAssertTrue(replace(reopened, links: [identity("main")], eventID: "two"))
+    }
+
+    /// The index never ran `PRAGMA optimize` on close, so its file never gets optimizer statistics.
+    func testCloseWritesNoOptimizerStatistics() throws {
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        XCTAssertTrue(replace(store, links: [identity("main"), identity("related", isMain: false)]))
+        XCTAssertEqual(store.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch"), ["main"])
+        XCTAssertEqual(store.replacedLinkIDs(ofReplacingMain: "main", hashKeyEpoch: "epoch"), ["old"])
+        store.close()
+
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(
+                handle, "SELECT COUNT(*) FROM sqlite_schema WHERE name='sqlite_stat1';", -1, &statement, nil),
+            SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 0)
     }
 
     func testReplacingMainReadReturnsAncestorsOnlyForItsEpoch() throws {

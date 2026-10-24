@@ -298,8 +298,8 @@ private struct MobileMainTabView: View {
     private var suggestionsRevision: String {
         SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: libraryModel.timelineRevision, favoriteUIDs: libraryModel.favoriteUIDs,
-            coordinateCount: libraryModel.locationIndex.coordinates.count, smartSearch: libraryModel.smartSearch,
-            coordinateRevision: libraryModel.locationIndex.revision
+            smartSearch: libraryModel.smartSearch,
+            placeRevision: mapAndPlacesEnabled ? libraryModel.locationIndex.placeRevision : nil
         ) + "|librarySettled:\(libraryModel.allowsAutomaticSuggestionRefresh)"
             + "|cacheContentSettled:\(libraryModel.allowsSuggestionCacheRestore)"
             + "|mapAndPlaces:\(mapAndPlacesEnabled)"
@@ -342,7 +342,8 @@ private struct MobileMainTabView: View {
                     smartSearch: libraryModel.smartSearch,
                     libraryIsSettled: libraryModel.allowsAutomaticSuggestionRefresh,
                     cacheContentIsSettled: libraryModel.allowsSuggestionCacheRestore,
-                    coordinateRevision: libraryModel.locationIndex.revision
+                    placeRevision: mapAndPlacesEnabled ? libraryModel.locationIndex.placeRevision : nil,
+                    locationEvidence: mapAndPlacesEnabled ? libraryModel.locationIndex.placeEvidence() : nil
                 )
             }
             .onChange(of: selection, initial: true) { _, _ in updateSearchActivity() }
@@ -406,7 +407,8 @@ private struct MobileMainTabView: View {
                     libraryModel: libraryModel,
                     viewerRouter: viewerRouter,
                     showsInfoInitially: presentation.showsInfoInitially,
-                    followsLibraryReplacements: presentation.followsLibraryReplacements
+                    followsLibraryReplacements: presentation.followsLibraryReplacements,
+                    duplicateGroup: presentation.duplicateGroup
                 )
             }
             .onChange(of: networkMonitor.didRecentlyRestoreConnection) { _, restored in

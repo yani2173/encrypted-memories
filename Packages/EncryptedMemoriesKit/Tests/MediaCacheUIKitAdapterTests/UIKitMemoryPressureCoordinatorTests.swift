@@ -10,16 +10,16 @@
             var tiers: [MemoryBudgetTier] = []
         }
 
-        @Test func separateOwnersSharingRoleReceiveEveryTierChange() {
+        @Test func separateOwnersReceiveEveryTierChange() {
             let governor = MemoryPressureGovernor()
             let coordinator = UIKitMemoryPressureCoordinator(testGovernor: governor)
             let first = Owner()
             let second = Owner()
 
-            coordinator.attach(first, key: "gridTextureCache") { [weak first] tier in
+            coordinator.attach(first) { [weak first] tier in
                 first?.tiers.append(tier)
             }
-            coordinator.attach(second, key: "gridTextureCache") { [weak second] tier in
+            coordinator.attach(second) { [weak second] tier in
                 second?.tiers.append(tier)
             }
 
@@ -36,10 +36,10 @@
             let first = Owner()
             let second = Owner()
 
-            coordinator.attach(first, key: "gridTextureCache") { [weak first] tier in
+            coordinator.attach(first) { [weak first] tier in
                 first?.tiers.append(tier)
             }
-            coordinator.attach(second, key: "gridTextureCache") { [weak second] tier in
+            coordinator.attach(second) { [weak second] tier in
                 second?.tiers.append(tier)
             }
             coordinator.detach(first)
@@ -55,7 +55,7 @@
             let coordinator = UIKitMemoryPressureCoordinator(testGovernor: governor)
             let owner = Owner()
 
-            coordinator.attach(owner, key: "gridTextureCache") { [weak owner] tier in
+            coordinator.attach(owner) { [weak owner] tier in
                 owner?.tiers.append(tier)
             }
 
@@ -75,7 +75,7 @@
             let owner = Owner()
             var coordinator: UIKitMemoryPressureCoordinator? = UIKitMemoryPressureCoordinator(testGovernor: governor)
 
-            coordinator?.attach(owner, key: "gridTextureCache") { [weak owner] tier in
+            coordinator?.attach(owner) { [weak owner] tier in
                 owner?.tiers.append(tier)
             }
             #expect(owner.tiers == [.normal])

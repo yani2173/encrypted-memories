@@ -27,10 +27,27 @@ public struct FavoriteState: Sendable, Equatable {
     private var nextRead = 0
     /// The newest read whose response was applied. An older response that arrives later is stale.
     private var appliedRead = -1
+    /// The library event token of the newest refresh. A favorite that another device changes moves it.
+    private var observedToken: String?
+    /// The observed token at the start of each open read, and at the start of the newest applied read.
+    private var readTokens: [Int: String] = [:]
+    private var appliedToken: String?
 
     private var tracksNewerWrites: Bool { !openReads.isEmpty || availability != .available }
 
+    /// Whether the favorites may predate the newest observed library token, so a server read is due. A read that
+    /// failed, or that started before the newest token, leaves them outdated.
+    public var isOutdated: Bool { observedToken != nil && observedToken != appliedToken }
+
+    /// Whether a server read is due: the last one is unknown or failed, or a newer library token arrived.
+    public var needsRead: Bool { availability != .available || isOutdated }
+
     public init() {}
+
+    /// Records the token that a successful library refresh returned. A nil token carries no information.
+    public mutating func observeLibraryToken(_ token: String?) {
+        if let token { observedToken = token }
+    }
 
     /// Forgets the writes in flight and the read state, for a new session or a retry. The shown favorites stay
     /// when `keepingFavorites` is true, so a retry does not blank the hearts. A read started before the reset
@@ -49,6 +66,7 @@ public struct FavoriteState: Sendable, Equatable {
         let read = Read(id: nextRead)
         nextRead += 1
         openReads.insert(read.id)
+        readTokens[read.id] = observedToken
         if availability != .available { availability = .loading }
         return read
     }
@@ -57,10 +75,12 @@ public struct FavoriteState: Sendable, Equatable {
     /// known before stay available. A response older than an applied one changes no favorites.
     public mutating func finishLoad(_ loaded: Set<PhotoUID>?, for read: Read) {
         guard openReads.remove(read.id) != nil else { return }
+        let token = readTokens.removeValue(forKey: read.id)
         if let loaded {
             if read.id > appliedRead {
                 favorites = FavoriteMutationPolicy.reconciling(authoritative: loaded, newerTargets: newerTargets)
                 appliedRead = read.id
+                appliedToken = token
             }
             availability = .available
         } else if availability != .available {
@@ -72,6 +92,7 @@ public struct FavoriteState: Sendable, Equatable {
     /// Ends a read whose task was cancelled, without a result.
     public mutating func cancelLoad(_ read: Read) {
         guard openReads.remove(read.id) != nil else { return }
+        readTokens.removeValue(forKey: read.id)
         endRead()
     }
 

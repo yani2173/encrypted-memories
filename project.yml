@@ -35,7 +35,7 @@ packages:
     path: Packages/EncryptedMemoriesKit
   ProtonCore:
     url: https://github.com/ProtonMail/protoncore_ios.git
-    # Proton Drive SDK 0.29.1 does not pin ProtonCore; the app pins this version for ProtonAuth and crypto.
+    # Proton Drive SDK 0.31.1 does not pin ProtonCore; the app pins this version for ProtonAuth and crypto.
     exactVersion: 37.3.0
 
 fileGroups:
@@ -244,6 +244,7 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - iOSTests
+      - Packages/EncryptedMemoriesKit/Tests/PhotosCoreTests/AppSettingsDefaultTests.swift
     dependencies:
       - target: EncryptedMemoriesMobile
     settings:
@@ -303,4 +304,16 @@ schemes:
     test:
       config: Debug
       targets:
+        - EncryptedMemoriesMobileUITests
+
+  EncryptedMemoriesMobileCI:
+    build:
+      targets:
+        EncryptedMemoriesMobile: all
+        EncryptedMemoriesMobileTests: [test]
+        EncryptedMemoriesMobileUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - EncryptedMemoriesMobileTests
         - EncryptedMemoriesMobileUITests

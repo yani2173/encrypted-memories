@@ -25,6 +25,9 @@ public enum ProtonColor {
         public static let backgroundNorm = Color(nsColor: .windowBackgroundColor)
     #elseif os(iOS)
         public static let backgroundNorm = Color(uiColor: .systemBackground)
+        /// The background of an inset grouped list, and of the rounded cards on it.
+        public static let groupedBackground = Color(uiColor: .systemGroupedBackground)
+        public static let groupedCard = Color(uiColor: .secondarySystemGroupedBackground)
     #endif
 
     // Text uses semantic label roles that support Dynamic Type and vibrancy.

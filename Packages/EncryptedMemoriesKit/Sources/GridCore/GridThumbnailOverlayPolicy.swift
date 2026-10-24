@@ -20,7 +20,8 @@ package struct GridThumbnailOverlay: Equatable, Sendable {
 }
 
 /// Upload state shown on a pending tile: an empty circle while waiting, a circle that fills while bytes move, a
-/// checkmark once backed up, and an exclamation mark for a failure that needs the person.
+/// checkmark once backed up, an exclamation mark for a failure that needs the person, and a pause symbol while
+/// the person pauses the backup.
 package enum GridUploadBadge: Equatable, Hashable, Sendable {
     package static let progressSteps = 20
 
@@ -31,6 +32,8 @@ package enum GridUploadBadge: Equatable, Hashable, Sendable {
     case attention
     /// A photo in "Zuletzt gelöscht" that was deleted before it uploaded: it exists only on this device.
     case notBackedUp
+    /// A waiting or uploading photo while the person pauses the backup.
+    case paused
 }
 
 package enum GridThumbnailOverlayLabelKind: Equatable, Sendable {

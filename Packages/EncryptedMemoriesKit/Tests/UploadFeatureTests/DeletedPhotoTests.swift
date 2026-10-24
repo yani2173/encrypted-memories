@@ -447,25 +447,29 @@ final class DeletedPhotoTests: XCTestCase {
         XCTAssertEqual(parts.queue.entry(for: source, revision: current)?.state, .completed)
     }
 
-    @MainActor
-    func testControllerBackUpAgainStartsAPass() async throws {
-        let suite = "deletion-controller-pass-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
-        XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
-        controller.setAccessStateForTesting(.full)
-        // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
-        controller.replacePassBodyForTesting {}
-        let item = try XCTUnwrap(controller.failedItems().first)
-        XCTAssertFalse(controller.isSyncing)
-        controller.backUpAgain(item)
-        XCTAssertTrue(controller.isSyncing)
-        XCTAssertNotNil(controller.activeExecutionRunID)
-        await controller.shutdown()
-    }
+    #if DEBUG
+        @MainActor
+        func testControllerBackUpAgainStartsAPass() async throws {
+            let suite = "deletion-controller-pass-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults,
+                    runtimeSignals: .wiFiWithMobileDataOff),
+                identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+            XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
+            controller.setAccessStateForTesting(.full)
+            // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
+            controller.replacePassBodyForTesting {}
+            let item = try XCTUnwrap(controller.failedItems().first)
+            XCTAssertFalse(controller.isSyncing)
+            controller.backUpAgain(item)
+            XCTAssertTrue(controller.isSyncing)
+            XCTAssertNotNil(controller.activeExecutionRunID)
+            await controller.shutdown()
+        }
+    #endif
 
     @MainActor
     func testControllerMapsDecisionRowsAndWritesBothChoicesWithoutDismissal() async throws {
@@ -596,6 +600,39 @@ final class DeletedPhotoTests: XCTestCase {
         let edit = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
         XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, edit.snapshot.revision)
         XCTAssertTrue(journal.entry(for: plain).isEmpty, "an unedited photo needs no answer")
+        await controller.shutdown()
+    }
+
+    /// "Back Up Again" on an excluded photo that was deleted in Apple Photos meanwhile succeeds and queues nothing,
+    /// so the restore ends and the entry leaves the excluded list.
+    @MainActor
+    func testReturningAPhotoDeletedInApplePhotosQueuesNothing() async throws {
+        let suite = "deletion-return-gone-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let info = PhotoBackupAssetInfo(
+            localIdentifier: source.identifier, creationDate: date, modificationDate: date,
+            pixelWidth: 4032, pixelHeight: 3024, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+            resources: [.init(role: .originalPhoto, originalFilename: "photo.heic", mimeType: "image/heic")])
+        let catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
+        _ = catalog.upsert(PhotoLibraryCatalogMapper.entry(for: info, observedAt: date))
+        XCTAssertTrue(catalog.markRemoved([source.identifier], removedAt: date.addingTimeInterval(60)).succeeded)
+        catalog.close()
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+
+        let returned = await controller.returnToBackup(identifiers: [source.identifier])
+
+        XCTAssertTrue(returned, "a photo that is gone needs nothing, so the restore completes")
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        defer { queue.close() }
+        XCTAssertTrue(queue.rows(kind: .photoLibraryAsset, identifiers: [source.identifier]).isEmpty)
+        XCTAssertFalse(controller.isSyncing)
         await controller.shutdown()
     }
 

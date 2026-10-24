@@ -20,6 +20,10 @@ final class FakeAlbumBackend: AlbumCatalogBackend, AlbumWriteBackend, @unchecked
     var sharedAlbums: [SharedAlbumSummary] = []
     var memberships: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
     var addError: (any Error)?
+    var listError: (any Error)?
+    var sharedListError: (any Error)?
+    /// Runs inside every catalog listing before it returns, so a test can hold a load while it checks the state.
+    var listHold: (@Sendable () async -> Void)?
 
     init(capabilities: AlbumCapabilities, albums: [AlbumSummary] = []) {
         self.capabilities = capabilities
@@ -28,10 +32,14 @@ final class FakeAlbumBackend: AlbumCatalogBackend, AlbumWriteBackend, @unchecked
 
     func listAlbums() async throws -> [AlbumSummary] {
         listAlbumRequests += 1
+        await listHold?()
+        if let listError { throw listError }
         return albums
     }
     func listSharedWithMeAlbums() async throws -> [SharedAlbumSummary] {
         listSharedAlbumRequests += 1
+        await listHold?()
+        if let sharedListError { throw sharedListError }
         return sharedAlbums
     }
     func leaveSharedAlbum(_ album: AlbumNodeIdentifier) async throws {

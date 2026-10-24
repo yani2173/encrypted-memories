@@ -230,7 +230,8 @@ public actor DragOutStager {
                 try? FileManager.default.removeItem(at: finalURL)
                 let deliveredURL: URL
                 if removesLocation {
-                    deliveredURL = try await LocationSanitizedCopy.write(from: destination, to: finalURL)
+                    deliveredURL = try await OriginalExportWriter.completeDownloadedOriginal(
+                        from: destination, to: finalURL, removeLocation: true)
                     try FileManager.default.removeItem(at: destination)
                 } else {
                     try FileManager.default.moveItem(at: destination, to: finalURL)
@@ -361,11 +362,13 @@ public protocol SizedOriginalFileProvider: Sendable {
 
 /// Serialises on-disk name assignment so two items resolving to the same original name
 /// (`IMG_0001.HEIC` twice) get `IMG_0001 2.HEIC` etc. Case-insensitive to match the typical
-/// filesystem. Mirrors `iOSApp/MobileSelectionSupport.swift`'s `ExportNames`.
-actor UniqueNames {
+/// filesystem.
+public actor UniqueNames {
     private var used: Set<String> = []
 
-    func unique(_ name: String) -> String {
+    public init() {}
+
+    public func unique(_ name: String) -> String {
         if reserve(name) { return name }
         let ns = name as NSString
         let base = ns.deletingPathExtension

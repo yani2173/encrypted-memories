@@ -656,7 +656,8 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
         switch compatibility {
         case .incompatible:
             return .incompatible
-        case .unavailable:
+        case .unavailable, .retryLater:
+            // The store stays as it is: it holds user data, so it is never replaced here.
             return .failed
         case .empty, .current:
             break

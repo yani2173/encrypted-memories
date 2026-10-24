@@ -65,6 +65,10 @@ public struct UploadBackendCapabilities: Sendable, Equatable {
 public protocol PhotoUploading: Sendable {
     var capabilities: UploadBackendCapabilities { get }
 
+    /// Waits until an upload of this network kind may start; see `UploadNetworkAdmission`. Every caller reserves before
+    /// it calls `upload` and puts the reservation into `PhotoUploadRequest.networkReservation`.
+    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation
+
     /// Uploads one file to the photo library, returning the new photo's identifier.
     func upload(
         _ request: PhotoUploadRequest,

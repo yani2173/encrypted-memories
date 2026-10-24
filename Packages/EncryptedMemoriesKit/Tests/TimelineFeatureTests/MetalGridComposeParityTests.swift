@@ -33,13 +33,13 @@ import Testing
         return ctx?.makeImage()
     }
 
-    private func makeCache() -> MetalGridTextureCache<PhotoUID>? {
+    private func makeCache(maxResidentBytes: Int = 256_000_000) -> MetalGridTextureCache<PhotoUID>? {
         guard let device = MTLCreateSystemDefaultDevice() else { return nil }  // no GPU (CI) to skip
         return MetalGridTextureCache(
             device: device,
             budget: GridTextureBudget(
                 maxUploadsPerFrame: 64, maxUploadBytesPerFrame: 64_000_000,
-                maxCachedTextures: 4096, maxResidentBytes: 256_000_000, overscanFraction: 1.0
+                maxCachedTextures: 4096, maxResidentBytes: maxResidentBytes, overscanFraction: 1.0
             ),
             maxTexturePixels: 64,
             glyphRasterizer: AppKitMetalGridGlyphRasterizer()
@@ -86,7 +86,7 @@ import Testing
         let ram: [PhotoUID: CGImage] = [a: image, b: image]
         let result = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: [a, b, c], overscanIDs: [],
-            pinOverscan: true, effectiveUploadPixels: 64, allowUpgrade: false,
+            effectiveUploadPixels: 64, allowUpgrade: false,
             hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] }
         )
         #expect(cache.isResident(a))
@@ -109,7 +109,7 @@ import Testing
 
         _ = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: [visible], overscanIDs: [overscan],
-            pinOverscan: true, effectiveUploadPixels: 64, allowUpgrade: false, now: startedAt,
+            effectiveUploadPixels: 64, allowUpgrade: false, now: startedAt,
             hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] }
         )
 
@@ -140,7 +140,7 @@ import Testing
         // prepared overscan tile, but it must remain immediately opaque when it later enters the viewport.
         _ = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: [visible], overscanIDs: [overscan],
-            pinOverscan: true, effectiveUploadPixels: 64, allowUpgrade: false, now: 200,
+            effectiveUploadPixels: 64, allowUpgrade: false, now: 200,
             hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] }
         )
         #expect(cache.isResident(overscan))
@@ -157,7 +157,7 @@ import Testing
         func run(effective: Int, allowUpgrade: Bool) -> MetalGridFrameComposer.StreamResult<PhotoUID> {
             MetalGridFrameComposer.stream(
                 cache: cache, visibleIDs: [a], overscanIDs: [],
-                pinOverscan: true, effectiveUploadPixels: effective, allowUpgrade: allowUpgrade,
+                effectiveUploadPixels: effective, allowUpgrade: allowUpgrade,
                 hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] })
         }
 
@@ -187,7 +187,7 @@ import Testing
         // Upload small with the source present.
         _ = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: [a], overscanIDs: [],
-            pinOverscan: true, effectiveUploadPixels: 32, allowUpgrade: false,
+            effectiveUploadPixels: 32, allowUpgrade: false,
             hasImage: { _ in true }, canRetry: { _ in true }, provideImage: { _ in image })
         #expect(cache.texture(for: a).width == 32)
 
@@ -196,7 +196,7 @@ import Testing
         // keeps ticking until it sharpens, never a permanent low-res and never a silent forever-spin.
         let settled = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: [a], overscanIDs: [],
-            pinOverscan: true, effectiveUploadPixels: 64, allowUpgrade: true,
+            effectiveUploadPixels: 64, allowUpgrade: true,
             hasImage: { _ in false }, canRetry: { _ in true }, provideImage: { _ in nil })
         #expect(cache.texture(for: a).width == 32)  // old soft texture still on screen (no placeholder gap)
         #expect(settled.warm.contains(a))  // source requested for re-decode
@@ -204,18 +204,79 @@ import Testing
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
-    func streamPinOverscanFalseClampsPinnedToVisibleCount() throws {
+    func streamFreesTheOverscanBandWhileARetryableVisibleTileIsMissing() throws {
         let cache = try #require(makeCache())
         let vis = [uid("v0"), uid("v1")]
         let over = [uid("o0"), uid("o1"), uid("o2")]
-        // Nothing is RAM-ready, so nothing uploads; assert only the pin-window shape.
+        // Nothing is RAM-ready and every tile can be fetched, so a visible tile is missing and nothing uploads.
         _ = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: vis, overscanIDs: over,
-            pinOverscan: false, effectiveUploadPixels: 64, allowUpgrade: false,
+            effectiveUploadPixels: 64, allowUpgrade: false,
             hasImage: { _ in false }, canRetry: { _ in true }, provideImage: { _ in nil }
         )
-        // pinOverscan:false, so pinned clamps to the visible count (2), never the overscan band.
-        #expect(cache.pinnedCount == 2)
+        // Pinned clamps to the visible count, never the overscan band.
+        #expect(cache.pinnedCount == vis.count)
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func streamUploadsAVisibleTileThatPinnedOverscanOfAnotherZoomLevelWouldBlock() throws {
+        let largeTextureBytes = 64 * 64 * 4
+        // The budget holds four 64 px textures and a little more, so a fifth pinned texture would not fit.
+        let cache = try #require(makeCache(maxResidentBytes: 4 * largeTextureBytes + 2048))
+        let image = try #require(makeImage())
+        let earlier = (0..<4).map { uid("earlier\($0)") }
+        let visible = uid("visible")
+        let ram: [PhotoUID: CGImage] = Dictionary(uniqueKeysWithValues: (earlier + [visible]).map { ($0, image) })
+        func run(visibleIDs: [PhotoUID], overscanIDs: [PhotoUID], effectiveUploadPixels: Int) {
+            _ = MetalGridFrameComposer.stream(
+                cache: cache, visibleIDs: visibleIDs, overscanIDs: overscanIDs,
+                effectiveUploadPixels: effectiveUploadPixels, allowUpgrade: false,
+                hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] }
+            )
+        }
+
+        // A zoom level with large tiles fills the budget; the next level shows other tiles and keeps these as overscan.
+        run(visibleIDs: earlier, overscanIDs: [], effectiveUploadPixels: 64)
+        #expect(earlier.allSatisfy { cache.isResident($0) })
+
+        run(visibleIDs: [visible], overscanIDs: earlier, effectiveUploadPixels: 32)
+        #expect(cache.isResident(visible))
+        #expect(!cache.residencySaturatedThisFrame)
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func streamPinsTheOverscanBandWhenAMissingVisibleTileCannotBeFetched() throws {
+        let cache = try #require(makeCache())
+        let vis = [uid("v0"), uid("v1")]
+        let over = [uid("o0"), uid("o1"), uid("o2")]
+        _ = MetalGridFrameComposer.stream(
+            cache: cache, visibleIDs: vis, overscanIDs: over,
+            effectiveUploadPixels: 64, allowUpgrade: false,
+            hasImage: { _ in false }, canRetry: { _ in false }, provideImage: { _ in nil }
+        )
+        #expect(cache.pinnedCount == vis.count + over.count)
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func streamPinsTheOverscanBandOnceEveryVisibleTileIsResident() throws {
+        let cache = try #require(makeCache())
+        let image = try #require(makeImage())
+        let vis = [uid("v0"), uid("v1")]
+        let over = [uid("o0"), uid("o1"), uid("o2")]
+        let ram: [PhotoUID: CGImage] = Dictionary(uniqueKeysWithValues: vis.map { ($0, image) })
+        func run() {
+            _ = MetalGridFrameComposer.stream(
+                cache: cache, visibleIDs: vis, overscanIDs: over,
+                effectiveUploadPixels: 64, allowUpgrade: false,
+                hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] }
+            )
+        }
+        run()
+        #expect(vis.allSatisfy { cache.isResident($0) })
+        // The first pass still saw missing visible tiles; the pass that follows finds none.
+        #expect(cache.pinnedCount == vis.count)
+        run()
+        #expect(cache.pinnedCount == vis.count + over.count)
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
@@ -228,7 +289,7 @@ import Testing
 
         let result = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: visible, overscanIDs: overscan,
-            pinOverscan: false, effectiveUploadPixels: 64, allowUpgrade: false,
+            effectiveUploadPixels: 64, allowUpgrade: false,
             hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] }
         )
 
@@ -248,14 +309,14 @@ import Testing
 
         _ = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: visible, overscanIDs: overscan,
-            pinOverscan: false, effectiveUploadPixels: 64, allowUpgrade: false,
+            effectiveUploadPixels: 64, allowUpgrade: false,
             hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] }
         )
         #expect(visible.allSatisfy { cache.isResident($0) })
 
         _ = MetalGridFrameComposer.stream(
             cache: cache, visibleIDs: visible, overscanIDs: overscan,
-            pinOverscan: true, effectiveUploadPixels: 64, allowUpgrade: false,
+            effectiveUploadPixels: 64, allowUpgrade: false,
             hasImage: { ram[$0] != nil }, canRetry: { _ in true }, provideImage: { ram[$0] }
         )
 

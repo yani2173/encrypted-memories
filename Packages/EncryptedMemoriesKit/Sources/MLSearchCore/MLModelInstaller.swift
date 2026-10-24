@@ -533,6 +533,33 @@ public actor MLModelInstaller {
         var completedBytes: Int64 = 0
         let staging = layout.stagingDirectory(for: entry.id, revision: plan.revision)
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        // The app can stop after the atomic record write, before the directory rename.
+        // Reuse the installed-record verifier; a marker alone never authorizes model loading.
+        if try fm.contentsOfDirectory(atPath: staging.path).contains(MLModelInstallLayout.installRecordFileName) {
+            if let record = readVerifiedRecord(
+                at: staging.appendingPathComponent(MLModelInstallLayout.installRecordFileName),
+                expecting: entry.id,
+                revision: plan.revision,
+                compatibility: MLModelInstallCompatibility(entry: entry),
+                expectedArtifacts: plan.items.map(\.artifact),
+                installDirectory: staging
+            ) {
+                try Task.checkCancellation()
+                return try promote(
+                    staging: staging,
+                    entry: entry,
+                    revision: plan.revision,
+                    specs: plan.items.map(\.artifact),
+                    layout: layout,
+                    installedAt: record.installedAt,
+                    recoveredRecord: record
+                )
+            }
+            // A failed verification invalidates the whole recorded install, including partials.
+            // Propagate deletion errors so a retry cannot silently keep the poisoned tree.
+            try fm.removeItem(at: staging)
+            try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        }
         // Resumed bytes already occupy the disk; only the rest of the transfer needs new space.
         let remainingBytes = plan.items.reduce(Int64(0)) { total, item in
             let destination = staging.appendingPathComponent(item.artifact.relativePath)
@@ -622,7 +649,8 @@ public actor MLModelInstaller {
         revision: String,
         specs: [MLModelArtifactSpec],
         layout: MLModelInstallLayout,
-        installedAt: Date
+        installedAt: Date,
+        recoveredRecord: MLModelInstallRecord? = nil
     ) throws -> MLModelInstallRecord {
         let fm = FileManager.default
         let normalizedSpecs = specs.sorted { $0.relativePath < $1.relativePath }
@@ -641,23 +669,31 @@ public actor MLModelInstaller {
             validateInstallTree(
                 at: staging,
                 artifacts: normalizedSpecs,
-                includesInstallRecord: false
+                includesInstallRecord: recoveredRecord != nil
             )
         else {
             throw MLModelInstallError.ambiguousModelArtifact
         }
-        let record = MLModelInstallRecord(
-            modelID: entry.id,
-            revision: revision,
-            compatibility: MLModelInstallCompatibility(entry: entry),
-            modelRootPath: modelRootPath,
-            artifacts: normalizedSpecs,
-            installedByteCount: normalizedSpecs.reduce(0) { $0 + $1.byteCount },
-            installedAt: installedAt
-        )
-        let recordData = try JSONEncoder().encode(record)
-        try recordData.write(
-            to: staging.appendingPathComponent(MLModelInstallLayout.installRecordFileName), options: .atomic)
+        let record =
+            recoveredRecord
+            ?? MLModelInstallRecord(
+                modelID: entry.id,
+                revision: revision,
+                compatibility: MLModelInstallCompatibility(entry: entry),
+                modelRootPath: modelRootPath,
+                artifacts: normalizedSpecs,
+                installedByteCount: normalizedSpecs.reduce(0) { $0 + $1.byteCount },
+                installedAt: installedAt
+            )
+        if recoveredRecord == nil {
+            let recordData = try JSONEncoder().encode(record)
+            try recordData.write(
+                to: staging.appendingPathComponent(MLModelInstallLayout.installRecordFileName), options: .atomic)
+        }
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            UpgradeTestProbe.checkpoint("model.installRecord")
+        #endif
+
         guard
             validateInstallTree(
                 at: staging,
@@ -672,6 +708,10 @@ public actor MLModelInstaller {
         try fm.createDirectory(at: installDir.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? fm.removeItem(at: installDir)
         try fm.moveItem(at: staging, to: installDir)
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            UpgradeTestProbe.checkpoint("model.promoted")
+        #endif
+
         return record
     }
 

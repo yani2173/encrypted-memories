@@ -63,9 +63,7 @@ struct MobileSignOutFailureView: View {
             } description: {
                 Text(L10n.string("sign_out.cleanup_failed_message"))
             } actions: {
-                Button(L10n.string("sign_out.try_again"), action: onRetry)
-                    .buttonStyle(.borderedProminent)
-                    .tint(ProtonColor.primary)
+                RetryButton(.prominent, action: onRetry)
             }
             .padding()
         }
@@ -121,23 +119,6 @@ final class MobileFrostedBackdropView: UIVisualEffectView {
     }
 }
 
-/// Shown only when the library truly holds no photos - the one case where a blank grid is acceptable.
-struct MobileEmptyLibraryView: View {
-    var body: some View {
-        let copy = PhotoFilter.all.emptyStateCopy
-        ContentUnavailableView {
-            Label {
-                Text(copy.title)
-            } icon: {
-                MemoriesBrandMark(height: 40)
-                    .accessibilityLabel(ProductBrand.displayName)
-            }
-        } description: {
-            Text(copy.description)
-        }
-    }
-}
-
 /// Shown when the first load fails; offers a retry when the failure is retryable.
 struct MobileLibraryErrorView: View {
     let message: String
@@ -151,9 +132,7 @@ struct MobileLibraryErrorView: View {
             Text(message)
         } actions: {
             if retryable {
-                Button(String(localized: "action.try_again"), action: onRetry)
-                    .buttonStyle(.borderedProminent)
-                    .tint(ProtonColor.primary)
+                RetryButton(.prominent, action: onRetry)
             }
         }
     }

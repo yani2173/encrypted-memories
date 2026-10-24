@@ -51,6 +51,40 @@ import Testing
         )
     }
 
+    @Test(arguments: ["missing", "changed", "unpaired"])
+    func publicationValidationRejectsAnUnprovenReread(state: String) async {
+        let repository = RereadValidationRepository(state: state)
+        let result = await TimelineCacheValidationPolicy.validateForPublication(
+            snapshot: snapshot(token: "photos-inventory-v2:a"), repository: repository)
+        #expect(result.validation == .refreshRequired(monitorBaseline: ""))
+        #expect(result.snapshot == nil, "An unproven reread cannot become an authoritative publication")
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func cancellationDuringRereadCannotValidateAPublication() async {
+        let repository = RereadValidationRepository(state: "held")
+        let validation = Task {
+            await TimelineCacheValidationPolicy.validateForPublication(
+                snapshot: snapshot(token: "photos-inventory-v2:a"), repository: repository)
+        }
+        await repository.waitUntilHeld()
+        validation.cancel()
+        await repository.release()
+        let result = await validation.value
+        #expect(result.validation == .refreshRequired(monitorBaseline: ""))
+        #expect(result.snapshot == nil)
+    }
+
+    @Test
+    func failedCheapValidationCannotAuthorizeACacheReread() async {
+        let repository = FailedRereadValidationRepository()
+        let result = await TimelineCacheValidationPolicy.validateForPublication(
+            snapshot: snapshot(token: "photos-inventory-v2:a"), repository: repository)
+        #expect(result.validation == .refreshRequired(monitorBaseline: "photos-inventory-v2:b"))
+        #expect(result.snapshot == nil, "A failed cheap check must not authorize cached content for publication")
+        #expect(await repository.cachedReads == 0, "A failed cheap check proceeds directly to authoritative recovery")
+    }
+
     private func snapshot(token: String?) -> CachedTimelineSnapshot {
         CachedTimelineSnapshot(sections: [], validationToken: token)
     }
@@ -87,3 +121,40 @@ private struct TerminalCacheValidationRepository: PhotosRepository, LibraryChang
 }
 
 private struct TerminalCacheValidationError: LibraryChangeTerminalError {}
+
+private actor RereadValidationRepository: PhotosRepository, LibraryChangeTokenProvider {
+    let state: String
+    private var held = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    init(state: String) { self.state = state }
+    func loadTimeline() async throws -> [TimelineSection] { [] }
+    func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String { "photos-inventory-v2:a" }
+    func libraryChangeToken() async throws -> String { "a#media=1#order=1" }
+    func cachedTimelineSnapshot() async -> CachedTimelineSnapshot? {
+        if state == "held" {
+            held = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+        if state == "missing" { return nil }
+        return CachedTimelineSnapshot(
+            sections: [],
+            validationToken: state == "changed"
+                ? "photos-inventory-v2:b" : state == "unpaired" ? nil : "photos-inventory-v2:a")
+    }
+    func waitUntilHeld() async { while !held { await Task.yield() } }
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor FailedRereadValidationRepository: PhotosRepository, LibraryChangeTokenProvider {
+    private(set) var cachedReads = 0
+    func loadTimeline() async throws -> [TimelineSection] { [] }
+    func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String { "photos-inventory-v2:b" }
+    func libraryChangeToken() async throws -> String { "b#media=1#order=1" }
+    func cachedTimelineSnapshot() async -> CachedTimelineSnapshot? {
+        cachedReads += 1
+        return CachedTimelineSnapshot(sections: [], validationToken: "photos-inventory-v2:a")
+    }
+}

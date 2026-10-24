@@ -20,13 +20,17 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
     private let identityResolver: any UploadIdentityResolving
     private let uploader: any PhotoUploading
     private let injectedResourceResolver: (any BackupResourceResolving)?
+    private let injectedProofCatalog: (any UploadBackupAssetCatalog)?
     private let stopFenceAcquired: (@Sendable () async -> Void)?
     private let stopFenceBarrier: (@Sendable () async -> Void)?
+    private let runtimeSignals: BackupRuntimeSignalSource
+    private let clock: any BackupSchedulerClock
 
     private let lock = NSLock()
     private struct ActiveOperation {
         let id: UUID
-        let task: Task<AlbumSyncBackupReport, any Error>
+        let cancel: @Sendable () -> Void
+        let wait: @Sendable () async -> Void
     }
     private var activeOperation: ActiveOperation?
     private var activeRunner: BackupSyncRunner?
@@ -43,8 +47,11 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         self.identityResolver = identityResolver
         self.uploader = uploader
         injectedResourceResolver = nil
+        injectedProofCatalog = nil
         stopFenceAcquired = nil
         stopFenceBarrier = nil
+        runtimeSignals = .apple
+        clock = BackupContinuousClock()
     }
 
     init(
@@ -53,40 +60,52 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         identityResolver: any UploadIdentityResolving,
         uploader: any PhotoUploading,
         resourceResolver: any BackupResourceResolving,
+        proofCatalog: (any UploadBackupAssetCatalog)? = nil,
         stopFenceAcquired: (@Sendable () async -> Void)? = nil,
-        stopFenceBarrier: (@Sendable () async -> Void)? = nil
+        stopFenceBarrier: (@Sendable () async -> Void)? = nil,
+        runtimeSignals: BackupRuntimeSignalSource = .apple,
+        clock: any BackupSchedulerClock = BackupContinuousClock()
     ) {
         self.accountDataDirectory = accountDataDirectory
         self.databasePolicy = databasePolicy
         self.identityResolver = identityResolver
         self.uploader = uploader
         injectedResourceResolver = resourceResolver
+        injectedProofCatalog = proofCatalog
         self.stopFenceAcquired = stopFenceAcquired
         self.stopFenceBarrier = stopFenceBarrier
+        self.runtimeSignals = runtimeSignals
+        self.clock = clock
     }
 
     public func ensureBackedUp(
         localIdentifiers: [String],
         onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
     ) async throws -> AlbumSyncBackupReport {
+        try await withOperation { [self] in
+            try await performEnsureBackedUp(localIdentifiers: localIdentifiers, onProgress: onProgress)
+        }
+    }
+
+    private func withOperation<Value: Sendable>(
+        _ operation: @Sendable @escaping () async throws -> Value
+    ) async throws -> Value {
         try Task.checkCancellation()
 
         let operationID = UUID()
         let startGate = PhotoAlbumBackupExecutorStartGate()
-        var operationTask: Task<AlbumSyncBackupReport, any Error>?
+        var operationTask: Task<Value, any Error>?
         let admitted = lock.withLock {
             guard activeOperation == nil, stopOwnerCount == 0 else { return false }
             let task = Task { [self] in
                 await startGate.wait()
                 defer { finishOperation(id: operationID) }
                 try Task.checkCancellation()
-                return try await performEnsureBackedUp(
-                    localIdentifiers: localIdentifiers,
-                    onProgress: onProgress
-                )
+                return try await operation()
             }
             operationTask = task
-            activeOperation = ActiveOperation(id: operationID, task: task)
+            activeOperation = ActiveOperation(
+                id: operationID, cancel: { task.cancel() }, wait: { _ = await task.result })
             return true
         }
         guard admitted, let operationTask else {
@@ -166,7 +185,9 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
             resolver: resourceResolver,
             identityResolver: identityResolver,
             uploader: uploader,
-            throttleInputs: { AppleBackupRuntimeSignals.current() }
+            throttleInputs: runtimeSignals.current,
+            runtimeChanges: runtimeSignals.updates,
+            clock: clock
         )
         lock.withLock { activeRunner = runner }
         defer { lock.withLock { activeRunner = nil } }
@@ -174,41 +195,33 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         await runner.setOnProgress { snapshot in onProgress(snapshot) }
         _ = try await engine.scan(PhotoLibraryBackupCatalog(localIdentifiers: localIdentifiers))
         _ = await runner.runUntilDrained(workIntent: .userInitiated)
+        try await runner.checkCancellation()
         try Task.checkCancellation()
         guard await runner.isQueueOperational(), queueStore.isOperational() else {
             throw AlbumSyncError.mappingStoreUnavailable
         }
         tempStore.sweep()
 
-        let summary = queueStore.summary()
-        guard queueStore.isOperational() else {
-            throw AlbumSyncError.mappingStoreUnavailable
+        return try AlbumSyncBackupReport.read(from: queueStore, localIdentifiers: localIdentifiers)
+    }
+
+    public func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        try await withOperation { [self] in
+            try await performRemoteProofLinks(for: localIdentifiers)
         }
-        // The scratch queue holds only this run, so its unresolved rows are the album's per-photo reasons.
-        // Problem rows arrive newest revision first; the first one per photo wins.
-        var problems: [String: BackupFailedItem] = [:]
-        queueStore.forEachProblemEntry { entry in
-            if entry.source.kind == .photoLibraryAsset, problems[entry.source.identifier] == nil {
-                problems[entry.source.identifier] = BackupFailedItem(entry: entry)
-            }
-            return true
-        }
-        var filenames: [String: String] = [:]
-        for row in queueStore.rows(kind: .photoLibraryAsset, identifiers: Set(localIdentifiers))
-        where !row.originalFilename.isEmpty {
-            if row.source.resource == .primary || filenames[row.source.identifier] == nil {
-                filenames[row.source.identifier] = row.originalFilename
-            }
-        }
-        return AlbumSyncBackupReport(
-            total: summary.total,
-            backedUp: summary.resolved,
-            failed: summary.failed,
-            sourceMissing: summary.sourceMissing,
-            skippedRemoteDeletion: summary.skippedRemoteDeletions,
-            problems: problems,
-            filenames: filenames
-        )
+    }
+
+    private func performRemoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        guard
+            let queue = UploadBackupSyncQueueManifestStore(
+                url: accountDataDirectory.appendingPathComponent(Self.queueDatabaseFileName),
+                policy: databasePolicy)
+        else { throw AlbumSyncError.mappingStoreUnavailable }
+        defer { queue.close() }
+        return try await AlbumSyncRemoteProofLookup.remoteLinks(
+            for: localIdentifiers,
+            catalog: injectedProofCatalog ?? PhotoLibraryBackupCatalog(localIdentifiers: localIdentifiers),
+            queue: queue, resolver: identityResolver)
     }
 
     public func stop() async {
@@ -223,11 +236,9 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
             }
         }
         await stopFenceAcquired?()
-        operation?.task.cancel()
+        operation?.cancel()
         await runner?.stop()
-        if let operation {
-            _ = await operation.task.result
-        }
+        await operation?.wait()
         await stopFenceBarrier?()
     }
 

@@ -16,8 +16,7 @@ final class AppleRuntimeMemoryPolicyTests: XCTestCase {
                     XCTAssertEqual(
                         AppleRuntimeMemoryPolicy.pressure(
                             dispatchPressure: pressure,
-                            memoryWarningLatched: warningLatched,
-                            isBackgrounded: opportunity == .backgroundPermitted || opportunity == .suspended
+                            memoryWarningLatched: warningLatched
                         ),
                         conditions(opportunity, pressure: pressure, warningLatched: warningLatched).pressure
                     )

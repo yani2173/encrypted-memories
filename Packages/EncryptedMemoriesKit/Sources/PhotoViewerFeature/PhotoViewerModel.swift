@@ -4,6 +4,7 @@ import AppKit
 import Foundation
 import MediaByteCache
 import MediaCache
+import MediaFeedCore
 import PhotoViewerCore
 import PhotosCore
 import VisionKit
@@ -81,6 +82,8 @@ public final class PhotoViewerModel {
     }
 
     private let feed: ThumbnailFeed
+    public let allowsVisibleDuplicateThumbnails: Bool
+    private let visibleThumbnail: VisibleThumbnailSession?
     private var pageIndex: ViewerPageIndex
     private let media: FullMediaProvider
     private let originalByteStreamer: (any OriginalByteStreamProvider)?
@@ -111,6 +114,10 @@ public final class PhotoViewerModel {
     private var requestedSharpPixelSize = 0
     private var originalLoadGeneration: UInt64 = 0
     private var burstSelection = BurstSelectionModel()
+    private let editedOriginalProvider: (any EditedPhotoOriginalProviding)?
+    private let editedOriginalLookup = EditedPhotoOriginalLookup()
+    /// The originals of edited photos that this viewer found, and whether the page shows one.
+    public private(set) var editedOriginal = EditedPhotoOriginalState()
 
     public var burstItems: [PhotoItem] { burstSelection.items }
     public var burstIndex: Int? { burstSelection.selectedIndex }
@@ -124,12 +131,16 @@ public final class PhotoViewerModel {
         knownLocationUIDs: Set<PhotoUID> = [],
         burstProvider: BurstGroupProvider? = nil,
         previewCache: ThumbnailCache? = nil, originalsCache: ThumbnailCache? = nil,
-        cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil
+        cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil,
+        allowsVisibleDuplicateThumbnails: Bool = false,
+        editedOriginalProvider: (any EditedPhotoOriginalProviding)? = nil
     ) {
         self.items = items
         self.index = index
         self.pageIndex = ViewerPageIndex(orderedUIDs: items.map(\.uid))
         self.feed = feed
+        self.allowsVisibleDuplicateThumbnails = allowsVisibleDuplicateThumbnails
+        self.visibleThumbnail = allowsVisibleDuplicateThumbnails ? VisibleThumbnailSession(feed: feed.feedCore) : nil
         self.media = media
         self.originalByteStreamer = media as? any OriginalByteStreamProvider
         self.streamer = streamer
@@ -141,6 +152,7 @@ public final class PhotoViewerModel {
         )
         self.knownLocationUIDs = knownLocationUIDs
         self.burstProvider = burstProvider
+        self.editedOriginalProvider = editedOriginalProvider
         self.previewCache = previewCache
         self.originalsCache = originalsCache
         self.cacheOriginals = cacheOriginals
@@ -206,14 +218,14 @@ public final class PhotoViewerModel {
         }
         let item = current
         isLoadingAlbumMemberships = true
-        albumMembershipTask = Task { [albumMembershipProvider] in
+        albumMembershipTask = Task { [weak self, albumMembershipProvider] in
             do {
                 let titles = try await albumMembershipProvider.albumMembershipTitles(for: item.uid)
-                guard !Task.isCancelled, self.isDisplaying(item) else { return }
+                guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
                 self.albumTitles = titles
                 self.isLoadingAlbumMemberships = false
             } catch {
-                guard !Task.isCancelled, self.isDisplaying(item) else { return }
+                guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
                 self.isLoadingAlbumMemberships = false
                 self.albumMembershipsLoadFailed = true
             }
@@ -230,9 +242,9 @@ public final class PhotoViewerModel {
             return
         }
         metadataLoadState = .loading
-        metadataTask = Task {
+        metadataTask = Task { [weak self, titleMetadataCoordinator] in
             let resolution = await titleMetadataCoordinator.resolve(item)
-            guard !Task.isCancelled, self.isDisplaying(item) else { return }
+            guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
             self.metadataLoadState = resolution.metadataLoadState
         }
     }
@@ -243,9 +255,9 @@ public final class PhotoViewerModel {
         placeTask?.cancel()
         titleMetadataCoordinator.prepare(items: items, around: index)
         titleMetadataState = titleMetadataCoordinator.state(for: item.uid)
-        placeTask = Task {
+        placeTask = Task { [weak self, titleMetadataCoordinator] in
             let resolution = await titleMetadataCoordinator.resolve(item)
-            guard !Task.isCancelled, self.isDisplaying(item) else { return }
+            guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
             self.titleMetadataState = .resolved(resolution)
             if self.showInfo, let metadata = resolution.metadata {
                 self.metadataLoadState = .loaded(metadata)
@@ -255,7 +267,17 @@ public final class PhotoViewerModel {
 
     public var baseCurrent: PhotoItem { items[index] }
     public var current: PhotoItem {
-        burstSelection.current(fallback: baseCurrent)
+        burstSelection.current(fallback: editedOriginal.displayed(baseCurrent))
+    }
+    /// The page is an edited photo whose original this viewer found.
+    public var canShowOriginal: Bool { editedOriginal.canShowOriginal(of: baseCurrent.uid) }
+    public var isShowingOriginal: Bool { editedOriginal.isShowingOriginal(of: baseCurrent.uid) }
+
+    /// Switches the page between the edited version and its original.
+    public func toggleOriginal() {
+        guard canShowOriginal else { return }
+        editedOriginal.toggle(baseCurrent.uid)
+        loadDisplayedItem(current)
     }
     public var canGoNext: Bool { index < items.count - 1 }
     public var canGoPrevious: Bool { index > 0 }
@@ -284,12 +306,14 @@ public final class PhotoViewerModel {
     /// Called when the viewer closes: cancels any in-flight load and tears the player down so closing
     /// stops playback/audio immediately and cancels unnecessary streaming/download work.
     public func stop() {
+        visibleThumbnail?.end()
         originalLoadGeneration &+= 1
         loadTask?.cancel()
         burstTask?.cancel()
         metadataTask?.cancel()
         albumMembershipTask?.cancel()
         placeTask?.cancel()
+        editedOriginalLookup.cancel()
         titleMetadataCoordinator.cancelAll()
         isLoadingOriginal = false
         video.teardown()
@@ -500,15 +524,21 @@ public final class PhotoViewerModel {
         burstTask?.cancel()
         burstSelection.reset()
         let item = baseCurrent
+        editedOriginal.pageChanged(to: item.uid)
+        editedOriginalLookup.settled(on: item, provider: editedOriginalProvider) { [weak self] base, original in
+            self?.editedOriginal.record(original, of: base.uid)
+        }
         burstSelection.seedKnownGroup(
             for: item,
             knownItems: pageIndex.items(withUIDs: item.burstMemberUIDs, from: items)
         )
-        loadDisplayedItem(item)
+        // A reload of the same page keeps its original on screen.
+        loadDisplayedItem(editedOriginal.displayed(item))
         loadBurstGroupIfNeeded(for: item)
     }
 
     private func loadDisplayedItem(_ item: PhotoItem) {
+        visibleThumbnail?.select(item.uid)
         originalLoadGeneration &+= 1
         loadTask?.cancel()
         liveTextAnalysis = nil
@@ -543,17 +573,26 @@ public final class PhotoViewerModel {
         // Otherwise show the thumbnail synchronously so rapid arrow navigation always shows something
         // immediately), and defer the heavy load so flicking past photos doesn't fire a network
         // storm - only the photo you actually land on loads its preview/original.
-        image = feed.memoryImage(for: item.uid)
+        if let visibleThumbnail {
+            image = visibleThumbnail.memoryImage(for: item.uid)
+        } else {
+            image = feed.memoryImage(for: item.uid)
+        }
         isSharp = false
 
         loadTask = Task {
             try? await Task.sleep(for: .milliseconds(160))  // debounce: skip work for photos flicked past
             guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
 
-            if self.image == nil, let thumb = await self.feed.image(for: item.uid), self.isDisplaying(item),
-                self.sessionIsCurrent()
-            {
-                self.image = thumb
+            if self.image == nil {
+                // A Duplicates copy reads only its cached thumbnail here, so the preview below never waits for it.
+                let thumb: NSImage?
+                if let visibleThumbnail = self.visibleThumbnail {
+                    thumb = await visibleThumbnail.cachedImage(for: item.uid)
+                } else {
+                    thumb = await self.feed.image(for: item.uid)
+                }
+                if let thumb, !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() { self.image = thumb }
             }
             // Larger preview for a crisper interim image (disk-cached for offline browsing).
             var hasDisplayPreview = false
@@ -571,13 +610,13 @@ public final class PhotoViewerModel {
 
     private func loadBurstGroupIfNeeded(for item: PhotoItem) {
         guard let burstProvider, burstSelection.beginLoadingIfCandidate(item) else { return }
-        burstTask = Task { [burstProvider] in
+        burstTask = Task { [weak self, burstProvider] in
             do {
                 let group = try await burstProvider.burstGroup(containing: item.uid)
-                guard !Task.isCancelled, self.isBaseCurrent(item) else { return }
+                guard !Task.isCancelled, let self, self.isBaseCurrent(item) else { return }
                 self.burstSelection.applyLoadedGroup(group, containing: item)
             } catch {
-                guard !Task.isCancelled, self.isBaseCurrent(item) else { return }
+                guard !Task.isCancelled, let self, self.isBaseCurrent(item) else { return }
                 self.burstSelection.failLoading()
             }
         }

@@ -86,6 +86,7 @@ actor ProtonAlbumWriteService {
     private let session: DriveSession
     private let crypto: DriveCrypto
     private nonisolated let admission: JoinedShutdownGate?
+    private nonisolated let requestCause: ProtonRequestCauseBinding?
     private let contextProvider: @Sendable () async throws -> PhotosShareContext
 
     /// Proton's normal add-multiple batch target. A single related-photo group can exceed this
@@ -148,15 +149,24 @@ actor ProtonAlbumWriteService {
         session: DriveSession,
         crypto: DriveCrypto,
         admission: JoinedShutdownGate? = nil,
+        requestCause: ProtonRequestCauseBinding? = nil,
         contextProvider: @Sendable @escaping () async throws -> PhotosShareContext
     ) {
         self.session = session
         self.crypto = crypto
         self.admission = admission
+        self.requestCause = requestCause
         self.contextProvider = contextProvider
     }
 
     private nonisolated func withAdmission<T: Sendable>(
+        _ operation: @escaping @Sendable (isolated ProtonAlbumWriteService) async throws -> T
+    ) async throws -> T {
+        guard let requestCause else { return try await admitted(operation) }
+        return try await requestCause.run { try await admitted(operation) }
+    }
+
+    private nonisolated func admitted<T: Sendable>(
         _ operation: @escaping @Sendable (isolated ProtonAlbumWriteService) async throws -> T
     ) async throws -> T {
         guard let admission else { return try await operation(self) }

@@ -29,6 +29,297 @@ final class PendingBackupStoreTests: XCTestCase {
         PendingPresentationMetadata(captureTime: date, mediaType: "image/heic", displayName: name)
     }
 
+    func testRecordHandoffRejectsUnreadableSourceState() throws {
+        try withUnreadableSourceState { _ in
+            let handoff = PendingHandoff(
+                key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote,
+                kind: .uploaded, createdAt: date)
+            XCTAssertEqual(store.recordHandoff(handoff), .failed)
+        }
+    }
+
+    func testIncludeRejectsUnreadableSourceStateAndRollsBackBatch() throws {
+        try withUnreadableSourceState { _ in
+            let earlier = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-0")
+            XCTAssertNil(store.include([earlier, key], at: date.addingTimeInterval(10)))
+        }
+    }
+
+    func testCompleteEffectRejectsUnreadableSourceState() throws {
+        try withUnreadableSourceState { state in
+            XCTAssertFalse(
+                store.completeEffect(.remoteTrash, for: key, generation: state.generation, at: date))
+        }
+    }
+
+    func testDeferEffectsRejectsUnreadableSourceState() throws {
+        try withUnreadableSourceState { _ in
+            XCTAssertFalse(store.deferEffects(for: key, at: date))
+        }
+    }
+
+    func testExcludeRejectsUnreadablePreviousSourceState() throws {
+        try withUnreadableSourceState { _ in
+            XCTAssertNil(
+                store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date))
+        }
+    }
+
+    func testExcludeRejectsUnknownRemoteOperationAfterInterruptedRestore() throws {
+        try assertRejectsSourceStateEnum("unknown")
+    }
+
+    func testExcludeRejectsEmbeddedNULRemoteOperationAfterInterruptedRestore() throws {
+        try assertRejectsSourceStateEnum("remoteTrash\u{0}unknown")
+    }
+
+    func testExcludeRejectsEmbeddedNULDesiredAfterInterruptedRestore() throws {
+        try assertRejectsSourceStateEnum("included\u{0}unknown", column: "desired", index: 2, repaired: "included")
+    }
+
+    func testReadsRejectEmbeddedNULSourceKindAfterInterruptedRestore() throws {
+        try assertRejectsSourceStateEnum(
+            "photoLibraryAsset\u{0}unknown", column: "source_kind", index: 0, repaired: "photoLibraryAsset")
+    }
+
+    private func assertRejectsSourceStateEnum(
+        _ marker: String, column: String = "remote_op", index: Int = 20, repaired: String = "remoteRestore"
+    ) throws {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date))
+        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key, generation: 1, at: date))
+        let included = try XCTUnwrap(store.include([key], at: date))
+        XCTAssertEqual(store.beginRemoteOperation(.remoteRestore, for: included), [key])
+        let restoring = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertTrue(restoring.remoteTrashed)
+        XCTAssertTrue(restoring.needsRemoteRestore)
+        XCTAssertEqual(restoring.remoteOperation, .remoteRestore)
+
+        // The restore may have succeeded remotely, but the app ends before recording its completion.
+        store.close()
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        try withRawPendingDatabase { db in
+            var stmt: OpaquePointer?
+            XCTAssertEqual(
+                sqlite3_prepare_v2(db, "UPDATE source_state SET \(column)=?;", -1, &stmt, nil), SQLITE_OK)
+            defer { sqlite3_finalize(stmt) }
+            marker.withCString {
+                XCTAssertEqual(
+                    sqlite3_bind_text(
+                        stmt, 1, $0, Int32(marker.utf8.count), SQLiteStoreSchemaGate.transientDestructor), SQLITE_OK)
+            }
+            XCTAssertEqual(sqlite3_step(stmt), SQLITE_DONE)
+        }
+        let before = try pendingTables()
+        XCTAssertEqual(try XCTUnwrap(before["source_state"]?.first)[index], Data(marker.utf8))
+        if column == "source_kind" {
+            // A typed-key lookup cannot select the corrupted key; all-row readers must reject its decoded prefix.
+            XCTAssertTrue(store.sourceStates().isEmpty)
+            XCTAssertTrue(store.dueSourceStates(by: date.addingTimeInterval(10)).isEmpty)
+        } else {
+            XCTAssertNil(
+                store.exclude(
+                    [PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date.addingTimeInterval(10)
+                ))
+        }
+        XCTAssertFalse(store.isOperational(), "an unknown non-null enum must record a decode failure")
+        XCTAssertEqual(try pendingTables(), before, "rejection must preserve the interrupted restore row")
+        store.close()
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        XCTAssertEqual(try pendingTables(), before, "the unchanged row must survive reopen")
+
+        // Repair only the enum, then prove the retained restore still makes the next exclusion owe trash.
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE source_state SET \(column)='\(repaired)';", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertEqual(store.sourceState(for: key), restoring)
+        let excluded = try XCTUnwrap(
+            try XCTUnwrap(
+                store.exclude(
+                    [PendingExclusionRequest(key: key, presentation: nil, remote: nil)],
+                    at: date.addingTimeInterval(10))
+            ).first)
+        XCTAssertEqual(excluded.generation, restoring.generation + 1)
+        XCTAssertEqual(excluded.remote, remote)
+        XCTAssertEqual(excluded.presentation, restoring.presentation)
+        XCTAssertTrue(excluded.needsRemoteTrash, "the interrupted restore may have made the remote photo active")
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testExcludeAcceptsSQLNullRemoteOperation() throws {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date))
+        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key, generation: 1, at: date))
+        XCTAssertNil(store.sourceState(for: key)?.remoteOperation)
+        let excluded = try XCTUnwrap(
+            try XCTUnwrap(
+                store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date)
+            ).first)
+        XCTAssertEqual(excluded.generation, 2)
+        XCTAssertTrue(excluded.remoteTrashed)
+        XCTAssertFalse(excluded.needsRemoteTrash, "SQL NULL means no interrupted restore")
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testAbsentSourceStateKeepsEachWriterResult() throws {
+        XCTAssertEqual(store.include([key], at: date), [])
+        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key, generation: 1, at: date))
+        XCTAssertTrue(store.deferEffects(for: key, at: date))
+        XCTAssertTrue(store.sourceStates().isEmpty)
+        let handoff = PendingHandoff(
+            key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote,
+            kind: .uploaded, createdAt: date)
+        XCTAssertEqual(store.recordHandoff(handoff), .recorded)
+        XCTAssertEqual(store.unacknowledgedHandoffs(), [handoff])
+        let states = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date))
+        XCTAssertEqual(states.first?.generation, 1)
+        XCTAssertNil(states.first?.remote)
+        XCTAssertFalse(states.first?.needsRemoteTrash ?? true)
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testSuccessfulSourceReadDoesNotInheritAnUnrelatedStickyFailure() throws {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date))
+        XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
+        try withRawPendingDatabase {
+            XCTAssertEqual(sqlite3_exec($0, "UPDATE pending_action SET kind='invalid';", nil, nil, nil), SQLITE_OK)
+        }
+        _ = store.actions()
+        XCTAssertFalse(store.isOperational())
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote,
+                    kind: .uploaded, createdAt: date)), .excludedRemoteNeedsTrash)
+        let included = try XCTUnwrap(try XCTUnwrap(store.include([key], at: date)).first)
+        XCTAssertTrue(store.deferEffects(for: key, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key, generation: included.generation, at: date))
+        XCTAssertNotNil(store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date))
+        XCTAssertFalse(store.isOperational(), "successful reads must not clear sticky health")
+    }
+
+    func testClosedSourceReadIsNotAbsenceForWriters() {
+        store.close()
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote,
+                    kind: .uploaded, createdAt: date)), .failed)
+        XCTAssertNil(store.include([key], at: date))
+        XCTAssertNil(store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date))
+        XCTAssertFalse(store.completeEffect(.queueSync, for: key, generation: 1, at: date))
+        XCTAssertFalse(store.deferEffects(for: key, at: date))
+    }
+
+    /// Exercise a decode error and a one-shot prepare error on the real connection, without a production hook.
+    private func withUnreadableSourceState(_ body: (PendingSourceState) throws -> Void) throws {
+        for corruptRow in [false, true] {
+            let earlier = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-0")
+            let requests = [earlier, key].map {
+                PendingExclusionRequest(key: $0, presentation: presentation(), remote: remote)
+            }
+            XCTAssertNotNil(store.exclude(requests, at: date))
+            // A repeated exclusion must retain its generation and remote trash, even if the next read fails.
+            XCTAssertNotNil(store.exclude(requests, at: date))
+            let state = try XCTUnwrap(store.sourceState(for: key))
+            if corruptRow {
+                try withRawPendingDatabase {
+                    XCTAssertEqual(
+                        sqlite3_exec(
+                            $0, "UPDATE source_state SET desired='invalid' WHERE source_id='asset-1';",
+                            nil, nil, nil), SQLITE_OK)
+                }
+            }
+            let before = try pendingTables()
+            if corruptRow {
+                try body(state)
+            } else {
+                try withOneDeniedSourceSelect { try body(state) }
+            }
+            XCTAssertFalse(store.isOperational(), "a real read failure must record failed health")
+            XCTAssertEqual(try pendingTables(), before, "a failed writer must not change any persisted row")
+            if corruptRow {
+                try withRawPendingDatabase {
+                    XCTAssertEqual(
+                        sqlite3_exec(
+                            $0, "UPDATE source_state SET desired='excluded' WHERE source_id='asset-1';",
+                            nil, nil, nil), SQLITE_OK)
+                }
+            }
+            store.close()
+            store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+            XCTAssertEqual(store.sourceState(for: key), state, "the owed effect survives failure and reopen")
+            XCTAssertTrue(store.isOperational())
+        }
+    }
+
+    private final class SelectDenial {
+        var denied = false
+    }
+
+    private func withOneDeniedSourceSelect(_ body: () throws -> Void) throws {
+        let connection = try XCTUnwrap(
+            Mirror(reflecting: store!).children.first(where: { $0.label == "connection" })?.value
+                as? SQLiteStoreConnection)
+        let denial = SelectDenial()
+        connection.withLock {
+            XCTAssertEqual(
+                sqlite3_set_authorizer(
+                    connection.database,
+                    { context, action, _, _, _, _ in
+                        guard let context, action == SQLITE_SELECT else { return SQLITE_OK }
+                        let denial = Unmanaged<SelectDenial>.fromOpaque(context).takeUnretainedValue()
+                        guard !denial.denied else { return SQLITE_OK }
+                        denial.denied = true
+                        return SQLITE_DENY
+                    }, Unmanaged.passUnretained(denial).toOpaque()), SQLITE_OK)
+        }
+        defer { connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) } }
+        try body()
+        XCTAssertTrue(denial.denied, "the writer must reach the failed prepare")
+    }
+
+    private func withRawPendingDatabase<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        defer { sqlite3_close(db) }
+        return try body(db)
+    }
+
+    private func pendingTables() throws -> [String: [[Data?]]] {
+        try withRawPendingDatabase { db in
+            var result: [String: [[Data?]]] = [:]
+            for table in [
+                "pending_info", "source_state", "upload_evidence", "handoff", "pending_action", "saved_from_app",
+            ] {
+                var stmt: OpaquePointer?
+                XCTAssertEqual(
+                    sqlite3_prepare_v2(db, "SELECT * FROM \(table) ORDER BY rowid;", -1, &stmt, nil), SQLITE_OK)
+                defer { sqlite3_finalize(stmt) }
+                var rows: [[Data?]] = []
+                var step = sqlite3_step(stmt)
+                while step == SQLITE_ROW {
+                    rows.append(
+                        try (0..<sqlite3_column_count(stmt)).map { column -> Data? in
+                            guard sqlite3_column_type(stmt, column) != SQLITE_NULL else { return nil }
+                            let bytes = sqlite3_column_blob(stmt, column)
+                            let count = Int(sqlite3_column_bytes(stmt, column))
+                            guard count > 0 else { return Data() }
+                            return Data(bytes: try XCTUnwrap(bytes), count: count)
+                        })
+                    step = sqlite3_step(stmt)
+                }
+                XCTAssertEqual(step, SQLITE_DONE)
+                result[table] = rows
+            }
+            return result
+        }
+    }
+
     // MARK: - Desired state
 
     func testDeleteThenRestoreRunsTheQueueSyncOfTheNewestGeneration() throws {
@@ -405,6 +696,57 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(store.handoffTime(for: key, revision: UploadBackupRevision(rawValue: 1)), date)
     }
 
+    func testPendingHealthDoesNotProbeDeniedSelect() throws {
+        XCTAssertTrue(store.isOperational())
+        try withDeniedSQLiteSelect(in: store!) {
+            XCTAssertTrue(store.isOperational(), "pending health checks only connection state")
+        }
+        XCTAssertTrue(store.isOperational(), "denied SELECT must not record a new failure")
+    }
+
+    func testPendingCloseRefusesRealWritesAndPreservesEmptyNoOpsAndRows() throws {
+        let revision = UploadBackupRevision(rawValue: 10)
+        XCTAssertTrue(store.recordUploadEvidence(key, revision: revision, at: date))
+        let states = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+        store.close()
+        XCTAssertFalse(store.isOperational())
+        XCTAssertTrue(store.removeEvidence(for: []))
+        XCTAssertTrue(store.removeEvidence([(PendingSourceKey, UploadBackupRevision)]()))
+        XCTAssertTrue(store.acknowledgeHandoffs([]))
+        XCTAssertTrue(store.unlistFromTrash([], at: date))
+        XCTAssertEqual(store.excludedIdentifiers(kind: .photoLibraryAsset, among: []), [])
+        XCTAssertEqual(store.exclude([], at: date), [])
+        XCTAssertEqual(store.include([], at: date), [])
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: []), [])
+        XCTAssertEqual(store.beginRemoteOperation(.queueSync, for: states), [])
+        XCTAssertTrue(store.latestHandoffs(for: []).isEmpty)
+        XCTAssertTrue(store.handoffs(forRemoteLinkIDs: []).isEmpty)
+        XCTAssertFalse(store.recordUploadEvidence(key, revision: UploadBackupRevision(rawValue: 20), at: date))
+        XCTAssertTrue(store.evidenceRevisions().isEmpty)
+        XCTAssertFalse(store.isOperational())
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        XCTAssertEqual(store.evidenceRevisions(), [key: [revision]])
+        XCTAssertEqual(store.sourceStates(), states)
+        XCTAssertEqual(store.sourceState(for: key)?.desired, .excluded)
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testPendingActionDecodeFailureStaysStickyWithoutChangingLaterSQLResults() throws {
+        XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(storeURL.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(sqlite3_exec(handle, "UPDATE pending_action SET kind='invalid-kind';", nil, nil, nil), SQLITE_OK)
+        _ = store.actions()
+        XCTAssertFalse(store.isOperational())
+        let revision = UploadBackupRevision(rawValue: 10)
+        XCTAssertTrue(store.recordUploadEvidence(key, revision: revision, at: date))
+        XCTAssertEqual(store.evidenceRevisions(), [key: [revision]])
+        XCTAssertFalse(store.isOperational(), "successful SQL cannot clear recorded failure")
+        XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]))
+    }
+
     func testClosedStoreCannotConfirmExclusions() {
         store.close()
         XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1"]))
@@ -427,12 +769,11 @@ final class PendingBackupStoreTests: XCTestCase {
         let action = try XCTUnwrap(store.actions().first)
         XCTAssertTrue(store.retryAction(action, at: date))
         XCTAssertTrue(store.dueActions(by: date).isEmpty)
-        XCTAssertEqual(store.nextActionDate(), date.addingTimeInterval(60))
+        XCTAssertEqual(store.actions().first?.nextAttemptAt, date.addingTimeInterval(60))
         XCTAssertEqual(store.dueActions(by: date.addingTimeInterval(60)).count, 1)
 
         XCTAssertTrue(store.failAction(action))
         XCTAssertTrue(store.dueActions(by: date.addingTimeInterval(1_000_000)).isEmpty)
-        XCTAssertNil(store.nextActionDate())
         XCTAssertEqual(store.actions().first?.failed, true)
     }
 
@@ -512,7 +853,61 @@ final class PendingQueueIntegrationTests: XCTestCase {
         XCTAssertEqual(queue.makeRetryableWorkEligible(updatedAt: date), 0, "an empty bulk update stays silent")
 
         let expected = UploadBackupSyncQueueChange.sources([.photoLibraryAsset: ["a"]])
-        XCTAssertEqual(changes.values, [expected, expected, expected])
+        XCTAssertEqual(changes.values, [.enqueued([.photoLibraryAsset: ["a"]]), expected, expected])
+    }
+
+    func testOnlyInsertedOrReopenedRowsNotifyAnEnqueue() {
+        let changes = LockedChanges()
+        queue.setChangeObserver { changes.append($0) }
+        let runnable = entry("a", state: .discovered)
+        let sources: [UploadSourceIdentity.Kind: Set<String>] = [.photoLibraryAsset: ["a"]]
+
+        XCTAssertTrue(queue.upsert(runnable))
+        XCTAssertTrue(queue.upsert(runnable), "a repeated scan does not add work")
+        XCTAssertTrue(queue.upsert(entry("a", state: .completed)))
+        XCTAssertTrue(queue.upsertBatch([runnable]), "a scan cannot reopen a successful row")
+        XCTAssertEqual(queue.entry(for: runnable.source, revision: runnable.revision)?.state, .completed)
+        XCTAssertEqual(changes.values, [.enqueued(sources), .sources(sources), .sources(sources), .sources(sources)])
+
+        let failed = entry("b", state: .failed)
+        XCTAssertTrue(queue.upsert(failed))
+        XCTAssertTrue(queue.upsertBatch([entry("b", state: .discovered)]))
+        XCTAssertEqual(changes.values.last, .enqueued([.photoLibraryAsset: ["b"]]))
+
+        XCTAssertTrue(queue.upsert(entry("active", state: .uploading)))
+        XCTAssertTrue(queue.upsert(entry("active", state: .needsRemoteReconciliation)))
+        XCTAssertEqual(changes.values.last, .sources([.photoLibraryAsset: ["active"]]))
+        XCTAssertEqual(
+            queue.entry(for: entry("active", state: .uploading).source, revision: runnable.revision)?.state, .uploading)
+
+        var delayed = entry("waiting", state: .discovered)
+        delayed.updatedAt = date.addingTimeInterval(60)
+        XCTAssertTrue(queue.upsert(delayed))
+        XCTAssertTrue(queue.upsert(entry("waiting", state: .discovered)))
+        XCTAssertEqual(changes.values.last, .enqueued([.photoLibraryAsset: ["waiting"]]))
+    }
+
+    func testMissingSourceInsertsNotifyOnlyNewRunnableRows() {
+        let changes = LockedChanges()
+        queue.setChangeObserver { changes.append($0) }
+        let runnable = entry("a", state: .discovered)
+        let sources: [UploadSourceIdentity.Kind: Set<String>] = [.photoLibraryAsset: ["a"]]
+
+        XCTAssertTrue(queue.insertMissingSources([runnable]))
+        XCTAssertEqual(changes.values.last, .enqueued(sources))
+        XCTAssertTrue(queue.insertMissingSources([runnable]), "an existing source adds no work")
+        XCTAssertEqual(changes.values.last, .sources(sources))
+
+        var newer = runnable
+        newer.revision = UploadBackupRevision(rawValue: 8)
+        XCTAssertTrue(queue.insertMissingSources([newer]), "the conditional insert preserves an existing source")
+        XCTAssertNil(queue.entry(for: newer.source, revision: newer.revision))
+        XCTAssertEqual(changes.values.last, .sources(sources))
+
+        XCTAssertTrue(queue.insertMissingSources([entry("settled", state: .completed)]))
+        XCTAssertEqual(changes.values.last, .sources([.photoLibraryAsset: ["settled"]]))
+        XCTAssertTrue(queue.insertMissingSources([runnable, entry("new", state: .discovered)]))
+        XCTAssertEqual(changes.values.last, .enqueued([.photoLibraryAsset: ["a", "new"]]))
     }
 
     func testUnsettledRowsLeaveTerminalOutcomesOut() {

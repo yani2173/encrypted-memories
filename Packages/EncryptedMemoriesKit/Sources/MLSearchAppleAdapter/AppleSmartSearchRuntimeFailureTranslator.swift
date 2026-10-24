@@ -69,10 +69,6 @@ public enum AppleSmartSearchRuntimeFailureTranslator {
         return failure(category: .unknown, error: error)
     }
 
-    public static func classify(_ error: Error) -> MLRuntimeFailure {
-        translate(error)
-    }
-
     private static func failure(category: MLRuntimeFailureCategory, error: Error) -> MLRuntimeFailure {
         MLRuntimeFailure(category: category, debugDescription: String(describing: error))
     }

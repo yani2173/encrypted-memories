@@ -141,6 +141,214 @@ final class BackupLocalDataPurgeTests: XCTestCase {
         XCTAssertFalse(BackupLocalDataPurge.purgeIfSignOutRequested(defaults: defaults, roots: [root]))
     }
 
+    private typealias MetadataFixture = (
+        sandbox: URL, parent: URL, root: URL, otherRoot: URL, permissions: NSNumber
+    )
+
+    private func makeMetadataFixture() throws -> MetadataFixture {
+        let fm = FileManager.default
+        let sandbox = fm.temporaryDirectory.appendingPathComponent("purge-metadata-\(UUID().uuidString)")
+        let parent = sandbox.appendingPathComponent("Library/Application Support", isDirectory: true)
+        let root = parent.appendingPathComponent("EncryptedMemories", isDirectory: true)
+        let otherRoot = sandbox.appendingPathComponent("Library/Caches/EncryptedMemories", isDirectory: true)
+        for directory in [root, otherRoot] {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("queue.sqlite"))
+        }
+        let permissions = try XCTUnwrap(fm.attributesOfItem(atPath: parent.path)[.posixPermissions] as? NSNumber)
+        return (sandbox, parent, root, otherRoot, permissions)
+    }
+
+    private func cleanUpMetadataFixture(_ fixture: MetadataFixture) {
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: fixture.permissions], ofItemAtPath: fixture.parent.path)
+        } catch {
+            XCTFail("Could not restore the owned account-root permission fixture")
+        }
+        do {
+            try FileManager.default.removeItem(at: fixture.sandbox)
+        } catch {
+            XCTFail("Could not remove the restored UUID account-root fixture")
+        }
+    }
+
+    func testUnreadableRootMetadataKeepsClaimPendingAndContinuesOtherRoots() throws {
+        let fm = FileManager.default
+        let fixture = try makeMetadataFixture()
+        defer { cleanUpMetadataFixture(fixture) }
+        BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+        let claim = try XCTUnwrap(
+            BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [fixture.root, fixture.otherRoot]))
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: fixture.parent.path)
+        do {
+            _ = try fm.attributesOfItem(atPath: fixture.root.path)
+            XCTFail("Pre-read fixture did not cause the required metadata permission error")
+            return
+        } catch {
+            guard let error = error as? CocoaError, error.code == .fileReadNoPermission else {
+                XCTFail("Pre-read fixture caused an unexpected metadata error")
+                return
+            }
+            print("605 account-root PRE probe: verified non-missing CocoaError.fileReadNoPermission")
+        }
+
+        let result = claim.perform(defaults: defaults)
+        try fm.setAttributes([.posixPermissions: fixture.permissions], ofItemAtPath: fixture.parent.path)
+
+        XCTAssertFalse(result.succeeded, "Uncertain pre-read absence must fail the account-root claim")
+        XCTAssertEqual(result.failedRoots, [fixture.root])
+        XCTAssertEqual(result.removedRoots, [fixture.otherRoot], "A refused root must not stop the other root")
+        XCTAssertTrue(BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent("queue.sqlite")), Data([1, 2, 3]))
+        XCTAssertFalse(fm.fileExists(atPath: fixture.otherRoot.path))
+    }
+
+    func testUnverifiableAbsenceAfterRemovalKeepsClaimPendingAndContinuesOtherRoots() throws {
+        let fm = FileManager.default
+        let fixture = try makeMetadataFixture()
+        defer { cleanUpMetadataFixture(fixture) }
+        BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+        let claim = try XCTUnwrap(
+            BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [fixture.root, fixture.otherRoot]))
+        var attempted: [URL] = []
+        var observedError: CocoaError.Code?
+        let result = claim.perform(
+            defaults: defaults, completesRequestOnSuccess: true,
+            removeItem: { root in
+                attempted.append(root)
+                guard root == fixture.root else {
+                    try fm.removeItem(at: root)
+                    return
+                }
+                try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: fixture.parent.path)
+                do {
+                    _ = try fm.attributesOfItem(atPath: fixture.root.path)
+                    XCTFail("Post-removal fixture did not cause the required metadata permission error")
+                } catch {
+                    observedError = (error as? CocoaError)?.code
+                    if observedError == .fileReadNoPermission {
+                        print("605 account-root POST probe: verified non-missing CocoaError.fileReadNoPermission")
+                    } else {
+                        XCTFail("Post-removal fixture caused an unexpected metadata error")
+                    }
+                }
+            })
+        try fm.setAttributes([.posixPermissions: fixture.permissions], ofItemAtPath: fixture.parent.path)
+
+        XCTAssertEqual(observedError, .fileReadNoPermission)
+        XCTAssertEqual(attempted, [fixture.root, fixture.otherRoot])
+        XCTAssertFalse(result.succeeded, "Unverifiable post-removal absence must fail the account-root claim")
+        XCTAssertEqual(result.failedRoots, [fixture.root])
+        XCTAssertEqual(result.removedRoots, [fixture.otherRoot])
+        XCTAssertTrue(BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent("queue.sqlite")), Data([1, 2, 3]))
+        XCTAssertFalse(fm.fileExists(atPath: fixture.otherRoot.path))
+    }
+
+    func testRemovalFailureStillAttemptsOtherRootsAndRetainsClaim() throws {
+        let fixture = try makeMetadataFixture()
+        defer { cleanUpMetadataFixture(fixture) }
+        BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+        let claim = try XCTUnwrap(
+            BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [fixture.root, fixture.otherRoot]))
+        var attempted: [URL] = []
+        let result = claim.perform(
+            defaults: defaults, completesRequestOnSuccess: true,
+            removeItem: { root in
+                attempted.append(root)
+                if root == fixture.root { throw CocoaError(.fileWriteNoPermission) }
+                try FileManager.default.removeItem(at: root)
+            })
+        XCTAssertEqual(attempted, [fixture.root, fixture.otherRoot])
+        XCTAssertEqual(result.failedRoots, [fixture.root])
+        XCTAssertEqual(result.removedRoots, [fixture.otherRoot])
+        XCTAssertFalse(result.succeeded)
+        XCTAssertTrue(BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent("queue.sqlite")), Data([1, 2, 3]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.otherRoot.path))
+    }
+
+    private func assertConfirmedMissing(_ url: URL, file: StaticString = #filePath, line: UInt = #line) throws {
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: url.path)
+            XCTFail("The owned root entry must be positively absent", file: file, line: line)
+        } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
+            return
+        }
+    }
+
+    private func verifyFinalAccountRootLink(pointsToExistingDirectory: Bool) throws {
+        let fm = FileManager.default
+        let sandbox = fm.temporaryDirectory.appendingPathComponent("purge-final-link-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: sandbox) }
+        let destination = sandbox.appendingPathComponent("outside-root", isDirectory: true)
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        let sentinel = destination.appendingPathComponent("must-survive")
+        try Data([7]).write(to: sentinel)
+        let root = sandbox.appendingPathComponent("account-root")
+        try fm.createSymbolicLink(
+            at: root,
+            withDestinationURL: pointsToExistingDirectory ? destination : destination.appendingPathComponent("missing"))
+        XCTAssertEqual(try fm.attributesOfItem(atPath: root.path)[.type] as? FileAttributeType, .typeSymbolicLink)
+        BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+        let claim = try XCTUnwrap(BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [root]))
+
+        let result = claim.perform(defaults: defaults)
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.removedRoots, [root])
+        XCTAssertTrue(result.failedRoots.isEmpty)
+        XCTAssertFalse(BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        try assertConfirmedMissing(root)
+        XCTAssertEqual(try Data(contentsOf: sentinel), Data([7]))
+    }
+
+    func testFinalAccountRootLinkRemovesOnlyTheLink() throws {
+        try verifyFinalAccountRootLink(pointsToExistingDirectory: true)
+    }
+
+    func testDanglingFinalAccountRootLinkIsRemovedAndVerifiedAbsent() throws {
+        try verifyFinalAccountRootLink(pointsToExistingDirectory: false)
+    }
+
+    func testNoOpRemovalCannotCompleteClaimWhileTheRootRemains() throws {
+        let fixture = try makeMetadataFixture()
+        defer { cleanUpMetadataFixture(fixture) }
+        BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+        let claim = try XCTUnwrap(
+            BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [fixture.root, fixture.otherRoot]))
+        let result = claim.perform(
+            defaults: defaults, completesRequestOnSuccess: true,
+            removeItem: { root in
+                if root != fixture.root { try FileManager.default.removeItem(at: root) }
+            })
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.failedRoots, [fixture.root])
+        XCTAssertEqual(result.removedRoots, [fixture.otherRoot])
+        XCTAssertTrue(BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent("queue.sqlite")), Data([1, 2, 3]))
+        try assertConfirmedMissing(fixture.otherRoot)
+    }
+
+    func testRemovalErrorAfterRemovingRootStillKeepsClaimPending() throws {
+        let fixture = try makeMetadataFixture()
+        defer { cleanUpMetadataFixture(fixture) }
+        BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+        let claim = try XCTUnwrap(BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [fixture.root]))
+        let result = claim.perform(
+            defaults: defaults, completesRequestOnSuccess: true,
+            removeItem: { root in
+                try FileManager.default.removeItem(at: root)
+                throw CocoaError(.fileWriteUnknown)
+            })
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.failedRoots, [fixture.root])
+        XCTAssertTrue(result.removedRoots.isEmpty)
+        XCTAssertTrue(BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        try assertConfirmedMissing(fixture.root)
+    }
+
     func testPurgeAllIsIdempotentOverMissingRoots() throws {
         let missing = FileManager.default.temporaryDirectory.appendingPathComponent(
             "does-not-exist-\(UUID().uuidString)")

@@ -237,6 +237,59 @@ public final class FileThumbnailCoverageCheckpointStore: ThumbnailCoverageCheckp
     }
 }
 
+/// Revocable access to one photo on a foreground surface. It never changes the library grid's authorization.
+public final class VisibleThumbnailAccess: @unchecked Sendable {
+    fileprivate let id: UUID
+    fileprivate let uid: PhotoUID
+    fileprivate let owner: UUID
+    fileprivate let cacheGeneration: CacheWriterGeneration.Token
+    private let authorized: @Sendable () -> Bool
+    private let lock = NSLock()
+    private var active = true
+    private let current: @Sendable () -> Bool
+    private let onEnd: @Sendable () -> Void
+
+    fileprivate init(
+        id: UUID, uid: PhotoUID, owner: UUID, cacheGeneration: CacheWriterGeneration.Token,
+        authorized: @escaping @Sendable () -> Bool, current: @escaping @Sendable () -> Bool,
+        onEnd: @escaping @Sendable () -> Void
+    ) {
+        self.id = id
+        self.uid = uid
+        self.owner = owner
+        self.cacheGeneration = cacheGeneration
+        self.authorized = authorized
+        self.current = current
+        self.onEnd = onEnd
+    }
+
+    fileprivate var isAuthorized: Bool { lock.withLock { active } && authorized() }
+    fileprivate var isCurrent: Bool { isAuthorized && current() }
+
+    public func end() {
+        let ended = lock.withLock {
+            defer { active = false }
+            return active
+        }
+        if ended { onEnd() }
+    }
+
+    deinit { end() }
+}
+
+/// A stop invalidates foreground capabilities synchronously; cancellation does not need an actor hop to revoke them.
+private final class VisibleThumbnailLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+    private var open: [UUID: PhotoUID] = [:]
+    func capture() -> UInt64 { lock.withLock { generation } }
+    func isCurrent(_ value: UInt64) -> Bool { lock.withLock { generation == value } }
+    func invalidate() { lock.withLock { generation &+= 1 } }
+    func opened(_ id: UUID, for uid: PhotoUID) { lock.withLock { open[id] = uid } }
+    func ended(_ id: UUID) { lock.withLock { _ = open.removeValue(forKey: id) } }
+    var openUIDs: [PhotoUID] { lock.withLock { Array(open.values) } }
+}
+
 /// Universal thumbnail pipeline core.
 ///
 /// Owns platform-independent feed behavior: disk/network decisions, priority ordering, background crawl,
@@ -250,6 +303,8 @@ public actor ThumbnailFeedCore {
     }
 
     private nonisolated let cache: ThumbnailCache
+    private nonisolated let visibleAccessOwner = UUID()
+    private nonisolated let visibleAccessLifetime = VisibleThumbnailLifetime()
     private nonisolated let loader: ThumbnailBatchLoader
     private nonisolated let onDecoded: @Sendable (PhotoUID, DecodedThumbnail) -> Void
     private nonisolated let decoded: DecodedThumbnailCache
@@ -329,6 +384,9 @@ public actor ThumbnailFeedCore {
     /// be declared settled until these reservations return, even if their source queues are already empty.
     private var diskProbeBatchesInFlight = 0
     private var downloadInFlight = 0
+    /// The photos of each crawl batch that is downloading, by batch. Only `loadDirectDecoded` reads it, to count
+    /// a direct load that overlaps a batch (`thumb.directLoadOverlapsBatch`). It never delays a load.
+    private var batchesInFlight: [UUID: Set<PhotoUID>] = [:]
     private var lastErrors: [String] = []
     private var prefetchEnabled = true
     private var prefetchPaused = false
@@ -432,7 +490,11 @@ public actor ThumbnailFeedCore {
     /// the backend, even when the SDK operation ignored the crawl worker's cancellation.
     private var timedOutLoaderTasks: [UUID: Task<Void, Never>] = [:]
     private var nextDirectDecodeFlightID: UInt64 = 0
-    private var directDecodeFlights: [PhotoUID: DirectDecodeFlight] = [:]
+    private struct DirectDecodeKey: Hashable {
+        let uid: PhotoUID
+        let accessID: UUID?
+    }
+    private var directDecodeFlights: [DirectDecodeKey: DirectDecodeFlight] = [:]
     /// Direct visible loads became feed-owned when exact-UID requests were coalesced. Retain cancelled flights
     /// until teardown joins them, just like cancellation-ignoring crawl loaders.
     private var retiredDirectDecodeTasks: [Task<DecodedThumbnail?, Never>] = []
@@ -463,6 +525,7 @@ public actor ThumbnailFeedCore {
     #if DEBUG
         /// Deterministic test-only gate for a disk probe. It is absent from release builds.
         private nonisolated let testingHooks = ThumbnailFeedCoreTestingHooks()
+        private var downloadSlotWaitHookForTesting: (@Sendable () -> Void)?
     #endif
 
     public init(
@@ -548,8 +611,26 @@ public actor ThumbnailFeedCore {
         visibleDiskDemandInbox.invalidate()
     }
 
-    public func cachedDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard readAllowed(uid) else { return nil }
+    /// The Duplicates surface has independently verified its group members. Grant only its visible tile,
+    /// and revoke the capability on disappearance, feed stop, cache clear or account transition.
+    public nonisolated func beginVisibleThumbnailAccess(for uid: PhotoUID) -> VisibleThumbnailAccess {
+        let id = UUID()
+        let generation = cache.captureWriterGeneration()
+        let lifetime = visibleAccessLifetime.capture()
+        visibleAccessLifetime.opened(id, for: uid)
+        return VisibleThumbnailAccess(
+            id: id, uid: uid, owner: visibleAccessOwner, cacheGeneration: generation,
+            authorized: { [visibleAccessLifetime] in visibleAccessLifetime.isCurrent(lifetime) },
+            current: { [self] in ownerLeaseIsCurrent() && cache.isCurrentWriterGeneration(generation) },
+            onEnd: { [visibleAccessLifetime] in visibleAccessLifetime.ended(id) })
+    }
+
+    /// The photos whose foreground access no surface has ended yet, including accesses that a stop or a cache clear
+    /// already revoked. A surface that left the screen must not appear here.
+    public nonisolated var openVisibleThumbnailAccessUIDs: [PhotoUID] { visibleAccessLifetime.openUIDs }
+
+    public func cachedDecoded(for uid: PhotoUID, access: VisibleThumbnailAccess? = nil) async -> DecodedThumbnail? {
+        guard readAllowed(uid, access: access) else { return nil }
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
@@ -563,17 +644,26 @@ public actor ThumbnailFeedCore {
         diagnostics.increment("thumb.ramDecodeMiss")
         diagnostics.recordDiskReadDuringPinch()
         let cache = self.cache
-        let generation = cache.captureWriterGeneration()
+        let generation = access?.cacheGeneration ?? cache.captureWriterGeneration()
         let maxPixels = configuration.targetPixels
         let result = await decodeExecutor.perform(priority: .visibleNow) { () -> (Bool, DecodedThumbnail?) in
-            guard let data = cache.diskData(for: uid) else { return (false, nil) }
+            // The library grid keeps the cache's own retention check; only a foreground access replaces it.
+            let data: Data?
+            if let access {
+                data = cache.diskData(
+                    for: uid, ifCurrent: generation, authorizing: { [self] in cacheReadAuthorized(uid, access: access) }
+                )
+            } else {
+                data = cache.diskData(for: uid)
+            }
+            guard let data else { return (false, nil) }
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return nil
         }
-        guard readAllowed(uid) else { return nil }
+        guard readAllowed(uid, access: access) else { return nil }
         if result.0 {
             diskPresence.set(uid, present: true)
             diagnostics.increment("thumb.diskCacheHit")
@@ -582,7 +672,7 @@ public actor ThumbnailFeedCore {
                 recordError("decode failed for \(Self.key(uid))")
                 return nil
             }
-            return storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels))
+            return storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels), access: access)
         }
         diskPresence.set(uid, present: false)
         diagnostics.increment("thumb.diskCacheMiss")
@@ -728,12 +818,13 @@ public actor ThumbnailFeedCore {
         return .decoded(image)
     }
 
-    public nonisolated func memoryDecoded(for uid: PhotoUID) -> DecodedThumbnail? {
+    public nonisolated func memoryDecoded(for uid: PhotoUID, access: VisibleThumbnailAccess? = nil) -> DecodedThumbnail?
+    {
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
-        guard readAllowed(uid) else { return nil }
+        guard readAllowed(uid, access: access) else { return nil }
         return decoded.image(for: uid)
     }
 
@@ -758,7 +849,12 @@ public actor ThumbnailFeedCore {
     }
 
     public nonisolated func isKnownUnfetchable(_ uid: PhotoUID) -> Bool {
-        readAllowed(uid) && unfetchable.contains(uid)
+        isKnownUnfetchable(uid, access: nil)
+    }
+
+    /// A foreground surface asks with its own access, so a photo outside the library inventory can end its load.
+    public nonisolated func isKnownUnfetchable(_ uid: PhotoUID, access: VisibleThumbnailAccess?) -> Bool {
+        readAllowed(uid, access: access) && unfetchable.contains(uid)
     }
 
     public func cacheState(
@@ -1259,22 +1355,23 @@ public actor ThumbnailFeedCore {
         )
     }
 
-    public func decoded(for uid: PhotoUID) async -> DecodedThumbnail? {
+    public func decoded(for uid: PhotoUID, access: VisibleThumbnailAccess? = nil) async -> DecodedThumbnail? {
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
-        guard readAllowed(uid) else { return nil }
+        guard readAllowed(uid, access: access) else { return nil }
         // Local photos never touch the disk tier or share a Proton flight; see `loadLocalDirect`.
         if uid.isLocalPending { return await loadLocalDirect(uid) }
-        if let image = await cachedDecoded(for: uid) { return image }
+        if let image = await cachedDecoded(for: uid, access: access) { return image }
         // Visible tiles re-request on every appearance; once the backend has said "no thumbnail"
         // for this crawl, don't burn a network round-trip per visibility.
         if unfetchable.contains(uid) {
             diagnostics.increment("thumb.unfetchableShortCircuit")
             return nil
         }
-        if let flight = directDecodeFlights[uid] {
+        let key = DirectDecodeKey(uid: uid, accessID: access?.id)
+        if let flight = directDecodeFlights[key] {
             return await flight.task.value
         }
 
@@ -1282,12 +1379,20 @@ public actor ThumbnailFeedCore {
         let flightID = nextDirectDecodeFlightID
         let flight: Task<DecodedThumbnail?, Never> = Task { [weak self] in
             guard let self else { return nil }
-            return await self.loadDirectDecoded(for: uid)
+            return await self.loadDirectDecoded(for: uid, access: access)
         }
-        directDecodeFlights[uid] = DirectDecodeFlight(id: flightID, task: flight)
-        let result = await flight.value
-        if directDecodeFlights[uid]?.id == flightID {
-            directDecodeFlights.removeValue(forKey: uid)
+        directDecodeFlights[key] = DirectDecodeFlight(id: flightID, task: flight)
+        let result = await withTaskCancellationHandler {
+            await flight.value
+        } onCancel: {
+            // A foreground capability belongs to this caller; ordinary shared flights keep their existing lifetime.
+            if let access {
+                access.end()
+                flight.cancel()
+            }
+        }
+        if directDecodeFlights[key]?.id == flightID {
+            directDecodeFlights.removeValue(forKey: key)
         }
         return result
     }
@@ -1324,13 +1429,16 @@ public actor ThumbnailFeedCore {
         return decoded.image(for: uid)
     }
 
-    private func loadDirectDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard readAllowed(uid) else { return nil }
+    private func loadDirectDecoded(for uid: PhotoUID, access: VisibleThumbnailAccess?) async -> DecodedThumbnail? {
+        guard readAllowed(uid, access: access) else { return nil }
         let box = ByteBox()
         let cache = self.cache
-        let writerGeneration = cache.captureWriterGeneration()
+        let writerGeneration = access?.cacheGeneration ?? cache.captureWriterGeneration()
         guard cache.isCurrentWriterGeneration(writerGeneration) else { return nil }
         diagnostics.recordNetworkRequestDuringPinch()
+        if batchesInFlight.values.contains(where: { $0.contains(uid) }) {
+            diagnostics.increment("thumb.directLoadOverlapsBatch")
+        }
         let result: ThumbnailBatchLoadResult
         if let priorityLoader = loader as? any PriorityThumbnailBatchLoader {
             result = await priorityLoader.loadThumbnails(for: [uid], priority: .visibleNow) { loadedUID, data in
@@ -1345,7 +1453,7 @@ public actor ThumbnailFeedCore {
             decoded.removeAll()
             return nil
         }
-        guard readAllowed(uid) else { return nil }
+        guard readAllowed(uid, access: access) else { return nil }
         guard let data = box.value else {
             if let reason = result.itemErrors[uid] {
                 scheduleRefusalLapseWake(unfetchable.insert(uid))
@@ -1361,7 +1469,14 @@ public actor ThumbnailFeedCore {
         let (image, stored): (DecodedThumbnail?, ThumbnailCacheStoreResult) = await decodeExecutor.perform(
             priority: .visibleNow
         ) {
-            let stored = cache.storeToDisk(data, for: uid, ifCurrent: writerGeneration)
+            let stored: ThumbnailCacheStoreResult
+            if let access {
+                stored = cache.storeToDisk(
+                    data, for: uid, ifCurrent: writerGeneration,
+                    authorizing: { [self] in cacheReadAuthorized(uid, access: access) })
+            } else {
+                stored = cache.storeToDisk(data, for: uid, ifCurrent: writerGeneration)
+            }
             guard stored == .stored || stored == .storagePaused else { return (nil, stored) }
             return (ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels), stored)
         }
@@ -1369,7 +1484,7 @@ public actor ThumbnailFeedCore {
             decoded.removeAll()
             return nil
         }
-        guard readAllowed(uid) else { return nil }
+        guard readAllowed(uid, access: access) else { return nil }
         if stored == .stored { diskPresence.set(uid, present: true) }
         cacheArrivalWake.call()
         guard let image else {
@@ -1377,7 +1492,7 @@ public actor ThumbnailFeedCore {
             recordError("decode failed for \(Self.key(uid))")
             return nil
         }
-        return storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels))
+        return storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels), access: access)
     }
 
     public func startPrefetch(_ uids: [PhotoUID]) async {
@@ -1525,6 +1640,7 @@ public actor ThumbnailFeedCore {
 
     private func stopPrefetch(preservingVisibleDemand: Bool) {
         if !preservingVisibleDemand {
+            visibleAccessLifetime.invalidate()
             visibleDiskDemandInbox.cancel()
             visiblePriorityDemand = nil
             // A stopped feed wakes no host for a lapsed refusal, also not for a load that ends after the stop.
@@ -1547,6 +1663,7 @@ public actor ThumbnailFeedCore {
         priority.removeAll()
         priorityByUID.removeAll()
         priorityReservations.removeAll(keepingCapacity: false)
+        batchesInFlight.removeAll(keepingCapacity: false)
         sequential.removeAll()
         withheldRetry.removeAll()
         withheldRequeues.removeAll()
@@ -2048,6 +2165,9 @@ public actor ThumbnailFeedCore {
         while !Task.isCancelled, generation == prefetchGeneration {
             guard ownerLeaseIsCurrent() else { return }
             let work = await takeBatch()
+            // Every exit of this iteration gives the returned reservations back; the download path below also
+            // releases them as soon as the load ends.
+            defer { releasePriorityReservations(for: work.uids, generation: generation) }
             guard ownerLeaseIsCurrent() else { return }
             // Local pending photos load from the device on their own queue; an iCloud wait never holds back
             // Proton downloads or counts against the network pacing.
@@ -2113,14 +2233,21 @@ public actor ThumbnailFeedCore {
                 continue
             }
             while activeDownloaders + timedOutLoaders >= targetConcurrency, !Task.isCancelled {
+                #if DEBUG
+                    downloadSlotWaitHookForTesting?()
+                #endif
                 try? await Task.sleep(for: .milliseconds(60))
             }
             if Task.isCancelled { return }
+            // Nothing is counted before the lease check: a worker that stops here has no other way to give the
+            // download slot and the in-flight items back.
+            guard ownerLeaseIsCurrent() else { return }
             activeDownloaders += 1
             downloadInFlight += chunk.count
+            let batchID = UUID()
+            batchesInFlight[batchID] = Set(chunk)
             prefetchDownloadStarted += reportedCount(in: chunk)
             diagnostics.recordNetworkRequestDuringPinch()
-            guard ownerLeaseIsCurrent() else { return }
             let writerGeneration = cache.captureWriterGeneration()
             let snapshot = await Self.loadBatch(
                 chunk,
@@ -2145,11 +2272,12 @@ public actor ThumbnailFeedCore {
                 let taskID = UUID()
                 let tracker = Task { [weak self] in
                     _ = await lateLoader.value
-                    await self?.timedOutLoaderFinished(taskID: taskID, itemCount: chunk.count)
+                    await self?.timedOutLoaderFinished(taskID: taskID, batchID: batchID, itemCount: chunk.count)
                 }
                 timedOutLoaderTasks[taskID] = tracker
             } else {
                 downloadInFlight = max(0, downloadInFlight - chunk.count)
+                batchesInFlight[batchID] = nil
             }
             guard generation == prefetchGeneration, ownerLeaseIsCurrent() else { return }
             let completed = snapshot.delivered.count
@@ -2359,10 +2487,11 @@ public actor ThumbnailFeedCore {
         )
     }
 
-    private func timedOutLoaderFinished(taskID: UUID, itemCount: Int) {
+    private func timedOutLoaderFinished(taskID: UUID, batchID: UUID, itemCount: Int) {
         timedOutLoaderTasks[taskID] = nil
         timedOutLoaders = max(0, timedOutLoaders - 1)
         downloadInFlight = max(0, downloadInFlight - itemCount)
+        batchesInFlight[batchID] = nil
     }
 
     /// Reserves queue candidates on the actor, then yields it while the dedicated executor performs the actual
@@ -2378,6 +2507,18 @@ public actor ThumbnailFeedCore {
         var batchPriority = ThumbnailPriority.idleLibraryCrawl
         var diskHits: [PhotoUID] = []
         var diskMisses: [PhotoUID] = []
+        // A batch that ends empty (lost lease, fenced or aborted probe) never reaches the worker's own release,
+        // so every priority reservation not handed over in the returned batch is given back here. The generation
+        // is the one that reserved, so a newer generation keeps its own reservation.
+        let reservationGeneration = prefetchGeneration
+        var reservedPriority: [PhotoUID] = []
+        var handedOver = Set<PhotoUID>()
+        defer {
+            releasePriorityReservations(
+                for: reservedPriority.filter { !handedOver.contains($0) },
+                generation: reservationGeneration
+            )
+        }
         while candidates.count < configuration.batchSize, !priority.isEmpty {
             let bestIndex =
                 priority.indices.min {
@@ -2405,6 +2546,7 @@ public actor ThumbnailFeedCore {
                     priority: itemPriority,
                     generation: prefetchGeneration
                 ))
+            reservedPriority.append(uid)
             candidates.append(uid)
         }
 
@@ -2419,6 +2561,7 @@ public actor ThumbnailFeedCore {
                 writerGeneration: probeGeneration,
                 forceAuthentication: startupAuthenticationPending
             )
+            handedOver = Set(batch.uids)
             if startupAuthenticationPending,
                 sequentialIndex >= sequential.count,
                 candidates.isEmpty || batch.probedDisk
@@ -2499,6 +2642,7 @@ public actor ThumbnailFeedCore {
         if forceAuthentication, sequentialIndex >= sequential.count {
             completeStartupAuthentication()
         }
+        handedOver = Set(diskMisses)
         return BatchWork(uids: diskMisses, priority: batchPriority, probedDisk: !candidates.isEmpty)
     }
 
@@ -2953,15 +3097,16 @@ public actor ThumbnailFeedCore {
     private func storeDecoded(
         _ image: DecodedThumbnail,
         for uid: PhotoUID,
-        decodePixelCap: Int
+        decodePixelCap: Int,
+        access: VisibleThumbnailAccess? = nil
     ) -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), readAllowed(uid) else { return nil }
+        guard ownerLeaseIsCurrent(), readAllowed(uid, access: access) else { return nil }
         let becameCurrent = decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
-        guard readAllowed(uid) else {
+        guard readAllowed(uid, access: access) else {
             decoded.remove(uid)
             return nil
         }
@@ -2971,10 +3116,19 @@ public actor ThumbnailFeedCore {
 
     // MARK: - Local pending photos
 
-    private nonisolated func readAllowed(_ uid: PhotoUID) -> Bool {
-        uid.isLocalPending
+    private nonisolated func readAllowed(_ uid: PhotoUID, access: VisibleThumbnailAccess? = nil) -> Bool {
+        if let access {
+            return !uid.isLocalPending && access.owner == visibleAccessOwner && access.uid == uid && access.isCurrent
+        }
+        return uid.isLocalPending
             ? localAuthorization.isAllowed(uid)
             : thumbnailReadAuthorization.isAllowed(uid) || adoptedAuthorization.isAllowed(uid)
+    }
+
+    /// Called inside the cache's writer fence. Never re-enter its generation/session lock here.
+    /// Scoped operations pass their captured generation separately; the cache validates that generation itself.
+    private nonisolated func cacheReadAuthorized(_ uid: PhotoUID, access: VisibleThumbnailAccess) -> Bool {
+        return !uid.isLocalPending && access.owner == visibleAccessOwner && access.uid == uid && access.isAuthorized
     }
 
     /// Installs the device loader for local pending photos.
@@ -3345,6 +3499,20 @@ public actor ThumbnailFeedCore {
 
         /// Debug-only seam that reports refreshes which ran a chunked `cache.has` sweep.
         func coverageFullScanCountForTesting() -> Int { coverageFullScans }
+
+        func waitForRetiredWorkersForTesting() async {
+            let tasks = retiredWorkerTasks
+            for task in tasks { await task.value }
+        }
+
+        func setDownloadSlotWaitHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            downloadSlotWaitHookForTesting = hook
+        }
+
+        /// Debug-only seam that reports the download counters and whether any worker task still runs.
+        func downloadCountersForTesting() -> (activeDownloaders: Int, downloadInFlight: Int, workersRunning: Bool) {
+            (activeDownloaders, downloadInFlight, workersRunning)
+        }
     }
 #endif
 
@@ -3873,5 +4041,48 @@ private final class ImagesAvailableWakeBox: @unchecked Sendable {
     func call() {
         let current: [@Sendable () -> Void] = lock.withLock { Array(callbacks.values) }
         for callback in current { callback() }
+    }
+}
+
+extension ThumbnailFeedCore {
+    private static let visibleRetryFirstDelay: Duration = .seconds(1)
+    private static let visibleRetryLongestDelay: Duration = .seconds(16)
+
+    /// Loads one thumbnail for a view that is on screen into the decoded tier, and keeps trying until it exists.
+    ///
+    /// A single request can return no image while the bytes are still on the way. This asks with visible priority,
+    /// then waits for the arrival wake or a bounded backoff, whichever comes first, and asks again. It returns nil
+    /// for a photo that has no thumbnail, and ends when the caller's task is cancelled, for example when the view
+    /// leaves the screen. Every platform loads its on-screen thumbnails through this one loop.
+    public nonisolated func visibleDecoded(
+        for uid: PhotoUID, access: VisibleThumbnailAccess? = nil
+    ) async -> DecodedThumbnail? {
+        var delay = Self.visibleRetryFirstDelay
+        while !Task.isCancelled {
+            if let access, !readAllowed(uid, access: access) { return nil }
+            // The wait starts before the request, so an arrival during the request already ends it.
+            let pause = delay
+            let wait = Task<Void, Never> { try? await Task.sleep(for: pause) }
+            let registration = setOnCacheArrivalWake { wait.cancel() }
+            defer { registration.end() }
+            // Scoped tiles own a direct flight. The grid's replaceable priority queue cannot displace it.
+            if access == nil { _ = await requestPriority(uid, priority: .visibleNow) }
+            if let image = await decoded(for: uid, access: access) {
+                wait.cancel()
+                return image
+            }
+            // The feed proved that this photo has no thumbnail. Another request cannot change that.
+            if isKnownUnfetchable(uid, access: access) {
+                wait.cancel()
+                return nil
+            }
+            await withTaskCancellationHandler {
+                _ = await wait.value
+            } onCancel: {
+                wait.cancel()
+            }
+            delay = min(delay * 2, Self.visibleRetryLongestDelay)
+        }
+        return nil
     }
 }

@@ -15,40 +15,45 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
     public static let defaultLeaseInterval: TimeInterval = 120
 
     private static let schemaVersion = 1
-    private var db: OpaquePointer?
-    private let lock = NSLock()
+    private let connection: SQLiteStoreConnection
+    private var db: OpaquePointer? { connection.database }
     private let lockName: String
     private let leaseInterval: TimeInterval
     private let now: @Sendable () -> Date
 
-    public init?(
+    public convenience init?(
         url: URL,
         policy: LibraryDatabasePolicy = .conservative,
         lockName: String = "photoBackup",
         leaseInterval: TimeInterval = defaultLeaseInterval,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
+        self.init(
+            connection: SQLiteStoreConnection(database: handle), lockName: lockName, leaseInterval: leaseInterval,
+            now: now)
+    }
+
+    /// Takes ownership of an already-verified connection; each store owns its connection exclusively.
+    internal init(
+        connection: SQLiteStoreConnection,
+        lockName: String = "photoBackup",
+        leaseInterval: TimeInterval = defaultLeaseInterval,
+        now: @Sendable @escaping () -> Date = { Date() }
+    ) {
+        self.connection = connection
         self.lockName = lockName.isEmpty ? "photoBackup" : lockName
         self.leaseInterval = max(1, leaseInterval)
         self.now = now
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
-        db = handle
     }
 
     deinit { close() }
 
-    public func close() {
-        lock.withLock {
-            guard db != nil else { return }
-            sqlite3_exec(db, "PRAGMA optimize;", nil, nil, nil)
-            sqlite3_close(db)
-            db = nil
-        }
-    }
+    public func close() { connection.close() }
 
     public func currentLock() -> BackupExecutionLock? {
-        lock.withLock { readLock() }
+        connection.withLock { readLock() }
     }
 
     public func acquire(
@@ -57,7 +62,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
         phase: String?,
         processContext: String?
     ) -> BackupLockAcquisition {
-        lock.withLock {
+        connection.withLock {
             // The execution lock is durable across store instances and processes, so the read/decide/write
             // sequence must be one SQLite write transaction. An instance-local NSLock alone allows two
             // connections to both observe an empty row and both report acquisition after racing UPSERTs.
@@ -72,7 +77,12 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
             }
 
             let moment = now()
-            if let existing = readLock() {
+            switch readLockResult() {
+            case .failed:
+                return .unavailable
+            case .confirmedAbsent:
+                break
+            case .row(let existing):
                 let isOurs = existing.runID == runID
                 let isStale = existing.heartbeatAt < moment.addingTimeInterval(-leaseInterval)
                 guard isOurs || isStale else {
@@ -98,7 +108,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
 
     @discardableResult
     public func heartbeat(runID: String, phase: String?) -> Bool {
-        lock.withLock {
+        connection.withLock {
             guard let existing = readLock(), existing.runID == runID else { return false }
             var stmt: OpaquePointer?
             guard
@@ -119,7 +129,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
 
     @discardableResult
     public func release(runID: String) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -137,7 +147,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
 
     @discardableResult
     public func recoverStaleLocks(olderThan cutoff: Date) -> [BackupExecutionLock] {
-        lock.withLock {
+        connection.withLock {
             guard let existing = readLock(), existing.heartbeatAt < cutoff else { return [] }
             var stmt: OpaquePointer?
             guard
@@ -165,7 +175,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
         currentProcessContext: String,
         isProcessAlive: (Int32) -> Bool
     ) -> [BackupExecutionLock] {
-        lock.withLock {
+        connection.withLock {
             guard let existing = readLock(),
                 let old = Self.parseProcessContext(existing.processContext),
                 let current = Self.parseProcessContext(currentProcessContext),
@@ -191,9 +201,20 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
         }
     }
 
-    // MARK: - Read/write (must be called under `lock`)
+    // MARK: - Read/write (must be called inside `connection.withLock`)
+
+    private enum LockReadResult {
+        case row(BackupExecutionLock)
+        case confirmedAbsent
+        case failed
+    }
 
     private func readLock() -> BackupExecutionLock? {
+        guard case .row(let row) = readLockResult() else { return nil }
+        return row
+    }
+
+    private func readLockResult() -> LockReadResult {
         var stmt: OpaquePointer?
         guard
             sqlite3_prepare_v2(
@@ -204,18 +225,21 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
                 """,
                 -1, &stmt, nil
             ) == SQLITE_OK
-        else { return nil }
+        else { return .failed }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, lockName)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return BackupExecutionLock(
-            owner: BackupExecutionOwner(rawValue: columnText(stmt, 0) ?? BackupExecutionOwner.foreground.rawValue),
-            runID: columnText(stmt, 1) ?? "",
-            acquiredAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
-            heartbeatAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3)),
-            phase: columnText(stmt, 4),
-            processContext: columnText(stmt, 5)
-        )
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_DONE { return .confirmedAbsent }
+        guard result == SQLITE_ROW else { return .failed }
+        return .row(
+            BackupExecutionLock(
+                owner: BackupExecutionOwner(rawValue: columnText(stmt, 0) ?? BackupExecutionOwner.foreground.rawValue),
+                runID: columnText(stmt, 1) ?? "",
+                acquiredAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
+                heartbeatAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3)),
+                phase: columnText(stmt, 4),
+                processContext: columnText(stmt, 5)
+            ))
     }
 
     private func writeLock(_ lock: BackupExecutionLock) -> Bool {

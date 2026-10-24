@@ -409,6 +409,31 @@ extension DriveSessionStubSuite {
             #expect(retryData.compactMap { $0["LinkID"] as? String } == ["main", "late-related"])
         }
 
+        @Test func attachResolvesAccountVolumeAndDigestForAnExactProofLink() async throws {
+            StubURLProtocol.reset()
+            let fixture = try AlbumCryptoFixture()
+            fixture.routeShareAndRoot()
+            StubURLProtocol.route(
+                "POST /drive/photos/volumes/vol1/albums",
+                json: #"{"Code":1000,"Album":{"Link":{"LinkID":"album1"}}}"#)
+            fixture.routePhotoMetadata([fixture.photoMetadata(id: "proven", xAttr: fixture.photoXAttrMessage)])
+            StubURLProtocol.route(
+                "POST /drive/photos/volumes/vol1/albums/album1/add-multiple",
+                json: #"{"Code":1001,"Responses":[{"LinkID":"proven","Response":{"Code":1000}}]}"#)
+            let service = fixture.makeService()
+            _ = try await service.createAlbum(name: "Proof")
+            let result = try await service.attach(
+                [AlbumAttachRequestItem(uid: PhotoUID(volumeID: "", nodeID: "proven"), sha1Hex: nil)],
+                albumID: "album1")
+            #expect(result.attachedCount == 1)
+            #expect(result.failedCount == 0)
+            let requests = StubURLProtocol.requests().filter { $0.path.contains("/add-multiple") }
+            #expect(requests.count == 1)
+            #expect(requests.first?.path == "/drive/photos/volumes/vol1/albums/album1/add-multiple")
+            let payload = try #require(try body(of: requests[0])["AlbumData"] as? [[String: Any]])
+            #expect(payload.first?["LinkID"] as? String == "proven")
+        }
+
         @Test func attachBatchesToTheAPILimitAndAggregatesPerItemOutcomes() async throws {
             StubURLProtocol.reset()
             let fixture = try AlbumCryptoFixture()

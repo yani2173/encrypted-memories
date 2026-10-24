@@ -318,7 +318,14 @@ public actor MLIndexRunner {
             processedFromPlan += processedCount
 
             // Durable commit before the next chunk: this is the resume point.
+            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                UpgradeTestProbe.checkpoint("index.beforeCommit")
+            #endif
             let stored = store.upsert(records)
+            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                UpgradeTestProbe.checkpoint("index.afterCommit")
+            #endif
+
             let failuresPersisted = store.recordFailures(failureRecords)
             let chunkReport = MLIndexBatchReport(
                 total: processedCount,

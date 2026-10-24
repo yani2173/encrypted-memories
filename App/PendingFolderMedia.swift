@@ -83,7 +83,7 @@ struct PendingFolderMedia: LocalThumbnailLoading, LocalFileMedia {
 
     func preview(for uid: PhotoUID) async throws -> Data {
         guard let url = access.fileURL(for: uid), let image = await Self.render(url, side: 2048),
-            let data = Self.jpegData(from: image)
+            let data = JPEGEncoding.data(from: image)
         else { throw FolderMediaError.unavailable }
         return data
     }
@@ -154,14 +154,5 @@ struct PendingFolderMedia: LocalThumbnailLoading, LocalFileMedia {
         let request = QLThumbnailGenerator.Request(
             fileAt: url, size: CGSize(width: side, height: side), scale: 1, representationTypes: .thumbnail)
         return try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).cgImage
-    }
-
-    private static func jpegData(from image: CGImage) -> Data? {
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil)
-        else { return nil }
-        CGImageDestinationAddImage(
-            destination, image, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
-        return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 }

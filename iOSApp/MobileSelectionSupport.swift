@@ -281,40 +281,12 @@ extension View {
 /// file; no selected photo/video is materialized as `Data`. Items whose download fails are skipped (the share
 /// proceeds with whatever succeeded); if none succeed the caller surfaces the failure honestly.
 enum MobileMediaExporter {
-    /// Cold-launch purge owns this shared root. Each active export owns a UUID child.
-    private static var exportRoot: URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent("ShareExports", isDirectory: true)
-    }
+    private static var exporter: TemporaryOriginalExporter { TemporaryOriginalExporter() }
 
-    private static func makeExportDirectory() -> URL {
-        exportRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    }
+    private static func makeExportDirectory() -> URL { exporter.makeExportDirectory() }
 
-    /// Share completion deletes only its own files. It never removes the shared root or another job.
-    static func cleanup(_ urls: [URL]) {
-        let root = exportRoot.standardizedFileURL
-        let resolvedRoot = root.resolvingSymlinksInPath()
-        var parents = Set<URL>()
-        for url in urls {
-            let file = url.standardizedFileURL
-            let parent = file.deletingLastPathComponent()
-            let resolvedParent = parent.resolvingSymlinksInPath()
-            let isLegacyFile = parent == root && resolvedParent == resolvedRoot
-            let isOwnedChild =
-                parent.deletingLastPathComponent() == root
-                && UUID(uuidString: parent.lastPathComponent) != nil
-                && resolvedParent.deletingLastPathComponent() == resolvedRoot
-                && resolvedParent.lastPathComponent == parent.lastPathComponent
-            guard isLegacyFile || isOwnedChild else { continue }
-            try? FileManager.default.removeItem(at: file)
-            if isOwnedChild { parents.insert(parent) }
-        }
-        for parent in parents {
-            if (try? FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty) == true {
-                try? FileManager.default.removeItem(at: parent)
-            }
-        }
-    }
+    /// Native share completion remains responsible for releasing the job's files.
+    static func cleanup(_ urls: [URL]) { exporter.cleanup(urls) }
 
     /// Support reports receive the same per-job ownership as original-media exports.
     static func exportSupportReport(_ data: Data) async -> URL? {
@@ -344,13 +316,7 @@ enum MobileMediaExporter {
         return result
     }
 
-    /// The result of an export run: successfully written URLs, the count of items left out, and whether
-    /// the device ran short of space.
-    struct ExportResult {
-        let urls: [URL]
-        let failed: Int
-        var ranOutOfSpace = false
-    }
+    typealias ExportResult = TemporaryOriginalExporter.ExportResult
 
     static func exportOriginals(
         _ items: [PhotoItem],
@@ -358,155 +324,8 @@ enum MobileMediaExporter {
         runtimeState: LibraryRuntimeState = .shared,
         availableCapacity: (URL) -> Int64? = DeviceStorage.availableCapacity(at:)
     ) async -> ExportResult {
-        guard !items.isEmpty else { return ExportResult(urls: [], failed: 0) }
-        guard !Task.isCancelled else { return ExportResult(urls: [], failed: items.count) }
-        let activity = runtimeState.beginActivity(.userTransfer)
-        defer { activity.end() }
-        let directory = makeExportDirectory()
-        let directoryReady = await Task.detached(priority: .utility) {
-            let files = FileManager.default
-            do {
-                try files.createDirectory(at: directory, withIntermediateDirectories: true)
-                return true
-            } catch {
-                return false
-            }
-        }.value
-        guard directoryReady else { return ExportResult(urls: [], failed: items.count) }
-
-        // Two selected photos can share an original Proton name. Reserve a unique path before writing
-        // so concurrent exports cannot overwrite each other.
-        let names = ExportNames()
-        let removeLocationWhenSharing = PrivacyExportPolicy.isEnabled()
-
-        let maxConcurrent = 2
-        var exported: [URL] = []
-        var index = 0
-        var ranOutOfSpace = false
-        // Original sizes are unknown up front, so each next item needs the reserve free before it starts. The rest
-        // of the selection is then reported as a space failure instead of filling the device.
-        func hasRoomForNextItem() -> Bool {
-            (availableCapacity(directory) ?? .max) >= exportReserveBytes
-        }
-        // Bounded task group: at most `maxConcurrent` downloads in flight so a big video selection can't spike RAM.
-        await withTaskGroup(of: ItemExport.self) { group in
-            func addNext() {
-                guard index < items.count, !Task.isCancelled, !ranOutOfSpace else { return }
-                guard hasRoomForNextItem() else {
-                    ranOutOfSpace = true
-                    return
-                }
-                let item = items[index]
-                index += 1
-                group.addTask {
-                    await export(
-                        item, backend: backend, names: names, into: directory,
-                        removeLocationWhenSharing: removeLocationWhenSharing)
-                }
-            }
-            for _ in 0..<min(maxConcurrent, items.count) { addNext() }
-            for await outcome in group {
-                switch outcome {
-                case .exported(let url): exported.append(url)
-                // A full device fails every later item too. Stop instead of retrying into the same wall.
-                case .outOfSpace: ranOutOfSpace = true
-                case .failed: break
-                }
-                addNext()
-            }
-        }
-        if Task.isCancelled {
-            cleanup(exported)
-            try? FileManager.default.removeItem(at: directory)
-            return ExportResult(urls: [], failed: items.count)
-        }
-        if exported.isEmpty { try? FileManager.default.removeItem(at: directory) }
-        return ExportResult(urls: exported, failed: items.count - exported.count, ranOutOfSpace: ranOutOfSpace)
-    }
-
-    /// Free space an export leaves untouched, matching the drag-out staging reserve.
-    private static let exportReserveBytes: Int64 = 128 * 1024 * 1024
-
-    private enum ItemExport: Sendable {
-        case exported(URL)
-        case outOfSpace
-        case failed
-    }
-
-    private static func export(
-        _ item: PhotoItem,
-        backend: any OriginalFileProvider & PhotoMetadataProvider,
-        names: ExportNames,
-        into directory: URL,
-        removeLocationWhenSharing: Bool
-    ) async -> ItemExport {
-        let staging = directory.appendingPathComponent(".\(UUID().uuidString).download")
-        defer { try? FileManager.default.removeItem(at: staging) }
-        do {
-            try Task.checkCancellation()
-            try await backend.writeOriginal(for: item.uid, to: staging)
-            try Task.checkCancellation()
-            // The decrypted Proton filename is authoritative. Preserve it when available, and use the
-            // generated fallback if metadata lookup fails.
-            let meta = try? await backend.metadata(for: item.uid)
-            // Derive a missing extension from the bounded header, then use the link MIME as a secondary signal.
-            let desired = try OriginalExportWriter.exportFilename(
-                forDownloadedOriginal: staging, item: item, metadata: meta, fallbackBase: fallbackBase(for: item)
-            )
-            // A location-free copy of a RAW photo is a JPEG; reserve that name so it never replaces another file.
-            let name =
-                removeLocationWhenSharing ? LocationSanitizedCopy.outputFilename(forOriginalName: desired) : desired
-            let url = directory.appendingPathComponent(await names.unique(name))
-            try Task.checkCancellation()
-            if removeLocationWhenSharing {
-                return .exported(try await LocationSanitizedCopy.write(from: staging, to: url))
-            }
-            try FileManager.default.moveItem(at: staging, to: url)
-            return .exported(url)
-        } catch {
-            return DeviceStorage.isOutOfSpace(error) ? .outOfSpace : .failed
-        }
-    }
-
-    /// Generates a fallback base name when Proton metadata has no filename. The timestamp and node suffix
-    /// avoid collisions before the unique-name actor assigns the final path.
-    static func fallbackBase(for item: PhotoItem) -> String {
-        let stamp = Self.stampFormatter.string(from: item.captureTime)
-        let suffix = String(item.uid.nodeID.suffix(6))
-        return "Encrypted-Memories-\(stamp)-\(suffix)"
-    }
-
-    private static let stampFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter
-    }()
-}
-
-/// Serialises on-disk name assignment across the concurrent export/save tasks so two files that resolve to
-/// the same original name (a real collision, e.g. two `IMG_0001.HEIC`) get `IMG_0001 2.HEIC` etc. instead of
-/// clobbering each other's temp URL. Case-insensitive to match the (typically case-insensitive) filesystem.
-/// Mirrors macOS `MainView.uniqueName`.
-actor ExportNames {
-    private var used: Set<String> = []
-
-    func unique(_ name: String) -> String {
-        if reserve(name) { return name }
-        let ns = name as NSString
-        let base = ns.deletingPathExtension
-        let ext = ns.pathExtension
-        var n = 2
-        while true {
-            let candidate = ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)"
-            if reserve(candidate) { return candidate }
-            n += 1
-        }
-    }
-
-    /// Records `name` and returns true if it was free; false if already taken.
-    private func reserve(_ name: String) -> Bool {
-        used.insert(name.lowercased()).inserted
+        await exporter.exportOriginals(
+            items, backend: backend, runtimeState: runtimeState, availableCapacity: availableCapacity)
     }
 }
 

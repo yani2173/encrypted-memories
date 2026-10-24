@@ -2,6 +2,7 @@
     import GridCore
     import PhotosCore
     import Testing
+    import TimelineCore
     import UIKit
     @testable import TimelineUIKitFeature
 
@@ -98,6 +99,28 @@
             #expect(selection.accessibilityHint == L10n.string("a11y.select_photo_hint"))
             #expect(selection.accessibilityActivate())
             #expect(toggled == video.uid)
+        }
+
+        @Test func aWaitingPhotoSaysThatTheBackupIsPaused() {
+            let container = UIView(frame: CGRect(x: 0, y: 0, width: 160, height: 80))
+            let provider = UIKitTimelineGridAccessibilityProvider(container: container)
+            let waiting = PhotoItem(
+                uid: PhotoUID(localPending: .photoLibrary, identifier: "asset"),
+                captureTime: Date(timeIntervalSince1970: 0), mediaType: "image/heic")
+            let paused = PendingUploadBadges(base: [waiting.uid: .waiting], isPaused: true)
+            let rebuild = { (badges: PendingUploadBadges) in
+                provider.rebuild(
+                    items: [waiting], visibleSlots: [slot(0, x: 0)], selectedUIDs: [], selectionMode: false,
+                    uploadBadges: badges, frameForSlot: \.viewportRect)
+            }
+
+            rebuild(paused)
+            let element = provider.elements[0]
+            #expect(element.accessibilityLabel?.hasSuffix(", \(L10n.string("a11y.upload_badge.paused"))") == true)
+
+            rebuild(paused.replacing(isPaused: false))
+            #expect(provider.elements[0] === element)
+            #expect(element.accessibilityLabel?.contains(L10n.string("a11y.upload_badge.paused")) == false)
         }
 
         @Test func viewportFrameDoesNotApplyScrollOffsetTwice() {

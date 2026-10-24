@@ -8,7 +8,7 @@ import ProtonDriveSDK
 /// so the C# core can decrypt node/thumbnail metadata. All key material is unlocked once at
 /// sign-in (see `SDKAccountClientBuilder`) and read synchronously here, as the SDK requires.
 ///
-/// SDK 0.29.1 no longer accepts `ProtonCoreDataModel.Address`. The app maps its ProtonCore account
+/// SDK 0.31.1 no longer accepts `ProtonCoreDataModel.Address`. The app maps its ProtonCore account
 /// data into the SDK-owned `AccountClientAddress` through `SDKAddressDescriptor`, which keeps the
 /// key-capability derivation testable without `@testable` access to the SDK module.
 struct SDKAccountClient: AccountClientProtocol, @unchecked Sendable {
@@ -51,7 +51,7 @@ struct SDKAccountClient: AccountClientProtocol, @unchecked Sendable {
     }
 }
 
-/// App-owned, fully readable projection of one ProtonCore `Address` into the SDK 0.29.1 account
+/// App-owned, fully readable projection of one ProtonCore `Address` into the SDK 0.31.1 account
 /// contract. Before 0.27.0 the SDK derived these booleans itself from `Key.keyFlags`; the mapping
 /// here reproduces that derivation exactly (`KeyFlags.encryptNewData` / `.verifySignatures`).
 struct SDKAddressDescriptor: Equatable, Sendable {

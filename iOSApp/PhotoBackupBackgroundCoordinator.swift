@@ -10,6 +10,8 @@ import os
 private final class PhotoBackupProcessingAttempt {
     var didExpire = false
     var runID: String?
+    /// The work of this window. Expiration cancels it, so a pass that still waits for the first network path ends.
+    var work: Task<Void, Never>?
 }
 
 /// Owns only the iOS execution opportunities for the shared photo-backup controller.
@@ -187,7 +189,7 @@ final class PhotoBackupBackgroundCoordinator {
 
         let completion = PhotoBackupTaskCompletion(task: task)
         let attempt = PhotoBackupProcessingAttempt()
-        _ = Task { @MainActor [weak self] in
+        attempt.work = Task { @MainActor [weak self] in
             guard !attempt.didExpire else {
                 completion.finish(success: false)
                 return
@@ -225,6 +227,7 @@ final class PhotoBackupBackgroundCoordinator {
         task.expirationHandler = { [weak self] in
             Task { @MainActor in
                 attempt.didExpire = true
+                attempt.work?.cancel()
                 let controller = PhotoLibraryBackupSharedRef.shared.controller
                 if let runID = attempt.runID {
                     controller?.stopSync(runID: runID)

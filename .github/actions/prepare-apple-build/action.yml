@@ -5,11 +5,28 @@ inputs:
   sdk-version:
     description: Reviewed Proton Drive SDK tag.
     required: false
-    default: "0.29.1"
+    default: "0.31.1"
   xcode-version:
     description: Xcode version that the build expects. A runner with another version fails.
     required: false
-    default: "27.0"
+    default: "27.1"
+  xcode-build:
+    description: Reviewed Xcode build identifier. A runner with another build fails.
+    required: false
+    default: "27A9275"
+
+  build-profile:
+    description: Dependency graphs to prepare (app, package, or all).
+    required: false
+    default: all
+  save-cache:
+    description: Publish resolved dependencies after a cache miss.
+    required: false
+    default: "true"
+  measure-cache:
+    description: Restore the populated dependency cache again to measure its cost.
+    required: false
+    default: "false"
 
 outputs:
   source-packages-path:
@@ -22,19 +39,27 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Check the pinned Xcode version
+    - name: Validate the build profile
       shell: bash
       env:
-        EXPECTED_XCODE_VERSION: ${{ inputs.xcode-version }}
+        BUILD_PROFILE: ${{ inputs.build-profile }}
       run: |
         set -euo pipefail
-        source .github/scripts/release_failure.sh
-        xcode_version="$(awk '/^Xcode / { print $2; exit }' <<< "$(xcodebuild -version)")"
-        [[ "$xcode_version" == "$EXPECTED_XCODE_VERSION" ]] || release_fail toolchain \
-          "The runner uses Xcode '${xcode_version:-unknown}'; the build expects Xcode '$EXPECTED_XCODE_VERSION'." \
-          "Select the expected Xcode on the runner, or update the xcode-version input in a reviewed change."
+        case "$BUILD_PROFILE" in app|package|all) ;; *) echo "Invalid build profile." >&2; exit 64 ;; esac
+
+    - name: Check the pinned Xcode version and build
+      shell: bash
+      env:
+        DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+        EXPECTED_XCODE_VERSION: ${{ inputs.xcode-version }}
+        EXPECTED_XCODE_BUILD: ${{ inputs.xcode-build }}
+      run: |
+        set -euo pipefail
+        bash .github/scripts/verify_xcode_toolchain.sh
+        printf 'DEVELOPER_DIR=%s\n' "$DEVELOPER_DIR" >> "$GITHUB_ENV"
 
     - name: Install pinned XcodeGen
+      if: ${{ inputs.build-profile != 'package' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -63,7 +88,7 @@ runs:
         : > "$key_material"
         while IFS= read -r file; do
           case "$file" in
-            Package.swift|*/Package.swift|Package.resolved|*/Package.resolved|VendorPatches/*|project.yml|scripts/build-paths.sh|scripts/install-xcodegen.sh|scripts/update-proton-sdk.sh|.github/actions/prepare-apple-build/action.yml)
+            Package.swift|*/Package.swift|Package.resolved|*/Package.resolved|VendorPatches/*|project.yml|scripts/build-paths.sh|scripts/install-xcodegen.sh|scripts/update-proton-sdk.sh|.github/scripts/verify_xcode_toolchain.sh|.github/actions/prepare-apple-build/action.yml)
               shasum -a 256 "$file" >> "$key_material"
               ;;
           esac
@@ -71,20 +96,30 @@ runs:
         digest="$(shasum -a 256 "$key_material" | awk '{print $1}')"
         xcode_version_output="$(xcodebuild -version)"
         xcode_version="$(awk '/^Xcode / { print $2; exit }' <<< "$xcode_version_output")"
-        [[ -n "$xcode_version" ]] || release_fail toolchain \
+        xcode_build="$(awk '/^Build version / { print $3; exit }' <<< "$xcode_version_output")"
+        [[ -n "$xcode_version" && -n "$xcode_build" ]] || release_fail toolchain \
           "xcodebuild -version did not report an Xcode version." \
           "Use the configured xcode-27 runner with a working Xcode installation."
         printf 'key=%s-sdk-%s-xcode-%s-package-cache-%s\n' \
-          "$RUNNER_OS" "$SDK_VERSION" "$xcode_version" "$digest" >> "$GITHUB_OUTPUT"
+          "$RUNNER_OS-$RUNNER_ARCH" "$SDK_VERSION" "$xcode_version-$xcode_build" "$digest" >> "$GITHUB_OUTPUT"
 
-    - name: Restore SwiftPM and Xcode package caches
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+    - name: Restore SwiftPM dependencies
+      id: spm-cache
+      if: ${{ inputs.build-profile != 'app' }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/Developer/xcode/EncryptedMemories/SwiftPMCache.noindex
+        key: ${{ steps.dependency-cache-key.outputs.key }}-spm-v2
+
+    - name: Restore Xcode dependencies
+      id: xcode-cache
+      if: ${{ inputs.build-profile != 'package' }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          ~/Developer/xcode/EncryptedMemories/SwiftPMCache.noindex
           ~/Developer/xcode/EncryptedMemories/SourcePackages.noindex
           ~/Developer/xcode/EncryptedMemories/XcodePackageCache.noindex
-        key: ${{ steps.dependency-cache-key.outputs.key }}
+        key: ${{ steps.dependency-cache-key.outputs.key }}-xcode-v2
 
     - name: Export shared Xcode build paths
       id: build-paths
@@ -97,7 +132,8 @@ runs:
           echo "package-cache-path=$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE"
         } >> "$GITHUB_OUTPUT"
 
-    - name: Resolve and pin package graph
+    - name: Resolve the pinned SwiftPM graph
+      if: ${{ inputs.build-profile != 'app' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -111,6 +147,14 @@ runs:
           --force-resolved-versions \
           resolve
         git diff --exit-code -- Packages/EncryptedMemoriesKit/Package.resolved
+
+    - name: Resolve the pinned Xcode graph
+      if: ${{ inputs.build-profile != 'package' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        source scripts/build-paths.sh
+        [[ -f BuildSupport/Package.resolved ]]
         xcodegen generate
         encryptedmemories_pin_generated_project_packages "$GITHUB_WORKSPACE"
         cmp \
@@ -127,3 +171,37 @@ runs:
           -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
           -packageAuthorizationProvider netrc \
           -onlyUsePackageVersionsFromResolvedFile
+
+    - name: Save resolved SwiftPM dependencies
+      if: ${{ inputs.save-cache != 'false' && inputs.build-profile != 'app' && steps.spm-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/Developer/xcode/EncryptedMemories/SwiftPMCache.noindex
+        key: ${{ steps.dependency-cache-key.outputs.key }}-spm-v2
+
+    - name: Save resolved Xcode dependencies
+      if: ${{ inputs.save-cache != 'false' && inputs.build-profile != 'package' && steps.xcode-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/Developer/xcode/EncryptedMemories/SourcePackages.noindex
+          ~/Developer/xcode/EncryptedMemories/XcodePackageCache.noindex
+        key: ${{ steps.dependency-cache-key.outputs.key }}-xcode-v2
+
+    - name: Measure populated SwiftPM cache restore
+      if: ${{ inputs.measure-cache == 'true' && inputs.build-profile != 'app' }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/Developer/xcode/EncryptedMemories/SwiftPMCache.noindex
+        key: ${{ steps.dependency-cache-key.outputs.key }}-spm-v2
+        fail-on-cache-miss: true
+
+    - name: Measure populated Xcode cache restore
+      if: ${{ inputs.measure-cache == 'true' && inputs.build-profile != 'package' }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/Developer/xcode/EncryptedMemories/SourcePackages.noindex
+          ~/Developer/xcode/EncryptedMemories/XcodePackageCache.noindex
+        key: ${{ steps.dependency-cache-key.outputs.key }}-xcode-v2
+        fail-on-cache-miss: true

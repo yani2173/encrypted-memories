@@ -44,8 +44,8 @@
                 }
             )
             configureMap()
-            // The loader frames synchronously (centres on the dense core before first paint) and defers the
-            // first aggregation to the next runloop tick, so the map tab opens instantly and the pins follow.
+            // The loader computes the dense-core frame off-main, then loads its first pins.
+            // The index warms the shared coordinate evidence before the map opens.
             loader.attach(mapView)
         }
 

@@ -30,8 +30,7 @@
             }
         }
 
-        /// One token per live owner. The role string remains part of the call-site API for diagnostics and source
-        /// readability, but it never chooses which responder survives. Separate grids may therefore share a role.
+        /// One token per live owner, keyed by object identity. Separate grids each keep their own token.
         private var attachments: [ObjectIdentifier: Attachment] = [:]
 
         private init(governor: MemoryPressureGovernor) {
@@ -75,7 +74,7 @@
         /// Register the live thumbnail feed's RAM tiers (UIImage wrappers + decoded core).
         @discardableResult
         public func attachFeed(_ feed: UIKitThumbnailFeed) -> MemoryPressureRegistration {
-            attach(feed, key: "thumbnailFeed") { [weak feed] tier in
+            attach(feed) { [weak feed] tier in
                 feed?.applyMemoryPressure(scale: tier.budgetScale, purge: tier.requiresImmediatePurge)
             }
         }
@@ -83,22 +82,20 @@
         /// Register the live encrypted thumbnail byte cache's in-process plaintext RAM tier.
         @discardableResult
         public func attachByteCache(_ cache: ThumbnailCache) -> MemoryPressureRegistration {
-            attach(cache, key: "byteCache") { [weak cache] tier in
+            attach(cache) { [weak cache] tier in
                 cache?.applyMemoryPressure(scale: tier.budgetScale, purge: tier.requiresImmediatePurge)
             }
         }
 
         /// Generic owner attachment for owners this module must not depend on (the viewer display store, the grid
-        /// host's texture cache). Re-attaching the same object is a no-op; a distinct object always gets its own
-        /// registration even when it uses the same role key. The responder is invoked immediately with the current
-        /// tier (governor semantics), so an owner attached under existing pressure starts scaled.
+        /// host's texture cache). Re-attaching the same object is a no-op; every distinct object gets its own
+        /// registration. The responder is invoked immediately with the current tier (governor semantics), so an
+        /// owner attached under existing pressure starts scaled.
         @discardableResult
         public func attach(
             _ owner: AnyObject,
-            key: String,
             respond: @escaping @MainActor (MemoryBudgetTier) -> Void
         ) -> MemoryPressureRegistration {
-            _ = key
             pruneDeallocatedAttachments()
             let id = ObjectIdentifier(owner)
             if let existing = attachments[id] {

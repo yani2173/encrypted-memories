@@ -8,6 +8,15 @@ public enum DeviceStorage {
             .volumeAvailableCapacityForImportantUsage
     }
 
+    /// True when the volume that holds `url` has no free block for an ordinary process (`statfs` `f_bavail == 0`),
+    /// `nil` when the volume cannot be queried. `availableCapacity` cannot answer this: it counts purgeable space as
+    /// free, while a write fails as soon as the volume has no free block left.
+    public static func volumeHasNoFreeBlocks(at url: URL) -> Bool? {
+        var info = statfs()
+        guard statfs(url.path, &info) == 0 else { return nil }
+        return info.f_bavail == 0
+    }
+
     /// True when a write failed because the volume is full, also when the error wraps the file-system error.
     public static func isOutOfSpace(_ error: any Error) -> Bool {
         if let cocoa = error as? CocoaError, cocoa.code == .fileWriteOutOfSpace { return true }

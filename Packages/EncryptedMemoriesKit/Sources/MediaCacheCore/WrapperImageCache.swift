@@ -80,16 +80,6 @@ public final class WrapperImageCache<Image: AnyObject>: @unchecked Sendable {
         }
     }
 
-    /// Compatibility convenience for callers which do not build across an await. Async-capable adapter paths
-    /// must use `captureTicket()` before building and the ticketed overload above.
-    @discardableResult
-    public func setPaired(
-        _ image: Image, forKey key: NSString, cost: Int, source: AnyObject?
-    ) -> Bool {
-        guard let source else { return false }
-        return setPaired(image, forKey: key, cost: cost, source: source, ticket: captureTicket())
-    }
-
     /// Resolves a paired wrapper without ever publishing a builder result after source replacement or a
     /// destructive invalidation. The caller must capture `ticket` before its first authoritative source lookup.
     public func resolvePairedImage(
@@ -133,11 +123,6 @@ public final class WrapperImageCache<Image: AnyObject>: @unchecked Sendable {
     /// Removes one entry. Destructive whole-cache operations own builder invalidation.
     public func remove(forKey key: NSString) {
         invalidatePaired(forKey: key)
-    }
-
-    /// Removes all entries and invalidates every wrapper builder that was already in flight.
-    public func removeAll() {
-        invalidateAll()
     }
 
     /// Clears all wrappers and invalidates every in-flight wrapper build, including account-loss cleanup.

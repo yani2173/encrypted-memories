@@ -1,6 +1,7 @@
 #if canImport(UIKit)
     import GridCore
     import PhotosCore
+    import TimelineCore
     import UIKit
 
     /// Owns the native accessibility projection for the grid surface.
@@ -64,6 +65,7 @@
                 visibleSlots: plan.visibleSlots,
                 selectedUIDs: host.selectedUIDs,
                 selectionMode: host.selectionMode,
+                uploadBadges: host.uploadBadges,
                 localizationIdentifier: Self.currentLocalizationIdentifier,
                 frameForSlot: { [weak host] slot in
                     guard let host else { return .zero }
@@ -79,6 +81,7 @@
             visibleSlots: [GridSlot],
             selectedUIDs: Set<PhotoUID>,
             selectionMode: Bool,
+            uploadBadges: PendingUploadBadges = .empty,
             localizationIdentifier: String = UIKitTimelineGridAccessibilityProvider.currentLocalizationIdentifier,
             frameForSlot: (GridSlot) -> CGRect
         ) {
@@ -123,6 +126,7 @@
                     item: item,
                     selected: selectedUIDs.contains(item.uid),
                     selectionMode: selectionMode,
+                    backupState: uploadBadges.accessibilityDescription(for: item.uid),
                     position: slot.index + 1,
                     total: items.count,
                     localizationIdentifier: localizationIdentifier
@@ -155,6 +159,7 @@
             let isVideo: Bool
             let selected: Bool
             let selectionMode: Bool
+            let backupState: String?
             let position: Int
             let total: Int
             let localizationIdentifier: String
@@ -184,6 +189,7 @@
             item: PhotoItem,
             selected: Bool,
             selectionMode: Bool,
+            backupState: String? = nil,
             position: Int,
             total: Int,
             localizationIdentifier: String
@@ -195,6 +201,7 @@
                 isVideo: item.isVideo,
                 selected: selected,
                 selectionMode: selectionMode,
+                backupState: backupState,
                 position: position,
                 total: total,
                 localizationIdentifier: localizationIdentifier
@@ -204,7 +211,8 @@
             semanticUpdateCount += 1
             Self.labelFormatter.locale = .current
             let kind = L10n.string(item.isVideo ? "a11y.video" : "a11y.photo")
-            accessibilityLabel = "\(kind), \(Self.labelFormatter.string(from: item.captureTime))"
+            let label = "\(kind), \(Self.labelFormatter.string(from: item.captureTime))"
+            accessibilityLabel = backupState.map { "\(label), \($0)" } ?? label
             accessibilityValue = L10n.string("a11y.grid.position \(position) \(total)")
             accessibilityHint = L10n.string(selectionMode ? "a11y.select_photo_hint" : "a11y.open_photo_hint")
             var traits: UIAccessibilityTraits = [.image, .button]

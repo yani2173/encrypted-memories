@@ -139,17 +139,16 @@ public enum BackupLocalDataPurge {
         roots: [URL]?,
         removeItem: (URL) throws -> Void
     ) -> Result {
-        let fm = FileManager.default
         var removed: [URL] = []
         var failed: [URL] = []
         for root in roots ?? localDataRoots() {
-            guard fm.fileExists(atPath: root.path) else { continue }
             do {
+                guard try LocalPurgeItemState.read(at: root) != .missing else { continue }
                 try removeItem(root)
-                if fm.fileExists(atPath: root.path) {
-                    failed.append(root)
-                } else {
+                if try LocalPurgeItemState.read(at: root) == .missing {
                     removed.append(root)
+                } else {
+                    failed.append(root)
                 }
             } catch {
                 failed.append(root)

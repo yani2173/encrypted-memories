@@ -54,6 +54,39 @@ import Testing
         #expect(store?.search(normalizedTokens: ["secret"], in: key, limit: 10).map(\.uid) == [uid])
     }
 
+    /// Another connection holds the file exclusively longer than the busy timeout. The derived index is never
+    /// deleted for that, and it opens again with its progress once the lock is gone.
+    @Test func aFileThatAnotherConnectionHoldsIsKeptAndOpensAgainWithItsProgress() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName)
+        let cipher = TestDerivedCipher(key: 0x5a)
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account-a", artifacts: [artifact])
+        let asset = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "1"), sourceRevision: "source-v1")
+        let first = try openStore(url: url, cipher: cipher)
+        #expect(first.enqueue([asset], for: key))
+        first.close()
+        var blocker: OpaquePointer?
+        #expect(sqlite3_open(url.path, &blocker) == SQLITE_OK)
+        #expect(sqlite3_exec(blocker, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(blocker, "BEGIN EXCLUSIVE;", nil, nil, nil) == SQLITE_OK)
+
+        let noWait = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        let busy = SQLiteMLDerivedPipelineStore(url: url, policy: noWait, cipher: cipher)
+        busy?.close()
+        #expect(sqlite3_exec(blocker, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(blocker)
+
+        #expect(busy == nil, "the store is unavailable while the lock lasts")
+        #expect(FileManager.default.fileExists(atPath: url.path), "the index is not deleted")
+        let reopened = try openStore(url: url, cipher: cipher)
+        defer { reopened.close() }
+        #expect(try reopened.progress(for: key).total == 1)
+    }
+
     @Test func sourceRevisionInvalidatesPayloadAndPostingsBeforeReindex() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")

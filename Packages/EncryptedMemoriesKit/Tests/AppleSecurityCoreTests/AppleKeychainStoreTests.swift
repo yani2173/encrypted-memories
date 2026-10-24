@@ -6,6 +6,21 @@ import Testing
 
 @Suite("Shared Apple security transport")
 struct AppleKeychainStoreTests {
+    @Test func queryKeepsTheServiceAndImplicitAccessGroupContract() throws {
+        let security = MemorySecurityItemClient()
+        let store = SystemAppleKeychainStore(security: security)
+        let item = AppleKeychainItem(
+            service: "at.oncloud.encryptedmemories.session", account: "default",
+            accessibility: .whenUnlockedThisDeviceOnly)
+        _ = try store.data(for: item)
+        let query = try #require(security.lastReadQuery)
+        #expect(query[kSecAttrService as String] as? String == item.service)
+        #expect(query[kSecAttrAccount as String] as? String == "default")
+        #expect(query[kSecUseDataProtectionKeychain as String] as? Bool == true)
+        #expect(query[kSecAttrSynchronizable as String] as? Bool == false)
+        #expect(query[kSecAttrAccessGroup as String] == nil)
+    }
+
     @Test func protectedItemUpdatesWithoutDeleteAndAdd() throws {
         let security = MemorySecurityItemClient()
         let store = SystemAppleKeychainStore(security: security)
@@ -73,12 +88,16 @@ private final class MemorySecurityItemClient: SecurityItemCalling, @unchecked Se
     private var storage: [Key: Data] = [:]
     private var adds = 0
     private var deletes = 0
+    private var readQuery: [String: Any]?
+
+    var lastReadQuery: [String: Any]? { lock.withLock { readQuery } }
 
     var addCount: Int { lock.withLock { adds } }
     var deleteCount: Int { lock.withLock { deletes } }
 
     func copyMatching(_ query: [String: Any]) -> SecurityItemCopyResult {
         lock.withLock {
+            readQuery = query
             guard let key = key(from: query), let data = storage[key] else {
                 return SecurityItemCopyResult(status: errSecItemNotFound, data: nil)
             }

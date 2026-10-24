@@ -21,6 +21,8 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         case attention
         case paused
         case waiting
+        /// Mobile data is off for backups. Hosts show `BackupStatus.waitingForWiFiSymbolName`, never an offline symbol.
+        case waitingForWiFi
         case notice
     }
 
@@ -44,8 +46,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     // attention line.
     public var backedUp: Int
     public var total: Int
-    /// Items still to check or upload (`BackupStatus.remainingCount`); "<k> left" follows the backed-up count.
-    public var remainingCount: Int
     public var attentionCount: Int
     /// Retryable work waiting on external state. It may open details, but is never worded as failure.
     public var waitingCount: Int
@@ -57,9 +57,11 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     /// Exact aggregate byte fraction behind `activeTransferPercent`. When present, the visible progress
     /// bar represents this same transfer instead of an imperceptible one-item step across a large library.
     public var activeTransferFraction: Double?
-    /// Upload speed from `BackupTransferRate`. The status alone has no history, so the timeful row model sets it.
-    public var bytesPerSecond: Double?
     public var nextAttemptAt: Date?
+    /// Rows still to work on (waiting, checking, uploading). See `BackupStatus.remainingCount`.
+    public var remainingCount = 0
+    /// Smoothed upload speed; only set while the phase checks or uploads.
+    public var uploadSpeedBytesPerSecond: Double?
     /// Queue-wide dedupe-index failure. Kept separate from item failures so hosts do not open an empty
     /// per-photo failure list for an account/service problem.
     public var remoteIndexPreparationFailed: Bool
@@ -69,7 +71,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     public var detailLayout: DetailLayout {
         guard total > 0 else { return .compact }
         switch headlineKey {
-        case "backup.phase_checking", "backup.phase_uploading", "backup.phase_paused":
+        case "backup.phase_checking", "backup.phase_checking_photos", "backup.phase_uploading", "backup.phase_paused":
             return .progress
         default:
             return .compact
@@ -83,13 +85,11 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         progressFraction: Double?,
         backedUp: Int = 0,
         total: Int = 0,
-        remainingCount: Int = 0,
         attentionCount: Int = 0,
         waitingCount: Int = 0,
         skippedRemoteDeletions: Int = 0,
         activeTransferPercent: Int? = nil,
         activeTransferFraction: Double? = nil,
-        bytesPerSecond: Double? = nil,
         nextAttemptAt: Date? = nil,
         remoteIndexPreparationFailed: Bool = false,
         degradedDedupeUnresolvedCount: Int = 0,
@@ -101,13 +101,11 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         self.progressFraction = progressFraction
         self.backedUp = backedUp
         self.total = total
-        self.remainingCount = max(0, remainingCount)
         self.attentionCount = attentionCount
         self.waitingCount = waitingCount
         self.skippedRemoteDeletions = skippedRemoteDeletions
         self.activeTransferPercent = activeTransferPercent
         self.activeTransferFraction = activeTransferFraction.map { min(1, max(0, $0)) }
-        self.bytesPerSecond = bytesPerSecond
         self.nextAttemptAt = nextAttemptAt
         self.remoteIndexPreparationFailed = remoteIndexPreparationFailed
         self.degradedDedupeUnresolvedCount = max(0, degradedDedupeUnresolvedCount)
@@ -127,7 +125,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
 
         case .checking:
             self.init(
-                headlineKey: "backup.phase_checking",
+                headlineKey: status.titleKey,
                 isActive: true, accessory: .activity,
                 progressFraction: status.fractionCompleted,
                 backedUp: status.backedUp, total: backupTarget,
@@ -148,22 +146,35 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 backedUp: status.backedUp, total: backupTarget,
                 skippedRemoteDeletions: status.skippedRemoteDeletions)
 
+        case .waitingForWiFi:
+            self.init(
+                headlineKey: "backup.phase_waiting_wifi", isActive: false, accessory: .waitingForWiFi,
+                progressFraction: status.fractionCompleted,
+                backedUp: status.backedUp, total: backupTarget,
+                attentionCount: status.needsAttentionCount,
+                skippedRemoteDeletions: status.skippedRemoteDeletions)
+
         case .waiting:
-            let headlineKey =
-                switch status.outstandingIssue {
-                case .network: "backup.phase_waiting_network"
-                case .remoteService: "backup.phase_waiting_proton"
-                case .deviceStorage: "backup.phase_waiting_storage"
-                case .accountStorage: "backup.phase_waiting_account_storage"
-                case .remoteDraft: "backup.phase_waiting_draft"
-                case .deletedElsewhere: "backup.phase_attention"
-                default: "backup.phase_waiting"
-                }
+            let headlineKey: String
+            if status.hasOnlyDismissedSourceRechecks {
+                headlineKey = status.titleKey
+            } else {
+                headlineKey =
+                    switch status.outstandingIssue {
+                    case .network: "backup.phase_waiting_network"
+                    case .remoteService: "backup.phase_waiting_proton"
+                    case .deviceStorage: "backup.phase_waiting_storage"
+                    case .accountStorage: "backup.phase_waiting_account_storage"
+                    case .remoteDraft: "backup.phase_waiting_draft"
+                    case .deletedElsewhere: "backup.phase_attention"
+                    default: "backup.phase_waiting"
+                    }
+            }
             self.init(
                 headlineKey: headlineKey, isActive: false, accessory: .waiting,
                 progressFraction: status.fractionCompleted,
                 backedUp: status.backedUp, total: backupTarget,
-                waitingCount: status.outstandingCount,
+                waitingCount: max(0, status.outstandingCount - status.pendingSourceRechecks),
                 skippedRemoteDeletions: status.skippedRemoteDeletions,
                 nextAttemptAt: status.nextAttemptAt)
 
@@ -203,8 +214,12 @@ public struct BackupStatusPresentation: Sendable, Equatable {
             activeTransferFraction = fraction
             activeTransferPercent = min(100, max(0, Int((fraction * 100).rounded(.down))))
         }
-        if total > 0 { remainingCount = status.remainingCount ?? 0 }
         executionOpportunityIssue = status.executionOpportunityIssue
+        remainingCount = status.remainingCount
+        // A speed belongs to a sending phase only; a stale value never shows while paused or waiting.
+        if status.phase == .checking || status.phase == .uploading {
+            uploadSpeedBytesPerSecond = status.uploadSpeedBytesPerSecond
+        }
         if status.remoteContentIndexHealth.shouldWarn {
             degradedDedupeUnresolvedCount = status.remoteContentIndexHealth.unresolvedCount
         }
@@ -217,9 +232,12 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         switch headlineKey {
         case "backup.phase_scanning": return L10n.string("backup.phase_scanning")
         case "backup.phase_checking": return L10n.string("backup.phase_checking")
+        case "backup.phase_checking_photos": return L10n.string("backup.phase_checking_photos")
         case "backup.phase_uploading": return L10n.string("backup.phase_uploading")
         case "backup.phase_paused": return L10n.string("backup.phase_paused")
+        case "backup.phase_waiting_wifi": return L10n.string("backup.phase_waiting_wifi")
         case "backup.phase_waiting": return L10n.string("backup.phase_waiting")
+        case "backup.phase_waiting_photos": return L10n.string("backup.phase_waiting_photos")
         case "backup.phase_waiting_proton": return L10n.string("backup.phase_waiting_proton")
         case "backup.phase_waiting_network": return L10n.string("backup.phase_waiting_network")
         case "backup.phase_waiting_storage": return L10n.string("backup.phase_waiting_storage")
@@ -237,18 +255,21 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         }
     }
 
-    /// "<n> of <m> backed up", followed by "<k> left" while items still wait for their check or upload. Nil when
-    /// there is no honest total yet (scanning/idle).
+    /// "<n> of <m> backed up". Nil when there is no honest total yet (scanning/idle).
     public var localizedSubtitle: String? {
         guard total > 0 else { return nil }
-        guard remainingCount > 0 else { return L10n.string("backup.progress_backed_up \(backedUp) \(total)") }
-        return L10n.string("backup.progress_backed_up_left \(backedUp) \(total) \(remainingCount)")
+        return L10n.string("backup.progress_backed_up \(backedUp) \(total)")
     }
 
     /// Shown only when something actually needs the user; nil otherwise.
     public var localizedAttention: String? {
         guard attentionCount > 0 else { return nil }
         return L10n.string("backup.progress_attention \(attentionCount)")
+    }
+
+    /// Why the backup waits, where the row has room for a second line.
+    public var localizedWaitingForWiFiDetail: String? {
+        accessory == .waitingForWiFi ? L10n.string("backup.detail_waiting_wifi") : nil
     }
 
     public var localizedWaitingDetail: String? {
@@ -298,16 +319,27 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     /// "N of M backed up" subtitle so fractional bytes can never inflate the backed-up count.
     public var localizedTransferDetail: String? {
         guard let activeTransferPercent else { return nil }
-        guard let speed = localizedUploadSpeed else {
-            return L10n.string("backup.progress_transferring \(activeTransferPercent)")
-        }
-        return L10n.string("backup.progress_transferring_speed \(activeTransferPercent) \(speed)")
+        return L10n.string("backup.progress_transferring \(activeTransferPercent)")
     }
 
-    /// The upload speed as a byte count per second, such as "2.4 MB", while bytes move; nil before it is measured.
-    public var localizedUploadSpeed: String? {
-        guard activeTransferPercent != nil, let bytesPerSecond, bytesPerSecond >= 1 else { return nil }
-        return Int64(bytesPerSecond.rounded(.down)).formatted(.byteCount(style: .file))
+    /// "3,766 left · 3.2 MB/s", or "3,766 left" without a speed. Only in the progress layout, so the row reserves
+    /// its slot; nil when nothing is left.
+    public var localizedLeftLine: String? {
+        guard detailLayout == .progress, remainingCount > 0 else { return nil }
+        guard let speedText else { return L10n.string("backup.detail_left \(remainingCount)") }
+        return L10n.string("backup.detail_left_speed \(remainingCount) \(speedText)")
+    }
+
+    /// The same two values as one sentence for VoiceOver: "3,766 left, 3.2 MB per second".
+    public var localizedLeftAccessibilityLabel: String? {
+        guard detailLayout == .progress, remainingCount > 0 else { return nil }
+        guard let speedText else { return L10n.string("backup.detail_left \(remainingCount)") }
+        return L10n.string("backup.detail_left_speed_spoken \(remainingCount) \(speedText)")
+    }
+
+    private var speedText: String? {
+        guard let speed = uploadSpeedBytesPerSecond, speed >= 1 else { return nil }
+        return L10n.fileSize(Int64(speed.rounded()))
     }
 
     /// The bar follows the percentage immediately above it while bytes move. Otherwise it remains the

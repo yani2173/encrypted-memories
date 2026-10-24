@@ -1,5 +1,6 @@
 import CoreGraphics
 import GridCore
+import MetalGridTextureCore
 
 package enum UIKitMetalGridTextureSurfaceClass: String, Sendable {
     case compact
@@ -14,15 +15,7 @@ package enum UIKitMetalGridTextureSurfaceClass: String, Sendable {
     }
 }
 
-package struct UIKitMetalGridTexturePolicy: Equatable, Sendable {
-    package let budget: GridTextureBudget
-    package let maxTexturePixels: Int
-
-    package init(budget: GridTextureBudget, maxTexturePixels: Int) {
-        self.budget = budget
-        self.maxTexturePixels = maxTexturePixels
-    }
-}
+package typealias UIKitMetalGridTexturePolicy = MetalGridTexturePolicy
 
 /// Per-surface iOS/iPadOS texture budgets.
 ///

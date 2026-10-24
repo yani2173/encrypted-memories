@@ -7,12 +7,13 @@ import XCTest
 private func sharedAlbum(
     _ nodeID: String,
     role: SharedAlbumRole,
-    invitation: SharedAlbumInvitation? = nil
+    invitation: SharedAlbumInvitation? = nil,
+    photoCount: Int = 3
 ) -> SharedAlbumSummary {
     SharedAlbumSummary(
         node: AlbumNodeIdentifier(volumeID: "foreign-volume", nodeID: nodeID),
         title: "Shared \(nodeID)",
-        photoCount: 3,
+        photoCount: photoCount,
         coverPhotoID: nil,
         owner: "owner@example.test",
         lastActivityTime: nil,
@@ -266,6 +267,37 @@ final class SharedAlbumPresentationTests: XCTestCase {
         }
         XCTAssertEqual(
             SharedAlbumPresentation.roleTitle(.inherited), L10n.string("albums.shared_role_inherited"))
+    }
+
+    // String Catalogs are compiled to `.lproj` only by Xcode's build system; plain SwiftPM copies the raw
+    // catalog, so the lookups below skip there and run under `scripts/verify-tests.sh`.
+    private var catalogCompiledIntoBundle: Bool {
+        L10n.resourceBundle.localizations.contains("de")
+    }
+
+    func testDetailLineShowsTheLocalizedPhotoCountInsteadOfTheCatalogKey() throws {
+        try XCTSkipUnless(catalogCompiledIntoBundle, "String Catalog not compiled (plain SwiftPM build).")
+        let presentation = SharedAlbumPresentation(
+            album: sharedAlbum("one", role: .viewer, photoCount: 12),
+            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogWithHTTPWrites))
+        XCTAssertFalse(presentation.detailLine.contains("albums.photo_count"), presentation.detailLine)
+        XCTAssertTrue(presentation.detailLine.contains("12"), presentation.detailLine)
+        XCTAssertFalse(presentation.accessibilityLabel.contains("albums.photo_count"), presentation.accessibilityLabel)
+    }
+
+    func testPhotoCountIsTranslatedIntoEnglishAndGerman() throws {
+        try XCTSkipUnless(catalogCompiledIntoBundle, "String Catalog not compiled (plain SwiftPM build).")
+        let expected: [(language: String, count: Int, text: String)] = [
+            ("en", 1, "1 photo"), ("en", 12, "12 photos"),
+            ("de", 1, "1 Foto"), ("de", 12, "12 Fotos"),
+        ]
+        for (language, count, text) in expected {
+            let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)
+            let bundle = try XCTUnwrap(Bundle(path: path), language)
+            let translated = String(
+                localized: "albums.photo_count \(count)", bundle: bundle, locale: Locale(identifier: language))
+            XCTAssertEqual(translated, text, "\(language) \(count)")
+        }
     }
 
     func testInheritedAccessNeverShowsInvitationDetailsEvenIfTheSDKSendsThem() {

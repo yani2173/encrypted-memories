@@ -1,0 +1,288 @@
+--- a/Packages/EncryptedMemoriesKit/Sources/ProtonAuth/Session.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/ProtonAuth/Session.swift
+@@ -26,0 +27,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)
++            self.init(service: service, account: account, keychain: UpgradeTestSessionFile())
++        #else
+@@ -27,0 +31 @@
++        #endif
+@@ -39 +43,6 @@
+-    public static let defaultService = "at.oncloud.encryptedmemories.session"
++    private static let productionService = "at.oncloud.encryptedmemories.session"
++    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++        public static let defaultService = productionService + ".upgrade-test"
++    #else
++    public static let defaultService = productionService
++    #endif
+@@ -41,0 +51,21 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            guard UpgradeTestProbe.isRequested else { throw SessionKeychainError.invalidPayload }
++            UpgradeTestProbe.rejectExternalNetwork()
++            let seedIdentity = [
++                "server": UpgradeTestProbe.endpoint.absoluteString,
++                "account": UpgradeTestProbe.accountUID,
++            ]
++            if UpgradeTestProbe.seedsAccount,
++                UserDefaults.standard.dictionary(forKey: "upgrade.fixture.seeded") as? [String: String] != seedIdentity
++            {
++                guard let domain = Bundle.main.bundleIdentifier, domain.hasSuffix(".upgrade-test") else {
++                    throw SessionKeychainError.invalidPayload
++                }
++                UserDefaults.standard.removePersistentDomain(forName: domain)
++                try clear()
++                try save(ProtonSession(
++                    uid: UpgradeTestProbe.accountUID, accessToken: "synthetic-access",
++                    refreshToken: "synthetic-refresh", keyPassword: "synthetic-key"))
++                UserDefaults.standard.set(seedIdentity, forKey: "upgrade.fixture.seeded")
++            }
++        #endif
+@@ -44 +74,6 @@
+-            return try JSONDecoder().decode(ProtonSession.self, from: data)
++            let session = try JSONDecoder().decode(ProtonSession.self, from: data)
++            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++                guard session.uid == UpgradeTestProbe.accountUID else { throw SessionKeychainError.invalidPayload }
++                UpgradeTestProbe.checkpoint("session.loaded")
++            #endif
++            return session
+--- a/Packages/EncryptedMemoriesKit/Sources/ProtonAuth/DeviceIdentityKeychainStore.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/ProtonAuth/DeviceIdentityKeychainStore.swift
+@@ -9 +9,6 @@
+-    public static let defaultService = "at.oncloud.encryptedmemories.device-identity"
++    private static let productionService = "at.oncloud.encryptedmemories.device-identity"
++    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++        public static let defaultService = productionService + ".upgrade-test"
++    #else
++    public static let defaultService = productionService
++    #endif
+--- a/Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/ProtonDriveBackendPolicy.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/ProtonDriveBackendPolicy.swift
+@@ -74,0 +75,6 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested {
++                return try await ProtonClientFacade.makeUpgradeTestFacade(
++                    accountUID: session.uid, keyPassword: session.keyPassword, policy: policy)
++            }
++        #endif
+--- a/Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/ProtonClientFacade.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/ProtonClientFacade.swift
+@@ -204,0 +205,42 @@
++
++#if ENCRYPTED_MEMORIES_UPGRADE_TEST
++    extension ProtonClientFacade {
++        static func makeUpgradeTestFacade(
++            accountUID: String, keyPassword: String, policy: ProtonDriveBackendPolicy
++        ) async throws -> ProtonClientFacade {
++            let backend = UpgradeTestBackend()
++            let directory = LibraryDatabaseLocation.prepareAccountDirectory(uid: accountUID)
++            guard let identities = UploadIdentityManifestStore(
++                url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
++                policy: policy.libraryDatabasePolicy)
++            else { throw UploadError.backend("The upgrade identity store did not open") }
++            let sources = LibrarySourceCoordinator(
++                remote: backend, thumbnailLoader: backend, inventoryStore: LibrarySourceInventoryStore(
++                    directory: directory, accountUID: accountUID,
++                    encryptionKey: LibrarySourceInventoryKeyDerivation.key(
++                        accountUID: accountUID, keyPassword: keyPassword), policy: policy.libraryDatabasePolicy))
++            await sources.prepare()
++            let albums = AlbumsRepository(
++                catalogBackend: backend, writeBackend: backend,
++                capabilities: .init(canList: true, canCreate: false, canAddPhotos: false, canSetCover: false))
++            let pipeline = UploadDedupePipeline(store: identities, checker: backend)
++            let manager = UploadManager(
++                uploader: backend, albums: AlbumAttachingAdapter(albums: albums), identityResolver: pipeline)
++            let coordinator = UploadCoordinator(
++                manager: manager, uploadCapabilities: backend.capabilities,
++                canCreateAlbum: false, canAddToAlbum: false, canSetAlbumCover: false)
++            return ProtonClientFacade(
++                backend: backend, librarySources: sources, albums: albums, uploads: manager,
++                uploadCoordinator: coordinator, photoUploader: backend, photoTagAdder: backend,
++            seriesDissolution: nil,
++            uploadIdentityResolver: pipeline, accountDataDirectory: directory,
++                accountDatabasePolicy: policy.libraryDatabasePolicy, albumSyncRemoteOps: UpgradeTestAlbumSync(),
++                accountInfoRefresher: {},
++                shutdownHandler: {
++                    await sources.shutdown()
++                    await manager.shutdown()
++                    identities.close()
++                })
++        }
++    }
++#endif
+--- a/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryAuthorization.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryAuthorization.swift
+@@ -0,0 +1,3 @@
++#if ENCRYPTED_MEMORIES_UPGRADE_TEST
++    import PhotosCore
++#endif
+@@ -19 +22,4 @@
+-        state(from: PHPhotoLibrary.authorizationStatus(for: .readWrite))
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested { return .full }
++        #endif
++        return state(from: PHPhotoLibrary.authorizationStatus(for: .readWrite))
+@@ -25 +31,4 @@
+-        state(from: await PHPhotoLibrary.requestAuthorization(for: .readWrite))
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested { return .full }
++        #endif
++        return state(from: await PHPhotoLibrary.requestAuthorization(for: .readWrite))
+--- a/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryCatalogSync.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryCatalogSync.swift
+@@ -0,0 +1,3 @@
++#if ENCRYPTED_MEMORIES_UPGRADE_TEST
++    import PhotosCore
++#endif
+@@ -66,0 +70,6 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested {
++                return UpgradeTestPhotoLibrary.infoChunks(
++                    identifiers: identifiers, startOffset: startOffset, chunkSize: chunkSize)
++            }
++        #endif
+@@ -103,0 +113,5 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested {
++                return UpgradeTestPhotoLibrary.identifierChunks(chunkSize: chunkSize)
++            }
++        #endif
+--- a/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryResourceResolver.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryResourceResolver.swift
+@@ -38,0 +39,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested { return try await UpgradeTestPhotoLibrary.resolve(entry) }
++        #endif
+--- a/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryChangeMonitor.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryChangeMonitor.swift
+@@ -0,0 +1,3 @@
++#if ENCRYPTED_MEMORIES_UPGRADE_TEST
++    import PhotosCore
++#endif
+@@ -92,0 +96,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++        fileprivate let commitToken: PHPersistentChangeToken?
++        #else
+@@ -93,0 +100 @@
++        #endif
+@@ -131,0 +139,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested { return }
++        #endif
+@@ -218,0 +229,8 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested {
++                return PreparedChangeSet(
++                    changes: ChangeSet(changedIdentifiers: [], deletedIdentifiers: [],
++                        requiresFullRescan: !FileManager.default.fileExists(atPath: tokenURL.path)),
++                    commitToken: nil, liveGeneration: 0)
++            }
++        #endif
+@@ -283 +301,11 @@
+-        store(token: prepared.commitToken)
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested {
++                do { try Data("synthetic-token".utf8).write(to: tokenURL, options: .atomic) }
++                catch { fatalError("The synthetic PhotoKit token was not saved") }
++                return
++            }
++            guard let token = prepared.commitToken else { fatalError("Missing PhotoKit token") }
++        #else
++            let token = prepared.commitToken
++        #endif
++        store(token: token)
+--- a/Packages/EncryptedMemoriesKit/Sources/MLSearchAppleAdapter/AppleSmartSearchBootstrap.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/MLSearchAppleAdapter/AppleSmartSearchBootstrap.swift
+@@ -44,0 +45,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested { return .available }
++        #endif
+@@ -68,0 +72,7 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested {
++                return UpgradeTestSmartSearch.makeLifecycle(
++                    accountDirectory: accountDirectory, accountUID: accountUID, keyPassword: keyPassword,
++                    assetsProvider: assetsProvider, databasePolicy: databasePolicy)
++            }
++        #endif
+--- a/Packages/EncryptedMemoriesKit/Sources/MLSearchAppleAdapter/URLSessionMLModelArtifactTransport.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/MLSearchAppleAdapter/URLSessionMLModelArtifactTransport.swift
+@@ -2,0 +3,3 @@
++#if ENCRYPTED_MEMORIES_UPGRADE_TEST
++    import PhotosCore
++#endif
+@@ -18,0 +22,3 @@
++    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++        private static let chunkByteCount: Int64 = 8192
++    #else
+@@ -19,0 +26 @@
++    #endif
+@@ -31,0 +39,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            guard UpgradeTestProbe.isLoopback(url) else { throw MLArtifactTransportError.notHTTPS }
++        #else
+@@ -32,0 +43 @@
++        #endif
+@@ -85,0 +97,4 @@
++                #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++                    UpgradeTestProbe.checkpoint("model.partial")
++                #endif
++
+--- a/Packages/EncryptedMemoriesKit/Sources/MLSearchCore/MLModelInstaller.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/MLSearchCore/MLModelInstaller.swift
+@@ -660,0 +661,4 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            UpgradeTestProbe.checkpoint("model.installRecord")
++        #endif
++
+@@ -674,0 +679,4 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            UpgradeTestProbe.checkpoint("model.promoted")
++        #endif
++
+--- a/Packages/EncryptedMemoriesKit/Sources/MLSearchCore/MLIndexRunner.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/MLSearchCore/MLIndexRunner.swift
+@@ -320,0 +321,3 @@
++            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++                UpgradeTestProbe.checkpoint("index.beforeCommit")
++            #endif
+@@ -321,0 +325,4 @@
++            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++                UpgradeTestProbe.checkpoint("index.afterCommit")
++            #endif
++
+--- a/Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/BackupSyncRunner.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/BackupSyncRunner.swift
+@@ -572,0 +573,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            UpgradeTestProbe.checkpoint("backup.claimed")
++        #endif
+@@ -1247,0 +1251,4 @@
++            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++                UpgradeTestProbe.checkpoint("backup.localRecord")
++            #endif
++
+--- a/Packages/EncryptedMemoriesKit/Sources/MediaByteCache/ThumbnailCache.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/MediaByteCache/ThumbnailCache.swift
+@@ -384,0 +385,4 @@
++                    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++                        UpgradeTestProbe.checkpoint("thumbnail.stored")
++                    #endif
++
+--- a/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoKitLocalThumbnailLoader.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoKitLocalThumbnailLoader.swift
+@@ -34,0 +35,5 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
++            if UpgradeTestProbe.isRequested {
++                return await UpgradeTestPhotoLibrary.thumbnails(for: uids, maxPixelSize: maxPixelSize)
++            }
++        #endif
+diff --git a/Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift b/Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift
+--- a/Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift
++++ b/Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift
+@@ -8,0 +9 @@
++    // swift-format-ignore
+@@ -9,0 +11,3 @@
++        #if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)
++        return true
++        #else
+@@ -11,0 +16 @@
++        #endif

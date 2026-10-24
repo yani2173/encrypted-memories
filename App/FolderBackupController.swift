@@ -98,23 +98,8 @@ final class FolderBackupController {
                 resolver: FileBackupResourceResolver(),
                 identityResolver: identityResolver,
                 uploader: facade.photoUploader,
-                throttleInputs: {
-                    let snapshot = LibraryRuntimeState.shared.snapshot()
-                    let level: BackupThermalLevel =
-                        switch snapshot.thermalLevel {
-                        case .nominal: .nominal
-                        case .fair: .fair
-                        case .serious: .serious
-                        case .critical: .critical
-                        }
-                    return BackupThrottleInputs(
-                        thermalLevel: level,
-                        isLowPowerMode: snapshot.isLowPowerMode,
-                        isNetworkAvailable: snapshot.network.isReachable,
-                        isNetworkConstrained: snapshot.network.isConstrained,
-                        isNetworkExpensive: snapshot.network.isExpensive
-                    )
-                },
+                throttleInputs: BackupRuntimeSignalSource.apple.current,
+                runtimeChanges: BackupRuntimeSignalSource.apple.updates,
                 events: pendingRecorder
             )
         } else {

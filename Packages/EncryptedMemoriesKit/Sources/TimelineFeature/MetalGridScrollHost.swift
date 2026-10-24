@@ -113,7 +113,11 @@ final class MetalGridScrollHost: NSView {
     private let resizeSettleDuration: CFTimeInterval = 0.22
     /// Sidebar open/close clock: the full Metal surface interpolates to the canonical obstructed layout.
     private var sidebarResizeStart: CFTimeInterval = 0
-    private let sidebarResizeDuration: CFTimeInterval = 0.22
+    /// Clock of the sidebar transition. Tests replace it to step a transition without waiting.
+    var sidebarClock: () -> CFTimeInterval = CACurrentMediaTime
+    /// The enclosing split view's sidebar edge, read per frame while a sidebar toggle runs. Nil otherwise, and
+    /// when the grid is not hosted in a split view (the coordinator then runs its own clock).
+    private var sidebarEdgeSource: SplitViewSidebarEdgeSource?
 
     // Live focus-row pinch gesture state (engine-owned GridZoomTransaction).
     private var pinchActive = false
@@ -1063,7 +1067,11 @@ final class MetalGridScrollHost: NSView {
             return
         }
         if coordinator.isCommitBridging { advanceCommitBridge() }
-        if coordinator.isSidebarResizing { advanceSidebarResize() }
+        if coordinator.isSidebarResizing {
+            advanceSidebarResize()
+        } else {
+            sidebarEdgeSource = nil  // a superseded or finished transition leaves no edge source behind
+        }
         if coordinator.isResizeSettling { advanceResizeSettle() }
         if coordinator.gridTransition.activeKind == .click { requestFrame() }
         if coordinator.isOverviewClickDissolving { requestFrame() }
@@ -1096,11 +1104,11 @@ final class MetalGridScrollHost: NSView {
     /// Advance the sidebar open/close transition. Its last frame is the canonical target geometry, so committing
     /// the engine inset cannot produce a second resize; a release morph remains only for future column reflows.
     private func advanceSidebarResize() {
-        let t =
-            sidebarResizeDuration > 0 ? min(1, (CACurrentMediaTime() - sidebarResizeStart) / sidebarResizeDuration) : 1
-        coordinator.presentationSidebarProgress = CGFloat(t)
+        let arrived = coordinator.advanceSidebarResize(
+            elapsed: sidebarClock() - sidebarResizeStart, measuredEdge: sidebarEdgeSource?.edge())
         requestFrame()
-        guard t >= 1 else { return }
+        guard arrived else { return }
+        sidebarEdgeSource = nil
         let (settleScroll, animating) = coordinator.endSidebarResize()  // commits the inset + bottom-anchored scroll
         coordinator.liveResizeChanged?(false)
         stickToBottom = false
@@ -1218,7 +1226,8 @@ final class MetalGridScrollHost: NSView {
         if window != nil, !inLiveResize, oldFrame != .zero,
             coordinator.beginSidebarResize(fromInset: oldValue, toInset: eventLeadingInset)
         {
-            sidebarResizeStart = CACurrentMediaTime()
+            sidebarResizeStart = sidebarClock()
+            sidebarEdgeSource = SplitViewSidebarEdgeSource(hostedIn: self)
             coordinator.liveResizeChanged?(true)
             requestFrame()
             return
@@ -1297,7 +1306,9 @@ final class MetalGridScrollHost: NSView {
         case .oldest:
             targetY = 0
         case .restore(let anchor):
-            if let rect = coordinator.cellContentRect(forUID: anchor.itemID) {
+            if let index = coordinator.flatIndex(forUID: anchor.itemID),
+                let rect = coordinator.cellContentRect(forFlatIndex: index)
+            {
                 targetY = min(max(0, rect.minY - anchor.topOffset), maxY)
             } else {
                 targetY = maxY  // If the anchor is gone, use the newest edge.
@@ -1326,7 +1337,10 @@ final class MetalGridScrollHost: NSView {
     /// Returns a layout-independent anchor for restoring the current route.
     func currentScrollAnchor() -> GridScrollAnchor<PhotoUID>? {
         let originY = scrollView.contentView.bounds.origin.y
-        guard let top = coordinator.visibleCells().min(by: { $0.rect.minY < $1.rect.minY }),
+        guard
+            let top = GridScrollAnchorPolicy.anchor(
+                among: coordinator.visibleCells(), visibleTop: originY + topBarInset,
+                visibleBottom: originY + scrollView.contentView.bounds.height, frame: \.rect),
             let uid = coordinator.uid(atFlatIndex: top.flatIndex)
         else { return nil }
         return GridScrollAnchor(itemID: uid, topOffset: top.rect.minY - originY)
@@ -1419,14 +1433,20 @@ final class MetalGridScrollHost: NSView {
     /// Install a new data source. For an incremental update, pass `.preserve` to keep the current scroll
     /// position. For a sidebar route switch, pass `.newest` to arm one-shot placement consumed by
     /// `applyContentSize` after geometry is valid. It does not scroll immediately or arm sticky bottom-pinning.
-    func setDataSource(_ source: MetalGridDataSource, initialViewport: GridInitialViewport = .preserve) {
+    func setDataSource(
+        _ source: MetalGridDataSource, initialViewport: GridInitialViewport = .preserve,
+        preservingColumnPhase: Bool = false
+    ) {
         installImageAvailabilityCallback(on: source)
         if initialViewport != .preserve {
             pendingInitialViewport = initialViewport
-            coordinator.resetCommittedPhase()  // canonical bottom-right phase, BEFORE the size callback
+            if !preservingColumnPhase {
+                coordinator.resetCommittedPhase()  // canonical bottom-right phase, BEFORE the size callback
+            }
         }
         coordinator.setUserInteractionActive(false, owner: interactionOwner)
-        coordinator.setDataSource(source)  // Rebuild, then apply content size from the callback.
+        // Rebuild before the size callback.
+        coordinator.setDataSource(source, preservingColumnPhase: preservingColumnPhase)
         reportedFeedInteractionActive = false
         updateFeedInteractionState()
         applyContentSize(coordinator.contentSize())  // pins to bottom when sticky / consumes a pending policy

@@ -32,6 +32,11 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
     }
 
     public func thumbnails(for uids: [PhotoUID], maxPixelSize: CGFloat) async -> [PhotoUID: DecodedThumbnail] {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                return await UpgradeTestPhotoLibrary.thumbnails(for: uids, maxPixelSize: maxPixelSize)
+            }
+        #endif
         let identifiers = uids.compactMap { uid -> String? in
             uid.localPendingNamespace == .photoLibrary ? uid.nodeID : nil
         }

@@ -23,7 +23,8 @@ public enum ViewerTitleFormatter {
     ///   - captureDate: capture date/time, if known.
     ///   - index: zero-based index of the current item in the library.
     ///   - total: total item count.
-    ///   - locationName: reverse-geocoded POI/location name, if already available (never blocks on it).
+    ///   - locationName: reverse-geocoded POI/location name, if already available (never blocks on it). A name of
+    ///     whitespace alone counts as no name.
     ///   - filename: original filename, used only as a date-less fallback.
     ///   - locale: user/app locale - drives date wording ("um") and the "von"/"of" connector.
     public static func make(
@@ -38,7 +39,7 @@ public enum ViewerTitleFormatter {
         let position = positionString(index: index, total: total, locale: locale)
         let dateTime = captureDate.map { dateTimeString($0, locale: locale) }
 
-        if let locationName, !locationName.isEmpty {
+        if let locationName = PlaceNameText.displayable(locationName) {
             let second = dateTime.map { "\($0) · \(position)" } ?? position
             return ViewerTitle(line1: locationName, line2: second)
         }

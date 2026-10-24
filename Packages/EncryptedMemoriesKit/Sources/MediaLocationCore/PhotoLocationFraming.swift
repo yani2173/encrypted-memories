@@ -21,9 +21,12 @@ public enum PhotoLocationFraming {
         for coordinates: [PhotoCoordinate],
         gate: Double = 3.0,
         paddingFraction: Double = 0.15,
-        minimumSpanDegrees: Double = 0.02
+        minimumSpanDegrees: Double = 0.02,
+        excluding positions: Set<PhotoExactPosition> = []
     ) -> GeoBoundingBox? {
-        let points = coordinates.filter { $0.latitude.isFinite && $0.longitude.isFinite }
+        let points = coordinates.filter {
+            $0.latitude.isFinite && $0.longitude.isFinite && !positions.contains(PhotoExactPosition($0))
+        }
         guard !points.isEmpty else { return nil }
         guard points.count > 2 else {
             return paddedBox(of: points, paddingFraction: paddingFraction, minimumSpanDegrees: minimumSpanDegrees)

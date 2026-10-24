@@ -51,6 +51,51 @@ private final class SettlementStatsBox: @unchecked Sendable {
     }
 }
 
+private final class SettlementSequenceLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sequences: [UInt64] = []
+    private var firstItems: [UploadItem] = []
+    private var lastStats = UploadQueueStats()
+
+    func record(_ sequence: UInt64, items: [UploadItem], stats: UploadQueueStats) {
+        lock.withLock {
+            if sequences.isEmpty { firstItems = items }
+            sequences.append(sequence)
+            lastStats = stats
+        }
+    }
+
+    var received: [UInt64] { lock.withLock { sequences } }
+    var itemsOfFirstEvent: [UploadItem] { lock.withLock { firstItems } }
+    var latestStats: UploadQueueStats { lock.withLock { lastStats } }
+}
+
+/// Counts the reads of the durable rows and returns fixed rows, whatever its operational state says.
+private final class ReadCountingSettlementStore: UploadManualSettlementStoreProtocol, @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    private let rows: [UploadManualSettlementRecord]
+    private let operational: Bool
+
+    init(rows: [UploadManualSettlementRecord] = [], operational: Bool = true) {
+        self.rows = rows
+        self.operational = operational
+    }
+
+    var readCount: Int { lock.withLock { reads } }
+
+    func isOperational() -> Bool { operational }
+    func upsert(_ record: UploadManualSettlementRecord) -> Bool { false }
+    func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord? { nil }
+    func remove(queueItemID: UploadQueueItemID) -> Bool { false }
+    func close() {}
+
+    func allRecords() -> [UploadManualSettlementRecord] {
+        lock.withLock { reads += 1 }
+        return rows
+    }
+}
+
 private final class SettlementIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
     private let lock = NSLock()
     private let eventLog: SettlementEventLog?
@@ -219,10 +264,6 @@ private final class FailingSettlementStore: UploadManualSettlementStoreProtocol,
         lock.withLock { failed ? [] : Array(records.values) }
     }
 
-    func pendingRecords() -> [UploadManualSettlementRecord] {
-        lock.withLock { failed ? [] : records.values.filter(\.isPending) }
-    }
-
     @discardableResult
     func remove(queueItemID: UploadQueueItemID) -> Bool {
         lock.withLock {
@@ -324,6 +365,60 @@ final class ManualUploadSettlementTests: XCTestCase {
         return false
     }
 
+    func testManualHealthDoesNotProbeDeniedSelect() throws {
+        let store = try store()
+        defer { store.close() }
+        XCTAssertTrue(store.isOperational())
+        try withDeniedSQLiteSelect(in: store) {
+            XCTAssertTrue(store.isOperational(), "manual health checks only connection state")
+        }
+        XCTAssertTrue(store.isOperational(), "denied SELECT must not record a new failure")
+    }
+
+    func testManualCloseRefusesReadsAndWritesAndPreservesRows() async throws {
+        let id = try await seedCompletedRow()
+        let durableStore = try store()
+        let record = try XCTUnwrap(durableStore.record(for: id))
+        durableStore.close()
+        XCTAssertFalse(durableStore.isOperational())
+        XCTAssertNil(durableStore.record(for: id))
+        XCTAssertTrue(durableStore.allRecords().isEmpty)
+        XCTAssertFalse(durableStore.upsert(record))
+        XCTAssertFalse(durableStore.remove(queueItemID: id))
+        let reopened = try store()
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.record(for: id), record)
+    }
+
+    func testManualDecodeFailureKeepsReadsAndWritesFailClosedAfterRepair() async throws {
+        let id = try await seedCompletedRow()
+        let durableStore = try store()
+        defer { durableStore.close() }
+        let record = try XCTUnwrap(durableStore.record(for: id))
+        var handle: OpaquePointer?
+        let url = tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName)
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE manual_upload_settlement SET payload='{';", nil, nil, nil), SQLITE_OK)
+        XCTAssertNil(durableStore.record(for: id))
+        XCTAssertFalse(durableStore.isOperational())
+
+        var statement: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(handle, "UPDATE manual_upload_settlement SET payload=?;", -1, &statement, nil), SQLITE_OK
+        )
+        let payload = String(decoding: try JSONEncoder().encode(record), as: UTF8.self)
+        sqlite3_bind_text(statement, 1, payload, -1, SQLiteStoreSchemaGate.transientDestructor)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        sqlite3_finalize(statement)
+        XCTAssertNil(durableStore.record(for: id))
+        XCTAssertTrue(durableStore.allRecords().isEmpty)
+        XCTAssertFalse(durableStore.upsert(record))
+        XCTAssertFalse(durableStore.remove(queueItemID: id))
+        XCTAssertFalse(durableStore.isOperational())
+    }
+
     func testMarkerlessSettlementShapeFailsClosedWithoutRepairingIt() throws {
         let url = tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName)
         var handle: OpaquePointer?
@@ -361,6 +456,183 @@ final class ManualUploadSettlementTests: XCTestCase {
         XCTAssertTrue(stats.snapshot.persistenceUnavailable)
         XCTAssertEqual(stats.snapshot.total, 0)
         await manager.shutdown()
+    }
+
+    // MARK: - Notifications of the replay start
+
+    // The manager numbers every notification, also when no handler exists yet. Registering the
+    // ordered handler last therefore counts them: its first event carries the number of earlier
+    // notifications plus one, because the registration publishes once itself. A change handler is
+    // non-nil only after the replay started (both registrations assign it and start the replay in
+    // one actor segment), so this is the only way to see what an enqueue before any registration
+    // published.
+    private func registerAndCountEarlierNotifications(
+        _ manager: UploadManager
+    ) async throws -> (earlier: Int, log: SettlementSequenceLog) {
+        let log = SettlementSequenceLog()
+        await manager.setCoordinatorCallbacks(
+            onChange: { sequence, items, stats in log.record(sequence, items: items, stats: stats) },
+            onCompleted: { _ in })
+        let first = try XCTUnwrap(log.received.first)
+        return (Int(first) - 1, log)
+    }
+
+    /// Notifications that the replay start of an enqueue adds. The control is the same enqueue after
+    /// `snapshot()` started the replay silently, so the notifications of the enqueue itself cancel out.
+    private func notificationsAddedByTheReplay(
+        required: Bool,
+        urls: [URL] = [],
+        makeStore: () throws -> (any UploadManualSettlementStoreProtocol)?
+    ) async throws -> (added: Int, log: SettlementSequenceLog) {
+        var earlier: [Int] = []
+        var freshLog = SettlementSequenceLog()
+        for startedBySnapshot in [false, true] {
+            let manager = UploadManager(
+                uploader: SettlementUploader(),
+                settlementStore: try makeStore(),
+                requiresDurableSettlement: required
+            )
+            if startedBySnapshot { _ = await manager.snapshot() }
+            _ = await manager.enqueueFiles(urls, destination: .library)
+            let (count, log) = try await registerAndCountEarlierNotifications(manager)
+            earlier.append(count)
+            if !startedBySnapshot { freshLog = log }
+            await manager.shutdown()
+        }
+        return (earlier[0] - earlier[1], freshLog)
+    }
+
+    private func unavailableStore() -> FailingSettlementStore {
+        let store = FailingSettlementStore()
+        store.close()
+        return store
+    }
+
+    private func seedCompletedRow() async throws -> UploadQueueItemID {
+        let durableStore = try store()
+        let manager = UploadManager(
+            uploader: SettlementUploader(),
+            identityResolver: SettlementIdentityResolver(),
+            settlementStore: durableStore,
+            maxConcurrent: 1
+        )
+        let ids = await manager.enqueueFiles([try file()], destination: .library)
+        let id = try XCTUnwrap(ids.first)
+        _ = await waitUntil(manager) { $0.first?.state == .completed }
+        XCTAssertEqual(durableStore.record(for: id)?.stage, .terminal)
+        await manager.shutdown()
+        return id
+    }
+
+    func testEnqueueBeforeAnyHandlerNotifiesOnceForTheReplayOfAnUnavailableRequiredStore() async throws {
+        let (added, log) = try await notificationsAddedByTheReplay(required: true, urls: [try file()]) {
+            self.unavailableStore()
+        }
+
+        XCTAssertEqual(added, 1)
+        XCTAssertEqual(log.received.count, 1, "the handler sees only the notification of its registration")
+        XCTAssertTrue(log.latestStats.persistenceUnavailable)
+    }
+
+    func testEnqueueBeforeAnyHandlerIsSilentForTheReplayOfAnUnavailableStoreThatIsNotRequired() async throws {
+        let (added, _) = try await notificationsAddedByTheReplay(required: false, urls: [try file()]) {
+            self.unavailableStore()
+        }
+
+        XCTAssertEqual(added, 0)
+    }
+
+    func testEnqueueBeforeAnyHandlerNotifiesOnceForTheReplayOfAnEmptyOperationalStore() async throws {
+        let (added, _) = try await notificationsAddedByTheReplay(required: false) { try self.store() }
+
+        XCTAssertEqual(added, 1)
+    }
+
+    func testEnqueueBeforeAnyHandlerNotifiesOnceForTheReplayOfRestoredRows() async throws {
+        let id = try await seedCompletedRow()
+
+        let (added, log) = try await notificationsAddedByTheReplay(required: false) { try self.store() }
+
+        XCTAssertEqual(added, 1)
+        XCTAssertEqual(log.itemsOfFirstEvent.map(\.id), [id])
+        XCTAssertEqual(log.itemsOfFirstEvent.map(\.state), [.completed])
+    }
+
+    func testEnqueueWithoutAStoreNeverNotifiesForTheReplay() async throws {
+        for required in [false, true] {
+            let (added, _) = try await notificationsAddedByTheReplay(required: required) { nil }
+
+            XCTAssertEqual(added, 0, "store required: \(required)")
+        }
+    }
+
+    func testAShutDownManagerNeverReadsTheDurableRows() async throws {
+        let counting = ReadCountingSettlementStore()
+        let manager = UploadManager(uploader: SettlementUploader(), settlementStore: counting)
+        await manager.shutdown()
+
+        let items = await manager.snapshot()
+        await manager.setOnChange { _, _ in }
+        await manager.setCoordinatorCallbacks(onChange: { _, _, _ in }, onCompleted: { _ in })
+        _ = await manager.enqueueFiles([try file()], destination: .library)
+        _ = try await manager.enqueueFolder(tempDir, destination: .library)
+        await manager.resumeAll()
+        await manager.clearFinished()
+
+        XCTAssertTrue(items.isEmpty)
+        XCTAssertEqual(counting.readCount, 0, "a manager that was shut down does not start the replay")
+    }
+
+    func testRowsOfAStoreThatIsNotOperationalAreNotRestored() async throws {
+        _ = try await seedCompletedRow()
+        let seeded = try store()
+        let rows = seeded.allRecords()
+        seeded.close()
+        XCTAssertEqual(rows.count, 1)
+        let manager = UploadManager(
+            uploader: SettlementUploader(),
+            settlementStore: ReadCountingSettlementStore(rows: rows, operational: false)
+        )
+
+        let items = await manager.snapshot()
+
+        XCTAssertTrue(items.isEmpty, "rows that an unavailable store still returns are not restored")
+        await manager.shutdown()
+    }
+
+    func testTheReplayReadsTheStoreOnlyOnce() async throws {
+        for operational in [true, false] {
+            let counting = ReadCountingSettlementStore(operational: operational)
+            let manager = UploadManager(uploader: SettlementUploader(), settlementStore: counting)
+
+            _ = await manager.snapshot()
+            _ = await manager.enqueueFiles([], destination: .library)
+            _ = await manager.snapshot()
+
+            XCTAssertEqual(counting.readCount, 1, "store operational: \(operational)")
+            await manager.shutdown()
+        }
+    }
+
+    func testSnapshotStartsTheReplayWithoutNotifying() async throws {
+        let id = try await seedCompletedRow()
+        let restored = UploadManager(uploader: SettlementUploader(), settlementStore: try store())
+        let unavailable = UploadManager(
+            uploader: SettlementUploader(),
+            settlementStore: unavailableStore(),
+            requiresDurableSettlement: true
+        )
+
+        let restoredItems = await restored.snapshot()
+        _ = await unavailable.snapshot()
+        let (restoredEarlier, _) = try await registerAndCountEarlierNotifications(restored)
+        let (unavailableEarlier, _) = try await registerAndCountEarlierNotifications(unavailable)
+
+        XCTAssertEqual(restoredItems.map(\.id), [id], "the snapshot starts the replay")
+        XCTAssertEqual(restoredEarlier, 0)
+        XCTAssertEqual(unavailableEarlier, 0, "an unavailable required store stays silent for a snapshot")
+        await restored.shutdown()
+        await unavailable.shutdown()
     }
 
     private func sqliteCount(url: URL, table: String) -> Int {
@@ -494,9 +766,8 @@ final class ManualUploadSettlementTests: XCTestCase {
         let ids = await manager.enqueueFiles([try file()], destination: .library)
         let id = try XCTUnwrap(ids.first)
         _ = await waitUntil(manager) { items in
-            guard let state = items.first?.state else { return false }
-            if case .failed = state { return true }
-            return false
+            guard case .failed(let message) = items.first?.state else { return false }
+            return message == "Durable manual upload settlement could not be read."
         }
 
         for _ in 0..<3 {
@@ -510,7 +781,9 @@ final class ManualUploadSettlementTests: XCTestCase {
             return XCTFail(
                 "a settlement read failure must remain visibly failed: \(String(describing: visible.first?.state))")
         }
-        XCTAssertTrue(message.localizedCaseInsensitiveContains("read"), "failure must identify the store read failure")
+        XCTAssertTrue(
+            message.localizedCaseInsensitiveContains("read"),
+            "failure must identify the store read failure; actual: \(message)")
         await manager.shutdown()
     }
 
