@@ -451,6 +451,39 @@ final class TaggingBackupResolver: BackupResourceResolving, @unchecked Sendable 
     }
 }
 
+/// Holds each resolve until `participantCount` resolves have started, so they only finish without a timeout when
+/// that many photos prepare at the same time.
+final class ConcurrentPreparationResolver: BackupResourceResolving, @unchecked Sendable {
+    private let inner: ScriptedBackupResolver
+    private let participantCount: Int
+    private let timeout: Duration
+    private let lock = NSLock()
+    private var arrived = 0
+    private var timedOut = 0
+
+    init(inner: ScriptedBackupResolver, participantCount: Int, timeout: Duration = .seconds(5)) {
+        self.inner = inner
+        self.participantCount = participantCount
+        self.timeout = timeout
+    }
+
+    /// Resolves that stopped waiting for the others when the timeout passed.
+    var timedOutResolves: Int { lock.withLock { timedOut } }
+
+    func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+        lock.withLock { arrived += 1 }
+        let deadline = ContinuousClock.now + timeout
+        while lock.withLock({ arrived < participantCount }) {
+            guard ContinuousClock.now < deadline else {
+                lock.withLock { timedOut += 1 }
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return try await inner.resolve(entry)
+    }
+}
+
 /// Shared ordered event log for cross-component ordering assertions.
 final class BackupEventLog: @unchecked Sendable {
     private let lock = NSLock()
@@ -3804,6 +3837,26 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.uploaded, 1)
         let metrics = await coordinator.metrics()
         XCTAssertGreaterThanOrEqual(metrics.permitsAcquired, 2)
+        XCTAssertEqual(metrics.permitsAcquired, metrics.permitsReleased)
+    }
+
+    func testThreePhotosPrepareAtTheSameTimeInTheForeground() async throws {
+        let entries = ["first.jpg", "second.jpg", "third.jpg"].map { seedEntry($0) }
+        let preparation = ConcurrentPreparationResolver(inner: resolver, participantCount: 3)
+        let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())
+        let runner = makeRunner(
+            resolver: preparation,
+            throttle: BackupThrottlePolicy(baseConcurrency: 3),
+            resourceCoordinator: coordinator
+        )
+
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: .automatic)
+
+        XCTAssertEqual(preparation.timedOutResolves, 0, "a photo waited for the preparation permit of another")
+        XCTAssertEqual(progress.uploaded, 3)
+        XCTAssertEqual(entries.compactMap { state(of: $0) }, [.completed, .completed, .completed])
+        let metrics = await coordinator.metrics()
+        XCTAssertEqual(metrics.maximumConcurrentPermits, 3)
         XCTAssertEqual(metrics.permitsAcquired, metrics.permitsReleased)
     }
 

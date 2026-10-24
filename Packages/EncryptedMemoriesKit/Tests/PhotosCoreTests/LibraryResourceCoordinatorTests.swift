@@ -236,36 +236,195 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
     }
 
     func testEnforcedCoordinatorAllowsOnlyOneHeavyPermit() async throws {
-        let state = LibraryRuntimeState()
-        let coordinator = LibraryResourceCoordinator(runtimeState: state)
-        let counter = ActiveCounter()
-        let request = LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+        // Backup preparation shares admission only in the foreground without pressure; everything else runs alone.
+        let backup = LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+        let cases: [(LibraryWorkRequest, LibraryRuntimeSnapshot)] = [
+            (LibraryWorkRequest(workload: .mlIndexing, intent: .automatic), LibraryRuntimeSnapshot()),
+            (LibraryWorkRequest(workload: .videoDerivative, intent: .userInitiated), LibraryRuntimeSnapshot()),
+            (backup, LibraryRuntimeSnapshot(isLowPowerMode: true)),
+            (backup, LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted)),
+            (backup, LibraryRuntimeSnapshot(memoryBudgetTier: .reduced)),
+            (
+                LibraryWorkRequest(workload: .backupMaterialization, intent: .userInitiated),
+                LibraryRuntimeSnapshot(thermalLevel: .serious)
+            ),
+        ]
 
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for _ in 0..<8 {
-                group.addTask {
-                    try await coordinator.withHeavyPermit(request) { _ in
-                        await counter.enter()
-                        try await Task.sleep(for: .milliseconds(5))
-                        await counter.leave()
+        for (request, snapshot) in cases {
+            let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState(initial: snapshot))
+            let counter = ActiveCounter()
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<8 {
+                    group.addTask {
+                        try await coordinator.withHeavyPermit(request) { _ in
+                            await counter.enter()
+                            try await Task.sleep(for: .milliseconds(5))
+                            await counter.leave()
+                        }
                     }
                 }
+                try await group.waitForAll()
             }
-            try await group.waitForAll()
+            let maximum = await counter.maximum()
+            XCTAssertEqual(maximum, 1, "\(request.workload) in \(snapshot)")
+            let metrics = await coordinator.metrics()
+            XCTAssertEqual(metrics.permitsAcquired, 8)
+            XCTAssertEqual(metrics.permitsReleased, 8)
+            XCTAssertEqual(metrics.maximumConcurrentPermits, 1)
         }
+    }
+
+    func testBackupPreparationSharesAdmissionOnlyInTheForegroundWithoutPressure() {
+        let policy = LibraryResourcePolicy()
+        for intent in [LibraryWorkIntent.automatic, .userInitiated] {
+            for workload in [LibraryHeavyWorkload.backupMaterialization, .backupHashing] {
+                let request = LibraryWorkRequest(workload: workload, intent: intent, memoryClass: .large)
+                func permits(_ snapshot: LibraryRuntimeSnapshot) -> Int {
+                    policy.budget(for: request, snapshot: snapshot).concurrentPermits
+                }
+                let pressured = intent == .userInitiated ? 1 : 0
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot()), 3, "\(workload) \(intent)")
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(executionOpportunity: .foregroundInactive)), 3)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(thermalLevel: .fair)), 2)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(thermalLevel: .serious)), pressured)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(memoryPressure: .warning)), pressured)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(memoryHeadroom: .constrained)), pressured)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(memoryBudgetTier: .reduced)), 1)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(isLowPowerMode: true)), 1)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted)), 1)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(hasVisibleMediaDemand: true)), 0)
+                XCTAssertEqual(permits(LibraryRuntimeSnapshot(hasActiveUserInteraction: true)), 0)
+            }
+        }
+        let exclusiveWorkloads: [LibraryHeavyWorkload] = [
+            .mlModelLoading, .mlInference, .mlIndexing, .cryptoPreparation, .videoDerivative,
+        ]
+        for workload in exclusiveWorkloads {
+            let request = LibraryWorkRequest(workload: workload, intent: .userInitiated)
+            XCTAssertEqual(
+                policy.budget(for: request, snapshot: LibraryRuntimeSnapshot()).concurrentPermits, 1, "\(workload)")
+        }
+    }
+
+    func testThreeBackupPermitsRunTogetherWhileAFourthWaits() async throws {
+        let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())
+        let counter = ActiveCounter()
+        let gate = AsyncGate()
+        let permits = (0..<4).map { index in
+            Task {
+                let workload: LibraryHeavyWorkload = index.isMultiple(of: 2) ? .backupMaterialization : .backupHashing
+                try await coordinator.withHeavyPermit(
+                    LibraryWorkRequest(workload: workload, intent: .automatic, memoryClass: .large)
+                ) { _ in
+                    await counter.enter()
+                    await gate.wait()
+                    await counter.leave()
+                }
+            }
+        }
+
+        let threeRun = await waitUntilYielding {
+            let running = await counter.current()
+            let waiting = await coordinator.waitingPermitCount
+            return running == 3 && waiting == 1
+        }
+        XCTAssertTrue(threeRun, "three photos prepare at once and the fourth waits for a free permit")
+
+        await gate.open()
+        for permit in permits { try await permit.value }
         let maximum = await counter.maximum()
-        XCTAssertEqual(maximum, 1)
+        XCTAssertEqual(maximum, 3)
         let metrics = await coordinator.metrics()
-        XCTAssertEqual(metrics.permitsAcquired, 8)
-        XCTAssertEqual(metrics.permitsReleased, 8)
-        XCTAssertEqual(metrics.maximumConcurrentPermits, 1)
+        XCTAssertEqual(metrics.permitsAcquired, 4)
+        XCTAssertEqual(metrics.permitsReleased, 4)
+        XCTAssertEqual(metrics.maximumConcurrentPermits, 3)
+    }
+
+    func testQueuedExclusiveWorkStopsNewBackupPermitsAndNeverRunsBesideThem() async throws {
+        let exclusiveRequests = [
+            LibraryWorkRequest(workload: .mlIndexing, intent: .automatic),
+            LibraryWorkRequest(workload: .mlInference, intent: .interactive, memoryClass: .small),
+        ]
+        let backup = LibraryWorkRequest(workload: .backupMaterialization, intent: .automatic, memoryClass: .large)
+
+        for exclusive in exclusiveRequests {
+            let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())
+            let runningBackups = ActiveCounter()
+            let holderGate = AsyncGate()
+            let holder = Task {
+                try await coordinator.withHeavyPermit(backup) { _ in
+                    await runningBackups.enter()
+                    await holderGate.wait()
+                    await runningBackups.leave()
+                }
+            }
+            await holderGate.waitUntilEntered()
+
+            let exclusiveWork = Task {
+                try await coordinator.withHeavyPermit(exclusive) { _ in await runningBackups.current() }
+            }
+            let exclusiveQueued = await waitUntilYielding { await coordinator.waitingPermitCount == 1 }
+            XCTAssertTrue(exclusiveQueued, "\(exclusive.workload) waits for the running backup permit")
+
+            let laterBackup = Task {
+                try await coordinator.withHeavyPermit(backup) { _ in
+                    await runningBackups.enter()
+                    await runningBackups.leave()
+                }
+            }
+            let laterQueued = await waitUntilYielding { await coordinator.waitingPermitCount == 2 }
+            XCTAssertTrue(laterQueued, "a free shared permit must not let backup pass \(exclusive.workload)")
+
+            await holderGate.open()
+            try await holder.value
+            let backupsBesideExclusiveWork = try await exclusiveWork.value
+            XCTAssertEqual(backupsBesideExclusiveWork, 0)
+            try await laterBackup.value
+            let metrics = await coordinator.metrics()
+            XCTAssertEqual(metrics.permitsAcquired, 3)
+            XCTAssertEqual(metrics.permitsReleased, 3)
+            XCTAssertEqual(metrics.maximumConcurrentPermits, 1)
+        }
+    }
+
+    func testHigherPriorityWaiterPreemptsEveryLowerPrioritySharedPermit() async throws {
+        let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())
+        let holderGate = AsyncGate()
+        let leases = LeaseBox()
+        let backup = LibraryWorkRequest(workload: .backupMaterialization, intent: .automatic)
+        let holders = (0..<2).map { _ in
+            Task {
+                try await coordinator.withHeavyPermit(backup) { lease in
+                    await leases.store(lease)
+                    await holderGate.wait()
+                }
+            }
+        }
+        let held = await leases.waitForLeases(count: 2)
+        XCTAssertTrue(held.allSatisfy { $0.shouldContinue() }, "a permit that shares admission preempts no one")
+
+        let interactive = Task {
+            try await coordinator.withHeavyPermit(
+                LibraryWorkRequest(workload: .mlInference, intent: .interactive, memoryClass: .small)
+            ) { _ in true }
+        }
+        let didPreempt = await waitUntil {
+            held.allSatisfy { $0.continuationDecision() == .yield(.higherPriorityWork) }
+        }
+        XCTAssertTrue(didPreempt, "every running permit of lower priority yields at its next boundary")
+
+        await holderGate.open()
+        for holder in holders { try await holder.value }
+        let interactiveCompleted = try await interactive.value
+        XCTAssertTrue(interactiveCompleted)
     }
 
     func testCancelledWaiterDoesNotLeakAdmission() async throws {
         let state = LibraryRuntimeState()
         let coordinator = LibraryResourceCoordinator(runtimeState: state)
         let gate = AsyncGate()
-        let request = LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+        // Exclusive work, so the second permit waits instead of sharing admission.
+        let request = LibraryWorkRequest(workload: .mlIndexing, intent: .automatic)
         let holder = Task {
             try await coordinator.withHeavyPermit(request) { _ in await gate.wait() }
         }
@@ -377,7 +536,8 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
         let coordinator = LibraryResourceCoordinator(runtimeState: state)
         await coordinator.startObserving()
         let gate = AsyncGate()
-        let request = LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+        // Exclusive work, so the stale permit waits instead of sharing admission.
+        let request = LibraryWorkRequest(workload: .mlIndexing, intent: .automatic)
         let holder = Task {
             try await coordinator.withHeavyPermit(request) { _ in await gate.wait() }
         }
@@ -476,15 +636,19 @@ private actor ActiveCounter {
 }
 
 private actor LeaseBox {
-    private var lease: LibraryWorkLease?
+    private var leases: [LibraryWorkLease] = []
 
     func store(_ lease: LibraryWorkLease) {
-        self.lease = lease
+        leases.append(lease)
     }
 
     func waitForLease() async -> LibraryWorkLease {
-        while lease == nil { await Task.yield() }
-        return lease!
+        await waitForLeases(count: 1)[0]
+    }
+
+    func waitForLeases(count: Int) async -> [LibraryWorkLease] {
+        while leases.count < count { await Task.yield() }
+        return leases
     }
 }
 
