@@ -140,6 +140,11 @@ public struct UploadResourceDescriptor: Sendable {
         self.backupRevision = backupRevision
     }
 
+    /// A secondary of a main photo, for example the video of a Live Photo, counts as saved only through a remote
+    /// copy that is a related photo of `mainRemoteLinkID`. A main photo with the same name or the same bytes is
+    /// another file and proves nothing. The pipeline checks a burst member against its own rule first.
+    var needsRelatedProof: Bool { requiresRelatedMatch || mainRemoteLinkID != nil }
+
     public func withBackupRevision(_ revision: UploadBackupRevision) -> UploadResourceDescriptor {
         copy(backupRevision: revision)
     }
@@ -231,7 +236,7 @@ public struct UploadIdentity: Sendable, Equatable, Codable {
 /// transport types.
 public struct RemotePhotoDuplicate: Sendable, Equatable {
     /// `LinkState` raw values of the duplicates payload (Proton Drive iOS 1.61.0,
-    /// `FindDuplicatesEndpoint`). A missing state (`nil`) means the link was deleted.
+    /// `FindDuplicatesEndpoint`). A missing state (`nil`) is unknown.
     public enum LinkState: Int, Sendable {
         case draft = 0
         case active = 1
@@ -333,8 +338,8 @@ public struct UploadIdentityRecord: Sendable, Equatable {
     /// digest prefix, never key material). A different epoch - the photos share was recreated -
     /// invalidates the cached HMACs while the SHA-1 stays reusable.
     public var hashKeyEpoch: String
-    /// The remote photo this resource is known to be (an active duplicate or our own completed
-    /// upload), as `volumeID` + `linkID`.
+    /// The remote photo named by this row, including a trashed copy kept for Restore.
+    /// Only `provesUpload` outcomes identify an uploaded or active copy.
     public var remoteVolumeID: String?
     public var remoteLinkID: String?
     /// Raw persisted form of the last decision (see `UploadIdentityManifestStore.Outcome`).
@@ -437,7 +442,7 @@ public protocol UploadIdentityStore: Sendable {
 }
 
 /// One manifest move of the duplicate merge: rows that name `from` with this content name `to` afterwards.
-public struct UploadRemoteLinkMove: Sendable, Equatable {
+public struct UploadRemoteLinkMove: Sendable, Equatable, Codable {
     public var from: String
     public var to: String
     public var contentHash: String
@@ -845,8 +850,8 @@ public protocol UploadDuplicateChecking: Sendable {
     func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate]
     /// SDK-owned exact-match check. Unlike the detailed endpoint seam above, this returns only
     /// active photos whose corrected name and content SHA-1 both match. Implementations may return
-    /// an empty list when the SDK call is unavailable; the detailed conservative policy remains.
-    func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID]
+    /// an empty list for ordinary SDK unavailability; cancellation must throw across this boundary.
+    func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async throws -> [PhotoUID]
     /// Optional stronger lookup: an active remote photo with the same content hash, independent
     /// of filename/name hash. Backends that cannot provide a remote content index return nil.
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate?
@@ -858,6 +863,8 @@ public protocol UploadDuplicateChecking: Sendable {
     /// The current state and main photo of each link. A link that the server no longer knows is absent. The edit
     /// replacement reads it, because only the state of a photo proves that the person deleted it.
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility]
+    /// Fresh raw states and response completeness, without the legacy visibility defaults.
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot
     /// Active main photos carrying this iCloud identifier. Incomplete results cannot prove absence.
     /// Complete means complete as of the content index event frontier.
     /// Own uploads recorded through recordUploaded and events newer than the checkpoint are not in these tables yet.
@@ -874,10 +881,6 @@ public protocol UploadDuplicateChecking: Sendable {
     func modificationDate(ofMainLink linkID: String) async throws -> Date?
     /// Live complete compound metadata. Missing or unreadable evidence returns nil.
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound?
-    /// `compound(ofMainLink:)` for many main photos, with one metadata request for up to
-    /// `UploadDedupePipeline.protonDuplicateBatchSize` links. A main photo whose compound is missing or unreadable is
-    /// absent from the result. A failed request fails the whole read.
-    func compounds(ofMainLinks linkIDs: [String]) async throws -> [String: UploadRemoteCompound]
     /// Earlier links named by an active main's lineage. Uses the same completeness boundary as the head reads.
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool)
     /// Brings the persistent remote identity index current before a queue starts resolving items.
@@ -928,15 +931,6 @@ public extension UploadDuplicateChecking {
 
     func modificationDate(ofMainLink linkID: String) async throws -> Date? { nil }
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? { nil }
-    /// Backends without a batched read read each compound on its own.
-    func compounds(ofMainLinks linkIDs: [String]) async throws -> [String: UploadRemoteCompound] {
-        var compounds: [String: UploadRemoteCompound] = [:]
-        for linkID in Set(linkIDs).sorted() {
-            try Task.checkCancellation()
-            compounds[linkID] = try await compound(ofMainLink: linkID)
-        }
-        return compounds
-    }
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {
@@ -1111,15 +1105,19 @@ public struct UploadRemoteCommitSettlementError: LocalizedError, Sendable {
     public let receipt: UploadRemoteCommitReceipt
     public let settlementMessage: String
     public let reconciliationPersisted: Bool
+    /// Cancellation remains separate from the committed receipt: callers must retain both.
+    public let cancellation: (any Error)?
 
     public init(
         receipt: UploadRemoteCommitReceipt,
         settlementMessage: String,
-        reconciliationPersisted: Bool = false
+        reconciliationPersisted: Bool = false,
+        cancellation: (any Error)? = nil
     ) {
         self.receipt = receipt
         self.settlementMessage = settlementMessage
         self.reconciliationPersisted = reconciliationPersisted
+        self.cancellation = cancellation
     }
 
     public var errorDescription: String? { settlementMessage }
@@ -1164,7 +1162,8 @@ public extension UploadIdentityResolving {
                     throw UploadRemoteCommitSettlementError(
                         receipt: receipt,
                         settlementMessage: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription,
-                        reconciliationPersisted: false
+                        reconciliationPersisted: false,
+                        cancellation: UploadError.isCancellation(error) ? error : nil
                     )
                 }
             }
@@ -1179,7 +1178,8 @@ public extension UploadIdentityResolving {
                 throw UploadRemoteCommitSettlementError(
                     receipt: receipt,
                     settlementMessage: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription,
-                    reconciliationPersisted: onRemoteCommit != nil
+                    reconciliationPersisted: onRemoteCommit != nil,
+                    cancellation: UploadError.isCancellation(error) ? error : nil
                 )
             }
             return value

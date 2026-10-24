@@ -1,6 +1,7 @@
 import DesignSystemCore
 import Foundation
 import MLSearchCore
+import MediaByteCache
 import PhotoLibraryBackupAdapter
 import PhotosCore
 import PrivacyFeature
@@ -54,17 +55,9 @@ struct MobileSettingsScreen: View {
                     .mobileVisibilityPriority(.high)
                 }
             }
-            .task(id: scenePhase) {
+            .task(id: CacheSizeObservation(scenePhase: scenePhase, caches: libraryModel.diskCaches)) {
                 guard scenePhase == .active else { return }
-                await refreshCacheSize()
-                while !Task.isCancelled {
-                    do {
-                        try await Task.sleep(for: .seconds(10))
-                    } catch {
-                        return
-                    }
-                    await refreshCacheSize()
-                }
+                await libraryModel.diskCaches.followDiskChanges { await refreshCacheSize() }
             }
             .task(id: scenePhase) {
                 guard scenePhase == .active else { return }
@@ -117,8 +110,9 @@ struct MobileSettingsScreen: View {
                                 .monospacedDigit()
                                 .foregroundStyle(ProtonColor.textWeak)
                         }
-                        ProgressView(value: Double(min(used, max)), total: Double(max))
-                            .tint(ProtonColor.primary)
+                        ActivityProgressBar(
+                            fraction: Double(min(used, max)) / Double(max),
+                            accessibilityLabel: String(localized: "settings.storage"))
                     }
                 }
             }
@@ -234,7 +228,7 @@ struct MobileSettingsScreen: View {
                 HStack {
                     Text(String(localized: "settings.clear_cache"))
                     Spacer()
-                    if isClearingCache { ProgressView().controlSize(.small) }
+                    if isClearingCache { ProgressSpinner() }
                 }
             }
             .disabled(isClearingCache)
@@ -281,6 +275,10 @@ struct MobileSettingsScreen: View {
                         .font(.footnote)
                         .foregroundStyle(ProtonColor.textHint)
                     AppBuildInfoLabel()
+                    Text(ProductBrand.madeInAustria)
+                        .font(.caption2)
+                        .foregroundStyle(ProtonColor.textHint)
+                        .multilineTextAlignment(.center)
                 }
                 Spacer()
             }
@@ -291,7 +289,7 @@ struct MobileSettingsScreen: View {
     // MARK: - Actions
 
     private func refreshCacheSize() async {
-        cacheSize = await libraryModel.cacheDiskSizeBytes()
+        cacheSize = await libraryModel.diskCaches.diskSizeBytes()
     }
 
     private func clearCache() {
@@ -302,6 +300,12 @@ struct MobileSettingsScreen: View {
             isClearingCache = false
         }
     }
+}
+
+/// Restarts the cache-size observation when the scene becomes active or the account reload replaces the cache.
+private struct CacheSizeObservation: Equatable {
+    let scenePhase: ScenePhase
+    let caches: ThumbnailCacheGroup
 }
 
 private struct MobileBugReportSheet: View {
@@ -329,7 +333,7 @@ private struct MobileBugReportSheet: View {
                                 systemImage: "square.and.arrow.down"
                             )
                             Spacer()
-                            if isPreparingReport { ProgressView().controlSize(.small) }
+                            if isPreparingReport { ProgressSpinner() }
                         }
                     }
                     .disabled(isPreparingReport)

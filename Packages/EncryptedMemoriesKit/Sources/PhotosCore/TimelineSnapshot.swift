@@ -5,7 +5,7 @@ import Foundation
 /// The first occurrence of each uid wins. An O(n) scan detects an ordering inversion, and sorting runs only
 /// when the retained items are not already in canonical order. Lookups use the prebuilt index.
 ///
-/// Ordering follows `TimelineOrder`: capture time ascending, then volume and node id.
+/// Ordering follows `TimelineOrder`: capture time, optional subsecond evidence, then stable identity and link ID.
 public struct TimelineSnapshot: Sendable {
     /// The flattened, uid-unique items in timeline order.
     public let items: [PhotoItem]

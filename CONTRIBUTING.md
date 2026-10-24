@@ -7,6 +7,7 @@ Thank you for helping improve Encrypted Memories. Keep each pull request focused
 - Search existing issues and pull requests.
 - Open an issue before a large feature or architecture change.
 - Never include credentials, private user data, signing files, or local build output.
+- You license your contribution under the project's license: the AGPL-3.0 with the additional permission for application stores that the README states.
 - PR authors never set app versions, build numbers, release tags, or release notes. Maintainers own releases.
 - Coding agents also follow `AGENTS.md`.
 
@@ -28,6 +29,7 @@ The repository is public, and a pull request keeps every commit you push, even w
 - Never commit credentials, keys, tokens, certificates, provisioning profiles, or `.env` files.
 - Never commit personal data: real names, host names, local paths, device identifiers, or private network addresses. This includes commit metadata.
 - Use your GitHub noreply address as commit email, and run `git config --global user.useConfigOnly true`, so Git never derives an address from your machine name.
+- CI accepts only the noreply addresses of the account that opens the pull request (`<id>+<login>@users.noreply.github.com` or `<login>@users.noreply.github.com`) and `noreply@github.com` for the committer. A noreply address of another login credits that person's account. Every attribution trailer (`Co-authored-by`, `Signed-off-by`, `Reviewed-by`, `Tested-by`, and similar `-by` keys) must carry the author's own address and must not name a tool.
 - Check each commit before you push, not only the final result. CI scans every commit of a pull request, and GitHub push protection blocks known secret formats.
 
 ## Architecture rules
@@ -196,6 +198,174 @@ It refuses equal or newer active versions or unsafe states.
 
 The manual `External TestFlight` workflow runs from `main` with one published release tag.
 It reuses existing builds and never rebuilds or uploads.
+It also adds the builds to the internal group, so an external beta is always an internal beta, too.
+It enables the public link of the external group and shows the link in the job summary.
 It uses the `testflight-external` environment.
 `TESTFLIGHT_EXTERNAL_GROUP_NAME` optionally overrides `External Testers`.
 Stable and prerelease release tags can be promoted externally.
+
+## Release upgrade verification
+
+The Apple release workflow finishes both distribution builds before it tests installed upgrades.
+Both uploads depend on successful upgrade tests on iOS Simulator and macOS.
+This gate runs for stable releases and prereleases. It does not add a pull request check.
+Full verification runs in the merge queue.
+
+The source list includes every published stable GitHub release from `v1.0.5` onward.
+`OLDEST_SUPPORTED_STABLE` in `.github/scripts/release_upgrade.py` defines this lower bound:
+1.0.5 was the first public App Store version; earlier releases were admission tests.
+A prerelease also checks the previous published beta.
+Only `v1.1.0-beta.2` can be excluded, and only as the previous beta.
+The job summary states `nicht getestet: v1.1.0-beta.2 (kein Prüfeinstieg)`.
+Beta 2 had only testers. The full verification in the merge queue checks the 1.0.5 state fixtures.
+Any other predecessor without the test entry or a matching versioned overlay fails the gate.
+
+The test apps use Release optimization and the exact release commit, with
+`ENCRYPTED_MEMORIES_UPGRADE_TEST` set only for these separate builds.
+The archive and upload configurations never enable the synthetic account.
+Storage, migrations, and task algorithms run through their existing implementations.
+Only macOS upgrade probes admit devices without Metal 3 under
+`#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)`; shipping hardware admission stays unchanged.
+The journey logs the real Metal devices and their Metal 3 support. It retains the production
+grid and all rendered-pixel assertions, so failed rendering still fails the gate.
+The macOS journey does not click a visible window of another process at normal or modal-panel level.
+A system dialog can cover the app.
+Before each Settings click, the journey drags the Settings window by an uncovered title-bar point
+until the control keeps 32 points from every foreign window, preferably with the whole window clear.
+A covered library control fails the journey.
+The pixel checks use a photo that no foreign window covers.
+Metadata parity means exact string equality of `CFBundleShortVersionString` and `CFBundleVersion`
+with each published GitHub release's authoritative version and build number.
+The shared release identity helper and the existing build-number helper supply both archive and probe values.
+Each built, cached, and installed probe must match before its old or new journey phase starts.
+Evidence records the expected release, source commit, and actual bundle values.
+These journeys also verify commit, storage, and task paths. External authentication-header
+acceptance remains unverified. Tracked versions and build numbers remain unchanged.
+Synthetic photos, inference, and a loopback server replace external inputs and services.
+The server records uploads independently of app data. Duplicate uploads fail the journey.
+The journey kills the old app during backup claim, remote receipt, and local completion;
+model download, install record, and promotion; index embedding and commits; and thumbnail loading and storage.
+The new app must load the saved session, retain preferences, and finish the work through the native UI.
+
+The backup journey starts from consent that is already saved on disk.
+At the held task boundary, it waits within the existing preparation budget for
+`photoBackup.enabled.v1 == true` in the exact owned app container's preferences.
+Missing consent or unreadable preferences fail the gate. The task remains held until SIGKILL.
+The journey compares the saved consent before the kill, after install-over, and after UI verification.
+It neither writes preferences nor enables backup in the replacement app.
+The v1.0.5 Enable tap can reach a task boundary before its preference reaches disk;
+the immediate tap-to-SIGKILL case is a known historical limit and is not covered by this journey.
+
+Each source runs its own `scripts/update-proton-sdk.sh` in separate source and SDK scratch directories.
+The `v1.0.5` overlay is pinned to its published commit and must apply cleanly.
+Later releases carry their inactive test entry and require no overlay, with one exception:
+`v1.1.0-beta.3` predates the hosted Metal admission, so its pinned overlay adds only that test-only admission.
+Only completed builds enter the cache, keyed by source, toolchain, architecture, platform, and test-build inputs.
+A typical cold run needs two app builds per platform; cached historical products remove one build per source.
+Release metadata also keys the cache,
+so distinct releases on one commit cannot reuse the wrong version or build number.
+
+On the hosted runner one iOS case takes about seven minutes, so the iOS gate runs in two jobs.
+Each job tests every source with half of the interruption points; together they cover the same cases as one job.
+Each UI run gets up to 600 seconds to start its first test case. The 180-second preparation budget starts
+when the first test case starts, when the old app reaches its checkpoint on its own, or when the UI run ends, whichever comes first.
+The 240-second verification budget starts with the first test case or the end of the run.
+A slow UI runner start on a loaded runner therefore cannot use up either budget.
+Each iOS job holds six points per source. With three sources, a job needs about 145 minutes of its 180;
+a fourth source needs a third iOS job.
+A failing case keeps the app's system log. The evidence also holds the runner load, the free disk and the size of
+the large build and Simulator directories, and each case's timing and free disk.
+The job summary shows the free disk at the start and the end. The journey step prints only result, timing and disk
+lines, because GitHub cuts a step log at about 10 MB; the full output stays in the retained `release-upgrade.log`.
+A historical source keeps only its published app; its build scratch is deleted after the build.
+
+The iOS journey installs the new app with `simctl install` over the existing app.
+It never removes the app or resets its data between the old and new phases.
+It runs on the Simulator runtime pinned in `IOS_RUNTIME` of `scripts/upgrade-test/run_journey.py` (iOS 27.0, build 24A434).
+A missing, ambiguous, unavailable, or different runtime fails before a device exists; the message names the expected and the installed build.
+The new phase does not seed a session: loss of the real simulator Keychain entry fails the journey.
+The seed marker records both the loopback server URL and the case-specific account UID.
+A validated case identifier contains exactly 32 ASCII hexadecimal characters (`0-9`, `a-f`, `A-F`); its maximum length is 32.
+The test entry rejects every other identifier with an explicit error before it can become an account path component.
+A changed case or server, or an old URL-only marker, requires a new seed.
+An unchanged case and server retain the existing session.
+The native seed regression uses `UPGRADE_NATIVE_SEED_TARGET=HEAD`, `UPGRADE_NATIVE_WORKING_COPY=1`,
+and `UPGRADE_RELEASE_TAG` set to an existing published release for the candidate metadata
+with `.github/scripts/test_upgrade_journey.py UpgradeJourneyTests.test_native_seed_identity_survives_restarts_and_reseeds_changed_cases_or_servers`.
+Set `UPGRADE_NATIVE_SEED_PLATFORM=iOS` to include the old-format file in a fresh owned simulator container.
+The default macOS run also checks that an unchanged identity preserves the saved session contents.
+The opt-in simulator-isolation regression also passes `UPGRADE_RELEASE_TAG` explicitly.
+Both regressions require published metadata even when the source is an untagged working-copy revision.
+Both macOS installations use one temporary self-signed identity, without release credentials.
+Only the synthetic macOS session persists outside the Data Protection Keychain.
+Production Keychain access groups must match the last supported stable release.
+
+macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau geprüft; abgedeckt durch iOS-Simulator und Entitlement-Vergleich.
+
+For a local rehearsal, run these commands through the configured shared build queue:
+
+```bash
+bash scripts/test-release-upgrade.sh --target HEAD --release-tag "$CANDIDATE_RELEASE_TAG" --sources v1.0.5 --platform iOS --working-copy
+bash scripts/test-release-upgrade.sh --target HEAD --release-tag "$CANDIDATE_RELEASE_TAG" --sources v1.0.5 --platform macOS --working-copy
+```
+
+Set `CANDIDATE_RELEASE_TAG` to an existing published app release. The local working-copy rehearsal
+uses that release's metadata and reports its separate source identity; it is not a shipping artifact.
+Without `--working-copy`, the source commit must match the published tag. Missing or mismatched
+GitHub releases fail; no project fallback supplies metadata.
+These commands create no release or tag and perform no Apple upload.
+They use only an owned simulator and the macOS host. Never install them on a physical iPhone or iPad.
+Omit `--working-copy` to test an exact committed revision.
+Use `--points` with one or more named interruption points for focused diagnosis.
+Logs, UI result bundles, and the server ledger remain under the shared build root's `UpgradeCheck/evidence` directory.
+The release workflow uses trusted default-branch automation, so its changes take effect after merge.
+
+A failed upgrade stops both uploads and records its cause in the job summary.
+A maintainer can retry the run after fixing the cause.
+To deliberately override the gate, dispatch `Apple release` from `main` with an existing published
+`release_tag`, the same value in `upgrade_override_tag`, and a nonempty `upgrade_override_reason`.
+The summary records the override and its reason. Automatic release events cannot override the gate.
+
+## iPhone Duo verification
+
+Build with Xcode 27.1 or newer and install the iOS 27.1 simulator runtime before selecting iPhone Duo.
+`project.yml` keeps the existing deployment targets. The selected Xcode supplies the SDK;
+do not pin a versioned `SDKROOT` or a machine-specific Xcode path.
+
+Select the full Xcode toolchain with `DEVELOPER_DIR`, then use the existing test scripts:
+
+```bash
+export IOS_TEST_DESTINATION="platform=iOS Simulator,name=iPhone Duo,OS=latest"
+./scripts/verify-ios-app-tests.sh
+./scripts/verify-ios-app-tests.sh ui
+unset IOS_TEST_DESTINATION
+```
+
+The override is optional. Without it, the scripts keep selecting an installed iPhone simulator.
+A named override selects the newest matching runtime. `OS=27` matches 27.x; `OS=27.1` matches
+27.1 and 27.1.x. A three-component value such as `OS=27.1.0` matches exactly, with missing runtime
+components treated as zero. An omitted OS or `OS=latest` selects the newest runtime.
+OS values must use `latest` or one to three numeric components. Invalid OS values, empty `id=` or
+`OS=` fields, and fields without `=` fail with exit 64. Simulator names containing a comma are not
+supported; use `id=` for those devices. An `id=` override selects an existing simulator directly.
+Both test modes wait for that simulator
+to boot and pass the same device ID to Xcode. `build-for-testing` does not boot a simulator.
+Command tests cover these choices in `.github/scripts/test_ios_test_commands.py`.
+
+The Duo simulator starts on its outer display. Set the fully open, book, and tabletop poses in
+Device Hub before their runs. XCTest and `simctl` have no fold or pose command in Xcode 27.1.
+Rotation uses the documented `XCUIDevice.orientation` property; rotation does not open the inner display.
+Record the actual pose and orientation for each result. Do not label a window resize as a display handoff.
+Fold and unfold during grid, viewer, selection, and search flows remain manual checks.
+
+An explicit Duo baseline can expose existing failures without changing the default simulator run.
+List each failure, its evidence, and its owning issue in the pull request. Keep every existing assertion;
+correct the underlying behavior or test assumption in its owning change.
+
+Hosted CI uses the Xcode installed on its runner image. A Duo run needs Xcode 27.1, the matching
+simulator runtime, and a Duo simulator. A workflow change must select the installed toolchain and
+update the expected Xcode version together. Keep the merge queue and required checks unchanged.
+
+References: [Preparing your app for iPhone Duo](https://developer.apple.com/documentation/technologyoverviews/preparing-your-app-for-iphone-duo),
+[Device Hub interaction](https://developer.apple.com/documentation/xcode/interacting-with-your-app-in-device-hub),
+and [XCUIDevice.orientation](https://developer.apple.com/documentation/xcuiautomation/xcuidevice/orientation).

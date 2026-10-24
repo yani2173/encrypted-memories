@@ -19,6 +19,8 @@ public struct PhotoUID: Hashable, Sendable, Codable {
 public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
     public let uid: PhotoUID
     public let captureTime: Date
+    /// Optional subsecond order evidence; the server listing time remains unchanged.
+    public var timelineOrder: TimelineOrderMetadata?
     public let mediaType: String  // e.g. "image/jpeg", "video/quicktime"
     public let isLivePhoto: Bool
     /// For a Live Photo, the node ID (same volume) of the paired video file.
@@ -55,10 +57,12 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         relatedVideoID: String? = nil,
         durationSeconds: Double? = nil,
         tags: Set<PhotoTag> = [],
-        burstMemberIDs: [String] = []
+        burstMemberIDs: [String] = [],
+        timelineOrder: TimelineOrderMetadata? = nil
     ) {
         self.uid = uid
         self.captureTime = captureTime
+        self.timelineOrder = timelineOrder
         self.mediaType = mediaType
         self.isLivePhoto = isLivePhoto
         self.relatedVideoID = relatedVideoID
@@ -68,13 +72,15 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case uid, captureTime, mediaType, isLivePhoto, relatedVideoID, durationSeconds, tags, burstMemberIDs
+        case uid, captureTime, mediaType, isLivePhoto, relatedVideoID, durationSeconds, tags, burstMemberIDs,
+            timelineOrder
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         uid = try container.decode(PhotoUID.self, forKey: .uid)
         captureTime = try container.decode(Date.self, forKey: .captureTime)
+        timelineOrder = try container.decodeIfPresent(TimelineOrderMetadata.self, forKey: .timelineOrder)
         mediaType = try container.decode(String.self, forKey: .mediaType)
         isLivePhoto = try container.decodeIfPresent(Bool.self, forKey: .isLivePhoto) ?? false
         relatedVideoID = try container.decodeIfPresent(String.self, forKey: .relatedVideoID)
@@ -87,35 +93,13 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(uid, forKey: .uid)
         try container.encode(captureTime, forKey: .captureTime)
+        try container.encodeIfPresent(timelineOrder, forKey: .timelineOrder)
         try container.encode(mediaType, forKey: .mediaType)
         try container.encode(isLivePhoto, forKey: .isLivePhoto)
         try container.encodeIfPresent(relatedVideoID, forKey: .relatedVideoID)
         try container.encodeIfPresent(durationSeconds, forKey: .durationSeconds)
         try container.encode(tags.sorted { $0.rawValue < $1.rawValue }, forKey: .tags)
         try container.encode(burstMemberIDs, forKey: .burstMemberIDs)
-    }
-}
-
-extension PhotoItem {
-    /// The length of a video as the library shows it, for example "0:42" or "1:01:01". Nil for a photo and for a
-    /// video whose length is unknown.
-    public var durationText: String? { isVideo ? Self.durationText(for: durationSeconds) : nil }
-
-    /// A video length in seconds as the library shows it. Nil for a missing, invalid, or empty length.
-    public static func durationText(for seconds: Double?) -> String? {
-        guard let seconds, seconds.isFinite, seconds > 0, seconds < Double(Int.max) else { return nil }
-        let total = Int(seconds.rounded())
-        let hours = total / 3_600
-        let minutes = (total % 3_600) / 60
-        let remainder = total % 60
-        if hours > 0 {
-            return "\(hours):\(twoDigits(minutes)):\(twoDigits(remainder))"
-        }
-        return "\(minutes):\(twoDigits(remainder))"
-    }
-
-    private static func twoDigits(_ value: Int) -> String {
-        value < 10 ? "0\(value)" : "\(value)"
     }
 }
 
@@ -159,6 +143,12 @@ public struct TimelineLoadSnapshot: Sendable {
         self.sections = sections
         self.validationToken = validationToken
     }
+
+    /// An unaccepted or unpaired projection leaves the next successful monitor probe pending.
+    public func monitorBaseline(afterPublishing accepted: Bool) -> String {
+        guard accepted else { return "" }
+        return validationToken ?? ""
+    }
 }
 
 /// Marker for an authoritative timeline load that is valid but has not yet converged with a completed local
@@ -170,15 +160,20 @@ public protocol TimelineInventoryConvergenceError: Error, Sendable {}
 /// trash, so only the main photo's state tells whether the file still belongs to a photo in the library.
 public struct RemoteLinkVisibility: Equatable, Sendable {
     public var isActive: Bool
-    /// Nil for a main photo.
+    /// Nil for a main photo or unavailable role data.
     public var mainPhotoLinkID: String?
+    /// Whether the answer explicitly includes the state and revision Photo role data.
+    public var hasExplicitPhotoState: Bool
     /// The server time of the move to the trash, in seconds. Nil for a link that is not in the trash.
     public var trashTime: Int64?
 
-    public init(isActive: Bool, mainPhotoLinkID: String?, trashTime: Int64? = nil) {
+    public init(
+        isActive: Bool, mainPhotoLinkID: String?, trashTime: Int64? = nil, hasExplicitPhotoState: Bool = true
+    ) {
         self.isActive = isActive
         self.mainPhotoLinkID = mainPhotoLinkID
         self.trashTime = trashTime
+        self.hasExplicitPhotoState = hasExplicitPhotoState
     }
 }
 
@@ -191,8 +186,9 @@ public protocol PhotosRepository: Sendable {
     /// Last-known timeline persisted to disk, for instant startup (nil if none). `loadTimeline()`
     /// then refreshes in the background - stale-while-revalidate, so there's no spinner on relaunch.
     func cachedTimeline() async -> [TimelineSection]?
-    /// Reads the cached timeline and its paired validation revision as one snapshot. Implementations that
-    /// cannot provide an atomic pair should return a nil token so validation fails closed.
+    /// Reads the cached timeline and its paired validation revision as one snapshot. A failed or incomplete
+    /// photos, tags, or series read returns nil, so the caller uses the server load. Implementations that cannot provide an
+    /// atomic pair should return a nil token so validation fails closed.
     func cachedTimelineSnapshot() async -> CachedTimelineSnapshot?
     /// Opaque server revision captured atomically with the cached timeline. A caller may present the
     /// cached frame as authoritative only after this equals the provider's current change token.
@@ -221,6 +217,8 @@ public protocol LibraryChangeTokenProvider: Sendable {
     /// Allows a backend to use scope already present in the cached inventory (for example its volume ID),
     /// avoiding an unrelated root-discovery request on the user-visible launch path.
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String
+    /// Adapts a validated persisted revision without another listing. The validated remote cursor remains the baseline.
+    func monitorBaseline(for validationToken: String) async throws -> String
 }
 
 /// Marker for a change-token failure that cannot recover by polling the same remote scope again.
@@ -228,6 +226,15 @@ public protocol LibraryChangeTokenProvider: Sendable {
 public protocol LibraryChangeTerminalError: Error, Sendable {}
 
 public extension LibraryChangeTokenProvider {
+    func monitorBaseline(for validationToken: String) async throws -> String {
+        guard let remoteRevision = LibraryChangeMonitorSeedPolicy.remoteRevision(from: validationToken) else {
+            return validationToken
+        }
+        let observed = try await libraryChangeToken()
+        return LibraryChangeMonitorSeedPolicy.baseline(
+            validatedRemoteRevision: remoteRevision, observedMonitorToken: observed)
+    }
+
     func launchValidationToken() async throws -> String {
         try await libraryChangeToken()
     }

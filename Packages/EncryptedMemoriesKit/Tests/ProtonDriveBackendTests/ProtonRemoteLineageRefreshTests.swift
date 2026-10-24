@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosCore
 import ProtonAuth
 import ProtonCoreCryptoGoInterface
 import ProtonCoreCryptoPatchedGoImplementation
@@ -165,6 +166,431 @@ extension DriveSessionStubSuite {
             try await service.prepareRemoteIndex { _ in }
             let later = StubURLProtocol.requests().dropFirst(before).map(\.path)
             #expect(!later.contains { $0.hasPrefix("/drive/volumes/vol1/photos") }, "the rebuild runs once")
+        }
+
+        /// A background window that expires while its pass waits for the index build must end at once. The build
+        /// itself keeps running: a later preparation joins it instead of starting a second one, and the timeline
+        /// metadata pass stays held until the build ends.
+        @Test func aCancelledIndexPreparationStopsWaitingAndTheBuildKeepsRunning() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            func listings() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
+            }
+            let clock = ContinuousClock()
+            func waitedFor(_ outcome: LockedOutcome) async throws -> Duration {
+                let start = clock.now
+                while outcome.value == nil, clock.now - start < .seconds(5) {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                return clock.now - start
+            }
+            let laterProgress = LockedOutcome()
+            func preparation(reporting reported: LockedOutcome? = nil) -> (Task<Void, Never>, LockedOutcome) {
+                let cancelled = LockedOutcome()
+                let task = Task {
+                    do {
+                        try await service.prepareRemoteIndex { _ in reported?.set(true) }
+                        cancelled.set(false)
+                    } catch {
+                        cancelled.set(error is CancellationError)
+                    }
+                }
+                return (task, cancelled)
+            }
+
+            let (window, windowCancelled) = preparation()
+            let begin = clock.now
+            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(listings() == 1, "the build reached its library listing")
+            window.cancel()
+            let windowWait = try await waitedFor(windowCancelled)
+            #expect(windowCancelled.value == true, "the expired window ended with a cancellation")
+            #expect(windowWait < .seconds(2), "the expired window stopped waiting at once: \(windowWait)")
+
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            let (later, laterCancelled) = preparation(reporting: laterProgress)
+            // The later preparation reports loading just before it joins the running build.
+            while laterProgress.value == nil, clock.now - begin < .seconds(20) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(listings() == 1, "a later preparation joins the running build")
+            #expect(released.value == nil, "the metadata pass stays held while the build runs")
+            later.cancel()
+            let laterWait = try await waitedFor(laterCancelled)
+            #expect(laterCancelled.value == true, "the joined preparation ended with a cancellation")
+            #expect(laterWait < .seconds(2), "the joined preparation stopped waiting at once: \(laterWait)")
+
+            // The end of the build, here through an invalidation, releases the metadata pass.
+            await service.invalidateCachedRemoteState()
+            let passWait = try await waitedFor(released)
+            #expect(released.value == true, "the end of the build releases the metadata pass: \(passWait)")
+            pass.cancel()
+        }
+
+        /// Sign-out closes the account's stores after the shutdown of its work. A build that a cancelled waiter left
+        /// running must end first, and no build starts after the shutdown.
+        @Test func theShutdownEndsTheRunningBuildAndStartsNoOther() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            func listings() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
+            }
+            let clock = ContinuousClock()
+            let window = Task { try await service.prepareRemoteIndex { _ in } }
+            let begin = clock.now
+            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(listings() == 1, "the build reached its library listing")
+            window.cancel()
+            _ = await window.result
+
+            // The hanging listing ends only when the shutdown cancels the build.
+            let ended = LockedOutcome()
+            let shutdown = Task {
+                await service.shutdown()
+                // The shutdown returns only after the build ended, so no build can touch the stores after it.
+                ended.set(!(await service.hasUnfinishedRemoteContentIndexBuild))
+            }
+            let stopped = clock.now
+            while ended.value == nil, clock.now - stopped < .seconds(5) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(ended.value == true, "the shutdown ended the running build")
+            shutdown.cancel()
+            // The cancelled build ended, so the metadata pass that the cancelled preparation left held is released.
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            defer { pass.cancel() }
+            let shut = clock.now
+            while released.value == nil, clock.now - shut < .seconds(5) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(released.value == true, "the shutdown cancelled the build")
+
+            let requestsBefore = StubURLProtocol.requests().count
+            let afterShutdown = LockedOutcome()
+            let late = Task {
+                do {
+                    try await service.prepareRemoteIndex { _ in }
+                    afterShutdown.set(false)
+                } catch {
+                    afterShutdown.set(error is CancellationError)
+                }
+            }
+            let asked = clock.now
+            while afterShutdown.value == nil, clock.now - asked < .seconds(5) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            late.cancel()
+            #expect(afterShutdown.value == true, "a preparation after the shutdown ends with a cancellation")
+            #expect(StubURLProtocol.requests().count == requestsBefore, "no build starts after the shutdown")
+        }
+
+        /// An invalidation cancels a build without waiting for it. The shutdown still waits for that build, so it cannot
+        /// touch the stores after the shutdown.
+        @Test func theShutdownWaitsForABuildThatAnInvalidationCancelled() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            let service = makeService(content: content, lineage: lineage)
+            func listings() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
+            }
+            let clock = ContinuousClock()
+            let pass = Task { try await service.prepareRemoteIndex { _ in } }
+            let begin = clock.now
+            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(listings() == 1, "the build reached its library listing")
+
+            await service.invalidateCachedRemoteState()
+            await service.shutdown()
+
+            #expect(
+                !(await service.hasUnfinishedRemoteContentIndexBuild),
+                "the cancelled build ended before the shutdown returned")
+            _ = await pass.result
+        }
+
+        /// A preparation that needs the first full build can stop while a shorter refresh runs. The end of that refresh
+        /// is not the end of the first full build, so the timeline metadata pass stays held.
+        @Test func theEndOfAShorterRefreshKeepsThePassHeldForTheFirstFullBuild() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            StubURLProtocol.hang("GET /drive/volumes/vol1/events/one")
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            func eventReads() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/events/one") }.count
+            }
+            let clock = ContinuousClock()
+            // An asset proof starts the shorter refresh of the events, which hangs.
+            let proof = Task {
+                try await service.findRemoteAssetProofs(for: [
+                    UploadBackupExternalIdentity(identifier: "asset", modificationDate: Date(timeIntervalSince1970: 0))
+                ])
+            }
+            let begin = clock.now
+            while eventReads() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(eventReads() == 1, "the shorter refresh reads the events")
+            // The preparation needs the lineage rebuild, waits for the running refresh and then stops.
+            let loading = LockedOutcome()
+            let preparation = Task { try await service.prepareRemoteIndex { _ in loading.set(true) } }
+            while loading.value == nil, clock.now - begin < .seconds(20) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            preparation.cancel()
+            _ = await preparation.result
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            defer { pass.cancel() }
+
+            // The refresh ends without the lineage rebuild.
+            await service.invalidateCachedRemoteState()
+            _ = await proof.result
+            try await Task.sleep(for: .milliseconds(300))
+
+            #expect(released.value == nil, "the pass stays held for the first full build")
+        }
+
+        /// Series dissolution and the edit replacement hold the service directly, so they can reach it after the shutdown.
+        /// The identity stores may be closed by then, so neither method writes any more.
+        @Test func aServiceThatIsShutDownInvalidatesNothingAndRecordsNothing() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            var hasher = SHA256()
+            hasher.update(data: Data("a".utf8))
+            hasher.update(data: Data([0]))
+            let fingerprint = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            let service = makeService(content: content, lineage: nil)
+            await service.recordUploaded(contentHash: "early", remoteLinkID: "link-early")
+            #expect(
+                content.remoteContentRecord(contentHash: "early", hashKeyEpoch: "epoch") != nil, "before the shutdown")
+            // A new record ends a staged build, so the build starts after it.
+            #expect(
+                content.beginRemoteContentIndexBuild(
+                    hashKeyEpoch: "epoch", eventID: "e1", sourceFingerprint: fingerprint, total: 1, updatedAt: Date())
+                    != nil)
+            #expect(content.remoteContentIndexBuildCheckpoint(hashKeyEpoch: "epoch") != nil, "the staged build exists")
+
+            await service.shutdown()
+            await service.invalidateCachedRemoteState()
+            await service.recordUploaded(contentHash: "late", remoteLinkID: "link-late")
+
+            #expect(
+                content.remoteContentIndexBuildCheckpoint(hashKeyEpoch: "epoch") != nil,
+                "the invalidation after the shutdown leaves the staged build alone")
+            #expect(
+                content.remoteContentRecord(contentHash: "late", hashKeyEpoch: "epoch") == nil,
+                "no write after the shutdown")
+        }
+
+        /// Sequence B: a lineage rebuild L, whose preparation was cancelled, is cancelled by an invalidation, and another
+        /// caller starts a build N before L ends. L's end must neither release the metadata pass nor clear N.
+        private func sequenceB(
+            _ body: (_ service: ProtonUploadDedupeService, _ gate: TimelineMetadataStartGate, _ released: LockedOutcome)
+                async throws -> Void
+        ) async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            StubURLProtocol.hang("GET /drive/volumes/vol1/events/one")
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            defer { pass.cancel() }
+            let clock = ContinuousClock()
+            let holdsTheBuild = HandlerGate()
+            let reachedTheBuild = LockedOutcome()
+
+            // The preparation's handler holds the lineage rebuild L at its first progress, before L asks for anything.
+            let calls = LockedCount()
+            let preparation = Task {
+                try await service.prepareRemoteIndex { _ in
+                    if calls.next() == 2 {
+                        reachedTheBuild.set(true)
+                        await holdsTheBuild.wait()
+                    }
+                }
+            }
+            let begin = clock.now
+            while reachedTheBuild.value == nil, clock.now - begin < .seconds(10) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(reachedTheBuild.value == true, "L runs and waits in the handler")
+            preparation.cancel()
+            _ = await preparation.result
+            await service.invalidateCachedRemoteState()
+            let requestsBeforeN = StubURLProtocol.requests().count
+            let newer = Task {
+                try await service.findRemoteAssetProofs(for: [
+                    UploadBackupExternalIdentity(identifier: "asset", modificationDate: Date(timeIntervalSince1970: 0))
+                ])
+            }
+            let started = clock.now
+            while StubURLProtocol.requests().count == requestsBeforeN, clock.now - started < .seconds(10) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(await service.unfinishedRemoteContentIndexBuildCount == 2, "L and N run")
+
+            await holdsTheBuild.open()
+            let ending = clock.now
+            while await service.unfinishedRemoteContentIndexBuildCount > 1, clock.now - ending < .seconds(10) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(await service.unfinishedRemoteContentIndexBuildCount == 1, "L ended and N still runs")
+            try await body(service, gate, released)
+            await service.shutdown()
+            newer.cancel()
+            _ = await newer.result
+        }
+
+        @Test func theEndOfAnOlderLineageRebuildKeepsThePassHeldWhileANewerBuildRuns() async throws {
+            try await sequenceB { _, _, released in
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(released.value == nil, "L ended with the lineage rebuilt, but N still runs")
+            }
+        }
+
+        @Test func theEndOfAnOlderBuildDoesNotClearTheNewerBuild() async throws {
+            try await sequenceB { service, _, _ in
+                let requests = StubURLProtocol.requests().count
+                // A later caller finds N still running and joins it, instead of starting a build of its own.
+                let later = Task {
+                    try await service.findRemoteAssetProofs(for: [
+                        UploadBackupExternalIdentity(
+                            identifier: "other", modificationDate: Date(timeIntervalSince1970: 0))
+                    ])
+                }
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(StubURLProtocol.requests().count == requests, "no second build started beside N")
+                later.cancel()
+                _ = await later.result
+            }
+        }
+
+        /// A build that ended no longer counts as running: once its result is no longer current, the next preparation
+        /// refreshes the index again instead of reusing the ended build.
+        @Test func anEndedBuildLetsTheNextPreparationRefreshAgain() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            routeEmptyEvents(from: "two", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+            let service = makeService(content: content, lineage: lineage)
+            func eventReads() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/events") }.count
+            }
+
+            try await service.prepareRemoteIndex { _ in }
+            let afterFirst = eventReads()
+            #expect(afterFirst > 0, "the first preparation reads the events")
+            // A trash of main photos on this device makes the refreshed index no longer current.
+            await service.remoteMainsChangedHere()
+            try await service.prepareRemoteIndex { _ in }
+
+            #expect(eventReads() > afterFirst, "the next preparation refreshes again")
         }
 
         /// A merge trashes main photos while the library check runs. The trash is a later event than the build, so the
@@ -669,13 +1095,253 @@ extension DriveSessionStubSuite {
             }
         }
 
+        /// At the first launch after the update the lineage index has no checkpoint, so the index preparation runs the
+        /// first full build. The timeline metadata pass reads the whole library too; it starts after the build ends.
+        @Test func theFirstFullBuildHoldsTheTimelineMetadataPassUntilItEnds() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+            // The build outlasts the start limit, which applies only until a build starts.
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(1), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+            let events = BuildOrderLog()
+            reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
+
+            try await service.prepareRemoteIndex { step in
+                // The last progress comes a moment after the build ends; the pass still starts only after it.
+                if step.phase == .ready { try? await Task.sleep(for: .milliseconds(500)) }
+                await events.append("build \(step.phase)")
+                if step.phase == .indexing { try? await Task.sleep(for: .milliseconds(1_500)) }
+            }
+            #expect(await passStart(events, reconciliation) != nil)
+
+            let log = await events.entries
+            #expect(log.contains("build indexing"), "\(log)")
+            #expect(Array(log.suffix(2)) == ["build ready", "metadata pass"], "\(log)")
+        }
+
+        /// A refresh for an asset proof is no first full build. It ends while no preparation waits, and the pass stays held
+        /// for the preparation that builds the index.
+        @Test func aRefreshForAnAssetProofKeepsTheTimelineMetadataPassHeld() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            defer { pass.cancel() }
+
+            _ = try await service.findRemoteAssetProofs(for: [
+                UploadBackupExternalIdentity(identifier: "asset", modificationDate: Date(timeIntervalSince1970: 0))
+            ])
+            #expect(
+                StubURLProtocol.requests().contains { $0.path.hasPrefix("/drive/volumes/vol1/events") },
+                "the proof lookup refreshed the index")
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(released.value == nil, "the pass stays held for the first full build")
+
+            // A pass that is already cancelled starts no refresh, also when the index is no longer current.
+            await service.remoteMainsChangedHere()
+            let requestsBefore = StubURLProtocol.requests().count
+            let cancelledPass = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                try await service.prepareRemoteIndex { _ in }
+            }
+            await #expect(throws: CancellationError.self) { try await cancelledPass.value }
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(StubURLProtocol.requests().count == requestsBefore, "the cancelled pass started no refresh")
+        }
+
+        @Test func aFailedFirstBuildReleasesTheTimelineMetadataPass() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            StubURLProtocol.reset()
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(20), limit: .seconds(20))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+            let events = BuildOrderLog()
+            reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
+
+            await #expect(throws: (any Error).self) {
+                try await service.prepareRemoteIndex { step in
+                    await events.append("build \(step.phase)")
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+            }
+
+            #expect(await passStart(events, reconciliation) != nil, "the failed build must release the pass")
+            let log = await events.entries
+            #expect(log.first == "build loading", "\(log)")
+            #expect(log.last == "metadata pass", "the pass waits for the failure: \(log)")
+        }
+
+        /// Only the launch that created the lineage index holds the pass. A later launch, also one whose earlier build
+        /// never ran, and a launch without a writable lineage index start the pass as before.
+        @Test func aLaterLaunchStartsTheTimelineMetadataPassAtOnce() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            for mode in ["absent", "without checkpoint", "with checkpoint", "closed"] {
+                let url = directory.appendingPathComponent("\(mode).sqlite")
+                var lineage: UploadRemoteLineageIndexStore?
+                if mode != "absent" {
+                    let earlier = try #require(UploadRemoteLineageIndexStore(url: url))
+                    #expect(earlier.createdFile, "\(mode)")
+                    if mode == "with checkpoint" {
+                        #expect(
+                            earlier.replaceRows(
+                                identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                                unresolvedRemoteLinkIDs: []))
+                    }
+                    if mode == "closed" {
+                        earlier.close()
+                        lineage = earlier
+                    } else {
+                        earlier.close()
+                        lineage = try #require(UploadRemoteLineageIndexStore(url: url))
+                        #expect(lineage?.createdFile == false, "\(mode)")
+                    }
+                }
+                defer { lineage?.close() }
+                let gate = TimelineMetadataStartGate(startLimit: .seconds(20), limit: .seconds(20))
+                _ = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+                let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+                let events = BuildOrderLog()
+
+                reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
+
+                let waited = await passStart(events, reconciliation)
+                #expect(waited.map { $0 < .seconds(5) } == true, "\(mode): a later launch must not hold the pass")
+            }
+        }
+
+        /// Waits at most ten seconds for the pass, then retires the scheduler so a held pass cannot outlive the test.
+        private func passStart(
+            _ events: BuildOrderLog, _ reconciliation: TimelineMetadataReconciliation
+        ) async -> Duration? {
+            let clock = ContinuousClock()
+            let begin = clock.now
+            var started: Duration?
+            while started == nil, clock.now - begin < .seconds(10) {
+                if await events.entries.contains("metadata pass") {
+                    started = clock.now - begin
+                } else {
+                    try? await Task.sleep(for: .milliseconds(20))
+                }
+            }
+            reconciliation.retire()
+            await reconciliation.waitForCurrentPass()
+            return started
+        }
+
+        private var timelineInventory: TimelineMetadataReconciliation.Inventory {
+            .init(
+                items: [
+                    PhotoItem(
+                        uid: PhotoUID(volumeID: "vol1", nodeID: "photo"), captureTime: Date(timeIntervalSince1970: 1),
+                        mediaType: "image/jpeg")
+                ], classifiedNodeIDs: [], libraryID: "vol1")
+        }
+
+        @Test(arguments: ["initial", "retry", "repair", "lineage"])
+        func requestCancellationNeverSettlesADegradedIndex(route: String) async throws {
+            let fixture = try RepairFixture(unresolved: route == "lineage" ? ["photo"] : [])
+            defer { fixture.close() }
+            let metadataPath = "POST /drive/shares/share1/links/fetch_metadata"
+            if route == "lineage" {
+                StubURLProtocol.fail(metadataPath)
+                await #expect(throws: (any Error).self) { try await fixture.refresh(to: "two") }
+                #expect(try metadataRequestLinkIDs() == ["photo"], "no retry after cancellation")
+                fixture.clock.advance(10_000)
+                #expect(
+                    fixture.lineage.unresolvedLinkIDsForRepair(
+                        hashKeyEpoch: "epoch", limit: 10, sweepInterval: 0
+                    ).contains("photo"))
+            } else {
+                StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+                StubURLProtocol.route(
+                    "GET /drive/volumes/vol1/photos",
+                    json: #"{"Code":1000,"Photos":[{"LinkID":"photo","CaptureTime":1,"Tags":[],"RelatedPhotos":[]}]}"#)
+                if route == "repair" {
+                    var photo = try fixture.keys.activePhoto("photo", attributes: "{}")
+                    photo["Name"] = try fixture.keys.crypto.encrypt(text: "photo.heic", to: fixture.keys.root)
+                    try routeMetadata([photo])
+                    StubURLProtocol.fail("POST /drive/volumes/vol1/photos/duplicates")
+                } else {
+                    try routeMetadata([])
+                    StubURLProtocol.fail(metadataPath, afterResponses: route == "retry" ? 1 : 0)
+                }
+                let fresh = try #require(
+                    UploadIdentityManifestStore(
+                        url: fixture.directory.appendingPathComponent("fresh.sqlite")))
+                defer { fresh.close() }
+                do {
+                    try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                        material: Self.material(rootKey: fixture.keys.root), session: makeSession(),
+                        crypto: fixture.keys.crypto, store: fresh, lineageStore: nil,
+                        rebuildsMissingLineage: false, progress: { _ in })
+                    Issue.record("request cancellation must propagate from \(route)")
+                } catch { #expect(UploadError.isCancellation(error)) }
+                #expect(fresh.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch") == nil)
+                if route != "repair" {
+                    #expect(try metadataRequestLinkIDs().count == (route == "retry" ? 2 : 1))
+                } else {
+                    #expect(StubURLProtocol.requests().contains { $0.path.contains("/photos/duplicates") })
+                }
+            }
+            #expect(!Task.isCancelled)
+        }
+
         private func makeService(
-            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?
+            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
+            firstBuildGate: TimelineMetadataStartGate? = nil
         ) -> ProtonUploadDedupeService {
             ProtonUploadDedupeService(
                 session: makeSession(), crypto: DriveCrypto(addressKeys: [], signers: []),
                 photosClient: NoPhotoDuplicates(), contentIndexStore: content, lineageIndexStore: lineage,
-                material: material
+                material: material, firstBuildGate: firstBuildGate
             ) { throw UploadError.backend("The test material is resolved") }
         }
 
@@ -707,50 +1373,6 @@ extension DriveSessionStubSuite {
             StubURLProtocol.route(
                 "GET /drive/volumes/vol1/events/\(from)",
                 json: #"{"Code":1000,"EventID":"\#(to)","More":0,"Refresh":0,"Events":[]}"#)
-        }
-
-        /// The metadata of the next window downloads while the current window decrypts. Every photo is still asked
-        /// for, the progress still advances window by window, and the build still finishes with its checkpoint.
-        @Test func aFullBuildOverSeveralWindowsAsksForEveryPhotoInOrder() async throws {
-            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let content = try #require(
-                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
-            defer { content.close() }
-            // 601 photos: one full window of 600 and one more. A page that is not exactly 500 long ends the list.
-            let ids = (0..<601).map { String(format: "p%04d", $0) }
-            let photos = ids.map { #"{"LinkID":"\#($0)","CaptureTime":1,"Tags":[],"RelatedPhotos":[]}"# }
-            StubURLProtocol.reset()
-            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
-            StubURLProtocol.route(
-                "GET /drive/volumes/vol1/photos",
-                json: #"{"Code":1000,"Photos":["# + photos.joined(separator: ",") + "]}")
-            StubURLProtocol.route("POST /drive/shares/share1/links/fetch_metadata", json: #"{"Code":1000,"Links":[]}"#)
-            let indexed = IndexedCounts()
-
-            try await refresh(content: content, lineage: nil) { value in
-                if value.phase == .indexing { indexed.append(value.completed) }
-            }
-
-            #expect(indexed.values == [0, 600, 601])
-            let requested = StubURLProtocol.requests()
-                .filter { $0.path == "/drive/shares/share1/links/fetch_metadata" }
-                .flatMap { request -> [String] in
-                    guard let body = request.body,
-                        let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
-                    else { return [] }
-                    return json["LinkIDs"] as? [String] ?? []
-                }
-            #expect(Set(requested) == Set(ids))
-            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
-        }
-
-        private final class IndexedCounts: @unchecked Sendable {
-            private let lock = NSLock()
-            private var stored: [Int] = []
-            var values: [Int] { lock.withLock { stored } }
-            func append(_ value: Int) { lock.withLock { stored.append(value) } }
         }
 
         private final class ManualClock: @unchecked Sendable {
@@ -846,6 +1468,50 @@ extension DriveSessionStubSuite {
             }
         }
 
+        /// The metadata of the next window downloads while the current window decrypts. Every photo is still asked
+        /// for, the progress still advances window by window, and the build still finishes with its checkpoint.
+        @Test func aFullBuildOverSeveralWindowsAsksForEveryPhotoInOrder() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            // 601 photos: one full window of 600 and one more. A page that is not exactly 500 long ends the list.
+            let ids = (0..<601).map { String(format: "p%04d", $0) }
+            let photos = ids.map { #"{"LinkID":"\#($0)","CaptureTime":1,"Tags":[],"RelatedPhotos":[]}"# }
+            StubURLProtocol.reset()
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/photos",
+                json: #"{"Code":1000,"Photos":["# + photos.joined(separator: ",") + "]}")
+            StubURLProtocol.route("POST /drive/shares/share1/links/fetch_metadata", json: #"{"Code":1000,"Links":[]}"#)
+            let indexed = IndexedCounts()
+
+            try await refresh(content: content, lineage: nil) { value in
+                if value.phase == .indexing { indexed.append(value.completed) }
+            }
+
+            #expect(indexed.values == [0, 600, 601])
+            let requested = StubURLProtocol.requests()
+                .filter { $0.path == "/drive/shares/share1/links/fetch_metadata" }
+                .flatMap { request -> [String] in
+                    guard let body = request.body,
+                        let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+                    else { return [] }
+                    return json["LinkIDs"] as? [String] ?? []
+                }
+            #expect(Set(requested) == Set(ids))
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
+        }
+
+        private final class IndexedCounts: @unchecked Sendable {
+            private let lock = NSLock()
+            private var stored: [Int] = []
+            var values: [Int] { lock.withLock { stored } }
+            func append(_ value: Int) { lock.withLock { stored.append(value) } }
+        }
+
         private func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
             rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: ""),
@@ -870,10 +1536,52 @@ extension DriveSessionStubSuite {
     }
 }
 
+/// One outcome that a test reads while the code under test still runs: nil until it is set.
+private final class LockedOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool?
+    var value: Bool? { lock.withLock { stored } }
+    func set(_ value: Bool) { lock.withLock { stored = value } }
+}
+
+private final class LockedCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func next() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
+    }
+}
+
+/// Holds a caller until the test opens it.
+private actor HandlerGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters = []
+        pending.forEach { $0.resume() }
+    }
+}
+
 /// The SDK's exact duplicate query, which these tests never reach.
 private struct NoPhotoDuplicates: SDKPhotoDuplicatesClient {
     func findPhotoDuplicates(name: String, sha1: Data, cancellationToken: UUID) async throws -> [SDKNodeUid] { [] }
     func cancelFindPhotoDuplicates(cancellationToken: UUID) async throws {}
+}
+
+private actor BuildOrderLog {
+    private(set) var entries: [String] = []
+    func append(_ entry: String) { entries.append(entry) }
 }
 
 private actor PreparationLog {

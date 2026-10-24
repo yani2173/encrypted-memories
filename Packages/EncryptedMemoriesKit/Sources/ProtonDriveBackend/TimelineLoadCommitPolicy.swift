@@ -269,6 +269,8 @@ struct TimelineContinuityRecoveryPendingError: LocalizedError, TimelineInventory
 enum TimelineInventorySource: Equatable {
     case sdkCache
     case authoritativePhotosList
+    /// The stored inventory with the local evidence applied. No listing runs (see `TimelineLocalRebuild`).
+    case localStore
 }
 
 /// Versioned envelope for the event token paired with a persisted Photos inventory. A contract bump invalidates
@@ -309,11 +311,12 @@ enum TimelineInventorySourcePolicy {
         cachedEventToken: String?,
         currentEventToken: String,
         hasPendingLocalUploads: Bool,
-        hasUnmaterializedLocalEvidence: Bool
+        hasUnmaterializedLocalEvidence: Bool,
+        canRebuildLocally: Bool = false
     ) -> TimelineInventorySource {
         if hasPendingLocalUploads || hasUnmaterializedLocalEvidence { return .authoritativePhotosList }
-        guard let cachedEventToken else { return .authoritativePhotosList }
-        return cachedEventToken == currentEventToken ? .sdkCache : .authoritativePhotosList
+        guard let cachedEventToken, cachedEventToken == currentEventToken else { return .authoritativePhotosList }
+        return canRebuildLocally ? .localStore : .sdkCache
     }
 }
 

@@ -264,6 +264,7 @@
         var thumbnailFeed: UIKitThumbnailFeed?
         private var items: [PhotoItem] = []
         private var configuredContentRevision: UInt64?
+        private var deferredOrderUpdate: (items: [PhotoItem], revision: UInt64?)?
         private var hasConfiguredContent = false
         /// Flat UID order for the current items, cached so the per-frame composer input never re-maps the library.
         var itemUIDs: [PhotoUID] = []
@@ -314,6 +315,7 @@
         /// opening it, and the grid draws the shared selection decorations (blue outline + checkmark badge).
         var selectionMode = false
         var selectedUIDs: Set<PhotoUID> = []
+        private(set) var uploadBadges = PendingUploadBadges.empty
         /// Shared static + on-demand duration/RAW descriptors. The resolver fetches encrypted video duration only
         /// after a resident viewport settles, so metadata cannot outrun thumbnail work while scrolling.
         private lazy var thumbnailOverlayResolver: TimelineThumbnailOverlayResolver = {
@@ -375,17 +377,17 @@
         /// visible photo can be captured against the layout that actually produced that offset, then re-resolved at
         /// the new width. A raw offset is not layout-invariant when rotation changes the column count.
         private var lastLaidOutViewportSize: CGSize = .zero
-        /// The photo that anchored the previous live resize. While it stays in the top visible row, later resizes keep
-        /// anchoring it instead of drifting to the row-first photo of a new column count. A real user scroll or a new
-        /// item set forgets it.
+        /// The photo that anchored the previous live resize. While its top stays below the top bar, later resizes keep
+        /// anchoring it instead of choosing again in each intermediate layout. A real user scroll, an explicit
+        /// placement, or a new item set forgets it.
         private var resizeAnchorItemID: PhotoUID?
         private var lastLaidOutSafeAreaInsets: UIEdgeInsets = .zero
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
         var isApplyingProgrammaticScroll = false
-        /// One-shot per content set: fires once the first fully-populated on-screen frame is drawn (every visible
-        /// cell resident or unfetchable), mirroring the macOS coordinator. Reset when a new non-empty UID set lands.
+        /// One-shot per content set: fires once the first settled frame with a resident visible thumbnail is drawn,
+        /// mirroring the macOS coordinator. Reset when a new non-empty UID set lands.
         private var firstContentReported = false
         /// Guards the deferred main-queue readiness callback. A cached frame may finish on the same runloop turn
         /// that authoritative UIDs replace it; only the generation that actually rendered may acknowledge itself.
@@ -410,8 +412,9 @@
 
         public private(set) var isMetal3Capable = false
 
-        /// Called on the main actor the first time every visible cell is drawn for the current content - the shell's
-        /// signal that the launch/loading UI can lift onto a real grid (never blank cells). One-shot per content set.
+        /// Called on the main actor the first time a visible thumbnail is drawn for the current content - the shell's
+        /// signal that the launch/loading UI can lift onto a real grid. The remaining thumbnails may still load.
+        /// One-shot per content set.
         public var onFirstContentReady: (() -> Void)?
 
         /// Called on the main actor when the user taps a photo cell, with the tapped item. The shell presents the viewer.
@@ -516,6 +519,7 @@
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
             // Upload badges change with progress; they never rebuild the item overlays.
+            self.uploadBadges = uploadBadges
             thumbnailOverlayResolver.updateUploadBadges(uploadBadges)
             for handover in pendingHandovers.newHandovers(in: uploadBadges.handovers) {
                 textureCache?.adoptTexture(from: handover.local, to: handover.remote)
@@ -528,7 +532,7 @@
             }
             swipeSelection.updateEnabled()
             let feedChanged = wiredFeed !== thumbnailFeed
-            let contentChanged: Bool
+            var contentChanged: Bool
             if let contentRevision {
                 contentChanged =
                     feedChanged
@@ -538,6 +542,31 @@
                 // Collection and map grids can omit a revision. Array equality retains Swift's shared-storage fast
                 // path and preserves their existing behavior until their owners expose a monotonic identity.
                 contentChanged = feedChanged || !hasConfiguredContent || items != self.items
+            }
+            var isOrderCorrection = false
+            var orderAnchor: GridScrollAnchor<PhotoUID>?
+            if contentChanged, !feedChanged, hasConfiguredContent,
+                fillOrder == self.fillOrder, gridProfile == requestedProfile,
+                initialViewportPlacement == self.initialViewportPlacement
+            {
+                if let contentRevision, deferredOrderUpdate?.revision == contentRevision {
+                    contentChanged = false
+                } else {
+                    let visible = Set(accessibilityFramePlan()?.visibleSlots.map(\.index) ?? [])
+                    let decision = TimelineOrderRefinementPolicy.decision(
+                        incoming: items, previousCount: self.items.count, visibleIndices: visible,
+                        previous: { uid in self.itemIndexByUID[uid].map { ($0, self.items[$0]) } })
+                    isOrderCorrection = decision != .ordinaryUpdate
+                    if decision == .deferVisibleCorrection || (isOrderCorrection && !canRefineOrder) {
+                        deferredOrderUpdate = (items, contentRevision)
+                        contentChanged = false
+                    } else {
+                        deferredOrderUpdate = nil
+                        if isOrderCorrection { orderAnchor = currentScrollAnchor() }
+                    }
+                }
+            } else if contentChanged {
+                deferredOrderUpdate = nil
             }
             let newUIDs = contentChanged ? items.map(\.uid) : itemUIDs
             let uidsChanged = contentChanged && itemUIDs != newUIDs
@@ -551,7 +580,8 @@
                 // Do not let a later revision-bearing caller match an identity from an earlier surface by accident.
                 configuredContentRevision = nil
             }
-            let shouldPlaceInitialViewport = uidsChanged && !itemUIDs.isEmpty && !userHasScrolledTimeline
+            let shouldPlaceInitialViewport =
+                uidsChanged && !isOrderCorrection && !itemUIDs.isEmpty && !userHasScrolledTimeline
             self.thumbnailFeed = thumbnailFeed
             self.metadataProvider = metadataProvider
             if requestedProfile != gridProfile {
@@ -600,7 +630,7 @@
                 swipeSelection.cancel()
                 resizeAnchorItemID = nil
                 contentGeneration &+= 1
-                committedPhase = nil
+                if !isOrderCorrection { committedPhase = nil }
                 cancelLiveZoomState()
                 itemIndexByUID = Dictionary(
                     itemUIDs.enumerated().map { ($0.element, $0.offset) },
@@ -621,8 +651,31 @@
                 }
             }
             refreshContentSize()
+            if let orderAnchor { restoreScrollAnchor(orderAnchor, marksTimelineAsScrolled: false) }
             requestRender()
             invalidateAccessibilityElements()
+        }
+
+        private var canRefineOrder: Bool {
+            !pinchInputActive && !pinchSettling && zoomTransaction == nil && commitBridgeTransaction == nil
+                && !gridTransition.isActive && overviewDissolve == nil
+        }
+
+        /// A scroll inspects only visible slots. The pending array shares its storage with the publication.
+        func applyDeferredOrderIfOffscreen() {
+            guard let pending = deferredOrderUpdate, canRefineOrder, let thumbnailFeed else { return }
+            let visible = Set(accessibilityFramePlan()?.visibleSlots.map(\.index) ?? [])
+            guard
+                !TimelineOrderRefinementPolicy.movesVisiblePhoto(
+                    incoming: pending.items, visibleIndices: visible, previousUID: { self.itemUIDs[$0] })
+            else { return }
+            deferredOrderUpdate = nil
+            configure(
+                items: pending.items, contentRevision: pending.revision,
+                thumbnailFeed: thumbnailFeed, metadataProvider: metadataProvider,
+                level: levelOverride, gridProfile: requestedProfile, fillOrder: fillOrder,
+                initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
+                selectionMode: selectionMode, selectedUIDs: selectedUIDs, uploadBadges: uploadBadges)
         }
 
         /// Captures the currently presented Metal surface before a projection replacement.
@@ -890,9 +943,7 @@
             // Register the GPU texture cache with the shared memory governor. On pressure the cache sheds offscreen but never
             // the visible pinned set, so what is on screen stays drawable - mirroring the macOS coordinator.
             if let cache {
-                texturePressureRegistration = UIKitMemoryPressureCoordinator.shared.attach(
-                    cache, key: "gridTextureCache"
-                ) { [weak cache] tier in
+                texturePressureRegistration = UIKitMemoryPressureCoordinator.shared.attach(cache) { [weak cache] tier in
                     cache?.setResidencyPressureScale(tier.budgetScale)
                 }
             }
@@ -948,6 +999,7 @@
             scrollView.setContentOffset(CGPoint(x: 0, y: targetY), animated: false)
             isApplyingProgrammaticScroll = false
             needsInitialViewportPlacement = false
+            resizeAnchorItemID = nil
         }
 
         private var initialViewportOpensAtNewest: Bool {
@@ -982,6 +1034,8 @@
         /// placement, not a learned user position, so later projection changes can still apply their own contract.
         public func scrollToTop(animated: Bool = false) {
             guard window != nil, bounds.height > 0, !itemUIDs.isEmpty else { return }
+            // An explicit placement chooses a new place, like a scroll; the next resize anchors at the top.
+            resizeAnchorItemID = nil
             let target = -safeAreaInsets.top
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
             isApplyingProgrammaticScroll = true
@@ -1013,7 +1067,7 @@
             return (displayMode, context.engine.contentModeToggleAvailable(level: context.level))
         }
 
-        /// Captures the top visible photo plus its sub-row offset. The shell can restore this after temporarily
+        /// Captures the first photo below the top bar plus its offset. The shell can restore this after temporarily
         /// replacing the item projection (for example while Smart Search is active) without guessing a raw offset.
         public func currentScrollAnchor() -> GridScrollAnchor<PhotoUID>? {
             guard bounds.width > 0, bounds.height > 0, !itemUIDs.isEmpty else { return nil }
@@ -1027,7 +1081,12 @@
                 overscan: 0,
                 columnPhase: committedPhase
             )
-            guard let top = plan.visibleSlots.min(by: { $0.slotRect.minY < $1.slotRect.minY }),
+            guard
+                let top = GridScrollAnchorPolicy.anchor(
+                    among: plan.visibleSlots,
+                    visibleTop: scrollView.contentOffset.y + safeAreaInsets.top,
+                    visibleBottom: scrollView.contentOffset.y + bounds.height - safeAreaInsets.bottom,
+                    frame: \.slotRect),
                 itemUIDs.indices.contains(top.index)
             else { return nil }
             return GridScrollAnchor(
@@ -1039,6 +1098,7 @@
         /// Re-resolves a captured photo through the current width, density and phase, then restores it to the
         /// same viewport position. If the item disappeared, the current position is left untouched.
         public func restoreScrollAnchor(_ anchor: GridScrollAnchor<PhotoUID>) {
+            resizeAnchorItemID = nil
             restoreScrollAnchor(anchor, marksTimelineAsScrolled: true)
         }
 
@@ -1078,7 +1138,7 @@
 
         /// Capture against the previous layout, not the already-mutated `bounds`: the scroll offset belongs to the
         /// previous column geometry until `refreshContentSize()` resolves the new one. Preserve the newest edge as an
-        /// edge; otherwise preserve the top visible photo identity plus its within-row offset.
+        /// edge; otherwise preserve the first photo below the top bar plus its distance to the bar.
         private func captureViewportResizePositionIfNeeded() -> ViewportResizePosition? {
             guard lastLaidOutViewportSize.width > 0,
                 lastLaidOutViewportSize.height > 0,
@@ -1109,25 +1169,27 @@
                 overscan: 0,
                 columnPhase: committedPhase
             )
-            guard let top = plan.visibleSlots.min(by: { $0.slotRect.minY < $1.slotRect.minY }),
-                itemUIDs.indices.contains(top.index)
+            // The usable area of the previous layout: below the translucent top bar, above the bottom bar. A rotation
+            // lays out several intermediate sizes, and repeated Split View or Stage Manager resizes follow each other;
+            // keep the photo anchored by the first of them while its top stays in that area, so the place does not
+            // creep with each layout or column count.
+            let visibleTop = scrollView.contentOffset.y + lastLaidOutSafeAreaInsets.top
+            let visibleBottom =
+                scrollView.contentOffset.y + lastLaidOutViewportSize.height - lastLaidOutSafeAreaInsets.bottom
+            let remembered = resizeAnchorItemID
+            guard
+                let anchorSlot = GridScrollAnchorPolicy.anchor(
+                    among: plan.visibleSlots, visibleTop: visibleTop, visibleBottom: visibleBottom,
+                    isKept: { [itemUIDs] in itemUIDs.indices.contains($0.index) && itemUIDs[$0.index] == remembered },
+                    frame: \.slotRect),
+                itemUIDs.indices.contains(anchorSlot.index)
             else { return nil }
-            // Repeated Split View / Stage Manager resizes: keep the photo the user anchored as long as it is still
-            // in the top row, so a changed column count does not creep the viewport up by a fraction of a row.
-            var anchorSlot = top
-            if let remembered = resizeAnchorItemID,
-                let slot = plan.visibleSlots.first(where: {
-                    itemUIDs.indices.contains($0.index) && itemUIDs[$0.index] == remembered
-                }),
-                abs(slot.slotRect.minY - top.slotRect.minY) < 0.5
-            {
-                anchorSlot = slot
-            }
             resizeAnchorItemID = itemUIDs[anchorSlot.index]
+            // Keep the photo's distance to the bar, not to the viewport top: rotation changes the bar height.
             return .anchor(
                 GridScrollAnchor(
                     itemID: itemUIDs[anchorSlot.index],
-                    topOffset: anchorSlot.slotRect.minY - scrollView.contentOffset.y
+                    topOffset: anchorSlot.slotRect.minY - visibleTop + safeAreaInsets.top
                 ))
         }
 
@@ -1173,10 +1235,12 @@
 
         /// The grid profile for the current layout size, rebuilt only when that size changes (never mid-scroll).
         /// The profile is a pure function of the usable layout size, so caching on it keeps a plain scroll frame
-        /// from re-resolving the density ladder every vsync.
+        /// from re-resolving the density ladder every vsync. It reads the host's own safe area: during a rotation the
+        /// Metal subview still reports the insets of the previous layout, which picked the other ladder for one pass
+        /// and moved the density and the place.
         func currentProfile() -> GridLevelProfile {
             let layoutSize = UIKitTimelineGridProfileAdapter.layoutSize(
-                forBounds: metalView.bounds, safeAreaInsets: metalView.safeAreaInsets)
+                forBounds: bounds, safeAreaInsets: safeAreaInsets)
             if let cachedProfile, cachedProfileLayoutSize == layoutSize { return cachedProfile }
             let previousProfile = cachedProfile
             let previousLayoutSize = cachedProfileLayoutSize
@@ -1184,7 +1248,7 @@
                 committedPhase = nil
                 cancelLiveZoomState()
             }
-            let profile = requestedProfile ?? profileAdapter.profile(for: metalView)
+            let profile = requestedProfile ?? profileAdapter.profile(for: self)
             if let previousProfile, previousProfile.id != profile.id,
                 previousLayoutSize.width > 0, layoutSize.width > 0
             {
@@ -1448,16 +1512,9 @@
             drawableWaitMs: Double,
             now: Double = CACurrentMediaTime()
         ) -> GridRenderOutcome {
-            let feed = thumbnailFeed
-            let missing = newestFirst(
-                uids.filter { uid in
-                    !textureCache.isResident(uid) && !(feed?.isKnownUnfetchable(uid) ?? false)
-                })
+            let (missing, ramReadyMissing) = missingRetryableTiles(in: uids, isResident: textureCache.isResident)
             scheduleWarmIfNeeded(
                 missing, pixelSize: transitionUploadPixels(slotSidePoints: slotSidePoints, textureCache: textureCache))
-            let ramReadyMissing = missing.reduce(into: 0) { count, uid in
-                if feed?.memoryCGImage(for: uid) != nil { count += 1 }
-            }
             perf.noteDraw(
                 visible: uids.count, missing: missing.count,
                 ramHitGpuMiss: ramReadyMissing, saturated: textureCache.residencySaturatedThisFrame,
@@ -1609,7 +1666,6 @@
                 cache: textureCache,
                 visibleIDs: ids.visible,
                 overscanIDs: ids.overscan,
-                pinOverscan: true,
                 effectiveUploadPixels: uploadPixels,
                 allowUpgrade: allowUpgrade,
                 now: now,
@@ -1639,11 +1695,8 @@
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
             renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups)
 
-            let missingVisible = newestFirst(
-                ids.visible.filter { uid in
-                    !textureCache.isResident(uid) && !(feed?.isKnownUnfetchable(uid) ?? false)
-                }
-            )
+            let (missingVisible, ramReadyMissing) = missingRetryableTiles(
+                in: ids.visible, isResident: textureCache.isResident)
             // The first visible thumbnail tells the shell to lift the loading UI onto the grid. Remaining
             // thumbnails continue loading behind the presented grid.
             // One-shot per content set; deferred to the next runloop tick so it never mutates observed shell
@@ -1670,9 +1723,6 @@
             // when its bytes land, so we idle through that wait instead of spinning full frames the whole time.
             // RAM-decoded but not yet GPU-resident (the `ramHitGpuMissing` diagnostic): these tiles can fill on
             // the very next frames within the upload budget - a persistent count means upload-budget starvation.
-            let ramReadyMissing = missingVisible.reduce(into: 0) { count, uid in
-                if feed?.memoryCGImage(for: uid) != nil { count += 1 }
-            }
             let uploadPending = ramReadyMissing > 0
             // Residency saturation means neither a deferred upload nor a deferred upgrade can make progress until the
             // streaming window changes (scroll/zoom, which re-arm on their own), so both are gated on it - matching
@@ -1836,6 +1886,7 @@
                 if abs(dy) > 1 { scrollDirectionDown = dy > 0 }
             }
             lastScrollY = scrollView.contentOffset.y
+            if !isApplyingProgrammaticScroll { applyDeferredOrderIfOffscreen() }
             // Scroll deltas arrive faster than vsync - mark dirty only; the display link draws exactly once
             // per frame with whatever offset is current by then.
             perf.noteScrollEvent()

@@ -1,6 +1,10 @@
 import Foundation
 import MLSearchCore
 
+#if ENCRYPTED_MEMORIES_UPGRADE_TEST
+    import PhotosCore
+#endif
+
 public enum MLArtifactTransportError: Error, Equatable {
     case httpStatus(Int)
     case notHTTPS
@@ -16,12 +20,19 @@ public enum MLArtifactTransportError: Error, Equatable {
 /// Transfers bounded ranges into an installer-owned partial file. A suspended app resumes at
 /// the exact byte boundary without retaining a model-sized `Data` value in memory.
 public struct URLSessionMLModelArtifactTransport: MLModelArtifactTransport {
-    private static let chunkByteCount: Int64 = 8 << 20
+    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+        private static let chunkByteCount: Int64 = 8192
+    #else
+        private static let chunkByteCount: Int64 = 8 << 20
+    #endif
     private let downloadClient: RangeDownloadClient
 
-    public init(session: URLSession = .shared) {
+    public init(session: URLSession = MLModelNetworkSession.shared) {
         self.downloadClient = RangeDownloadClient(configuration: session.configuration)
     }
+
+    /// The configuration of the session that performs the downloads.
+    var downloadConfiguration: URLSessionConfiguration { downloadClient.configuration }
 
     public func download(
         from url: URL,
@@ -29,7 +40,11 @@ public struct URLSessionMLModelArtifactTransport: MLModelArtifactTransport {
         expectedByteCount: Int64,
         progress: @escaping @Sendable (Int64, Int64?) async -> Void
     ) async throws {
-        guard url.scheme?.lowercased() == "https" else { throw MLArtifactTransportError.notHTTPS }
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            guard UpgradeTestProbe.isLoopback(url) else { throw MLArtifactTransportError.notHTTPS }
+        #else
+            guard url.scheme?.lowercased() == "https" else { throw MLArtifactTransportError.notHTTPS }
+        #endif
         guard expectedByteCount > 0 else { throw MLArtifactTransportError.responseTooSmall }
 
         let fm = FileManager.default
@@ -83,6 +98,10 @@ public struct URLSessionMLModelArtifactTransport: MLModelArtifactTransport {
                 }
                 try Self.append(temporaryURL, to: destination)
                 offset += received
+                #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                    UpgradeTestProbe.checkpoint("model.partial")
+                #endif
+
             case 200 where offset == 0:
                 let received = Self.fileSize(at: temporaryURL)
                 guard received > 0, received == expectedByteCount else {
@@ -214,6 +233,8 @@ private final class RangeDownloadClient: @unchecked Sendable {
         self.delegate = delegate
         self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
     }
+
+    var configuration: URLSessionConfiguration { session.configuration }
 
     deinit {
         session.invalidateAndCancel()
@@ -347,4 +368,15 @@ private final class RangeDownloadSessionDelegate: NSObject, URLSessionDownloadDe
             }
         }
     }
+}
+
+/// Default catalogs use this session for the process lifetime; production never invalidates it.
+/// Artifact transports copy its configuration into their owned download sessions.
+/// Keep no URL cache; ephemeral cookies and credentials remain in memory only.
+public enum MLModelNetworkSession {
+    public static let shared: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration)
+    }()
 }

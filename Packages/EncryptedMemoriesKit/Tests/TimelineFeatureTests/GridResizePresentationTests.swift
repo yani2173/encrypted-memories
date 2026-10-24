@@ -366,3 +366,118 @@ private final class PresentationTestDataSource: MetalGridDataSource {
             abs(left.width - 100 * k) < eps && abs(left.width - left.height) < eps, "tiles stay square, scaled by k")
     }
 }
+
+// The grid follows the real sidebar edge instead of a parallel 0.22 s animation (#183). AppKit animates the
+// sidebar for about 255 ms with its own curve, so a clock-driven grid led it by up to 60-100 pt. These tests feed
+// recorded edges through the coordinator; no test waits for time.
+extension GridResizePresentationTests {
+    /// Right edge of a 220 pt sidebar on every display frame of AppKit's opening animation (macOS 27.0.1).
+    static let recordedOpeningEdges: [CGFloat] = [
+        0, 0, 0, 1, 3, 5, 7, 10, 14, 18, 23, 28, 34, 40, 47, 55, 62, 79, 88, 97, 106, 116, 125, 134, 142, 151, 159,
+        167, 174, 181, 187, 193, 198, 203, 207, 211, 216, 218, 219, 220,
+    ]
+    /// The same sidebar closing, every fourth display frame.
+    static let recordedClosingEdges: [CGFloat] = [220, 215, 201, 178, 148, 112, 76, 44, 21, 6, 0]
+    /// How far the grid edge may lead or trail the sidebar edge, in points.
+    private static let followTolerance: CGFloat = 2
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
+    func gridEdgeFollowsRecordedSidebarEdgesWithinTwoPoints() throws {
+        for opening in [true, false] {
+            let edges = opening ? Self.recordedOpeningEdges : Self.recordedClosingEdges
+            let (coordinator, view, clip) = try #require(makeCoordinator())
+            _ = clip  // coordinator holds clipView weakly; keep the test clip alive for the lifecycle.
+            coordinator.normalLevelLeadingGap = 16
+            let from: CGFloat = opening ? 0 : 220
+            let to: CGFloat = opening ? 220 : 0
+            coordinator.sidebarObstructionInset = from
+            #expect(coordinator.beginSidebarResize(fromInset: from, toInset: to))
+
+            let size = view.bounds.size
+            let sources = coordinator.sidebarPresentationSlots(viewportSize: size, fraction: 0)
+            let targets = coordinator.sidebarPresentationSlots(viewportSize: size, fraction: 1)
+            let leading = try #require(sources.first { $0.column == 0 })
+            let leadingTarget = try #require(targets.first { $0.index == leading.index })
+            let travelX = leadingTarget.rect.minX - leading.rect.minX
+            #expect(abs(travelX) > 100, "the leading column moves with the sidebar")
+
+            for (frame, edge) in edges.enumerated() {
+                let arrived = coordinator.advanceSidebarResize(elapsed: Double(frame) * 0.004, measuredEdge: edge)
+                #expect(arrived == (edge == to), "the transition ends with the sidebar, not before")
+                let slots = coordinator.sidebarPresentationSlots(
+                    viewportSize: size, fraction: coordinator.presentationSidebarFraction)
+                let slot = try #require(slots.first { $0.index == leading.index })
+                // The leading column's x, mapped back to the sidebar width it stands for.
+                let gridEdge = from + (slot.rect.minX - leading.rect.minX) / travelX * (to - from)
+                let lead = (gridEdge - edge) * (to > from ? 1 : -1)
+                #expect(lead <= Self.followTolerance, "grid leads the sidebar by \(lead) pt at edge \(edge)")
+                #expect(lead >= -Self.followTolerance, "grid trails the sidebar by \(-lead) pt at edge \(edge)")
+            }
+            #expect(coordinator.presentationSidebarFraction == 1)
+            _ = coordinator.endSidebarResize()
+        }
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
+    func withoutAMeasuredEdgeTheClockRunsTheTransitionInTwoHundredTwentyMilliseconds() throws {
+        let (coordinator, view, clip) = try #require(makeCoordinator())
+        _ = clip
+        #expect(coordinator.beginSidebarResize(fromInset: 0, toInset: 280))
+        #expect(!coordinator.advanceSidebarResize(elapsed: 0, measuredEdge: nil))
+        #expect(coordinator.presentationSidebarFraction == 0)
+        #expect(!coordinator.advanceSidebarResize(elapsed: 0.11, measuredEdge: nil))
+        #expect(abs(coordinator.presentationSidebarFraction - 0.5) < 0.001, "easeInOutCubic is 0.5 at half time")
+        #expect(coordinator.advanceSidebarResize(elapsed: 0.22, measuredEdge: nil))
+        #expect(coordinator.presentationSidebarFraction == 1)
+        let end = coordinator.sidebarPresentationSlots(viewportSize: view.bounds.size, fraction: 1)
+        let target = coordinator.presentationSidebarTargetSlots
+        #expect(MetalGridCoordinator.maxIndexedRectDelta(source: end, target: target) < 0.001)
+        _ = coordinator.endSidebarResize()
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
+    func aMeasuredEdgeKeepsTheTransitionRunningPastTheClockAndEndsAtTheDeadline() throws {
+        let (coordinator, _, clip) = try #require(makeCoordinator())
+        _ = clip
+        #expect(coordinator.beginSidebarResize(fromInset: 0, toInset: 220))
+        #expect(
+            !coordinator.advanceSidebarResize(elapsed: 0.25, measuredEdge: 150),
+            "the clock does not end a followed transition")
+        #expect(abs(coordinator.presentationSidebarFraction - 150.0 / 220.0) < 0.001)
+        // The edge never moves: the deadline ends the transition on the target instead of freezing it.
+        let deadline = MetalGridCoordinator.sidebarFollowDeadline
+        #expect(!coordinator.advanceSidebarResize(elapsed: deadline - 0.01, measuredEdge: 150))
+        #expect(coordinator.advanceSidebarResize(elapsed: deadline, measuredEdge: 150))
+        #expect(coordinator.presentationSidebarFraction == 1)
+        _ = coordinator.endSidebarResize()
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
+    func anEdgeBeyondTheSidebarTravelIsClampedToTheTransition() throws {
+        let (coordinator, _, clip) = try #require(makeCoordinator())
+        _ = clip
+        #expect(coordinator.beginSidebarResize(fromInset: 0, toInset: 220))
+        #expect(!coordinator.advanceSidebarResize(elapsed: 0.01, measuredEdge: -30))
+        #expect(coordinator.presentationSidebarFraction == 0, "an edge before the start leaves the grid at the start")
+        #expect(!coordinator.advanceSidebarResize(elapsed: 0.02, measuredEdge: 400))
+        #expect(
+            coordinator.presentationSidebarFraction == 1, "an edge past the end never moves the grid past the target")
+        _ = coordinator.endSidebarResize()
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
+    func theEdgeArrivesWithinHalfAPointAndTheFractionNeverReverses() throws {
+        let (coordinator, _, clip) = try #require(makeCoordinator())
+        _ = clip
+        #expect(coordinator.beginSidebarResize(fromInset: 0, toInset: 220))
+        #expect(!coordinator.advanceSidebarResize(elapsed: 0.05, measuredEdge: 100))
+        let reached = coordinator.presentationSidebarFraction
+        #expect(!coordinator.advanceSidebarResize(elapsed: 0.06, measuredEdge: 80), "a stale smaller edge")
+        #expect(coordinator.presentationSidebarFraction == reached)
+        #expect(!coordinator.advanceSidebarResize(elapsed: 0.07, measuredEdge: nil), "a lost reading uses the clock")
+        #expect(coordinator.presentationSidebarFraction >= reached)
+        #expect(!coordinator.advanceSidebarResize(elapsed: 0.08, measuredEdge: 219.4))
+        #expect(coordinator.advanceSidebarResize(elapsed: 0.09, measuredEdge: 219.6))
+        _ = coordinator.endSidebarResize()
+    }
+}

@@ -4,6 +4,8 @@ import Foundation
 public struct LibrarySyncSupportSnapshot: Codable, Sendable, Equatable {
     public enum SourcePath: String, Codable, Sendable {
         case preparation, authoritative, continuity, sdkCache, cache
+        /// The library was rebuilt from the stored inventory because only local evidence changed. No listing ran.
+        case localStore
     }
 
     public enum ErrorKind: String, Codable, Sendable {

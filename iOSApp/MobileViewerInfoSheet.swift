@@ -1,3 +1,4 @@
+import DesignSystemCore
 import Foundation
 import MapKit
 import PhotoViewerCore
@@ -91,10 +92,9 @@ struct MobileViewerInfoSheet: View {
                 .accessibilityLabel(L10n.string("infopanel.info"))
 
         case .loading:
-            ProgressView()
+            ProgressSpinner(accessibilityLabel: L10n.string("infopanel.info"))
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
-                .accessibilityLabel(L10n.string("infopanel.info"))
 
         case .loaded(let metadata):
             loadedMetadataSection(metadata)
@@ -111,8 +111,7 @@ struct MobileViewerInfoSheet: View {
             } description: {
                 Text(L10n.string("infopanel.load_failed_message"))
             } actions: {
-                Button(L10n.string("action.retry"), action: onRetry)
-                    .buttonStyle(.borderedProminent)
+                RetryButton(.prominent, action: onRetry)
             }
             .frame(maxWidth: .infinity)
         }
@@ -143,18 +142,22 @@ struct MobileViewerInfoSheet: View {
 
     @ViewBuilder
     private var locationSection: some View {
-        if placeName != nil || metadata?.hasLocation == true {
+        let location = ViewerInfoLocation(
+            metadata: metadata, placeName: placeName, mapAndPlacesEnabled: mapAndPlacesEnabled)
+        if location.hasContent {
             VStack(alignment: .leading, spacing: 10) {
-                if mapAndPlacesEnabled, let placeName = nonEmpty(placeName) {
+                if let placeName = location.placeName {
                     Label(placeName, systemImage: "mappin.and.ellipse")
                         .font(.headline)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                if let latitude = metadata?.latitude, let longitude = metadata?.longitude {
-                    if mapAndPlacesEnabled {
+                if let latitude = metadata?.latitude, let longitude = metadata?.longitude,
+                    let coordinates = location.coordinateText
+                {
+                    if location.showsMap, let mapLabel = location.mapAccessibilityLabel {
                         let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
-                        let mapTitle = placeName ?? L10n.string("map.cluster_title")
+                        let mapTitle = location.markerTitle
                         Map(
                             initialPosition: .region(
                                 MKCoordinateRegion(
@@ -164,21 +167,20 @@ struct MobileViewerInfoSheet: View {
                         ) {
                             Marker(mapTitle, coordinate: coordinate)
                         }
+                        .id(location.mapIdentity)
                         .frame(maxWidth: .infinity)
                         .aspectRatio(1.55, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(
-                            Text("\(mapTitle), \(coordinateText(latitude: latitude, longitude: longitude))")
-                        )
+                        .accessibilityLabel(Text(mapLabel))
                     }
 
-                    Text(coordinateText(latitude: latitude, longitude: longitude))
+                    Text(coordinates)
                         .font(.subheadline.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .accessibilityLabel(
-                            Text(coordinateText(latitude: latitude, longitude: longitude))
+                            Text(coordinates)
                         )
                 }
             }
@@ -196,9 +198,7 @@ struct MobileViewerInfoSheet: View {
                     .textCase(.uppercase)
 
                 if isLoadingAlbumMemberships {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel(L10n.string("infopanel.albums"))
+                    ProgressSpinner(accessibilityLabel: L10n.string("infopanel.albums"))
                 } else if albumMembershipsLoadFailed {
                     Label(
                         L10n.string("infopanel.albums_load_failed"),
@@ -254,9 +254,5 @@ struct MobileViewerInfoSheet: View {
     private func durationString(_ seconds: Double) -> String {
         let total = max(0, Int(seconds.rounded()))
         return String(format: "%d:%02d", total / 60, total % 60)
-    }
-
-    private func coordinateText(latitude: Double, longitude: Double) -> String {
-        PhotoCoordinateText.format(latitude: latitude, longitude: longitude)
     }
 }

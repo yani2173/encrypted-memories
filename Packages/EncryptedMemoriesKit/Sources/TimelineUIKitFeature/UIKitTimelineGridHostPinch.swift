@@ -268,37 +268,15 @@
             level: Int,
             engine: SquareTileGridEngine,
             viewportSize: CGSize
-        ) -> (phase: Int?, scrollY: CGFloat) {
-            if level == pinchStartLevel {
-                return (
-                    committedPhase, min(max(pinchLockedOffsetY ?? scrollView.contentOffset.y, 0), maxContentOffsetY)
-                )
+        ) -> GridPinchDetentFrame {
+            if level != pinchStartLevel, let tx = zoomTransaction {
+                return GridPinchDetentGeometry.cursorAlignedFrame(
+                    level: level, transaction: tx, engine: engine, width: bounds.width,
+                    viewportHeight: viewportSize.height)
             }
-            guard let tx = zoomTransaction else {
-                return (
-                    committedPhase, min(max(pinchLockedOffsetY ?? scrollView.contentOffset.y, 0), maxContentOffsetY)
-                )
-            }
-            let desiredColumn = engine.cursorColumn(
-                viewportX: tx.anchorViewportPoint.x, level: level, width: bounds.width)
-            let phase = engine.columnPhase(
-                forItem: tx.anchorGlobalIndex, targetColumn: desiredColumn, level: level, width: bounds.width)
-            let rawY = engine.anchoredScrollOffset(
-                flatIndex: tx.anchorGlobalIndex,
-                localFraction: tx.anchorLocalFraction,
-                viewportPoint: tx.anchorViewportPoint,
-                level: level,
-                width: bounds.width,
-                columnPhase: phase
-            ).y
-            let maxY = engine.clampScrollOffsetY(
-                rawY,
-                level: level,
-                width: bounds.width,
-                viewportHeight: viewportSize.height,
-                columnPhase: phase
-            )
-            return (phase, maxY)
+            return GridPinchDetentFrame(
+                phase: committedPhase,
+                scrollY: min(max(pinchLockedOffsetY ?? scrollView.contentOffset.y, 0), maxContentOffsetY))
         }
 
         private func selectedFlatIndices() -> Set<Int> {

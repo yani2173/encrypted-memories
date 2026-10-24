@@ -246,6 +246,12 @@ import TimelineCore
         await repository.waitUntilRemoteRequested()
 
         #expect(model.initialLibraryLoadState == .validatingCachedContent(count: 0))
+        guard case .loading = model.gridState else {
+            Issue.record("An unvalidated empty cache must show loading, never the empty screen")
+            await repository.releaseRemote()
+            await load.value
+            return
+        }
         model.markInitialContentReady()
         #expect(
             model.initialLibraryLoadState == .validatingCachedContent(count: 0),
@@ -258,6 +264,62 @@ import TimelineCore
 
         model.markInitialContentReady()
         #expect(model.initialLibraryLoadState == .contentReady(count: 1))
+    }
+
+    @Test func firstPagePendingCannotShowAnEmptyLibrary() async {
+        let remote = photo("first-page", month: 1)
+        let repository = ControlledStartupRepository(cached: nil, remote: [section([remote])])
+        let model = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed().feedCore)
+        let load = Task { await model.load() }
+        await repository.waitUntilRemoteRequested()
+        #expect(model.initialLibraryLoadState == .preparingInventory)
+        #expect(model.initialLibraryLoadState.knownCount == nil)
+        if case .loading = model.gridState {} else { Issue.record("The first page has not arrived") }
+        await repository.releaseRemote()
+        await load.value
+        #expect(!model.initialLibraryLoadState.isEmpty)
+        #expect(model.allItems.map(\.uid) == [remote.uid])
+    }
+
+    @Test func successfulEmptyAccountCanFillLaterWithoutStayingEmpty() async {
+        let remote = photo("later-upload", month: 1)
+        let model = TimelineViewModel(
+            repository: VisibleContentRepository(timelines: [[], [section([remote])]]),
+            feed: makeVisibleContentFeed().feedCore
+        )
+        await model.load()
+        #expect(model.initialLibraryLoadState.isCompletelyEmpty)
+        if case .empty = model.gridState {} else { Issue.record("A successful empty listing must settle") }
+        _ = await model.refreshLibrary()
+        #expect(model.allItems.map(\.uid) == [remote.uid])
+        if case .loaded = model.gridState {} else { Issue.record("Known photos must replace the empty screen") }
+    }
+
+    @Test(arguments: [false, true])
+    func failedFirstReadNeverShowsEmptyEvenWithAnEmptyCache(hasCache: Bool) async {
+        let model = TimelineViewModel(
+            repository: FailedEmptyStartupRepository(hasCache: hasCache), feed: makeVisibleContentFeed().feedCore
+        )
+        await model.load()
+        #expect(model.initialLibraryLoadState.failure != nil)
+        #expect(!model.initialLibraryLoadState.isCompletelyEmpty)
+        if case .failed = model.gridState {} else { Issue.record("A failed first listing must show failure") }
+    }
+
+    @Test func backendCancellationOfAnActiveFirstReadShowsFailure() async {
+        for hasCache in [false, true] {
+            let model = TimelineViewModel(
+                repository: FailedEmptyStartupRepository(hasCache: hasCache, cancelled: true),
+                feed: makeVisibleContentFeed().feedCore
+            )
+            await model.load()
+            #expect(model.initialLibraryLoadState.failure != nil)
+            #expect(!model.initialLibraryLoadState.isCompletelyEmpty)
+            if case .failed = model.gridState {
+            } else {
+                Issue.record("An active cancelled first listing must show failure")
+            }
+        }
     }
 
     @Test func metadataEnrichmentDoesNotRebuildUnchangedWholeLibraryGrid() async {
@@ -428,14 +490,14 @@ private final class VisibleContentRepository: PhotosRepository, @unchecked Senda
 }
 
 private actor ControlledStartupRepository: PhotosRepository {
-    private let cached: [TimelineSection]
+    private let cached: [TimelineSection]?
     private let remote: [TimelineSection]
     private var remoteRequested = false
     private(set) var remoteRequestCount = 0
     private var requestWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseContinuation: CheckedContinuation<Void, Never>?
 
-    init(cached: [TimelineSection], remote: [TimelineSection]) {
+    init(cached: [TimelineSection]?, remote: [TimelineSection]) {
         self.cached = cached
         self.remote = remote
     }
@@ -495,10 +557,12 @@ private actor ValidatedStartupRepository: PhotosRepository, LibraryChangeTokenPr
 
     func cachedTimelineValidationToken() async -> String? { persistedToken }
 
-    func loadTimeline() async throws -> [TimelineSection] {
+    func loadTimeline() async throws -> [TimelineSection] { try await loadTimelineSnapshot().sections }
+
+    func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot {
         remoteRequestCount += 1
         persistedToken = currentToken
-        return remote
+        return TimelineLoadSnapshot(sections: remote, validationToken: currentToken)
     }
 
     func libraryChangeToken() async throws -> String { currentToken }
@@ -537,4 +601,15 @@ private actor VisibleContentThumbnailLoader: ThumbnailBatchLoader {
     func loadThumbnails(
         for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult { .delivered }
+}
+
+private struct FailedEmptyStartupRepository: PhotosRepository {
+    enum Failure: Error { case firstRead }
+    let hasCache: Bool
+    var cancelled = false
+    func cachedTimeline() async -> [TimelineSection]? { hasCache ? [] : nil }
+    func loadTimeline() async throws -> [TimelineSection] {
+        if cancelled { throw CancellationError() }
+        throw Failure.firstRead
+    }
 }

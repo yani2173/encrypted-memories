@@ -282,6 +282,8 @@ public final class PhotoDiagnostics: @unchecked Sendable {
     /// useful for live diagnostics, but a future caller cannot accidentally export an asset-derived
     /// suffix merely by choosing a familiar prefix.
     private static let supportCounterKeys: Set<String> = [
+        "backup.metadata.equalCoordinates",
+        "duplicates.thumbnail.blankOver3Seconds",
         "metrickit.diagnosticPayloads",
         "metrickit.metricPayloads",
         "ml.suggestions.cacheReadFailed",
@@ -296,6 +298,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         "perf.videoPrefetchDeduped",
         "perf.videoPrefetchScheduled",
         "thumb.decodedUpgrade",
+        "thumb.directLoadOverlapsBatch",
         "thumb.diskCacheHit",
         "thumb.diskCacheMiss",
         "thumb.diskDecodeFailed",
@@ -610,8 +613,8 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         switch event {
         case "ResourceState":
             allowedFields = [
-                "execution", "headroom", "lowPower", "memory", "networkConstrained",
-                "networkExpensive", "networkReachable", "recoveryPending", "thermal",
+                "execution", "headroom", "lowPower", "memory", "networkAvailableInterfaces", "networkConstrained",
+                "networkExpensive", "networkInterfaces", "networkReachable", "recoveryPending", "thermal",
                 "userInteraction", "visibleDemand",
             ]
         case "ResourcePermit":

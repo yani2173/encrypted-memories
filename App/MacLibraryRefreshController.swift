@@ -84,7 +84,7 @@ final class MacLibraryRefreshController {
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
         let succeeded = result.errorMessage == nil
         banner.finishRemoteRefresh(succeeded: succeeded)
-        return succeeded ? .refreshed : .retry
+        return succeeded ? result.refreshedOutcome : .retry
     }
 
     /// Stops a coalesced backup refresh when the library view disappears.

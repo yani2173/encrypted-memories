@@ -1,3 +1,4 @@
+import PhotosCore
 import Testing
 
 @testable import TimelineCore
@@ -16,6 +17,33 @@ import Testing
         }
         let presented = LibraryLoadState.contentReady(count: 37_249)
         #expect(LibraryLoadPolicy.reduce(presented, .contentLoadFailed(message: "test-error")) == presented)
+    }
+
+    @Test func completelyEmptyRequiresAuthoritativeZeroKnownItems() {
+        for count in [nil, -1, 0, 1, 10_000] as [Int?] {
+            for authority in [SourceInventoryAuthority.hydrating, .cached, .authoritative] {
+                #expect(
+                    LibraryEmptyPolicy.isCompletelyEmpty(knownItemCount: count, authority: authority)
+                        == (count == 0 && authority == .authoritative)
+                )
+            }
+        }
+    }
+
+    @Test func firstSignInWithLaterMetadataNeverSettlesEmpty() {
+        let waiting = reduce(.initial, [.firstContentReady])
+        #expect(waiting.isLoading)
+        #expect(!waiting.isCompletelyEmpty)
+        let known = reduce(waiting, [.authoritativeInventoryResolved(count: 10, requiresNewFrame: true)])
+        #expect(known.knownCount == 10)
+        #expect(known.isLoading)
+        #expect(!known.isCompletelyEmpty)
+        #expect(reduce(known, [.firstContentReady]) == .contentReady(count: 10))
+    }
+
+    @Test func invalidNegativeCountCannotProveAnEmptyLibrary() {
+        #expect(reduce(.initial, [.inventoryResolved(count: -1, cached: false)]).isLoading)
+        #expect(reduce(.initial, [.authoritativeInventoryResolved(count: -1, requiresNewFrame: false)]).isLoading)
     }
 
     private func reduce(_ state: LibraryLoadState, _ events: [LibraryLoadEvent]) -> LibraryLoadState {
@@ -131,9 +159,12 @@ import Testing
         )
     }
 
-    @Test func failedValidationOfCachedEmptyInventorySettlesAsEmpty() {
+    @Test func failedValidationOfCachedEmptyInventoryShowsFailure() {
         let cached = reduce(.initial, [.inventoryResolved(count: 0, cached: true)])
-        #expect(reduce(cached, [.failed(message: "offline", retryable: true)]) == .empty)
+        #expect(
+            reduce(cached, [.failed(message: "offline", retryable: true)])
+                == .failed(message: "offline", retryable: true)
+        )
     }
 
     @Test func cachedEmptyWaitsForAuthoritativeNonemptyFrame() {

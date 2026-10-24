@@ -33,7 +33,7 @@ public struct TipJarView: View {
     private var storeContent: some View {
         switch productLoadState {
         case .loading:
-            ProgressView()
+            ProgressSpinner()
                 .frame(maxWidth: .infinity, alignment: .center)
         case .loaded:
             StoreView(products: products) { product in
@@ -50,9 +50,7 @@ public struct TipJarView: View {
                 Text(L10n.string("settings.tip_jar_unavailable"))
                     .font(.footnote)
                     .foregroundStyle(ProtonColor.textWeak)
-                Button(L10n.string("action.retry")) {
-                    Task { await loadProducts() }
-                }
+                RetryButton(.compact) { Task { await loadProducts() } }
             }
         }
     }

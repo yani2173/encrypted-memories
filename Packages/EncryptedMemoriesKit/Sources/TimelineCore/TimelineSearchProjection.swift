@@ -53,11 +53,31 @@ public struct TimelineSearchProjection: Sendable {
         if key.refinement.isActive || !TimelineSearchQuery(key.query).isEmpty || key.requiredUIDs != nil
             || (key.context.activeFilter != nil && key.context.activeFilter != .all)
         {
-            presentationItems = Array(projection.snapshot.items.reversed())
+            presentationItems = Self.namesFirst(Array(projection.snapshot.items.reversed()), key: key)
         } else {
             presentationItems = projection.snapshot.items
         }
         self.revision = revision
+    }
+
+    /// For a query that reads as a file name, the photos whose name matches lead, newest first; the other results
+    /// follow in their own order. Every other query keeps the date order.
+    private static func namesFirst(_ items: [PhotoItem], key: TimelineSearchProjectionKey) -> [PhotoItem] {
+        guard key.requiredUIDs == nil, let names = key.context.photoNames, !names.isEmpty,
+            TimelineSearchQuery.looksLikeFileName(key.query)
+        else { return items }
+        let query = TimelineSearchQuery(key.query)
+        var named: [PhotoItem] = []
+        var others: [PhotoItem] = []
+        others.reserveCapacity(items.count)
+        for item in items {
+            if query.matchesName(of: item.uid, in: names) {
+                named.append(item)
+            } else {
+                others.append(item)
+            }
+        }
+        return named + others
     }
 }
 
@@ -118,5 +138,18 @@ public actor TimelineSearchProjectionCoordinator {
         pendingTask?.cancel()
         pendingTask = nil
         cachedProjection = nil
+    }
+}
+
+/// The file names a search projection needs: the backend's name index while a text query is active, and nil
+/// otherwise. An empty query ends the search in the backend too, so no decrypted names stay outside a search.
+public enum TimelineFileNameSearchSource {
+    public static func names(forQuery query: String, from backend: Any?) async -> PhotoNameIndex? {
+        guard let provider = backend as? any PhotoNameSearchProvider else { return nil }
+        guard !TimelineSearchQuery(query).isEmpty else {
+            await provider.endPhotoNameSearch()
+            return nil
+        }
+        return await provider.photoNameIndex()
     }
 }

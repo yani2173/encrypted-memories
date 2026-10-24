@@ -1,3 +1,4 @@
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 import UploadCore
@@ -48,10 +49,9 @@ public struct UploadQueuePanel: View {
                     .disabled(!UploadQueuePresentation.canClearFinished(s))
             }
             if s.total > 0 {
-                ProgressView(value: s.totalProgress)
-                Text(s.summaryText)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                ActivityProgressRow(
+                    title: nil, detail: s.summaryText, fraction: s.totalProgress,
+                    accessibilityName: L10n.string("upload.queue_title"))
             }
             if let error = coordinator.latestFolderEnumerationError {
                 HStack(alignment: .top, spacing: 8) {
@@ -114,6 +114,8 @@ public struct UploadQueuePanel: View {
                     .lineLimit(1).truncationMode(.middle)
                 statusLine(item)
             }
+            // The name column takes the free width before the spacer, so the upload bar spans the row.
+            .layoutPriority(1)
             Spacer()
             actions(for: item)
         }
@@ -122,13 +124,9 @@ public struct UploadQueuePanel: View {
 
     @ViewBuilder private func statusLine(_ item: UploadItem) -> some View {
         if case .uploading(let p) = item.state {
-            VStack(alignment: .leading, spacing: 2) {
-                ProgressView(value: p)
-                    .frame(maxWidth: 170)
-                Text(L10n.string("upload.state_uploading \(Int(p * 100))"))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            ActivityProgressRow(
+                title: nil, detail: L10n.string("upload.state_uploading \(Int(p * 100))"), fraction: p,
+                accessibilityName: item.displayName)
         } else {
             Text(item.state.label)
                 .font(.caption)
@@ -154,7 +152,7 @@ public struct UploadQueuePanel: View {
         case .queued:
             Image(systemName: "clock").foregroundStyle(.secondary)
         default:
-            ProgressView().controlSize(.small)
+            ProgressSpinner()
         }
     }
 

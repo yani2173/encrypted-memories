@@ -4,10 +4,11 @@
 require "fileutils"
 require "base64"
 require "json"
+require_relative "release_identity"
 
 module GitHubReleaseContract
   MAX_APPLE_RELEASE_NOTES_LENGTH = 4_000
-  TAG_PATTERN = /\Av(?<version>[0-9]+\.[0-9]+\.[0-9]+)(?:-(?<channel>beta|rc)\.(?<sequence>[1-9][0-9]*))?\z/
+  TAG_PATTERN = GitHubReleaseIdentity::TAG_PATTERN
   PLATFORMS = {
     "IOS" => "iOS and iPadOS",
     "MAC_OS" => "macOS"
@@ -29,34 +30,17 @@ module GitHubReleaseContract
   module_function
 
   def parse(payload)
-    release_id = Integer(payload.fetch("id"), exception: false)
-    unless release_id&.positive?
-      raise Error, "GitHub release ID must be a positive integer"
-    end
-    raise Error, "GitHub release must be published" if payload["draft"] == true || payload["published_at"].to_s.empty?
-
-    tag = payload.fetch("tag_name").to_s
-    match = TAG_PATTERN.match(tag)
-    raise Error, "Tag must use vMAJOR.MINOR.PATCH, optionally followed by -beta.N or -rc.N" unless match
-
-    prerelease = payload.fetch("prerelease")
-    raise Error, "GitHub prerelease must be true or false" unless [true, false].include?(prerelease)
-
-    expected_prerelease = !match[:channel].nil?
-    if prerelease != expected_prerelease
-      raise Error, "GitHub prerelease flag does not match tag #{tag}"
-    end
-
+    identity = GitHubReleaseIdentity.parse(payload)
     notes = extract_notes(payload.fetch("body", ""))
     Release.new(
-      tag: tag,
-      version: match[:version],
-      prerelease: prerelease,
-      channel: prerelease ? "testflight" : "app-store",
+      tag: identity.fetch("tag"),
+      version: identity.fetch("version"),
+      prerelease: identity.fetch("prerelease"),
+      channel: identity.fetch("channel"),
       notes: notes
     )
-  rescue KeyError => error
-    raise Error, "GitHub release payload is missing #{error.key}"
+  rescue GitHubReleaseIdentity::Error => error
+    raise Error, error.message
   end
 
   def extract_notes(body)

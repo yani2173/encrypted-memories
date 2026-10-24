@@ -194,6 +194,38 @@ final class LibrarySourceInventoryStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
     }
 
+    func testAFileThatAnotherConnectionHoldsIsNeverReplaced() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent(LibrarySourceInventoryStore.databaseFileName)
+        var holder: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(file.path, &holder), SQLITE_OK)
+        defer { sqlite3_close(holder) }
+        XCTAssertEqual(
+            sqlite3_exec(
+                holder, "CREATE TABLE legacy(value TEXT); INSERT INTO legacy VALUES ('kept'); PRAGMA user_version=99;",
+                nil, nil, nil),
+            SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(holder, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+
+        let store = LibrarySourceInventoryStore(
+            directory: directory, accountUID: "test-account", encryptionKey: encryptionKey,
+            policy: LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0))
+        do {
+            _ = try await activate(store)
+            XCTFail("a file that another connection holds cannot be opened")
+        } catch {}
+        XCTAssertEqual(sqlite3_exec(holder, "COMMIT;", nil, nil, nil), SQLITE_OK)
+
+        // The inventory holds user data: a lock says nothing about the schema, so the file keeps its content.
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(holder, "SELECT value FROM legacy;", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(String(cString: sqlite3_column_text(statement, 0)), "kept")
+    }
+
     func testInvalidInventoryCannotReplaceExistingDocument() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

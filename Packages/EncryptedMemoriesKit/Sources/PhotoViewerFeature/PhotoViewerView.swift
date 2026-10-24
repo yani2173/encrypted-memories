@@ -194,6 +194,9 @@ private final class PlayerLayerHostView: NSView {
 
 /// Full-screen photo/video viewer: shows the best available image sharp (no blur) with a native progress
 /// indicator while the full original downloads, then pinch-to-zoom + two-finger pan.
+///
+/// A viewer of a small set of photos, such as a group of duplicates, shows a filmstrip of its photos at the bottom,
+/// in the style of the burst filmstrip.
 public struct PhotoViewerView: View {
     @State private var model: PhotoViewerModel
     private let onClose: () -> Void
@@ -203,6 +206,9 @@ public struct PhotoViewerView: View {
     /// True while the shared zoom overlay renders the shrink-to-cell transition. This view hides its own
     /// background and image but stays mounted and hit-testable for the pinch gesture.
     private let isDismissing: Bool
+    /// The spoken name of a filmstrip of the photos of this viewer, for a small set of photos such as a group of
+    /// duplicates. Nil shows no such filmstrip.
+    private let itemFilmstripLabel: String?
 
     private let mediaTransition = ViewerMediaTransitionStyle.standard
 
@@ -212,7 +218,8 @@ public struct PhotoViewerView: View {
         onPinchDismissBegan: @escaping () -> Void = {},
         onPinchDismissChanged: @escaping (CGFloat) -> Void = { _ in },
         onPinchDismissEnded: @escaping (Bool) -> Void = { _ in },
-        isDismissing: Bool = false
+        isDismissing: Bool = false,
+        itemFilmstripLabel: String? = nil
     ) {
         _model = State(initialValue: model)
         self.onClose = onClose
@@ -220,6 +227,7 @@ public struct PhotoViewerView: View {
         self.onPinchDismissChanged = onPinchDismissChanged
         self.onPinchDismissEnded = onPinchDismissEnded
         self.isDismissing = isDismissing
+        self.itemFilmstripLabel = itemFilmstripLabel
     }
 
     public var body: some View {
@@ -239,6 +247,7 @@ public struct PhotoViewerView: View {
             InfoPanelView(
                 item: model.current,
                 metadataLoadState: model.metadataLoadState,
+                placeName: model.placeName,
                 albumTitles: model.albumTitles,
                 canLoadAlbumMemberships: model.canLoadAlbumMemberships,
                 isLoadingAlbumMemberships: model.isLoadingAlbumMemberships,
@@ -259,7 +268,10 @@ public struct PhotoViewerView: View {
                     canGoNext: model.canNavigateNext,
                     goPrevious: { model.previousInContext() },
                     goNext: { model.nextInContext() },
-                    close: onClose
+                    close: onClose,
+                    canShowOriginal: model.canShowOriginal,
+                    isShowingOriginal: model.isShowingOriginal,
+                    toggleOriginal: { model.toggleOriginal() }
                 )
         )
         .onAppear {
@@ -299,8 +311,20 @@ public struct PhotoViewerView: View {
                 if model.hasBurstFilmstrip, !isDismissing {
                     // Only the filmstrip follows the width, so a resize evaluates it alone.
                     ViewerWidthReader { burstFilmstrip(areaWidth: $0) }
+                } else if let itemFilmstripLabel, !isDismissing {
+                    ViewerWidthReader { itemFilmstrip(areaWidth: $0, label: itemFilmstripLabel) }
                 }
             }
+    }
+
+    /// The photos of this viewer in the filmstrip panel of a burst. The title bar already shows the position.
+    private func itemFilmstrip(areaWidth: CGFloat, label: String) -> some View {
+        filmstripPanel(
+            items: model.items, selectedUID: model.baseCurrent.uid, title: nil, label: label, areaWidth: areaWidth,
+            onSelect: { index in
+                guard model.items.indices.contains(index) else { return }
+                model.selectPage(uid: model.items[index].uid)
+            })
     }
 
     @ViewBuilder private var content: some View {
@@ -358,10 +382,25 @@ public struct PhotoViewerView: View {
             .accessibilityLabel(L10n.string("viewer.live_photo_a11y"))
     }
 
+    /// Marks the original of an edited photo, in the same native label style as the Live badge.
+    private var originalBadge: some View {
+        Label(L10n.string("viewer.original_badge"), systemImage: "wand.and.rays.inverse")
+            .font(.system(size: 11, weight: .semibold))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .glassEffect(in: Capsule())
+            .padding(.top, 14)
+            .padding(.leading, 14)
+            .accessibilityLabel(L10n.string("viewer.original_badge_a11y"))
+    }
+
     @ViewBuilder private var mediaBadges: some View {
         VStack(alignment: .leading, spacing: 8) {
             if model.current.isLivePhoto {
                 livePhotoBadge
+            }
+            if model.isShowingOriginal {
+                originalBadge
             }
             if model.isLoadingBurst || model.hasBurstFilmstrip {
                 burstBadge
@@ -393,33 +432,53 @@ public struct PhotoViewerView: View {
     }
 
     private func burstFilmstrip(areaWidth: CGFloat) -> some View {
-        let width = max(areaWidth - 40, 320)
-        let itemSide = burstFilmstripItemSide(panelWidth: width, itemCount: model.burstItems.count)
-        let needsScroller = burstFilmstripNeedsScroller(
-            panelWidth: width, itemCount: model.burstItems.count, itemSide: itemSide)
         let position = (model.burstIndex ?? 0) + 1
         let total = max(model.burstItems.count, 1)
+        return filmstripPanel(
+            items: model.burstItems, selectedUID: model.current.uid,
+            title: L10n.string("viewer.burst_badge \(position) \(total)"),
+            label: L10n.string("viewer.burst_filmstrip_label"), areaWidth: areaWidth,
+            onSelect: { model.selectBurstIndex($0) })
+    }
+
+    /// The glass filmstrip panel at the bottom of the viewer, with an optional title above the photos and the spoken
+    /// name `label`. The panel fills the width it gets, 20 points in from each side; `areaWidth` sizes only the
+    /// photos. A panel width taken from the measured width became the minimum width of the viewer beside the native
+    /// inspector, so the viewer shrank by only 40 points in each layout pass: showing the sidebar then never finished
+    /// its layout, and AppKit stopped the app.
+    private func filmstripPanel(
+        items: [PhotoItem], selectedUID: PhotoUID, title: String?, label: String, areaWidth: CGFloat,
+        onSelect: @escaping (Int) -> Void
+    ) -> some View {
+        let width = max(areaWidth - 40, 0)
+        let itemSide = burstFilmstripItemSide(panelWidth: width, itemCount: items.count)
+        let needsScroller = burstFilmstripNeedsScroller(
+            panelWidth: width, itemCount: items.count, itemSide: itemSide)
         return VStack(alignment: .leading, spacing: 8) {
-            Text(L10n.string("viewer.burst_badge \(position) \(total)"))
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.primary)
-                .padding(.horizontal, 2)
+            if let title {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 2)
+            }
             BurstFilmstripView(
-                items: model.burstItems,
-                selectedUID: model.current.uid,
+                items: items,
+                selectedUID: selectedUID,
                 feed: model.thumbnailFeed,
                 itemSide: itemSide,
                 showsHorizontalScroller: needsScroller,
-                onSelect: { model.selectBurstIndex($0) }
+                allowsVisibleDuplicateThumbnails: model.allowsVisibleDuplicateThumbnails,
+                onSelect: onSelect
             )
             .frame(height: itemSide + (needsScroller ? 18 : 0))
-            .accessibilityLabel(Text(L10n.string("viewer.burst_filmstrip_label")))
+            .accessibilityLabel(Text(label))
         }
         .padding(.horizontal, 12)
         .padding(.top, 10)
         .padding(.bottom, 12)
-        .frame(width: width)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .glassEffect(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.horizontal, 20)
         .padding(.bottom, 16)
     }
 
@@ -471,8 +530,7 @@ public struct PhotoViewerView: View {
             Text(error.userMessage)
         } actions: {
             if error.isRetryable {
-                Button(L10n.string("action.retry")) { model.retry() }
-                    .buttonStyle(.glassProminent)
+                RetryButton(.prominent) { model.retry() }
             }
         }
         .fixedSize()

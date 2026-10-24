@@ -26,6 +26,7 @@ struct MainView: View {
     @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
         AppSettingsDefault.mapAndPlacesEnabled
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.openSettings) private var openSettings
     @Environment(\.undoManager) private var undoManager
 
     let model: AppModel
@@ -65,7 +66,8 @@ struct MainView: View {
     /// The Duplicates route of this account. Nil while the account cannot merge duplicates.
     @State private var duplicates: ExactDuplicatesModel?
     @State private var confirmsDuplicateMergeAll = false
-    @State private var confirmsDuplicateMergeSelected = false
+    /// The group of duplicates whose photos the open viewer shows, with the merge tools below them.
+    @State private var duplicateViewerGroup: DuplicateViewerGroup?
     @State private var mapClusterPageIndex = 0
     @State private var mapClusterRouteGeneration = 0
     @State private var routeScrollGeneration = 0
@@ -208,11 +210,11 @@ struct MainView: View {
                 NavigationSplitView(columnVisibility: $columnVisibility) {
                     SidebarView(
                         albums: albums,
-                        isLoadingAlbums: albumActions.showsInitialAlbumLoadingPlaceholder,
+                        isLoadingAlbums: albumActions.showsAlbumLoadingPlaceholder,
                         albumCatalogFailed: albumCatalogFailed,
                         sharedAlbums: albumActions.sharedAlbums,
                         sharedAlbumPresentation: albumActions.presentation(for:),
-                        isLoadingSharedAlbums: albumActions.showsInitialSharedAlbumLoadingPlaceholder,
+                        isLoadingSharedAlbums: albumActions.showsSharedAlbumLoadingPlaceholder,
                         sharedAlbumCatalogFailed: albumActions.sharedLoadErrorMessage != nil,
                         canLeaveSharedAlbum: albumActions.canLeaveSharedAlbum,
                         canCreateAlbum: albumActions.canCreate,
@@ -293,7 +295,7 @@ struct MainView: View {
                 // placement when geometry is valid.
                 routeInitialScrollAnchor = routeScrollPositions[newValue]
                 routeScrollGeneration += 1
-                Task { await timelineModel.select(newValue) }
+                Task { await timelineModel.select(newValue, resuming: libraryChangeMonitor) }
             }
             .onChange(of: model.pendingTrash.localUIDs) { _, _ in
                 timelineModel.setPendingTrash(model.pendingTrash)
@@ -302,9 +304,6 @@ struct MainView: View {
                 model.pendingGrid?.setRemote(timelineModel.wholeLibraryTimeline)
                 let items = timelineModel.wholeLibraryItemsForViewer
                 OfflineLibraryManager.shared.liveAssetCount = items.count
-                // Kick off the low-priority GPS crawl (once) so the Map's location index fills in behind the
-                // thumbnail crawl.
-                OfflineLibraryManager.shared.startLocationCrawl(items: items, metadata: backend)
                 // New/removed assets flow into the Smart Search index on its next background pass.
                 model.updateSmartSearchAssets(
                     items,
@@ -393,13 +392,11 @@ struct MainView: View {
                 MacDuplicatesView(
                     model: duplicates,
                     thumbnailFeed: feed,
-                    sourceAnalysisRevision: model.sourceAnalysisRevision,
                     topInset: topBarInset,
                     confirmsMergeAll: $confirmsDuplicateMergeAll,
-                    confirmsMergeSelected: $confirmsDuplicateMergeSelected,
-                    item: { timelineModel.allLibraryItem(matching: $0) },
-                    // The list has no grid cell to zoom from, so the viewer opens directly.
-                    open: { items, index in openPhoto(items[index], items, proxy: GridProxy()) }
+                    canOpen: { timelineModel.allLibraryItem(matching: $0) != nil },
+                    libraryRevision: timelineModel.wholeLibraryRevision,
+                    onOpen: { openDuplicate($0, inGroup: $1) }
                 )
                 .padding(.leading, leadingObstructionInset)
                 .animation(Self.sidebarAnimation, value: leadingObstructionInset)
@@ -449,7 +446,10 @@ struct MainView: View {
                     onPinchDismissBegan: beginInteractiveDismiss,
                     onPinchDismissChanged: updateInteractiveDismiss,
                     onPinchDismissEnded: { endInteractiveDismiss(shouldClose: $0) },
-                    isDismissing: zoom?.interactive == true
+                    isDismissing: zoom?.interactive == true,
+                    // A group of duplicates shows its photos in the filmstrip of the viewer.
+                    itemFilmstripLabel: viewerGroup(of: viewerModel) == nil
+                        ? nil : L10n.string("duplicates.viewer_filmstrip_label")
                 )
                 // Keep the viewer beside the floating sidebar. The inset matches the zoom overlay's content rect.
                 .padding(.leading, leadingObstructionInset)
@@ -677,6 +677,7 @@ struct MainView: View {
                     isOffline: !networkMonitor.isOnline,
                     dragOutProvider: media,
                     onDragOutFailed: { dragOutFailureMessage = $0.localizedMessage },
+                    emptyLibraryBackupAction: emptyLibraryBackupAction,
                     onSelectionChange: { selectedUIDs = $0 },
                     onOpen: { item, items in
                         openPhoto(item, items, proxy: nil, followsReplacements: showsUnfilteredLibrary)
@@ -1062,8 +1063,8 @@ struct MainView: View {
     }
 
     private func viewerReturnTarget(for vm: PhotoViewerModel) -> (item: PhotoItem, cell: CGRect)? {
-        // The grid under Duplicates keeps another route, so the viewer closes without flying into it.
-        guard selection != .duplicates else { return nil }
+        // The Duplicates list covers the grid, so a viewer opened from it closes without a zoom into a hidden cell.
+        guard viewerGroup(of: vm) == nil else { return nil }
         let preferredProxy = activeGridProxy
         for item in vm.gridReturnCandidates {
             if let cell = preferredProxy.windowFrameForItem?(item.uid) { return (item, cell) }
@@ -1076,7 +1077,9 @@ struct MainView: View {
         return nil
     }
 
-    private func makeViewer(_ item: PhotoItem, _ items: [PhotoItem]) -> PhotoViewerModel {
+    private func makeViewer(
+        _ item: PhotoItem, _ items: [PhotoItem], allowsVisibleDuplicateThumbnails: Bool = false
+    ) -> PhotoViewerModel {
         let index = items.firstIndex(of: item) ?? 0
         let offline = OfflineLibraryManager.shared
         // Pending photos that are not in Proton yet open from Apple Photos; everything else from Proton.
@@ -1091,7 +1094,9 @@ struct MainView: View {
             previewCache: offline.previewCache,
             originalsCache: offline.originalsCache,
             cacheOriginals: offline.offlineEnabled,
-            originalsCapBytes: offline.originalsCapBytes)
+            originalsCapBytes: offline.originalsCapBytes,
+            allowsVisibleDuplicateThumbnails: allowsVisibleDuplicateThumbnails,
+            editedOriginalProvider: backend as? any EditedPhotoOriginalProviding)
     }
 
     /// Shows local photos on their way to Proton in the whole-library grid.
@@ -1099,7 +1104,9 @@ struct MainView: View {
         guard let session = model.pendingGrid else { return }
         session.attachFeed(
             timelineModel.feed, imageRequest: PhotoKitPlatformImages.request, fileThumbnails: folderMedia)
-        session.presenter.onChange = { [timelineModel] presentation in
+        // A replaced or retired session publishes an empty presentation when it closes. Only the session that the
+        // connection shows may write into this timeline model.
+        session.presenter.onChange = model.pendingPresentationHandler(for: session) { [timelineModel] presentation in
             timelineModel.setPendingPresentation(presentation)
         }
         timelineModel.setPendingPresentation(session.presenter.current)
@@ -1111,6 +1118,15 @@ struct MainView: View {
     private var displayedFavorites: Set<PhotoUID> {
         _ = model.pendingFavoriteRevision
         return model.pendingGrid?.displayedFavorites(favorites) ?? favorites
+    }
+
+    private var emptyLibraryBackupAction: LibraryEmptyBackupAction? {
+        model.backupController.map { backup in
+            LibraryEmptyBackupAction(isAvailable: backup.isAvailable, isEnabled: !backup.folders.isEmpty) {
+                model.selectedSettingsTab = .backup
+                openSettings()
+            }
+        }
     }
 
     /// Pending files of the watched backup folders.
@@ -1284,7 +1300,10 @@ struct MainView: View {
         }
         Task { await loadAlbums() }
         model.refreshLibrarySources()
-        OfflineLibraryManager.shared.restartLocationCrawl(items: timelineModel.allItems, metadata: backend)
+        // The whole library, like the automatic start: the route open under the map may be an album, a tag or
+        // Recently Deleted.
+        OfflineLibraryManager.shared.restartLocationCrawl(
+            items: timelineModel.wholeLibraryItemsForLocations, metadata: backend)
     }
 
     private var gridFillOrder: GridFillOrder {
@@ -1530,6 +1549,13 @@ struct MainView: View {
                         Label(L10n.string("map.scan_failed_title"), systemImage: "exclamationmark.triangle")
                     } description: {
                         Text(L10n.string("map.scan_failed_message"))
+                    } actions: {
+                        // Scans the whole library again, like the automatic start and the iPhone map; the route
+                        // left under the map may hold only an album, a tag or Recently Deleted.
+                        RetryButton(.prominent) {
+                            OfflineLibraryManager.shared.restartLocationCrawl(
+                                items: timelineModel.wholeLibraryItemsForLocations, metadata: backend)
+                        }
                     }
                 case .completed:
                     ContentUnavailableView {
@@ -1570,9 +1596,13 @@ struct MainView: View {
 
     /// Reads the server favorites, also after a trash or restore changed which photos can carry them. When the
     /// read fails, the `trashed` photos still lose their hearts.
-    private func reloadFavorites(trashed: Set<PhotoUID> = []) async {
+    private func reloadFavorites(
+        trashed: Set<PhotoUID> = [], isCurrent: @MainActor () -> Bool = { true }
+    ) async {
+        guard isCurrent() else { return }
         let read = favoriteState.beginLoad()
         let loaded = try? await backend.favoriteUIDs()
+        guard isCurrent() else { return }
         guard !Task.isCancelled else {
             favoriteState.cancelLoad(read)
             return
@@ -1650,10 +1680,68 @@ struct MainView: View {
         }
     }
 
+    /// The merge tools of a group of duplicates in the viewer toolbar, as one glass group before the photo actions:
+    /// Keep This Copy for the photo shown, and Merge, which merges the group with the photo shown as kept.
+    @ToolbarContentBuilder
+    private func duplicateViewerToolbar(_ viewerModel: PhotoViewerModel) -> some ToolbarContent {
+        if let duplicates, viewerGroup(of: viewerModel) != nil {
+            let uid = viewerModel.baseCurrent.uid
+            let keepTitle = duplicates.keepTitle(for: uid)
+            let mergeTitle = duplicates.mergeTitle
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    duplicates.keep(uid)
+                } label: {
+                    Label(keepTitle, systemImage: duplicates.keepSymbol(for: uid))
+                        .labelStyle(.iconOnly)
+                }
+                .help(keepTitle)
+                .accessibilityLabel(keepTitle)
+                .disabled(!duplicates.canKeep(uid))
+                .accessibilityIdentifier("duplicates.viewer.keep")
+
+                Button {
+                    closePhoto()
+                    // The group is found at the tap: it can have split since the viewer opened.
+                    Task { await duplicates.merge(containing: uid) }
+                } label: {
+                    Label(mergeTitle, systemImage: duplicates.mergeSymbol)
+                        .labelStyle(.iconOnly)
+                }
+                .help(mergeTitle)
+                .accessibilityLabel(mergeTitle)
+                .disabled(!duplicates.canMerge(containing: uid))
+                .accessibilityIdentifier("duplicates.viewer.merge")
+            }
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+        }
+    }
+
+    /// Opens `uid` in the viewer with the other photos of its group of duplicates, without the zoom from a grid cell.
+    private func openDuplicate(_ uid: PhotoUID, inGroup groupID: String) {
+        guard let members = duplicates?.group(withID: groupID)?.members else { return }
+        let found = Dictionary(
+            timelineModel.allLibraryItems(matching: Set(members)).map { ($0.uid, $0) },
+            uniquingKeysWith: { first, _ in first })
+        guard let opened = duplicates?.viewerItems(opening: uid, inGroup: groupID, item: { found[$0] }) else { return }
+        let viewer = makeViewer(opened.items[opened.index], opened.items, allowsVisibleDuplicateThumbnails: true)
+        viewerFollowsReplacements = false
+        zoom = nil
+        viewerModel = viewer
+        duplicateViewerGroup = DuplicateViewerGroup(viewer: viewer)
+    }
+
+    /// The group of duplicates that `viewer` shows. Nil for a viewer opened anywhere else, also after the viewer of a
+    /// group closed and a new viewer took its memory.
+    private func viewerGroup(of viewer: PhotoViewerModel) -> DuplicateViewerGroup? {
+        guard let group = duplicateViewerGroup, group.viewer === viewer else { return nil }
+        return group
+    }
+
     /// Builds the Duplicates route for this account, or leaves it when the account cannot merge duplicates.
     private func installDuplicates() async {
-        duplicates = facade.exactDuplicates.map { finder in
-            ExactDuplicatesModel(finder: finder) { trashed in await commitDuplicateTrash(trashed) }
+        duplicates = model.makeDuplicatesModel(for: facade) { trashed, token in
+            await commitDuplicateTrash(trashed, account: token)
         }
         guard let duplicates else {
             if selection == .duplicates { selection = .all }
@@ -1663,15 +1751,21 @@ struct MainView: View {
     }
 
     /// The finder already moved the copies to Recently Deleted; the library and its derived state stop showing them.
-    private func commitDuplicateTrash(_ uids: [PhotoUID]) async {
+    private func commitDuplicateTrash(_ uids: [PhotoUID], account: ExactDuplicatesAccountLifetime.Token) async {
+        guard model.isCurrentDuplicatesAccount(account) else { return }
+        let locationOwner = OfflineLibraryManager.shared.captureLocationOwner()
         let trashed = Set(uids)
         await timelineModel.commitTrash(uids: trashed)
+        guard model.isCurrentDuplicatesAccount(account) else { return }
         await OfflineLibraryManager.shared.reconcileLocations(
-            items: timelineModel.wholeLibraryItemsForViewer,
+            items: timelineModel.wholeLibraryItemsForLocations,
+            owner: locationOwner,
             metadata: backend,
-            recrawlRestoredItems: false
+            recrawlRestoredItems: false,
+            isCurrent: { model.isCurrentDuplicatesAccount(account) }
         )
-        await reloadFavorites(trashed: trashed)
+        guard model.isCurrentDuplicatesAccount(account) else { return }
+        await reloadFavorites(trashed: trashed, isCurrent: { model.isCurrentDuplicatesAccount(account) })
     }
 
     private func trashPhotos(_ items: [PhotoItem], closeViewer: Bool) {
@@ -1680,6 +1774,8 @@ struct MainView: View {
         let items = items.filter { !$0.uid.isLocalPending }
         let uids = items.map(\.uid)
         isTrashMutating = true
+        // The account configuration this trash belongs to; a later sign-in rejects its location clean-up.
+        let locationOwner = OfflineLibraryManager.shared.captureLocationOwner()
         Task {
             defer { isTrashMutating = false }
             if !local.isEmpty {
@@ -1696,12 +1792,13 @@ struct MainView: View {
             }
             do {
                 try await backend.trash(uids)
-                // A copy that the person trashed, for example in the viewer of Duplicates, leaves its group.
-                duplicates?.photosLeftLibrary(Set(uids))
                 await timelineModel.commitTrash(items)
+                // A copy trashed in the viewer of a group, or anywhere else, leaves the Duplicates screen at once.
+                duplicates?.didTrashElsewhere(uids)
                 if mapClusterPresentation != nil { await mapClusterModel.commitTrash(items) }
                 await OfflineLibraryManager.shared.reconcileLocations(
-                    items: timelineModel.wholeLibraryItemsForViewer,
+                    items: timelineModel.wholeLibraryItemsForLocations,
+                    owner: locationOwner,
                     metadata: backend,
                     recrawlRestoredItems: false
                 )
@@ -1722,6 +1819,8 @@ struct MainView: View {
         let items = items.filter { !$0.uid.isLocalPending }
         let uids = items.map(\.uid)
         isTrashMutating = true
+        // The account configuration this restore belongs to; a later sign-in rejects its location clean-up.
+        let locationOwner = OfflineLibraryManager.shared.captureLocationOwner()
         Task {
             defer { isTrashMutating = false }
             if !local.isEmpty {
@@ -1742,7 +1841,8 @@ struct MainView: View {
                 model.pendingGrid?.photosRestored(uids)
                 await timelineModel.commitRestore(items)
                 await OfflineLibraryManager.shared.reconcileLocations(
-                    items: timelineModel.wholeLibraryItemsForViewer,
+                    items: timelineModel.wholeLibraryItemsForLocations,
+                    owner: locationOwner,
                     metadata: backend,
                     recrawlRestoredItems: true
                 )
@@ -1764,24 +1864,21 @@ struct MainView: View {
         isEmptyingTrash = true
         Task {
             defer { isEmptyingTrash = false }
-            // Photos deleted before upload only leave the list; they stay excluded and stay in Apple Photos.
-            if !pending.isEmpty, await model.pendingGrid?.removeFromTrashList(pending) != true {
-                trashActionFailureMessage = L10n.string("trash.empty_failed_message")
-                return
-            }
-            guard !uids.isEmpty else {
-                selectedUIDs = []
-                selectionMode = false
-                return
-            }
             do {
-                try await backend.emptyTrash()
-                timelineModel.commitEmptyTrash(uids)
+                // Photos deleted before upload only leave the list; they stay excluded and stay in Apple Photos.
+                try await TrashEmptying.empty(
+                    backend, pendingUIDs: pending,
+                    removePending: { await model.pendingGrid?.removeFromTrashList($0) == true },
+                    includesProtonTrash: !uids.isEmpty, checkingMergesWith: facade.exactDuplicates,
+                    accountDataDirectory: facade.accountDataDirectory,
+                    commit: { timelineModel.commitEmptyTrash(uids) },
+                    recoverFromTrashFailure: { error in
+                        DebugLog.log("empty-trash: FAILED n=\(uids.count) - \(error)")
+                        await timelineModel.retry()
+                    })
                 selectedUIDs = []
                 selectionMode = false
             } catch {
-                DebugLog.log("empty-trash: FAILED n=\(uids.count) - \(error)")
-                await timelineModel.retry()
                 trashActionFailureMessage = L10n.string("trash.empty_failed_message")
             }
         }
@@ -1930,17 +2027,29 @@ struct MainView: View {
                     smartSearch: model.smartSearch,
                     libraryIsSettled: librarySettled && !backgroundLibraryActivityActive,
                     cacheContentIsSettled: suggestionCacheContentReady,
-                    coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision
+                    placeRevision: mapAndPlacesEnabled ? OfflineLibraryManager.shared.locationIndex.placeRevision : nil,
+                    locationEvidence: mapAndPlacesEnabled
+                        ? OfflineLibraryManager.shared.locationIndex.placeEvidence() : nil
                 )
             }
     }
 
     private func mapAndPlacesLifecycle<Content: View>(_ view: Content) -> some View {
-        view.onChange(of: mapAndPlacesEnabled) { _, enabled in
+        view.onChange(of: timelineModel.wholeLibraryLocationRevision) { _, _ in
+            // The configuration this change belongs to. The task reads the newest library when it runs.
+            let owner = OfflineLibraryManager.shared.captureLocationOwner()
+            Task {
+                await OfflineLibraryManager.shared.publishLocationInventory(
+                    items: timelineModel.wholeLibraryItemsForLocations, owner: owner, metadata: backend,
+                    isCurrent: { model.facade === facade }
+                )
+            }
+        }
+        .onChange(of: mapAndPlacesEnabled) { _, enabled in
             if enabled {
                 viewerModel?.refreshPlaceNames()
                 OfflineLibraryManager.shared.resumeMapAndPlaces(
-                    items: timelineModel.wholeLibraryItemsForViewer, metadata: backend)
+                    items: timelineModel.wholeLibraryItemsForLocations, metadata: backend)
             } else {
                 if selection == .map { selection = .all }
                 OfflineLibraryManager.shared.pauseMapAndPlaces()
@@ -1958,6 +2067,12 @@ struct MainView: View {
             let presentation = timelineModel.pendingPresentation
             viewerModel?.followReplacements(presentation.replacements, in: presentation.snapshot)
         }
+        // Every path that closes or replaces the viewer of a group ends its group.
+        .onChange(of: viewerModel.map(ObjectIdentifier.init)) { _, _ in
+            if let group = duplicateViewerGroup, group.viewer == nil || group.viewer !== viewerModel {
+                duplicateViewerGroup = nil
+            }
+        }
     }
 
     private func updateSearchActivity() {
@@ -1972,8 +2087,9 @@ struct MainView: View {
     private var searchDiscoveryTaskKey: String {
         SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
-            favoriteUIDs: favorites, coordinateCount: OfflineLibraryManager.shared.locationIndex.coordinates.count,
-            smartSearch: model.smartSearch, coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision
+            favoriteUIDs: favorites,
+            smartSearch: model.smartSearch,
+            placeRevision: mapAndPlacesEnabled ? OfflineLibraryManager.shared.locationIndex.placeRevision : nil
         ) + "|librarySettled:\(librarySettled)|thumbnailWork:\(backgroundLibraryActivityActive)"
             + "|cacheContentSettled:\(suggestionCacheContentReady)"
             + "|mapAndPlaces:\(mapAndPlacesEnabled)"
@@ -2181,6 +2297,7 @@ struct MainView: View {
                 .padding(.horizontal, 16)
                 // The system toolbar supplies the single glass background for the principal item.
             }
+            duplicateViewerToolbar(viewerModel)
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     viewerModel.toggleInfo()
@@ -2302,26 +2419,9 @@ struct MainView: View {
             }
             if selection == .duplicates, let duplicates {
                 ToolbarItem(placement: .primaryAction) {
-                    Button(L10n.string(duplicates.isSelecting ? "action.done" : "action.select")) {
-                        if duplicates.isSelecting {
-                            duplicates.stopSelecting()
-                        } else {
-                            duplicates.startSelecting()
-                        }
-                    }
-                    .disabled(!duplicates.isSelecting && !duplicates.canMerge)
-                    .accessibilityIdentifier("duplicates.select")
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    if duplicates.isSelecting {
-                        Button(L10n.string("duplicates.merge_selected")) { confirmsDuplicateMergeSelected = true }
-                            .disabled(!duplicates.canMergeSelected)
-                            .accessibilityIdentifier("duplicates.mergeSelected")
-                    } else {
-                        Button(L10n.string("duplicates.merge_all")) { confirmsDuplicateMergeAll = true }
-                            .disabled(!duplicates.canMerge)
-                            .accessibilityIdentifier("duplicates.mergeAll")
-                    }
+                    Button(L10n.string("duplicates.merge_all")) { confirmsDuplicateMergeAll = true }
+                        .disabled(!duplicates.canMerge)
+                        .accessibilityIdentifier("duplicates.mergeAll")
                 }
                 ToolbarSpacer(.fixed, placement: .primaryAction)
             }
@@ -2492,7 +2592,7 @@ struct MainView: View {
             saveToLibrary(Array(uids))
         } label: {
             if isSavingToLibrary {
-                ProgressView().controlSize(.small)
+                ProgressSpinner()
             } else {
                 Label(
                     L10n.string("library.save_to_library"),
@@ -2775,4 +2875,11 @@ private extension View {
     func applying<Transformed: View>(_ transform: (Self) -> Transformed) -> Transformed {
         transform(self)
     }
+}
+
+/// The viewer that shows a group of duplicates. It holds the viewer weakly and compares it by identity, so a viewer
+/// opened elsewhere never shows the merge tools, even when it reuses the memory of a closed one. The actions find the
+/// group of the photo on screen, because the group can split while the viewer is open.
+private struct DuplicateViewerGroup {
+    weak var viewer: PhotoViewerModel?
 }

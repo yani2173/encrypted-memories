@@ -1,9 +1,11 @@
+import AlbumSyncCore
 import CryptoKit
 import Foundation
-import PhotoLibraryBackupAdapter
+import Photos
 import PhotosCore
 import XCTest
 
+@testable import PhotoLibraryBackupAdapter
 @testable import UploadCore
 
 /// A mutable library resolves the current revision, even when the queue contains an earlier scan.
@@ -24,6 +26,7 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
         var generation = 1
         var deleted = false
         var omitOriginal = false
+        var livePlaybackOff = false
 
         var source: UploadSourceIdentity {
             UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
@@ -51,13 +54,17 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
                 resources.append(
                     .init(role: .pairedVideo, originalFilename: "\(basename).MOV", mimeType: "video/quicktime"))
             }
+            // With the Live effect off, Photos drops `.photoLive` and presents a still, but still lists the paired video.
+            let playbackStyle: PHAsset.PlaybackStyle = pairedVideo != nil && !livePlaybackOff ? .livePhoto : .image
             return PhotoBackupAssetInfo(
                 localIdentifier: identifier, creationDate: captureTime,
                 modificationDate: modificationDate,
                 pixelWidth: 10, pixelHeight: 10, durationSeconds: pairedVideo == nil ? 0 : 1,
-                isLivePhoto: pairedVideo != nil, isVideo: false, resources: resources,
+                isLivePhoto: playbackStyle == .livePhoto, isVideo: false, resources: resources,
                 cloudIdentifier: cloudIdentifier ?? "cloud-\(identifier)", hasAdjustments: hasAdjustments,
-                adjustmentTimestamp: adjustmentTimestamp)
+                adjustmentTimestamp: adjustmentTimestamp,
+                livePlaybackOff: PhotoKitAssetMapper.livePlaybackOff(
+                    isVideo: false, resources: resources, playbackStyle: playbackStyle))
         }
     }
 
@@ -112,6 +119,11 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
             asset.omitOriginal = omitOriginal
             assets[identifier] = asset
         }
+    }
+
+    /// The Live effect of a Live Photo. Photos records the change as an edit; call `edit` for its rendered file.
+    func setLivePlaybackOff(_ off: Bool, identifier: String = "asset-1") {
+        lock.withLock { assets[identifier]?.livePlaybackOff = off }
     }
 
     func makeOriginalAvailable(_ identifier: String = "asset-1") {
@@ -302,6 +314,7 @@ final class EditScenarioHarness {
     /// Survives a relaunch, so rule U6 still knows which links this device uploaded.
     let deviceRemote: EditScenarioDeviceRemote
     private var pipeline: UploadDedupePipeline!
+    var identityResolver: any UploadIdentityResolving { pipeline }
     private var runner: BackupSyncRunner!
     private var engine: UploadBackupSyncEngine!
     private(set) var catalog: PhotoLibraryCatalogManifestStore!
@@ -343,9 +356,15 @@ final class EditScenarioHarness {
     }
 
     /// Seeds the values v1.0.5 wrote, then opens them again with today's stores and runner.
-    convenience init(v105 fixture: V105Fixture, assetCount: Int = 1, live: Bool = false) throws {
+    /// `liveOff` turns the Live effect off before v1.0.5 backs the photo up. v1.0.5 did not read it.
+    /// `remoteIdentity` stores the iCloud identity with each upload, so another device finds a remote proof.
+    convenience init(
+        v105 fixture: V105Fixture, assetCount: Int = 1, live: Bool = false, liveOff: Bool = false,
+        remoteIdentity: Bool = false
+    ) throws {
         try self.init(live: live)
         do {
+            library.setLivePlaybackOff(liveOff)
             if fixture == .unchanged {
                 for number in 2..<max(2, assetCount + 1) {
                     library.add("asset-\(number)", basename: "IMG_\(number)")
@@ -361,7 +380,7 @@ final class EditScenarioHarness {
                 library.add("asset-2", basename: "IMG_2", original: try XCTUnwrap(library.snapshot.first).original)
             }
             for asset in library.snapshot {
-                try seedV105(asset)
+                try seedV105(asset, remoteIdentity: remoteIdentity)
             }
             // The index may have no compound proof. The local stores must still protect existing uploads.
             try relaunch()
@@ -380,8 +399,56 @@ final class EditScenarioHarness {
         }
     }
 
-    private func seedV105(_ asset: EditScenarioLibrary.Asset) throws {
-        let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset.info))
+    /// A 1.0.5 resolver failure removed the queue row before any upload or complete backup state.
+    func seedV105DroppedPhoto(_ identifier: String = "dropped-photo", pending: Bool = false) throws {
+        library.add(identifier, basename: "DROPPED")
+        let asset = try XCTUnwrap(library.snapshot.first { $0.identifier == identifier })
+        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: asset.info, observedAt: clock.now)]))
+        if pending {
+            let candidate = try library.candidate(identifier)
+            XCTAssertTrue(
+                backupState.upsert(
+                    UploadBackupAssetRecord(
+                        source: candidate.snapshot.source, revision: candidate.snapshot.revision,
+                        resourceCount: candidate.snapshot.resourceCount,
+                        pendingResourceCount: candidate.snapshot.resourceCount,
+                        updatedAt: clock.now)))
+        }
+        try relaunch()
+    }
+
+    /// An unfinished local settlement keeps its upload manifest but loses the queue and backup state.
+    func removeLocalBackupSettlement(_ identifier: String = "asset-1") throws {
+        let candidate = try library.candidate(identifier)
+        XCTAssertTrue(queue.remove(source: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertTrue(backupState.removeRecords(for: candidate.snapshot.source, keeping: []))
+        try relaunch()
+    }
+
+    /// Album Sync deletes its queue and backup-state files before every run (`PhotoAlbumBackupExecutor`). The upload
+    /// manifest, the catalog and the running pipeline stay, as in the app.
+    func resetAlbumSyncScratch() throws {
+        queue.close()
+        backupState.close()
+        let scratch = [
+            UploadBackupSyncQueueManifestStore.databaseFileName, UploadBackupStateManifestStore.databaseFileName,
+        ]
+        for name in scratch {
+            for suffix in ["", "-wal", "-shm"] {
+                let file = directory.appendingPathComponent(name + suffix)
+                if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            }
+        }
+        try openBackupStores()
+        XCTAssertEqual(queue.summary().total, 0)
+        XCTAssertEqual(backupState.count(), 0)
+    }
+
+    private func seedV105(_ asset: EditScenarioLibrary.Asset, remoteIdentity: Bool = false) throws {
+        // v1.0.5 did not read the Live effect, so it planned every Live Photo with its tagged paired video.
+        var info = asset.info
+        info.livePlaybackOff = false
+        let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info))
         var main: PhotoUID?
         for item in [plan.primary] + plan.secondaries {
             let descriptor = try library.descriptor(item, asset: asset, materialize: false)
@@ -396,7 +463,15 @@ final class EditScenarioHarness {
                 uid = existing.uid
                 wasDuplicate = true
             } else {
-                uid = server.seedV105Upload(descriptor, digest: digest, asset: asset, main: main)
+                uid = server.seedV105Upload(
+                    descriptor, digest: digest, asset: asset, main: main,
+                    externalIdentifier: remoteIdentity ? asset.info.cloudIdentifier : nil)
+                // v1.0.5 tagged a Live Photo and its paired video like today's runner does.
+                if plan.secondaries.contains(where: { $0.sourceResource == .livePairedVideo }),
+                    item.sourceResource == .primary || item.sourceResource == .livePairedVideo
+                {
+                    server.setTags([PhotoTag.livePhotos.rawValue], of: uid)
+                }
                 deviceRemote.recordOwnUpload(uid)
                 wasDuplicate = false
             }
@@ -424,7 +499,24 @@ final class EditScenarioHarness {
                         remoteVolumeID: volumeID, remoteLinkID: uid.nodeID,
                         outcome: wasDuplicate ? "duplicateActive" : "uploaded", updatedAt: clock.now)))
         }
-        let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: asset.info))
+        try seedV105States(asset, info: info, queueState: .completed)
+    }
+
+    /// v1.0.5 settled each photo through the remote proof of another device's upload: it wrote complete backup states
+    /// and a settled queue row, but no manifest record. Its catalog lists each photo as the library shows it now.
+    func seedV105RemoteProofSettlement() throws {
+        for asset in library.snapshot {
+            var info = asset.info
+            info.livePlaybackOff = false
+            try seedV105States(asset, info: info, queueState: .alreadyBackedUp)
+        }
+        try relaunch()
+    }
+
+    private func seedV105States(
+        _ asset: EditScenarioLibrary.Asset, info: PhotoBackupAssetInfo, queueState: UploadBackupSyncQueueState
+    ) throws {
+        let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
         // v1.0.5 PhotoBackupAssetPlan.swift:167-170 uses the date even when the render is absent.
         let revision = UploadBackupRevision(date: asset.modificationDate)
         var revisions: Set<UploadBackupRevision> = [revision]
@@ -441,22 +533,16 @@ final class EditScenarioHarness {
             queue.upsert(
                 UploadBackupSyncQueueEntry(
                     source: asset.source, revision: revision, originalFilename: candidate.originalFilename,
-                    state: .completed, updatedAt: clock.now)))
-        var entry = PhotoLibraryCatalogMapper.entry(for: asset.info, observedAt: clock.now)
+                    state: queueState, updatedAt: clock.now)))
+        var entry = PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)
         entry.metadataRevision = revision.rawValue
         XCTAssertTrue(catalog.upsertBatch([entry]))
     }
 
     private func open() throws {
-        queue = try XCTUnwrap(
-            UploadBackupSyncQueueManifestStore(
-                url: directory.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
         identities = try XCTUnwrap(
             UploadIdentityManifestStore(
                 url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)))
-        backupState = try XCTUnwrap(
-            UploadBackupStateManifestStore(
-                url: directory.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)))
         catalog = try XCTUnwrap(
             PhotoLibraryCatalogManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
@@ -464,6 +550,17 @@ final class EditScenarioHarness {
         pipeline = UploadDedupePipeline(
             store: identities, checker: index, resourceCoordinator: coordinator, replacementJournal: journal,
             now: { [clock] in clock.now })
+        try openBackupStores()
+    }
+
+    /// The queue and backup state with the engine and runner that use them, over the open manifest and pipeline.
+    private func openBackupStores() throws {
+        queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
+        backupState = try XCTUnwrap(
+            UploadBackupStateManifestStore(
+                url: directory.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)))
         let replacement = EditedPhotoReplacement(
             remote: deviceRemote, albums: server, relations: index, identities: identities, journal: journal)
         let preflight = UploadBackupPreflightIndex(store: backupState, now: { [clock] in clock.now })
@@ -505,6 +602,7 @@ final class EditScenarioHarness {
     /// Like `PhotoLibraryBackupController.runScanPass`, the one-time reconciliation runs before the scan.
     func fullRescan() async throws -> PhotoLibraryCatalogProgress {
         let sync = PhotoLibraryCatalogSync(store: catalog, enumerator: library, now: { [clock] in clock.now })
+        try await sync.reconcileMissingSources(engine: engine)
         try await sync.reconcileLateRendersOnce(engine: engine)
         let result = try await sync.run(engine: engine)
         clock.advance(by: 1)
@@ -776,5 +874,62 @@ final class EditScenarioHarness {
             check(ownAlbums.isSubset(of: main.albums), "S4 own albums must move", file: file, line: line)
         }
         assertRetired(file: file, line: line)
+    }
+}
+
+/// A local album of the scenario library with a fixed list of photos.
+struct EditScenarioAlbumSource: AlbumSyncLocalAlbumSource {
+    let identifiers: [String]
+    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(identifiers) }
+}
+
+/// Like the album executor, each run starts with an empty queue and backup state, so every photo of the album goes
+/// through scan, preflight and the identity resolver again; a photo that is already known settles from the upload
+/// manifest. Then it reports the unresolved album rows.
+final class EditScenarioAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendable {
+    let device: EditScenarioHarness
+    init(device: EditScenarioHarness) { self.device = device }
+
+    func ensureBackedUp(
+        localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
+    ) async throws -> AlbumSyncBackupReport {
+        try device.resetAlbumSyncScratch()
+        try await device.enqueue()
+        await device.pass()
+        return try AlbumSyncBackupReport.read(from: device.queue, localIdentifiers: localIdentifiers)
+    }
+
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        try await AlbumSyncRemoteProofLookup.remoteLinks(
+            for: localIdentifiers, catalog: device.library, queue: device.queue, resolver: device.identityResolver)
+    }
+
+    func stop() async {}
+}
+
+extension EditScenarioHarness {
+    /// One Album Sync of the scenario album into the server's own album, with the real runner, upload manifest lookup
+    /// and mapping store of this device.
+    func syncAlbum(_ identifiers: [String], backup: any AlbumSyncBackupExecuting) async throws -> AlbumSyncReport {
+        let album = LocalAlbumSummary(id: "local-album", title: "Scenario album", assetCount: identifiers.count)
+        let lookup = try XCTUnwrap(
+            UploadManifestRemoteLinkLookup(
+                manifestURL: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
+                policy: .conservative))
+        let mapping = try XCTUnwrap(
+            AlbumSyncMappingStore(url: directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)))
+        defer { mapping.close() }
+        let runner = AlbumSyncRunner(
+            localSource: EditScenarioAlbumSource(identifiers: identifiers), backup: backup,
+            remoteOps: server, linkLookup: lookup, mappingStore: mapping)
+        do {
+            let report = try await runner.sync(album: album, resolution: .attachToExisting(remoteAlbumID: "own-album"))
+            await lookup.shutdown()
+            return report
+        } catch {
+            await lookup.shutdown()
+            throw error
+        }
     }
 }

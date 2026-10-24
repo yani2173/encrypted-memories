@@ -1,3 +1,4 @@
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 
@@ -27,7 +28,7 @@ struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
         ToolbarItem(placement: .bottomBar) {
             Button(action: onShare) {
                 if selection.isExporting {
-                    ProgressView()
+                    ProgressSpinner()
                 } else {
                     Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
                 }

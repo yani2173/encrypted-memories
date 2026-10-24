@@ -16,6 +16,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     private let crypto: DriveCrypto
     private let cache: VideoByteRangeCache
     private let admission: JoinedShutdownGate
+    private let requestCause: ProtonRequestCauseBinding?
     /// Stable owner lease for this loader lifetime. A later lookup after clear cannot authorize an old loader.
     private let ownerGeneration: CacheWriterGeneration.Token
     private let publicationOwner = VideoCacheWriteOwner()
@@ -69,12 +70,14 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         source: PhotoVideoStreamSource,
         crypto: DriveCrypto,
         admission: JoinedShutdownGate,
+        requestCause: ProtonRequestCauseBinding? = nil,
         cache: VideoByteRangeCache = .shared
     ) {
         self.prepared = prepared
         self.source = source
         self.crypto = crypto
         self.admission = admission
+        self.requestCause = requestCause
         self.cache = cache
         self.ownerGeneration = cache.captureOwnerGeneration()
         super.init()
@@ -200,7 +203,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             let task = Task { [weak self] in
                 guard let self else { return }
                 do {
-                    try await self.admission.withAdmission { [self] in
+                    try await self.admitted { [self] in
                         try await self.serve(dataRequest, request: loadingRequest)
                     }
                     self.finishRequest(key: key, id: taskID, error: nil)
@@ -354,7 +357,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
                         }
                     }
                 }
-                return try await self.admission.withAdmission { [self] in
+                return try await self.admitted { [self] in
                     try await self.fetchEncryptedBlock(block, priority: priority, priorityHandle: handle)
                 }
             }
@@ -443,7 +446,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             let task = Task { [weak self] in
                 guard let self else { return }
                 do {
-                    try await self.admission.withAdmission { [self] in
+                    try await self.admitted { [self] in
                         _ = try await self.sharedEncryptedBlock(block, priority: .foregroundPrefetch)
                     }
                 } catch is CancellationError {
@@ -483,7 +486,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             let task = Task { [weak self] in
                 guard let self else { return }
                 do {
-                    let (_, hit) = try await self.admission.withAdmission { [self] in
+                    let (_, hit) = try await self.admitted { [self] in
                         try await self.decryptedBlock(block, priority: priority)
                     }
                     PhotoDiagnostics.shared.emit(
@@ -529,4 +532,14 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     }
 
     private var uidKey: String { "\(prepared.uid.volumeID)~\(prepared.uid.nodeID)" }
+}
+
+extension ProtonVideoResourceLoader {
+    /// Range loads run after the viewer's open call returned, so they name their own cause.
+    fileprivate func admitted<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        guard let requestCause else { return try await admission.withAdmission(operation) }
+        return try await requestCause.run { try await admission.withAdmission(operation) }
+    }
 }

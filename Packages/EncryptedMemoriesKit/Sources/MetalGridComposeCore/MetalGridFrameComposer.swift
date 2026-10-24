@@ -55,12 +55,15 @@ package enum MetalGridFrameComposer {
     /// Runs the streaming pass in dependency order.
     ///
     /// Set the cap, pin visible IDs, upload visible tiles, upgrade deferred residents, and select off-main warm work.
+    ///
+    /// While a visible tile is missing and can still be fetched, only the visible tiles are pinned. The overscan band
+    /// stays evictable, so textures of another zoom level cannot block the visible upload. Otherwise the nearest
+    /// overscan is pinned too, within `cache.maxSafePinnedCount`.
     @MainActor
     package static func stream<ID: Hashable & Sendable>(
         cache: MetalGridTextureCache<ID>,
         visibleIDs: [ID],
         overscanIDs: [ID],
-        pinOverscan: Bool,
         effectiveUploadPixels: Int,
         allowUpgrade: Bool,
         now: Double = 0,
@@ -73,13 +76,13 @@ package enum MetalGridFrameComposer {
         // Level-aware upload size first: `maxSafePinnedCount` reads the effective cap, so setting it here lets
         // dense zoom levels pin far more (cheap) visible tiles within the same byte budget.
         cache.setEffectiveMaxTexturePixels(effectiveUploadPixels)
+        let visibleMissing = visibleIDs.contains { !cache.isResident($0) && canRetry($0) }
         // Pinning is clamped to what the byte budget can guarantee (visible first, then nearest overscan).
         let window = GridTextureStreamingPolicy.window(
             visibleIDs: visibleIDs, overscanIDs: overscanIDs,
-            maxPinned: cache.maxSafePinnedCount, pinOverscan: pinOverscan
+            maxPinned: cache.maxSafePinnedCount, pinOverscan: !visibleMissing
         )
         cache.beginFrame(pinned: window.pinned)
-        let visibleMissing = visibleIDs.contains { !cache.isResident($0) && canRetry($0) }
         let priority = visibleMissing ? visibleIDs : window.priority
         var wanted: [ID] = []
         for uid in priority where !cache.isResident(uid) && hasImage(uid) { wanted.append(uid) }

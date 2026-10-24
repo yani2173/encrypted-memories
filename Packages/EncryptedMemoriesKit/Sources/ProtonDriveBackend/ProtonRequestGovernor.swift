@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 enum ProtonRequestScope: CaseIterable, Hashable, Sendable {
     case api
@@ -20,6 +21,8 @@ enum ProtonRequestPriority: Int, CaseIterable, Sendable, Comparable {
 
 enum ProtonRequestContext {
     @TaskLocal static var priority: ProtonRequestPriority = .userInitiated
+    /// Set by `ProtonRequestCauseScopes.run`; nil in native SDK callbacks.
+    @TaskLocal static var cause: ProtonRequestCause?
 }
 
 struct ProtonRequestGovernorSnapshot: Sendable, Equatable {
@@ -73,6 +76,8 @@ actor ProtonRequestGovernor {
     struct Permit: Sendable {
         fileprivate let id: UUID
         fileprivate let scope: ProtonRequestScope
+        fileprivate let label: ProtonRequestLabel?
+        fileprivate let cause: String
     }
 
     struct PriorityScope: Sendable {
@@ -120,6 +125,8 @@ actor ProtonRequestGovernor {
         let priorityHandle: PriorityHandle?
         let sequence: UInt64
         let enqueuedAt: Date
+        let label: ProtonRequestLabel?
+        let cause: String
         let continuation: CheckedContinuation<Permit, Error>
     }
 
@@ -152,6 +159,10 @@ actor ProtonRequestGovernor {
 
     private let configuration: Configuration
     private let now: @Sendable () -> Date
+    /// Lock-based so a nonisolated caller can open and close a cause without an actor hop.
+    nonisolated let causes = ProtonRequestCauseScopes()
+    private var tally = ProtonRequestTally()
+    private let summaryLog: @Sendable ([String: String]) -> Void
     private var states: [ProtonRequestScope: ScopeState]
     private var sequence: UInt64 = 0
     private var wakeTasks: [ProtonRequestScope: Task<Void, Never>] = [:]
@@ -166,10 +177,14 @@ actor ProtonRequestGovernor {
 
     init(
         configuration: Configuration = .production,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        summaryLog: @escaping @Sendable ([String: String]) -> Void = {
+            PhotoDiagnostics.shared.emitDebug("ProtonRequests", $0)
+        }
     ) {
         self.configuration = configuration
         self.now = now
+        self.summaryLog = summaryLog
         states = Dictionary(
             uniqueKeysWithValues: ProtonRequestScope.allCases.map {
                 ($0, ScopeState(configuration: configuration.scope($0)))
@@ -179,10 +194,12 @@ actor ProtonRequestGovernor {
     func acquire(
         scope: ProtonRequestScope,
         priority: ProtonRequestPriority? = nil,
-        priorityHandle: PriorityHandle? = nil
+        priorityHandle: PriorityHandle? = nil,
+        label: ProtonRequestLabel? = nil
     ) async throws -> Permit {
         try Task.checkCancellation()
         let id = UUID()
+        let cause = causes.resolve(taskCause: ProtonRequestContext.cause)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 sequence &+= 1
@@ -205,6 +222,8 @@ actor ProtonRequestGovernor {
                         priorityHandle: priorityHandle,
                         sequence: sequence,
                         enqueuedAt: now(),
+                        label: label,
+                        cause: cause,
                         continuation: continuation
                     ))
                 drain(scope)
@@ -287,11 +306,23 @@ actor ProtonRequestGovernor {
     func finish(
         _ permit: Permit,
         statusCode: Int?,
-        retryAfter: TimeInterval? = nil
+        retryAfter: TimeInterval? = nil,
+        cancelled: Bool = false
     ) {
         guard var state = states[permit.scope], state.activePermitIDs.remove(permit.id) != nil else { return }
         state.inFlight = max(0, state.inFlight - 1)
         let timestamp = now()
+        let summary = tally.record(
+            ProtonRequestTally.Key(
+                scope: permit.scope,
+                method: permit.label?.method ?? "OTHER",
+                endpoint: permit.label?.endpoint ?? "<unlabeled>",
+                cause: permit.cause,
+                status: ProtonRequestStatusClass(statusCode: statusCode, cancelled: cancelled)
+            ),
+            at: timestamp
+        )
+        if let summary { summaryLog(summary) }
 
         if statusCode == 429 {
             state.rateLimited.append(timestamp)
@@ -308,7 +339,11 @@ actor ProtonRequestGovernor {
 
             let fallback = min(30, pow(2, Double(min(state.rateLimitStreak, 5))))
             let cooldown = max(1, min(retryAfter ?? fallback, 120))
+            let previousCooldownEnd = max(state.cooldownUntil, timestamp)
             state.cooldownUntil = max(state.cooldownUntil, timestamp.addingTimeInterval(cooldown))
+            tally.recordRateLimit(
+                scope: permit.scope, retryAfter: retryAfter,
+                cooldownFrom: previousCooldownEnd, until: state.cooldownUntil)
             let observedInterval = 1 / max(0.1, state.successfulRequestsPerSecondBeforeLastLimit * 0.8)
             state.admissionInterval = max(0.025, min(2, max(state.admissionInterval * 2, observedInterval)))
             state.lastRecoveryAt = timestamp
@@ -373,6 +408,38 @@ actor ProtonRequestGovernor {
         )
     }
 
+    /// Counts since the backend was built plus the live state of every scope, for the support report.
+    func requestSupportSnapshot() -> RemoteRequestSupportSnapshot {
+        let live = snapshot()
+        let counts = tally.counts
+            .map { key, count in
+                RemoteRequestSupportSnapshot.Count(
+                    scope: key.scope.supportName, method: key.method, endpoint: key.endpoint,
+                    cause: key.cause, status: key.status.rawValue, count: count)
+            }
+            .sorted {
+                ($0.scope, $0.cause, $0.endpoint, $0.method, $0.status)
+                    < ($1.scope, $1.cause, $1.endpoint, $1.method, $1.status)
+            }
+        let scopes = ProtonRequestScope.allCases.map { scope in
+            let state = live[scope]
+            let totals = tally.scopes[scope] ?? ProtonRequestTally.ScopeTotals()
+            return RemoteRequestSupportSnapshot.Scope(
+                scope: scope.supportName,
+                inFlight: state.inFlight,
+                queued: state.queued,
+                concurrencyLimit: state.concurrencyLimit,
+                admissionIntervalMilliseconds: Int((state.admissionInterval * 1_000).rounded()),
+                admittedLastMinute: state.admittedLastMinute,
+                rateLimitedLastMinute: state.rateLimitedLastMinute,
+                peakInFlight: totals.peakInFlight,
+                maximumRetryAfterSeconds: totals.maximumRetryAfter,
+                totalCooldownSeconds: totals.cooldownSeconds
+            )
+        }
+        return RemoteRequestSupportSnapshot(counts: counts, overflowRequests: tally.overflowRequests, scopes: scopes)
+    }
+
     private func cancel(id: UUID, scope: ProtonRequestScope) {
         guard var state = states[scope],
             let index = state.waiters.firstIndex(where: { $0.id == id })
@@ -427,7 +494,9 @@ actor ProtonRequestGovernor {
             state.activePermitIDs.insert(waiter.id)
             state.admitted.append(timestamp)
             state.nextAdmission = timestamp.addingTimeInterval(state.admissionInterval)
-            waiter.continuation.resume(returning: Permit(id: waiter.id, scope: scope))
+            tally.recordInFlight(state.inFlight, scope: scope)
+            waiter.continuation.resume(
+                returning: Permit(id: waiter.id, scope: scope, label: waiter.label, cause: waiter.cause))
 
             if state.admissionInterval > 0 {
                 states[scope] = state
@@ -553,5 +622,11 @@ enum ProtonRetryAfter {
             formatter.dateFormat = $0
             return formatter
         }
+    }
+}
+
+extension ProtonRequestGovernor: RemoteRequestSupportSource {
+    func remoteRequestSupportSnapshot() async -> RemoteRequestSupportSnapshot {
+        requestSupportSnapshot()
     }
 }

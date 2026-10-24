@@ -6,7 +6,7 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = false
-        app = XCUIApplication()
+        app = UITestApplication.make()
     }
 
     override func tearDown() { app.terminate() }
@@ -26,7 +26,7 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
     }
 
     private func row(_ filename: String) -> XCUIElement {
-        app.descendants(matching: .any).matching(identifier: "backup.failedItem.\(filename)").firstMatch
+        app.staticTexts["backup.failedItem.\(filename)"]
     }
 
     func testAlbumRowOpensPhotoReasonsWithoutTryAgain() {
@@ -52,6 +52,7 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
         XCTAssertTrue(status.label.contains("2 Fotos nicht im Album"))
         status.tap()
 
+        XCTAssertTrue(app.navigationBars["Fotos nicht im Album"].waitForExistence(timeout: 5))
         let attach = row("attach fixture.heic")
         XCTAssertTrue(attach.waitForExistence(timeout: 5))
         XCTAssertTrue(attach.label.contains("Konnte nicht zum Proton-Album hinzugefügt werden."))

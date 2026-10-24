@@ -9,6 +9,25 @@ import UploadCore
 
 @Suite("SDK album catalog")
 struct SDKAlbumCatalogBackendTests {
+    @Test func detailReadUsesOneRequestForDisplayAndOrderMetadata() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photo = photoNode(
+            id: "detail", albumIDs: [],
+            additionalMetadata: [
+                AdditionalMetadata(
+                    name: "Camera",
+                    utf8JsonValue: Data(#"{"CaptureTime":"2023-11-14T22:13:20.125Z","Device":"Test camera"}"#.utf8)),
+                AdditionalMetadata(name: "iOS.photos", utf8JsonValue: Data(#"{"ICloudID":"source-photo"}"#.utf8)),
+            ])
+        await client.configureNodes([photo.uid.sdkCompatibleIdentifier: DriveNode(photoNode: photo)])
+        let read = try await SDKPhotoMetadataReader.read(
+            for: PhotoUID(volumeID: "volume", nodeID: "detail"), client: client)
+        #expect(read.metadata.device == "Test camera")
+        #expect(read.timelineOrder?.exactCaptureTime == Date(timeIntervalSince1970: 1_700_000_000.125))
+        #expect(read.timelineOrder?.stableIdentity == "source-photo")
+        #expect(await client.getNodeCalls == 1)
+    }
+
     @Test func photoMetadataUsesForeignVolumeAndKeepsMissingAttributesOptional() async throws {
         let client = FakeSDKPhotoCatalogClient()
         let photo = photoNode(id: "same-node", albumIDs: [], volumeID: "foreign-volume")
@@ -51,6 +70,38 @@ struct SDKAlbumCatalogBackendTests {
         #expect(metadata.modificationTime == Date(timeIntervalSince1970: 123))
     }
 
+    @Test func duplicateNodeFactsCarryTheMetadataThatTheInfoPanelShows() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let described = photoNode(
+            id: "described", albumIDs: [], captureTime: 1_700_000_000,
+            additionalMetadata: [
+                AdditionalMetadata(name: "Media", utf8JsonValue: Data(#"{"Width":4000,"Height":3000}"#.utf8)),
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"Test Camera"}"#.utf8)),
+                AdditionalMetadata(
+                    name: "Location", utf8JsonValue: Data(#"{"Latitude":10.5,"Longitude":-20.25}"#.utf8)),
+            ])
+        let bare = photoNode(id: "bare", albumIDs: [], captureTime: 1_700_000_000)
+        await client.configureNodes([
+            described.uid.sdkCompatibleIdentifier: DriveNode(photoNode: described),
+            bare.uid.sdkCompatibleIdentifier: DriveNode(photoNode: bare),
+        ])
+        let describedUID = PhotoUID(volumeID: "volume", nodeID: "described")
+        let bareUID = PhotoUID(volumeID: "volume", nodeID: "bare")
+
+        let facts = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: [describedUID, bareUID])
+
+        let captureTime = Date(timeIntervalSince1970: 1_700_000_000)
+        #expect(
+            facts[describedUID]?.fingerprint
+                == ExactDuplicateFingerprint(
+                    captureTime: captureTime, latitude: 10.5, longitude: -20.25, device: "Test Camera",
+                    pixelWidth: 4000, pixelHeight: 3000, mimeType: "image/jpeg"))
+        #expect(
+            facts[bareUID]?.fingerprint == ExactDuplicateFingerprint(captureTime: captureTime, mimeType: "image/jpeg"),
+            "an upload without metadata has only its capture time and type")
+        #expect(facts[describedUID]?.fingerprint != facts[bareUID]?.fingerprint)
+    }
+
     @Test func malformedOptionalSDKSectionDoesNotDiscardAvailableMetadata() {
         let revision = FileRevision(
             uid: SDKRevisionUid(volumeID: "foreign", nodeID: "photo", revisionID: "revision"),
@@ -71,6 +122,21 @@ struct SDKAlbumCatalogBackendTests {
         #expect(metadata.device == "Camera")
     }
 
+    @Test func plainFileNodesWithTheSameMetadataNeverMatch() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let files = ["file-1", "file-2"].map { fileNode(id: $0) }
+        await client.configureNodes(
+            Dictionary(uniqueKeysWithValues: files.map { ($0.uid.sdkCompatibleIdentifier, DriveNode.file($0)) }))
+        let uids = files.map { PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID) }
+        let backend = SDKAlbumCatalogBackend(client: client)
+
+        let facts = try await backend.nodeFacts(of: uids)
+        let again = try await backend.nodeFacts(of: uids)
+
+        #expect(facts[uids[0]]?.fingerprint != facts[uids[1]]?.fingerprint, "a file has no capture time to compare")
+        #expect(facts[uids[0]]?.fingerprint == again[uids[0]]?.fingerprint, "a file still matches itself")
+    }
+
     @Test func seriesMemberCopyLeavesTheSourceAssetAndAppSectionsBehind() {
         let revision = FileRevision(
             uid: SDKRevisionUid(volumeID: "own", nodeID: "member", revisionID: "revision"),
@@ -89,6 +155,39 @@ struct SDKAlbumCatalogBackendTests {
             name: "IMG_2.HEIC", mimeType: "image/heic", captureTime: 100, revision: revision)
 
         #expect(source.additionalMetadata.map(\.name) == ["Camera"], "the copy replaces no earlier upload")
+    }
+
+    @Test(arguments: [nil, -1, 1234] as [Int64?])
+    func relatedFileSourceUsesThePhotoRevisionClaimedSizeFromOneRead(size: Int64?) async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photo = photoNode(
+            id: "related", albumIDs: [],
+            additionalMetadata: [
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data("camera".utf8)),
+                AdditionalMetadata(name: "iOS.photos", utf8JsonValue: Data("source-asset".utf8)),
+                AdditionalMetadata(name: "EncryptedMemories.lineage", utf8JsonValue: Data("earlier-node".utf8)),
+            ], claimedSize: size)
+        await client.configureNodes([photo.uid.sdkCompatibleIdentifier: .photo(photo)])
+        let source = try await SDKPhotoMetadataReader.relatedFileSource(
+            for: PhotoUID(volumeID: photo.uid.volumeID, nodeID: photo.uid.nodeID), client: client)
+        #expect(source.claimedSize == size)
+        #expect(source.metadata.filename == "related.jpg")
+        #expect(
+            source.metadata.additionalMetadata == [
+                PhotoUploadAdditionalMetadata(name: "Camera", utf8JsonValue: Data("camera".utf8))
+            ])
+        #expect(await client.getNodeCalls == 1)
+    }
+
+    @Test func relatedFileSourceRejectsAFileNodeInsteadOfGuessingACaptureTime() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let file = fileNode(id: "related-file")
+        await client.configureNodes([file.uid.sdkCompatibleIdentifier: .file(file)])
+        await #expect(throws: CocoaError(.fileReadUnknown)) {
+            try await SDKPhotoMetadataReader.relatedFileSource(
+                for: PhotoUID(volumeID: file.uid.volumeID, nodeID: file.uid.nodeID), client: client)
+        }
+        #expect(await client.getNodeCalls == 1)
     }
 
     @Test func ownedCatalogMapsSDKMetadataSortsAndKeepsDegradedNodesVisible() async throws {
@@ -776,18 +875,46 @@ private func albumNode(
     )
 }
 
-private func photoNode(id: String, albumIDs: [SDKNodeUid], volumeID: String = "volume") -> PhotoNode {
+private func fileNode(id: String) -> FileNode {
+    FileNode(
+        uid: SDKNodeUid(volumeID: "volume", nodeID: id),
+        parentUid: nil,
+        name: .success("same.jpg"),
+        creationTime: 1,
+        trashTime: nil,
+        nameAuthor: Author(emailAddress: nil, signatureVerificationError: nil),
+        keyAuthor: Author(emailAddress: nil, signatureVerificationError: nil),
+        ownedBy: OwnedBy(email: nil, organization: nil),
+        directRole: .inherited,
+        membership: nil,
+        mediaType: "image/jpeg",
+        totalStorageSize: 1,
+        activeRevision: FileRevision(
+            uid: SDKRevisionUid(volumeID: "volume", nodeID: id, revisionID: "revision"),
+            state: .active, creationTime: 1, storageSize: 1, claimedSize: 1,
+            claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
+            claimedModificationTime: nil, thumbnails: [], claimedAdditionalMetadata: nil, contentAuthor: nil),
+        isShared: false,
+        isSharedByUrl: false,
+        errors: []
+    )
+}
+
+private func photoNode(
+    id: String, albumIDs: [SDKNodeUid], volumeID: String = "volume", captureTime: TimeInterval = 1,
+    additionalMetadata: [AdditionalMetadata]? = nil, claimedSize: Int64? = 1
+) -> PhotoNode {
     let uid = SDKNodeUid(volumeID: volumeID, nodeID: id)
     let revision = FileRevision(
         uid: SDKRevisionUid(volumeID: volumeID, nodeID: id, revisionID: "revision"),
         state: .active,
         creationTime: 1,
         storageSize: 1,
-        claimedSize: 1,
+        claimedSize: claimedSize,
         claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
         claimedModificationTime: nil,
         thumbnails: [],
-        claimedAdditionalMetadata: nil,
+        claimedAdditionalMetadata: additionalMetadata,
         contentAuthor: nil
     )
     return PhotoNode(
@@ -807,7 +934,7 @@ private func photoNode(id: String, albumIDs: [SDKNodeUid], volumeID: String = "v
         directRole: .inherited,
         membership: nil,
         errors: [],
-        captureTime: 1,
+        captureTime: captureTime,
         albumUids: albumIDs
     )
 }

@@ -5,18 +5,32 @@ import UploadCore
 /// Builds the per-photo list behind an album row's "not in the album" count. It reuses the backup's
 /// `BackupFailedItem`, so both native hosts show it with the shared problem sheet.
 public enum AlbumSyncProblemList {
-    /// One item for each photo without a usable remote link and one for each failed attach.
+    /// The id prefix of a photo that is in the Proton album while its backup is not complete. The last-run file
+    /// keeps item ids, so the album row can tell these photos from photos that are not in the album.
+    public static let incompleteIDPrefix = "album-incomplete/"
+
+    /// One item for each photo without a usable remote link, one for each failed attach and one for each photo
+    /// in the album whose backup is not complete.
     /// - Parameters:
     ///   - missingIdentifiers: Local identifiers without a usable remote link after the backup step.
     ///   - attachFailedIdentifiers: Local identifiers whose remote photo could not be attached.
+    ///   - incompleteIdentifiers: Local identifiers with a usable remote link whose backup row is unresolved.
     ///   - backup: The backup step's report with its unresolved rows and filenames.
     public static func items(
         missingIdentifiers: [String],
         attachFailedIdentifiers: [String],
+        incompleteIdentifiers: [String] = [],
+        trashedIdentifiers: [String] = [],
         backup: AlbumSyncBackupReport
     ) -> [BackupFailedItem] {
         var items: [BackupFailedItem] = []
-        items.reserveCapacity(missingIdentifiers.count + attachFailedIdentifiers.count)
+        items.reserveCapacity(missingIdentifiers.count + attachFailedIdentifiers.count + incompleteIdentifiers.count)
+        // First, so that the list limit of the last-run store never cuts the photos that decide the row text.
+        for identifier in incompleteIdentifiers {
+            // The backup row names the reason. Without one, the photo is not incomplete.
+            guard let problem = backup.problems[identifier] else { continue }
+            items.append(albumItem(from: problem, id: incompleteIDPrefix + identifier))
+        }
         for identifier in missingIdentifiers {
             if let problem = backup.problems[identifier] {
                 items.append(albumItem(from: problem))
@@ -27,6 +41,9 @@ public enum AlbumSyncProblemList {
                         reason: L10n.string("albumsync.issue_not_backed_up")))
             }
         }
+        for identifier in trashedIdentifiers {
+            items.append(remoteDeletionItem(identifier: identifier, backup: backup))
+        }
         for identifier in attachFailedIdentifiers {
             items.append(
                 albumOnlyItem(
@@ -36,11 +53,23 @@ public enum AlbumSyncProblemList {
         return items
     }
 
+    static func remoteDeletionItem(identifier: String, backup: AlbumSyncBackupReport) -> BackupFailedItem {
+        if let problem = backup.problems[identifier], problem.issue == .remoteDeletion {
+            return albumItem(from: problem)
+        }
+        return BackupFailedItem(
+            id: "album/\(identifier)",
+            filename: backup.filenames[identifier] ?? L10n.string("albumsync.issue_photo_fallback"),
+            reason: L10n.string("backup.state_skipped_remote_deletion"), isPermanent: false,
+            issue: .remoteDeletion, isRetryable: false,
+            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier))
+    }
+
     /// The album scratch queue runs only on Sync now. A backup wait therefore does not continue by
     /// itself here: the row's Sync now is the retry, and no retry date applies.
-    static func albumItem(from item: BackupFailedItem) -> BackupFailedItem {
+    static func albumItem(from item: BackupFailedItem, id: String? = nil) -> BackupFailedItem {
         BackupFailedItem(
-            id: item.id, filename: item.filename, reason: item.reason, isPermanent: item.isPermanent,
+            id: id ?? item.id, filename: item.filename, reason: item.reason, isPermanent: item.isPermanent,
             issue: item.issue, nextAttemptAt: nil, isRetryable: item.isRetryable, source: item.source,
             revision: item.revision,
             category: item.category == .automatic ? .userResolvable : item.category,

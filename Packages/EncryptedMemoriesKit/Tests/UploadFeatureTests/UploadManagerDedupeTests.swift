@@ -13,6 +13,8 @@ final class FakeIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
     var recordErrorsByFilename: [String: Error] = [:]
     var resolveDelay: Duration?
     var primeGate: DedupePrimeGate?
+    /// Called after each recorded prime, so a test can await the fire-and-forget prime instead of sleeping.
+    var onPrime: (@Sendable () -> Void)?
     private var _resolved: [String] = []
     private var _primedFilenames: [[String]] = []
     private var _recordedUploads: [(filename: String, remoteLinkID: String)] = []
@@ -43,6 +45,7 @@ final class FakeIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
 
     func prime(_ descriptors: [UploadResourceDescriptor]) async {
         lock.withLock { _primedFilenames.append(descriptors.map(\.filename)) }
+        onPrime?()
         if let primeGate {
             await primeGate.waitForRelease()
         }
@@ -421,15 +424,21 @@ final class UploadManagerDedupeTests: XCTestCase {
     func testEnqueuePrimesTheBatch() async throws {
         let urls = try makeTempFiles(["a.jpg", "b.jpg", "c.jpg"], in: tempDir)
         let resolver = FakeIdentityResolver()
+        // The prime is fire-and-forget: the test awaits it. The timeout only ends a hung test. Created directly, the
+        // expectation does not raise on a second or a late fulfillment, which would end the whole test bundle; the
+        // count below fails the test instead.
+        let primed = XCTestExpectation(description: "the batch is primed")
+        resolver.onPrime = { primed.fulfill() }
         let manager = UploadManager(uploader: MockUploader(), identityResolver: resolver)
 
         await manager.enqueueFiles(urls, destination: .library)
         _ = await waitForAllTerminal(manager)
-        // prime is fire-and-forget - give it a beat.
-        try await Task.sleep(for: .milliseconds(100))
+        await fulfillment(of: [primed], timeout: 300)
 
         XCTAssertEqual(resolver.primedFilenames.count, 1)
-        XCTAssertEqual(Set(resolver.primedFilenames[0]), ["a.jpg", "b.jpg", "c.jpg"])
+        // A missing prime fails the test; an index out of range would end the whole test bundle.
+        let batch = try XCTUnwrap(resolver.primedFilenames.first, "the batch was not primed")
+        XCTAssertEqual(Set(batch), ["a.jpg", "b.jpg", "c.jpg"])
     }
 
     func testWithoutResolverBehaviourIsUnchanged() async throws {

@@ -271,8 +271,18 @@ public actor ThumbnailCache {
     /// Direct disk read + decrypt (no in-memory layer). Returns plaintext bytes, or `nil` on a miss, a
     /// missing key, or an authentication failure (the corrupt blob is then deleted so it re-fetches).
     public nonisolated func diskData(for uid: PhotoUID) -> Data? {
-        guard retentionAuthorization.isAllowed(uid) else { return nil }
-        let generation = writerGeneration.capture()
+        diskData(for: uid, authorizing: { [retentionAuthorization] in retentionAuthorization.isAllowed(uid) })
+    }
+
+    /// A foreground surface owns this revocable, identity-specific read independently of the grid inventory.
+    /// The session and writer fences still apply before plaintext can leave the cache.
+    package nonisolated func diskData(
+        for uid: PhotoUID, ifCurrent expectedGeneration: CacheWriterGeneration.Token? = nil,
+        authorizing: @Sendable () -> Bool
+    ) -> Data? {
+        guard authorizing() else { return nil }
+        let generation = expectedGeneration ?? writerGeneration.capture()
+        guard writerGeneration.isCurrent(generation) else { return nil }
         let (cipher, account) = crypto.snapshot()
         guard let cipher else { return nil }  // locked
         let name = filename(uid: uid, account: account)
@@ -297,12 +307,12 @@ public actor ThumbnailCache {
             writerGeneration.performIfCurrent(
                 generation,
                 {
-                    guard retentionAuthorization.isAllowed(uid) else { return false }
+                    guard authorizing() else { return false }
                     validated.insert(name, generation: generation)
                     return true
                 }) == true
         else { return nil }
-        return retentionAuthorization.isAllowed(uid) ? plaintext : nil
+        return authorizing() ? plaintext : nil
     }
 
     /// URL of the on-disk encrypted blob (bytes are ciphertext - not directly decodable).
@@ -366,7 +376,17 @@ public actor ThumbnailCache {
         for uid: PhotoUID,
         ifCurrent generation: CacheWriterGeneration.Token
     ) -> ThumbnailCacheStoreResult {
-        guard retentionAuthorization.isAllowed(uid) else { return .stale }
+        storeToDisk(data, for: uid, ifCurrent: generation) { [retentionAuthorization] in
+            retentionAuthorization.isAllowed(uid)
+        }
+    }
+
+    /// Foreground writes use the same live authorization as their read, without authorizing grid consumers.
+    package nonisolated func storeToDisk(
+        _ data: Data, for uid: PhotoUID, ifCurrent generation: CacheWriterGeneration.Token,
+        authorizing: @Sendable () -> Bool
+    ) -> ThumbnailCacheStoreResult {
+        guard authorizing() else { return .stale }
         guard runtimeState.snapshot().storagePressure.permitsDiskWrite(for: storageKind) else {
             return .storagePaused
         }
@@ -376,14 +396,21 @@ public actor ThumbnailCache {
         let name = filename(uid: uid, account: account)
         let result: ThumbnailCacheStoreResult =
             writerGeneration.performIfCurrent(generation) {
-                guard retentionAuthorization.isAllowed(uid) else {
+                guard authorizing() else {
                     return ThumbnailCacheStoreResult.stale
                 }
                 guard runtimeState.snapshot().storagePressure.permitsDiskWrite(for: storageKind) else {
                     return ThumbnailCacheStoreResult.storagePaused
                 }
                 do {
-                    try sealed.write(to: directory.appendingPathComponent(name), options: .atomic)
+                    let url = directory.appendingPathComponent(name)
+                    let previousBytes = Self.blobSize(at: url)
+                    try sealed.write(to: url, options: .atomic)
+                    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                        UpgradeTestProbe.checkpoint("thumbnail.stored")
+                    #endif
+
+                    diskUsage.record(name, from: previousBytes, to: Int64(sealed.count))
                     validated.insert(name, generation: generation)  // we just sealed it - it's decryptable
                     return ThumbnailCacheStoreResult.stored
                 } catch {
@@ -499,12 +526,16 @@ public actor ThumbnailCache {
             return writerGeneration.isCurrent(generation)
         }
         let evictionTarget = ThumbnailCacheDiskCapPolicy.evictionTarget(capBytes: capBytes)
+        var evicted = false
+        defer { if evicted { diskUsage.notifyChange() } }
         for entry in entries.sorted(by: { $0.modified < $1.modified }) {  // oldest first
             if total <= evictionTarget { break }
             let removed =
                 writerGeneration.performIfCurrent(generation) {
                     do {
+                        let previousBytes = Self.blobSize(at: entry.url)
                         try FileManager.default.removeItem(at: entry.url)
+                        diskUsage.record(entry.url.lastPathComponent, from: previousBytes, to: 0)
                         validated.remove(entry.url.lastPathComponent, generation: generation)
                         return true
                     } catch {
@@ -515,6 +546,7 @@ public actor ThumbnailCache {
                 diskUsage.invalidate()
                 return false
             }
+            evicted = true
             total -= entry.size
         }
         if sizesKnown { diskUsage.finishScan(total: total, token: scan) } else { diskUsage.invalidate() }
@@ -655,11 +687,22 @@ public actor ThumbnailCache {
         return remaining.isEmpty
     }
 
+    #if DEBUG
+        private var clearHookForTesting: (@Sendable () -> Void)?
+
+        package func setClearHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            clearHookForTesting = hook
+        }
+    #endif
+
     /// Erases the on-disk cache (keeps the account key - re-crawl refills). Used by "Delete Offline Cache".
     public func clear() {
         // Advance before removing files. A late non-cooperative loader can still invoke its callback,
         // but its captured token will fail the write fence instead of recreating stale data.
         writerGeneration.invalidateAndPerform {
+            #if DEBUG
+                clearHookForTesting?()
+            #endif
             memory.removeAllObjects()
             validated.clearAll()
             if purgeDirectoryContents() { diskUsage.reset() } else { diskUsage.invalidate() }
@@ -697,10 +740,52 @@ public actor ThumbnailCache {
 
     // MARK: - Stats
 
+    /// Signals each change of the encrypted disk contents: a stored blob, an eviction, a removal, or a clear.
+    /// The stream keeps at most one pending signal, so a write burst reaches a slow reader as one element.
+    public nonisolated func diskChanges() -> AsyncStream<Void> {
+        diskUsage.changes()
+    }
+
+    /// Signals disk changes of any of `caches`, at most once per `interval`. The first change arrives at once;
+    /// later changes inside the interval collapse into one trailing signal, so a reader that measures the
+    /// directories on each element never scans once per written blob. The subscription starts before this
+    /// function returns, so a change during the caller's first measurement still produces a signal.
+    public nonisolated static func diskChanges(
+        of caches: [ThumbnailCache],
+        interval: Duration = .seconds(10)
+    ) -> AsyncStream<Void> {
+        let sources = caches.map { $0.diskChanges() }
+        let (merged, mergedContinuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let (output, outputContinuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let task = Task.detached(priority: .utility) {
+            await withTaskGroup(of: Void.self) { group in
+                for source in sources {
+                    group.addTask {
+                        for await _ in source { mergedContinuation.yield() }
+                    }
+                }
+                group.addTask {
+                    for await _ in merged {
+                        outputContinuation.yield()
+                        try? await Task.sleep(for: interval)
+                    }
+                }
+            }
+            outputContinuation.finish()
+        }
+        outputContinuation.onTermination = { _ in task.cancel() }
+        return output
+    }
+
     /// The automatic disk-cap pass's cached byte estimate, or `nil` when unknown (forces the next pass to
     /// enumerate the directory). Test-only visibility into `enforceByteCap`'s enumeration-skip behavior.
     package nonisolated func diskUsageEstimateForTesting() -> Int64? {
         diskUsage.get()
+    }
+
+    /// The exact running total behind `trackedDiskSizeBytes()`, or `nil` while unknown. Test-only.
+    package nonisolated func diskUsageExactForTesting() -> Int64? {
+        diskUsage.exactBytes()
     }
 
     public nonisolated func diskFileCount() -> Int {
@@ -719,6 +804,69 @@ public actor ThumbnailCache {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             return total + Int64(size)
         }
+    }
+
+    /// The exact byte total of the encrypted blobs, for a size display. The cache counts each blob it writes,
+    /// replaces, and evicts, so this reads a running total. Only while that total is unknown (a new instance, or
+    /// a removal the cache could not measure) does this enumerate the directory, and that enumeration sets the
+    /// total again even while writes land, so a download burst costs one enumeration, not one per measurement.
+    public nonisolated func trackedDiskSizeBytes() -> Int64 {
+        if let exact = diskUsage.exactBytes() { return exact }
+        let generation = writerGeneration.capture()
+        guard let seed = diskUsage.beginExactScan() else {
+            // Another measurement sets the total now; answer once from a listing unless it already finished.
+            return diskUsage.exactBytes() ?? Self.blobTotal(of: listDirectory() ?? [])
+        }
+        let listed = listDirectory()
+        #if DEBUG
+            diskUsage.runSeedListingHook()
+        #endif
+        guard let listed,
+            let changed = writerGeneration.performIfCurrent(generation, { diskUsage.closeExactScan(seed) }) ?? nil
+        else {
+            diskUsage.cancelExactScan(seed)
+            return Self.blobTotal(of: listed ?? [])
+        }
+        // A blob changed during the listing counts with its size after the last change, not the listed one.
+        var total: Int64 = changed.values.reduce(0, +)
+        for url in listed where url.pathExtension == "blob" && changed[url.lastPathComponent] == nil {
+            guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+                diskUsage.cancelExactScan(seed)
+                return Self.blobTotal(of: listed)
+            }
+            total += Int64(size)
+        }
+        return diskUsage.finishExactScan(seed, total: total)
+    }
+
+    #if DEBUG
+        /// Runs `hook` after a measurement listed the directory and before it closes the listing.
+        package nonisolated func setSeedListingHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            diskUsage.setSeedListingHook(hook)
+        }
+    #endif
+
+    /// Lists the directory with prefetched file sizes, or returns `nil` when it is unreadable.
+    private nonisolated func listDirectory() -> [URL]? {
+        try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )
+    }
+
+    private nonisolated static func blobTotal(of urls: [URL]) -> Int64 {
+        urls.reduce(Int64(0)) { total, url in
+            guard url.pathExtension == "blob" else { return total }
+            return total + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+    }
+
+    /// The size of the file at `url`: zero when it does not exist, `nil` when the size cannot be read.
+    private nonisolated static func blobSize(at url: URL) -> Int64? {
+        var info = stat()
+        if lstat(url.path, &info) == 0 { return Int64(info.st_size) }
+        return errno == ENOENT ? 0 : nil
     }
 
     // MARK: - Keys
@@ -887,33 +1035,132 @@ private final class ValidatedPresence: @unchecked Sendable {
 /// skip enumerating the directory while under budget. Writes that land after a scan's listing are re-added to
 /// the scan result and a removal during a scan discards that result, so the estimate can only over-count; every
 /// removal path that does not recompute the total calls `invalidate()`.
+///
+/// It also keeps an exact total of the `.blob` files for size displays. Every write and eviction reports the
+/// blob's size before and after through `record`, while the writer fence is held, so these reports are ordered
+/// with the file changes. An enumeration sets the exact total through `beginExactScan`, `closeExactScan` (under
+/// the writer fence), and `finishExactScan`: a blob reported during the enumeration counts with its reported
+/// size, and a report after the close adds to the result.
 package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
     package struct ScanToken {
         let invalidations: UInt64
         let addedBytes: Int64
     }
 
+    package struct ExactScanToken {
+        let epoch: UInt64
+    }
+
     private let lock = NSLock()
     private var knownBytes: Int64?
     private var invalidations: UInt64 = 0
     private var cumulativeAddedBytes: Int64 = 0
+    private var observers: [UInt64: AsyncStream<Void>.Continuation] = [:]
+    private var nextObserverID: UInt64 = 0
+    /// Exact `.blob` total, or `nil` when unknown.
+    private var exact: Int64?
+    /// Advances whenever the exact total becomes unknown or zero, so an enumeration that started before is discarded.
+    private var exactEpoch: UInt64 = 0
+    /// Sizes reported while an enumeration lists the directory, by filename.
+    private var exactScanChanges: [String: Int64]?
+    /// Size changes reported after an enumeration closed and before it finished.
+    private var exactScanTail: Int64?
 
     package init() {}
 
     package func get() -> Int64? { lock.withLock { knownBytes } }
+
+    package func exactBytes() -> Int64? { lock.withLock { exact.map { max(0, $0) } } }
+
+    /// Reports that blob `name` changed from `oldBytes` (zero when absent, `nil` when unknown) to `newBytes`.
+    /// Callers hold the writer fence across the file change and this report.
+    package func record(_ name: String, from oldBytes: Int64?, to newBytes: Int64) {
+        guard name.hasSuffix(".blob") else { return }
+        lock.withLock {
+            guard let oldBytes else {
+                loseExactBytes()
+                return
+            }
+            let delta = newBytes - oldBytes
+            if let current = exact { exact = current + delta }
+            if exactScanChanges != nil { exactScanChanges?[name] = newBytes }
+            if let tail = exactScanTail { exactScanTail = tail + delta }
+        }
+    }
+
+    /// Starts an enumeration that sets the exact total, or returns `nil` while another one runs.
+    package func beginExactScan() -> ExactScanToken? {
+        lock.withLock {
+            guard exactScanChanges == nil, exactScanTail == nil else { return nil }
+            exactScanChanges = [:]
+            return ExactScanToken(epoch: exactEpoch)
+        }
+    }
+
+    /// Ends the listing and returns the sizes reported during it. Callers hold the writer fence, so no file
+    /// change is between its file operation and its report.
+    package func closeExactScan(_ token: ExactScanToken) -> [String: Int64]? {
+        lock.withLock {
+            guard exactEpoch == token.epoch, let changes = exactScanChanges else { return nil }
+            exactScanChanges = nil
+            exactScanTail = 0
+            return changes
+        }
+    }
+
+    /// Sets the exact total from the closed enumeration and returns it.
+    package func finishExactScan(_ token: ExactScanToken, total: Int64) -> Int64 {
+        lock.withLock {
+            guard exactEpoch == token.epoch, let tail = exactScanTail else { return max(0, exact ?? total) }
+            exactScanTail = nil
+            exact = total + tail
+            return max(0, total + tail)
+        }
+    }
+
+    package func cancelExactScan(_ token: ExactScanToken) {
+        lock.withLock {
+            guard exactEpoch == token.epoch else { return }
+            exactScanChanges = nil
+            exactScanTail = nil
+        }
+    }
+
+    #if DEBUG
+        private var seedListingHook: (@Sendable () -> Void)?
+
+        package func setSeedListingHook(_ hook: (@Sendable () -> Void)?) {
+            lock.withLock { seedListingHook = hook }
+        }
+
+        package func runSeedListingHook() {
+            let hook = lock.withLock { seedListingHook }
+            hook?()
+        }
+    #endif
+
+    private func loseExactBytes() {
+        exactEpoch &+= 1
+        exact = nil
+        exactScanChanges = nil
+        exactScanTail = nil
+    }
 
     package func add(_ bytes: Int64) {
         lock.withLock {
             cumulativeAddedBytes += bytes
             if let current = knownBytes { knownBytes = current + bytes }
         }
+        notifyChange()
     }
 
     package func invalidate() {
         lock.withLock {
             invalidations &+= 1
             knownBytes = nil
+            loseExactBytes()
         }
+        notifyChange()
     }
 
     /// The directory was emptied; a scan still in flight must not overwrite the zero.
@@ -921,7 +1168,31 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
         lock.withLock {
             invalidations &+= 1
             knownBytes = 0
+            loseExactBytes()
+            exact = 0
         }
+        notifyChange()
+    }
+
+    /// A stream that receives one element after each change of the directory contents.
+    package func changes() -> AsyncStream<Void> {
+        let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let id = lock.withLock {
+            nextObserverID &+= 1
+            observers[nextObserverID] = continuation
+            return nextObserverID
+        }
+        continuation.onTermination = { [weak self] _ in
+            guard let self else { return }
+            _ = lock.withLock { observers.removeValue(forKey: id) }
+        }
+        return stream
+    }
+
+    /// Signals a change that the byte bookkeeping above does not report itself, for example a cap-pass eviction.
+    package func notifyChange() {
+        let current = lock.withLock { Array(observers.values) }
+        for continuation in current { continuation.yield() }
     }
 
     package func beginScan() -> ScanToken {

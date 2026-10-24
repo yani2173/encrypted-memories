@@ -18,6 +18,8 @@
 <p align="center">
   <a href="https://memories.oncloud.at/">Website</a>
   ·
+  <a href="https://testflight.apple.com/join/tUTca8Y5">Join the TestFlight beta</a>
+  ·
   <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Quick-Start">Get started</a>
   ·
   <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Device-and-Feature-Support">See supported features</a>
@@ -33,7 +35,7 @@ Encrypted Memories is not affiliated with or endorsed by Proton AG.
 
 ## Support Encrypted Memories
 
-Encrypted Memories is free and open source.
+Encrypted Memories is open source under the AGPL-3.0 license.
 
 **[Sponsor Encrypted Memories through GitHub Sponsors](https://github.com/sponsors/traktuner)**
 
@@ -47,7 +49,9 @@ Financial support helps cover Apple membership, test devices, infrastructure, an
 - Metal timeline with responsive grid densities, selection, transitions, and viewport-aware loading.
 - Full-screen image, video, Live Photo, and burst viewing.
 - Albums, trash, restore, sharing, and original-format export.
-- Photo Library backup on macOS, iOS, and iPadOS with persistent queues, streamed hashing, duplicate detection, crash recovery, album synchronization, and OS-scheduled background catch-up.
+- Duplicates: find identical photos and merge them. The app checks every group first and then shows only the final groups. Merged copies move to Recently Deleted. Storage is freed when Recently Deleted is emptied.
+- Photo Library backup on macOS, iOS, and iPadOS with persistent queues, streamed hashing, duplicate detection, crash recovery, album synchronization, and OS-scheduled background catch-up. The backup status shows which photos are not backed up yet, and why. Live Photos and edited photos back up with their extra files. Photos that you hide in the Photos app are not backed up.
+- Privacy settings: location is removed from shared and exported copies, the app preview is blurred in the App Switcher on iPhone and iPad, and backups do not use cellular data unless you allow it. Map and Places has its own switch.
 - MapKit browsing with encrypted location metadata and adaptive clustering.
 - Encrypted thumbnail, preview, original, and offline caches.
 - Optional on-device Smart Search using Core ML. Model artifacts and the local search index stay on the device, and photos and search queries are not sent to a search service. Initial indexing can temporarily make the device warmer. Its duration varies with the number of photos and the device's performance, so large libraries can take longer to finish.
@@ -78,7 +82,7 @@ The reviewed Wiki source lives in [`Wiki`](Wiki). GitHub stores the visible Wiki
 - Metal-based timeline rendering with shared layout, transition, composition, and residency policies.
 - Swift Package Manager modules under `Packages/EncryptedMemoriesKit`.
 - Xcode project generation from `project.yml` with XcodeGen.
-- The official open-source Proton Drive SDK 0.29.1, distributed under the MIT License and restored at `Vendor/sdk-swift`.
+- The official open-source Proton Drive SDK 0.31.1, distributed under the MIT License and restored at `Vendor/sdk-swift`.
 
 `EncryptedMemoriesKit` is application-internal source. Its public declarations support package target
 boundaries and are not a stable third-party library API.
@@ -101,11 +105,15 @@ Proton Drive's end-to-end encryption protects your photos in Proton Drive. Encry
 - The app does not encrypt its library and backup bookkeeping databases. They hold photo IDs, capture times, media types, and dimensions, and for backups also local filenames and file hashes. They hold no photos. FileVault or iOS Data Protection and the app sandbox protect them.
 - Decrypted photos are written to disk only when you share, drag out, or export them. The app removes its temporary share and drag files automatically.
 
+Cellular backup is off by default. Shared and exported copies have standard GPS metadata removed by default.
+On iPhone and iPad, the app preview is hidden in the App Switcher by default. Map and Places stays on by default.
+These defaults apply whenever no choice is saved, including existing installations. Saved choices remain unchanged.
+
 **Network**
 
 - The app connects to Proton for sign-in and for Proton Drive.
 - When you turn on Smart Search, the app downloads the model catalog and the model from `models.oncloud.at`. These requests contain no photos and no search text. Smart Search runs on the device.
-- Map tiles and place names come from Apple Maps. Place names in the viewer and on the map send the photo's coordinates. Search suggestions send a location rounded to about 1 km.
+- Map tiles and place names come from Apple Maps. Place names in the viewer and on the map send the photo's coordinates. Search suggestions send a location rounded to about 1 km. Turn off Map and Places in Settings > Privacy to stop these requests. The Map tab (iPhone and iPad) and the Map item (Mac) disappear. Location data stays encrypted on the device.
 - There is no analytics, crash reporting, or tracking. The Proton Drive SDK's telemetry callback discards all events.
 
 **Build and platform**
@@ -133,13 +141,13 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 ```bash
 git clone https://github.com/OnCloud-at/encrypted-memories.git
 cd encrypted-memories
-./scripts/update-proton-sdk.sh 0.29.1
+./scripts/update-proton-sdk.sh 0.31.1
 ./scripts/proton-sdk-current-version.sh
 xcodegen generate
 ```
 
 The SDK checkout is reproducible: the bootstrap script applies the versioned fixes tracked under
-`VendorPatches/sdk-swift/0.29.1` after checking out the upstream tag. The updater fails before
+`VendorPatches/sdk-swift/0.31.1` after checking out the upstream tag. The updater fails before
 changing the checkout when the requested tag has no reviewed patch set.
 The repository retains a complete patch set only for the currently supported SDK tag. An SDK upgrade
 must add its reviewed patch and `UPSTREAM_COMMIT` pin together.
@@ -200,6 +208,16 @@ Reviewed GitHub Actions workflows own Apple distribution.
 PR authors never set app versions, build numbers, release tags, or release notes.
 A maintainer publishes a GitHub Release after its tagged commit passes the pull request checks.
 
+Three channels exist. Each one is a separate owner action:
+
+| Channel | Owner action | Result |
+|---|---|---|
+| Internal TestFlight | Publish a prerelease such as `v1.2.0-beta.1` | Both builds reach the internal group. |
+| External TestFlight | Run `External TestFlight` with a published release tag | The same builds reach the internal and the external group; no new build. |
+| App Store | Publish a stable release such as `v1.2.0` | Both apps enter App Review. |
+
+An internal beta can stay internal. An external beta is always an internal beta, too.
+
 - A prerelease tag such as `v1.2.0-beta.1` or `v1.2.0-rc.1` builds iOS and macOS. It publishes both builds only to internal TestFlight.
 - A stable tag such as `v1.2.0` builds both apps. It creates the platform versions when necessary, updates both localizations, submits each platform to App Review, and selects automatic release after approval.
 - Keep beta releases and their notes as history. Publish a separate stable release after testing; even when it targets the same commit, it gets new iOS and macOS builds. Do not rename beta tags.
@@ -254,6 +272,9 @@ It refuses equal or newer active versions and unsafe states.
 The manual `External TestFlight` workflow runs from `main` with one published release tag.
 It reuses the release's existing iOS and macOS builds. It never rebuilds or uploads them.
 Stable and prerelease release tags can be promoted externally.
+It also adds both builds to the internal group, so a promoted stable release reaches internal testers, too.
+It submits both builds to Beta App Review and enables the public link of the external group.
+The job summary shows the public link. A rerun after Beta App Review is safe and enables the link when Apple refused it before.
 
 Owner action: `Actions` → `External TestFlight` → `Run workflow` from `main` → enter the published release tag.
 GitHub then pauses at the configured `testflight-external` approval gate. Approve that deployment to continue.
@@ -347,8 +368,14 @@ The test targets cover module and import boundaries, encrypted persistence, medi
 
 ## License
 
-Encrypted Memories is available under the permissive [MIT License](LICENSE). You may use, copy, modify, distribute, sublicense, and sell the original project source under its terms.
+Encrypted Memories is available under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). You may use, study, modify, and share it. When you distribute a modified version, or offer it to users over a network, you must publish its complete source code under the same license.
+
+Additional permission under GNU AGPL version 3 section 7: if you distribute this program or a work based on it through an application store or a similar platform whose terms add restrictions (for example Apple's App Store), the licensors grant you permission to do so, provided that the Corresponding Source stays available under this license.
+
+Releases up to and including 1.0.5 were published under the MIT License.
 
 The software is provided without warranty or a support obligation. Dependencies and optional model artifacts retain their respective license terms.
 
 Apple and the Apple logo are trademarks of Apple Inc., registered in the U.S. and other countries and regions. App Store is a service mark of Apple Inc.
+
+<p align="center">Made with ❤️ in Austria 🇦🇹</p>

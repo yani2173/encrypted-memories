@@ -1,0 +1,176 @@
+diff --git a/Tests/UploadStreamTests.swift b/Tests/UploadStreamTests.swift
+new file mode 100644
+index 0000000..bc2f0fd
+--- /dev/null
++++ b/Tests/UploadStreamTests.swift
+@@ -0,0 +1,170 @@
++import Foundation
++import XCTest
++
++@testable import ProtonDriveSDK
++
++final class UploadStreamTests: XCTestCase, @unchecked Sendable {
++    func testSpaceDuringReadContinuesWithoutAnotherEvent() async throws {
++        let firstRead = expectation(description: "first read")
++        let closed = expectation(description: "end of file")
++        let reader = HeldUploadRead(firstRead: firstRead)
++        let output = RecordingUploadOutput(closed: closed)
++        let stream = try await makeStream(output: output, reader: reader)
++
++        stream.stream(output, handle: .hasSpaceAvailable)
++        await fulfillment(of: [firstRead], timeout: 5)
++        stream.stream(output, handle: .hasSpaceAvailable)
++        reader.completeFirstRead(bytes: [1, 2, 3])
++        await fulfillment(of: [closed], timeout: 5)
++
++        XCTAssertEqual(output.bytes, [1, 2, 3])
++        XCTAssertEqual(reader.count, 2)
++        XCTAssertEqual(output.closeCount, 1)
++        withExtendedLifetime(stream) {}
++    }
++
++    func testShortReadKeepsOnlyUnreadBytesAndClosesBeforeDeferredEvent() async throws {
++        let firstRead = expectation(description: "first read")
++        let closed = expectation(description: "end of file")
++        let reader = HeldUploadRead(firstRead: firstRead)
++        let output = RecordingUploadOutput(closed: closed, firstWriteLimit: 1)
++        let stream = try await makeStream(output: output, reader: reader)
++        output.afterWrite = { [weak stream, weak output] in
++            guard let stream, let output else { return }
++            stream.stream(output, handle: .hasSpaceAvailable)
++        }
++        reader.beforeEndOfFile = { [weak stream, weak output] in
++            guard let stream, let output else { return }
++            stream.stream(output, handle: .hasSpaceAvailable)
++        }
++
++        stream.stream(output, handle: .hasSpaceAvailable)
++        await fulfillment(of: [firstRead], timeout: 5)
++        reader.completeFirstRead(bytes: [4, 5, 6])
++        await fulfillment(of: [closed], timeout: 5)
++        // A late event must also leave the closed stream untouched.
++        stream.stream(output, handle: .hasSpaceAvailable)
++
++        XCTAssertEqual(output.bytes, [4, 5, 6])
++        XCTAssertEqual(output.writeSizes, [3, 2])
++        XCTAssertEqual(reader.count, 2)
++        XCTAssertEqual(output.closeCount, 1)
++        withExtendedLifetime(stream) {}
++    }
++
++    func testEndOfFileRejectsDeferredAndLaterSpaceEvents() async throws {
++        let firstRead = expectation(description: "first read")
++        let closed = expectation(description: "end of file")
++        let unexpectedRead = expectation(description: "read after end of file")
++        unexpectedRead.isInverted = true
++        let reader = HeldUploadRead(firstRead: firstRead, unexpectedRead: unexpectedRead)
++        let output = RecordingUploadOutput(closed: closed)
++        let stream = try await makeStream(output: output, reader: reader)
++
++        stream.stream(output, handle: .hasSpaceAvailable)
++        await fulfillment(of: [firstRead], timeout: 5)
++        stream.stream(output, handle: .hasSpaceAvailable)
++        reader.completeFirstRead(bytes: [])
++        await fulfillment(of: [closed], timeout: 5)
++        stream.stream(output, handle: .hasSpaceAvailable)
++        await fulfillment(of: [unexpectedRead], timeout: 5)
++
++        XCTAssertEqual(reader.count, 1)
++        XCTAssertEqual(output.closeCount, 1)
++        XCTAssertTrue(output.bytes.isEmpty)
++        withExtendedLifetime(stream) {}
++    }
++
++    private func makeStream(output: RecordingUploadOutput, reader: HeldUploadRead) async throws -> StreamForUpload {
++        let logger = try await Logger(logCallback: { _ in })
++        return try StreamForUpload(
++            inputStream: InputStream(data: Data()), outputStream: output,
++            bufferLength: 8, sdkContentHandle: 0, logger: logger,
++            readChunk: reader.read)
++    }
++}
++
++private final class HeldUploadRead: @unchecked Sendable {
++    private let lock = NSLock()
++    private let firstRead: XCTestExpectation
++    private let unexpectedRead: XCTestExpectation?
++    private var reads = 0
++    private var pending: (UnsafeMutableRawBufferPointer, (Result<Int32, Error>) -> Void)?
++    var beforeEndOfFile: (() -> Void)?
++
++    init(firstRead: XCTestExpectation, unexpectedRead: XCTestExpectation? = nil) {
++        self.firstRead = firstRead
++        self.unexpectedRead = unexpectedRead
++    }
++
++    var count: Int { lock.withLock { reads } }
++
++    func read(_ buffer: UnsafeMutableRawBufferPointer, completion: @escaping (Result<Int32, Error>) -> Void) {
++        let readNumber = lock.withLock { () -> Int in
++            reads += 1
++            if reads == 1 {
++                pending = (buffer, completion)
++            }
++            return reads
++        }
++        if readNumber == 1 {
++            firstRead.fulfill()
++        } else {
++            if readNumber == 2 {
++                unexpectedRead?.fulfill()
++                beforeEndOfFile?()
++            }
++            completion(.success(0))
++        }
++    }
++
++    func completeFirstRead(bytes: [UInt8]) {
++        let request = lock.withLock { () -> (UnsafeMutableRawBufferPointer, (Result<Int32, Error>) -> Void)? in
++            defer { pending = nil }
++            return pending
++        }
++        guard let (buffer, completion) = request else { return XCTFail("No pending read") }
++        buffer.initializeMemory(as: UInt8.self, repeating: 0xee)
++        for (index, byte) in bytes.enumerated() { buffer[index] = byte }
++        completion(.success(Int32(bytes.count)))
++    }
++}
++
++private final class RecordingUploadOutput: OutputStream, @unchecked Sendable {
++    private let lock = NSLock()
++    private let closed: XCTestExpectation
++    private let firstWriteLimit: Int?
++    private var storedBytes: [UInt8] = []
++    private var storedWriteSizes: [Int] = []
++    private var closes = 0
++    var afterWrite: (() -> Void)?
++
++    init(closed: XCTestExpectation, firstWriteLimit: Int? = nil) {
++        self.closed = closed
++        self.firstWriteLimit = firstWriteLimit
++        super.init(toMemory: ())
++    }
++
++    var bytes: [UInt8] { lock.withLock { storedBytes } }
++    var writeSizes: [Int] { lock.withLock { storedWriteSizes } }
++    var closeCount: Int { lock.withLock { closes } }
++
++    override func write(_ buffer: UnsafePointer<UInt8>, maxLength: Int) -> Int {
++        let written = lock.withLock { () -> Int in
++            let count = storedWriteSizes.isEmpty ? min(firstWriteLimit ?? maxLength, maxLength) : maxLength
++            storedWriteSizes.append(maxLength)
++            storedBytes.append(contentsOf: UnsafeBufferPointer(start: buffer, count: count))
++            return count
++        }
++        afterWrite?()
++        return written
++    }
++
++    override func close() {
++        let first = lock.withLock { () -> Bool in
++            closes += 1
++            return closes == 1
++        }
++        if first { closed.fulfill() }
++    }
++}

@@ -128,6 +128,7 @@ actor PhotoVideoStreamSource {
     /// chunk immediately; the legacy `originalData` contract remains for callers that explicitly require `Data`.
     func streamOriginalBytes(
         uid: PhotoUID,
+        allowsExpensiveNetwork: Bool = true,
         onChunk: @Sendable (Data) async throws -> Void,
         onProgress: @Sendable (Double) -> Void
     ) async throws {
@@ -138,7 +139,8 @@ actor PhotoVideoStreamSource {
         for block in prepared.blocks {
             try Task.checkCancellation()
             guard block.clearSize > 0 else { continue }
-            let encrypted = try await encryptedBlockData(block, priority: .immediate)
+            let encrypted = try await encryptedBlockData(
+                block, priority: .immediate, allowsExpensiveNetwork: allowsExpensiveNetwork)
             let clear = try crypto.decryptBlock(encrypted, sessionKey: prepared.sessionKey)
             guard clear.count >= block.clearSize else {
                 throw StreamingError.decryptedBlockLengthMismatch(
@@ -260,7 +262,8 @@ actor PhotoVideoStreamSource {
     func encryptedBlockData(
         _ block: VideoBlock,
         priority: ProtonRequestPriority = .immediate,
-        priorityHandle: ProtonRequestGovernor.PriorityHandle? = nil
+        priorityHandle: ProtonRequestGovernor.PriorityHandle? = nil,
+        allowsExpensiveNetwork: Bool = true
     ) async throws -> Data {
         if priority == .immediate {
             return try await session.requestGovernor.withPriorityScope(
@@ -271,11 +274,13 @@ actor PhotoVideoStreamSource {
                 suspending: [.storageUpload]
             ) {
                 try await session.fetchBlock(
-                    url: block.url, token: block.token, priority: priority, priorityHandle: priorityHandle)
+                    url: block.url, token: block.token, priority: priority, priorityHandle: priorityHandle,
+                    allowsExpensiveNetwork: allowsExpensiveNetwork)
             }
         }
         return try await session.fetchBlock(
-            url: block.url, token: block.token, priority: priority, priorityHandle: priorityHandle)
+            url: block.url, token: block.token, priority: priority, priorityHandle: priorityHandle,
+            allowsExpensiveNetwork: allowsExpensiveNetwork)
     }
 
     /// Keep upload admission suspended through joining, cache verification and any failed-prefetch retry.

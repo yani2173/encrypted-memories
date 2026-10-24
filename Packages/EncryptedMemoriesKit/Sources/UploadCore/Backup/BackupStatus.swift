@@ -46,6 +46,9 @@ public struct BackupStatus: Sendable, Equatable {
         case uploading
         /// A running pass is held by policy (thermal/power) or items are user-paused.
         case paused
+        /// Mobile data is off for backups and the device is online on cellular data or Personal Hotspot. Uploads
+        /// resume on Wi-Fi or Ethernet. Deliberately distinct from any offline state.
+        case waitingForWiFi
         /// Work remains but nothing runs right now (interrupted pass, draft re-checks pending).
         case waiting
         /// Everything considered is settled and nothing failed.
@@ -66,6 +69,8 @@ public struct BackupStatus: Sendable, Equatable {
     public var failed = 0
     /// Permanent failures whose warning the user acknowledged. They remain outside `backedUp`.
     public var dismissedFailures = 0
+    /// Acknowledged missing photos still owed a check; already counted in dismissedFailures.
+    public var pendingSourceRechecks = 0
     /// Proven prior Proton copies that were deleted there and deliberately not re-uploaded.
     public var skippedRemoteDeletions = 0
     /// Local files that disappeared before backup.
@@ -85,9 +90,12 @@ public struct BackupStatus: Sendable, Equatable {
     public var settled = 0
     /// Ephemeral byte progress for resources currently moving.
     public var activeTransfer: BackupActiveTransferProgress?
-    /// Bytes the backup has sent since its runner started; see `BackupSyncProgress.transferredBytes`.
-    public var transferredBytes: Int64 = 0
     public var activeExecutionItemEquivalents: Double = 0
+    /// Rows the backup still works on: waiting, being checked or being uploaded. Failed, missing, dismissed and
+    /// draft-blocked rows are not counted.
+    public var remainingCount = 0
+    /// Smoothed upload speed. Only the projector knows it; it is nil whenever the backup does not send.
+    public var uploadSpeedBytesPerSecond: Double?
     /// Dominant typed reason for unfinished work and the next time Core can honestly retry it.
     public var outstandingIssue: BackupIssueKind?
     public var nextAttemptAt: Date?
@@ -95,6 +103,9 @@ public struct BackupStatus: Sendable, Equatable {
     public var executionOpportunityIssue: BackupExecutionOpportunityIssue?
 
     public init() {}
+
+    /// The one SF Symbol for `waitingForWiFi` on every platform. It must never be an offline symbol.
+    public static let waitingForWiFiSymbolName = "antenna.radiowaves.left.and.right.slash"
 
     /// The only number UI may call "backed up".
     public var backedUp: Int { uploaded + alreadyBackedUp }
@@ -105,11 +116,6 @@ public struct BackupStatus: Sendable, Equatable {
         totalConsidered.map { max(0, $0 - skippedRemoteDeletions) }
     }
     public var needsAttentionCount: Int { failed + sourceMissing }
-    /// Items the backup still has to check or upload: everything considered that has not settled with any outcome.
-    /// Nil while scanning, like the total.
-    public var remainingCount: Int? {
-        totalConsidered.map { max(0, $0 - settled) }
-    }
     /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
     /// list reloads only when its content can differ.
     public var problemListKey: ProblemListKey {
@@ -131,6 +137,12 @@ public struct BackupStatus: Sendable, Equatable {
         guard let totalConsidered else { return needsAttentionCount + waitingRetry }
         return max(0, totalConsidered - backedUp - skippedRemoteDeletions)
     }
+    /// Only Photos checks remain, without a separate remote-index operation or failure.
+    var hasOnlyDismissedSourceRechecks: Bool {
+        pendingSourceRechecks > 0 && outstandingCount == pendingSourceRechecks
+            && !isPreparingRemoteIndex && !remoteIndexPreparationFailed && remoteIndexPreparationIssue == nil
+    }
+
     public var isActive: Bool {
         phase == .scanning || phase == .checking || phase == .uploading
     }
@@ -154,12 +166,13 @@ public struct BackupStatus: Sendable, Equatable {
         uploaded = progress.uploaded
         failed = progress.failed
         dismissedFailures = progress.dismissedFailures
+        pendingSourceRechecks = progress.pendingSourceRechecks
         skippedRemoteDeletions = progress.skippedRemoteDeletions
         sourceMissing = progress.sourceMissing
         waitingRetry = progress.blocked
+        remainingCount = progress.waiting + progress.checking + progress.uploading
         settled = progress.settled
         activeTransfer = progress.activeTransfer
-        transferredBytes = progress.transferredBytes
         activeExecutionItemEquivalents = max(
             progress.activeExecutionItemEquivalents,
             progress.activeTransfer?.completedItemEquivalents ?? 0
@@ -199,6 +212,13 @@ public struct BackupStatus: Sendable, Equatable {
         totalConsidered = progress.total
         fractionCompleted = progress.total > 0 ? progress.fraction : nil
 
+        // The policy pause names its reason when only the mobile-data setting holds the backup. It outranks
+        // item failures so the person sees why the rest waits; the failure count stays in the row.
+        if progress.isPausedByPolicy, progress.isWaitingForWiFi, progress.hasOutstandingWork {
+            phase = .waitingForWiFi
+            return
+        }
+
         if progress.isRunning && (progress.hasOutstandingWork || progress.paused > 0 || isPreparingRemoteIndex) {
             // `waiting` lumps not-yet-examined `discovered` rows with confirmed `queuedForUpload`
             // ones; the unexamined part is `waiting - uploadQueued`. During a first pass over an
@@ -216,7 +236,7 @@ public struct BackupStatus: Sendable, Equatable {
             }
         } else if progress.needsAttention > 0 {
             phase = .needsAttention
-        } else if progress.waiting + progress.checking + progress.uploading + progress.blocked > 0 {
+        } else if progress.hasOutstandingWork {
             phase = .waiting
         } else if progress.total > 0 {
             phase = .completed
@@ -260,10 +280,13 @@ public struct BackupStatus: Sendable, Equatable {
         switch phase {
         case .idle: "backup.phase_idle"
         case .scanning: "backup.phase_scanning"
-        case .checking: "backup.phase_checking"
+        case .checking:
+            hasOnlyDismissedSourceRechecks ? "backup.phase_checking_photos" : "backup.phase_checking"
         case .uploading: "backup.phase_uploading"
         case .paused: "backup.phase_paused"
-        case .waiting: "backup.phase_waiting"
+        case .waitingForWiFi: "backup.phase_waiting_wifi"
+        case .waiting:
+            hasOnlyDismissedSourceRechecks ? "backup.phase_waiting_photos" : "backup.phase_waiting"
         case .completed:
             dismissedFailures > 0 ? "backup.phase_completed_with_omissions" : "backup.phase_completed"
         case .needsAttention: "backup.phase_attention"
@@ -274,10 +297,15 @@ public struct BackupStatus: Sendable, Equatable {
         switch phase {
         case .idle: L10n.string("backup.phase_idle")
         case .scanning: L10n.string("backup.phase_scanning")
-        case .checking: L10n.string("backup.phase_checking")
+        case .checking:
+            hasOnlyDismissedSourceRechecks
+                ? L10n.string("backup.phase_checking_photos") : L10n.string("backup.phase_checking")
         case .uploading: L10n.string("backup.phase_uploading")
         case .paused: L10n.string("backup.phase_paused")
-        case .waiting: L10n.string("backup.phase_waiting")
+        case .waitingForWiFi: L10n.string("backup.phase_waiting_wifi")
+        case .waiting:
+            hasOnlyDismissedSourceRechecks
+                ? L10n.string("backup.phase_waiting_photos") : L10n.string("backup.phase_waiting")
         case .completed:
             dismissedFailures > 0
                 ? L10n.string("backup.phase_completed_with_omissions")
@@ -291,6 +319,8 @@ public struct BackupStatus: Sendable, Equatable {
         switch phase {
         case .idle, .scanning, .paused:
             return nil
+        case .waitingForWiFi:
+            return L10n.string("backup.detail_waiting_wifi")
         case .checking:
             if isPreparingRemoteIndex {
                 if let completed = remoteIndexCompleted, let total = remoteIndexTotal, total > 0 {
@@ -298,12 +328,14 @@ public struct BackupStatus: Sendable, Equatable {
                 }
                 return L10n.string("backup.detail_preparing_index_indeterminate")
             }
+            guard !hasOnlyDismissedSourceRechecks else { return nil }
             guard let total = totalConsidered, total > 0 else { return currentItemName }
             return L10n.string("backup.detail_checked \(checked) \(total)")
         case .uploading:
             guard let total = totalConsidered, total > 0 else { return nil }
             return L10n.string("backup.detail_backed_up \(backedUp) \(total)")
         case .waiting:
+            guard !hasOnlyDismissedSourceRechecks else { return nil }
             return L10n.string(
                 "backup.detail_waiting \(uploadQueued + waitingRetry + max(0, (totalConsidered ?? 0) - checked))")
         case .completed:
@@ -315,6 +347,11 @@ public struct BackupStatus: Sendable, Equatable {
             }
             return L10n.string("backup.detail_attention \(needsAttentionCount)")
         }
+    }
+
+    /// A reachable permitted path ends the Wi-Fi wait, including an expensive path when mobile data is on.
+    public func endsWiFiWait(for inputs: BackupThrottleInputs) -> Bool {
+        phase == .waitingForWiFi && inputs.canEndWiFiWait
     }
 
     /// Scaled units let a continued-processing task advance within one large item while preserving

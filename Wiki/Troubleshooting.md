@@ -18,12 +18,24 @@ Large libraries can show usable media before all thumbnails, map locations, and 
 ## Photos are missing from backup
 
 - Check Photos permission.
-- With limited access, review **Manage Selection**.
+- With limited access, review **Change selection…**.
 - Resume a paused backup.
-- Open the failed-items view and retry recoverable items.
+- On the Backup page, open **Photos not backed up**. It names the reason for each photo. Select **Try again** for the photos that you can fix.
 - On iPhone and iPad, remember that the operating system schedules background work.
 - A photo you deleted in the app before its upload is excluded on purpose. Find it under **Excluded from
   Backup** in the Backup settings and choose **Back Up Again**.
+
+## Backup shows Waiting for Wi-Fi
+
+**Use Cellular Data** is off, and the device uses cellular data or Personal Hotspot. Connect to Wi-Fi, or turn on **Use Cellular Data** on the Backup page.
+
+## The Map tab or sidebar item is missing
+
+**Map and Places** is off. Turn it on in Settings under **Privacy**.
+
+## Merging duplicates did not free storage
+
+Merged copies move to Recently Deleted. Storage is freed only when Recently Deleted is emptied. See [[Duplicates|Duplicates]].
 
 ## A search scope is missing
 

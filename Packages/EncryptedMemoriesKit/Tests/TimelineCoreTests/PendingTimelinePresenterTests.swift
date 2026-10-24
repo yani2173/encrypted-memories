@@ -45,10 +45,7 @@ import Testing
     }
 
     private func settle(_ presenter: PendingTimelinePresenter) async -> PendingTimelinePresentation {
-        for _ in 0..<200 {
-            await Task.yield()
-            try? await Task.sleep(for: .milliseconds(2))
-        }
+        await presenter.waitUntilIdle()
         return presenter.current
     }
 
@@ -589,8 +586,8 @@ import Testing
         let gate = EditMembershipGate()
         let harness = try EditPendingHarness(
             date: base, membershipInterval: .seconds(60),
-            sleep: { _ in
-                await gate.wait()
+            sleep: { duration in
+                await gate.wait(duration)
             })
         defer { harness.closeStores() }
         let presenter = PendingTimelinePresenter(
@@ -614,6 +611,8 @@ import Testing
         harness.enqueue(revision: 2, state: .completed)
         presenter.setRemote(TimelineSnapshot(orderedItems: [earlier, uploaded]))
         #expect(await settle(presenter).items.map(\.uid) == [earlier.uid])
+        // The coordinator handled the new rows and holds their membership publish for the rest of the 60 s interval.
+        await gate.waitForSleep(in: .seconds(1) ... .seconds(60))
         #expect(await harness.coordinator.currentSnapshot().membershipRevision == initial.membershipRevision)
         await gate.release()
         let settled = await harness.wait { $0.tiles.first?.isSettled == true }
@@ -1287,6 +1286,92 @@ import Testing
         #expect(after.revision != before.revision)
         #expect(after.uploadBadges[pendingTile.item.uid] == .uploading(step: 12))
     }
+
+    @Test func pausedBadgesReplaceOnlyWaitingAndUploadingApplePhotos() {
+        let waiting = tile("w", second: 0).item.uid
+        let uploading = tile("u", second: 1).item.uid
+        let done = tile("d", second: 2).item.uid
+        let attention = tile("a", second: 3).item.uid
+        let notBackedUp = tile("n", second: 4).item.uid
+        let file = PendingSourceKey(kind: .fileURL, identifier: "/f.heic").localUID
+        let handedOver = PhotoUID(volumeID: "vol", nodeID: "h")
+        let base: [PhotoUID: GridUploadBadge] = [
+            waiting: .waiting, uploading: .waiting, done: .done, attention: .attention, notBackedUp: .notBackedUp,
+            file: .waiting, handedOver: .waiting,
+        ]
+        let running = PendingUploadBadges(
+            base: base, progress: [uploading: 7, handedOver: 3], handovers: [handedOver: tile("h", second: 5).item.uid])
+        let paused = running.replacing(isPaused: true)
+
+        #expect(paused[waiting] == .paused)
+        #expect(paused[uploading] == .paused)
+        #expect(paused[handedOver] == .paused, "a Proton photo whose Apple Photos source still uploads pauses too")
+        #expect(paused[done] == .done, "a photo that just finished keeps its checkmark")
+        #expect(paused[attention] == .attention)
+        #expect(paused[notBackedUp] == .notBackedUp)
+        #expect(paused[file] == .waiting, "watched Mac folders do not pause with the Apple Photos backup")
+        #expect(paused != running, "hosts see a new value")
+
+        let resumed = paused.replacing(isPaused: false)
+        #expect(resumed[waiting] == .waiting)
+        #expect(resumed[uploading] == .uploading(step: 7))
+        #expect(resumed[handedOver] == .uploading(step: 3))
+    }
+
+    @Test func onlyAPausedPhotoTellsVoiceOverThatTheBackupIsPaused() {
+        let waiting = tile("w", second: 0).item.uid
+        let done = tile("d", second: 1).item.uid
+        let badges = PendingUploadBadges(base: [waiting: .waiting, done: .done], isPaused: true)
+        let description = badges.accessibilityDescription(for: waiting)
+        #expect(description == L10n.string("a11y.upload_badge.paused"))
+        #expect(description != "a11y.upload_badge.paused", "the catalog has the text")
+        #expect(badges.accessibilityDescription(for: done) == nil)
+        #expect(badges.replacing(isPaused: false).accessibilityDescription(for: waiting) == nil)
+    }
+
+    @Test func pausingAndResumingChangesOnlyTheBadges() async {
+        let presenter = PendingTimelinePresenter()
+        var published = 0
+        presenter.onChange = { _ in published += 1 }
+        presenter.setRemote(TimelineSnapshot(orderedItems: [remote("a", second: 0)]))
+        let waiting = tile("w", second: 10)
+        let uploading = tile("u", second: 11)
+        let failed = tile("f", second: 12, badge: .attention)
+        let tiles = [waiting, uploading, failed]
+        presenter.setPending(pending(tiles, membership: 1, progress: [uploading.item.uid: 4]), enabled: true)
+        let before = await settle(presenter)
+        #expect(before.uploadBadges[uploading.item.uid] == .uploading(step: 4))
+
+        let count = published
+        presenter.setBackupPaused(true)
+        let paused = presenter.current
+        #expect(published == count + 1, "visible tiles update at once")
+        #expect(paused.revision != before.revision)
+        #expect(paused.membershipRevision == before.membershipRevision)
+        #expect(paused.snapshot == before.snapshot, "the library does not reload")
+        #expect(paused.uploadBadges[waiting.item.uid] == .paused)
+        #expect(paused.uploadBadges[uploading.item.uid] == .paused)
+        #expect(paused.uploadBadges[failed.item.uid] == .attention)
+
+        presenter.setBackupPaused(true)
+        #expect(published == count + 1, "an unchanged pause publishes nothing")
+
+        // A progress tick and a new photo while paused keep the pause.
+        presenter.setPending(pending(tiles, membership: 1, progress: [uploading.item.uid: 6]), enabled: true)
+        #expect(presenter.current.uploadBadges[uploading.item.uid] == .paused)
+        let added = tile("n", second: 13)
+        presenter.setPending(
+            pending(tiles + [added], membership: 2, progress: [uploading.item.uid: 6]), enabled: true)
+        let grown = await settle(presenter)
+        #expect(grown.uploadBadges[added.item.uid] == .paused)
+
+        presenter.setBackupPaused(false)
+        let resumed = presenter.current
+        #expect(resumed.membershipRevision == grown.membershipRevision)
+        #expect(resumed.uploadBadges[waiting.item.uid] == .waiting)
+        #expect(resumed.uploadBadges[uploading.item.uid] == .uploading(step: 6))
+        #expect(resumed.uploadBadges[failed.item.uid] == .attention)
+    }
 }
 
 @MainActor private final class EditPendingHarness {
@@ -1430,10 +1515,20 @@ private final class TestClock: @unchecked Sendable {
 private actor EditMembershipGate {
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var released = false
+    private var requested: [Duration] = []
 
-    func wait() async {
+    func wait(_ duration: Duration = .zero) async {
+        requested.append(duration)
         guard !released else { return }
         await withCheckedContinuation { waiters.append($0) }
+    }
+
+    /// Returns once a sleep with a duration in `range` was requested, or after 5 seconds without one.
+    func waitForSleep(in range: ClosedRange<Duration>) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !requested.contains(where: range.contains), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
     }
 
     func release() {

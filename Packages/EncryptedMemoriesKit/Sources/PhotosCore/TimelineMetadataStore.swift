@@ -4,14 +4,22 @@ import SQLite3
 
 // MARK: - Timeline ordering
 
-/// The canonical timeline total order: `(captureTime, volumeID, nodeID)` ascending. This is the
-/// same order the database index `idx_photos_timeline(t, vol, node)` produces, so in-memory sorts,
-/// persisted rows, and grid identity agree deterministically across launches, devices, and
-/// platforms. String keys compare as UTF-8 bytes (SQLite's BINARY collation), and capture times
-/// compare in the `timeIntervalSince1970` projection that is actually stored in the `t` column -
-/// never diverge from either, or equal-time rows can silently swap grid positions between runs.
+/// Canonical chronological order. Valid encrypted subsecond times refine the listing's capture second.
+/// Stable source identities break exact ties; missing evidence retains the volume/link fallback.
+/// The timeline database keeps its original `(t, vol, node)` index. The separate order cache overlays evidence.
 public enum TimelineOrder {
     public static func areInIncreasingOrder(_ a: PhotoItem, _ b: PhotoItem) -> Bool {
+        let ka = a.timelineOrder?.validated(for: a.captureTime)
+        let kb = b.timelineOrder?.validated(for: b.captureTime)
+        let ta = (ka?.exactCaptureTime ?? a.captureTime).timeIntervalSince1970
+        let tb = (kb?.exactCaptureTime ?? b.captureTime).timeIntervalSince1970
+        if ta != tb { return ta < tb }
+        let identity = compareUTF8(ka?.stableIdentity ?? "", kb?.stableIdentity ?? "")
+        if identity != 0 { return identity < 0 }
+        return areInBaseOrder(a, b)
+    }
+
+    static func areInBaseOrder(_ a: PhotoItem, _ b: PhotoItem) -> Bool {
         let ta = a.captureTime.timeIntervalSince1970
         let tb = b.captureTime.timeIntervalSince1970
         if ta != tb { return ta < tb }
@@ -20,8 +28,35 @@ public enum TimelineOrder {
         return compareUTF8(a.uid.nodeID, b.uid.nodeID) < 0
     }
 
-    /// memcmp-style UTF-8 byte comparison, matching SQLite's BINARY TEXT collation. Swift's
-    /// `String <` is Unicode-canonical and could disagree on non-ASCII input.
+    /// Chronological input needs only an O(n) scan plus sorting of disordered capture-second groups.
+    /// Refined evidence cannot move a photo into another second. Arbitrary input keeps the full-sort fallback.
+    static func orderedByCaptureSecond(
+        _ items: [PhotoItem], by precedes: (PhotoItem, PhotoItem) -> Bool,
+        fullSort: () -> Void = {}
+    ) -> [PhotoItem] {
+        var result = items
+        var start = 0
+        while start < items.count {
+            let second = floor(items[start].captureTime.timeIntervalSince1970)
+            var end = start + 1
+            var disordered = false
+            while end < items.count, floor(items[end].captureTime.timeIntervalSince1970) == second {
+                disordered = disordered || precedes(items[end], items[end - 1])
+                end += 1
+            }
+            if end < items.count, floor(items[end].captureTime.timeIntervalSince1970) < second {
+                fullSort()
+                return items.sorted(by: precedes)
+            }
+            if disordered {
+                result.replaceSubrange(start..<end, with: items[start..<end].sorted(by: precedes))
+            }
+            start = end
+        }
+        return result
+    }
+
+    /// Matches SQLite's BINARY TEXT collation, including non-ASCII source identifiers.
     private static func compareUTF8(_ a: String, _ b: String) -> Int {
         if a.utf8.lexicographicallyPrecedes(b.utf8) { return -1 }
         if b.utf8.lexicographicallyPrecedes(a.utf8) { return 1 }
@@ -157,6 +192,10 @@ public struct TimelineSaveResult: Sendable, Equatable {
 }
 
 // MARK: - Store
+
+public enum TimelineMetadataReadError: Error {
+    case readFailed
+}
 
 /// App-owned SQLite timeline metadata store (schema v1). UI-free, SDK-free, platform-universal:
 /// raw SQLite C API over `Foundation` + Core value types only, with platform tuning injected via
@@ -334,24 +373,43 @@ public final class TimelineMetadataStore {
     /// Ordered timeline load. The hot path is one indexed scan of `photos`; tags and burst
     /// membership are reconstructed from their feature tables with one full pass each (dictionary
     /// join in memory - no per-row queries, no blob decoding).
-    public func load() -> [PhotoItem] {
-        PhotoPerformanceSignposts.database.interval("db.load") {
-            loadInstrumented()
+    /// Throws when photos, tags, or series cannot prepare, finish, or decode every selected identity.
+    public func load() throws -> [PhotoItem] {
+        try PhotoPerformanceSignposts.database.interval("db.load") {
+            try loadInstrumented()
         }
     }
 
-    private func loadInstrumented() -> [PhotoItem] {
+    /// Pairs only a successfully read complete timeline inventory with its existing validation token.
+    /// A complete empty inventory without a token remains an absent cache.
+    public func cachedTimelineSnapshot() throws -> CachedTimelineSnapshot? {
+        let items = try load()
+        let token = validationToken()
+        guard !items.isEmpty || token != nil else { return nil }
+        let sections =
+            items.isEmpty
+            ? []
+            : [TimelineSection(id: "all", date: items.first?.captureTime ?? .distantPast, title: "", items: items)]
+        return CachedTimelineSnapshot(sections: sections, validationToken: token)
+    }
+
+    private func loadInstrumented() throws -> [PhotoItem] {
         let start = Date()
-        let tags = loadTags()
-        let bursts = loadBurstMembers()
+        let tags = try loadTags()
+        let bursts = try loadBurstMembers()
 
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, Self.timelineLoadSQL, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        guard sqlite3_prepare_v2(db, Self.timelineLoadSQL, -1, &stmt, nil) == SQLITE_OK else {
+            throw TimelineMetadataReadError.readFailed
+        }
         defer { sqlite3_finalize(stmt) }
 
         var items: [PhotoItem] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1) else { continue }
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1) else {
+                throw TimelineMetadataReadError.readFailed
+            }
             let uid = PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC))
             let mime = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "image/jpeg"
             let relvid = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
@@ -367,7 +425,9 @@ public final class TimelineMetadataStore {
                     tags: tags[uid] ?? [],
                     burstMemberIDs: bursts[uid] ?? []
                 ))
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { throw TimelineMetadataReadError.readFailed }
         PhotoDiagnostics.shared.recordDBQuery(
             queryName: "timeline.load.orderedByTimelineIndex",
             durationMs: Date().timeIntervalSince(start) * 1000,
@@ -376,38 +436,55 @@ public final class TimelineMetadataStore {
         return items
     }
 
-    private func loadTags() -> [PhotoUID: Set<PhotoTag>] {
+    private func loadTags() throws -> [PhotoUID: Set<PhotoTag>] {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, "SELECT vol, node, tag FROM photo_tags;", -1, &stmt, nil) == SQLITE_OK else {
-            return [:]
+            throw TimelineMetadataReadError.readFailed
         }
         defer { sqlite3_finalize(stmt) }
         var result: [PhotoUID: Set<PhotoTag>] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1),
-                let tag = PhotoTag(rawValue: Int(sqlite3_column_int(stmt, 2)))
-            else { continue }
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1) else {
+                throw TimelineMetadataReadError.readFailed
+            }
+            guard sqlite3_column_type(stmt, 2) == SQLITE_INTEGER,
+                let tag = PhotoTag(rawValue: Int(sqlite3_column_int64(stmt, 2)))
+            else {
+                throw TimelineMetadataReadError.readFailed
+            }
             result[PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC)), default: []].insert(tag)
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { throw TimelineMetadataReadError.readFailed }
         return result
     }
 
-    private func loadBurstMembers() -> [PhotoUID: [String]] {
+    private func loadBurstMembers() throws -> [PhotoUID: [String]] {
         var stmt: OpaquePointer?
         let sql =
             "SELECT anchor_vol, anchor_node, member_node FROM burst_members ORDER BY anchor_vol, anchor_node, seq;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [:] }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw TimelineMetadataReadError.readFailed
+        }
         defer { sqlite3_finalize(stmt) }
         var result: [PhotoUID: [String]] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
             guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1),
                 let memberC = sqlite3_column_text(stmt, 2)
-            else { continue }
+            else { throw TimelineMetadataReadError.readFailed }
             result[PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC)), default: []]
                 .append(String(cString: memberC))
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { throw TimelineMetadataReadError.readFailed }
         return result
     }
+
+    #if DEBUG
+        private(set) var fullSaveSortCount = 0
+    #endif
 
     // MARK: Save
 
@@ -454,7 +531,11 @@ public final class TimelineMetadataStore {
         // Canonical order: identical input sets digest identically regardless of arrival order,
         // and rows persist in exactly the order load() returns them. The enumeration feeding save
         // is normally already in timeline order, so an O(n) precheck skips a redundant full sort.
-        let ordered = Self.isTimelineOrdered(items) ? items : items.sorted(by: TimelineOrder.areInIncreasingOrder)
+        let ordered = TimelineOrder.orderedByCaptureSecond(items, by: TimelineOrder.areInBaseOrder) {
+            #if DEBUG
+                fullSaveSortCount += 1
+            #endif
+        }
         let digest = Self.timelineDigest(of: ordered)
         let generation = readMetaInt(Self.metaGenerationKey) ?? 0
 
@@ -653,18 +734,6 @@ public final class TimelineMetadataStore {
         ) == SQLITE_OK
     }
 
-    /// True when `items` is already in canonical `(t, vol, node)` order - the common case, because
-    /// the enumeration feeding `save` is pre-sorted by the bridge. Lets `save` skip a redundant
-    /// O(n log n) resort via an O(n) scan; any out-of-order input falls back to a full sort.
-    private static func isTimelineOrdered(_ items: [PhotoItem]) -> Bool {
-        var index = 1
-        while index < items.count {
-            if TimelineOrder.areInIncreasingOrder(items[index], items[index - 1]) { return false }
-            index += 1
-        }
-        return true
-    }
-
     /// Feature tables are rewritten wholesale inside the save transaction. Their row counts scale
     /// with tagged/burst items (a small fraction of the library), not with library size - the
     /// digest short-circuit already spares the common unchanged refresh entirely.
@@ -713,8 +782,10 @@ public final class TimelineMetadataStore {
     /// One-pass read of every MIME type resolved from Drive link metadata for `volumeID`. Timeline
     /// listings expose tags but can omit/misclassify videos; this table is the durable, local
     /// authority used to overlay those lossy listing rows on every subsequent refresh.
-    public func mediaTypeEvidence(volumeID: String) -> [String: String] {
+    /// Returns nil for a failed or incomplete read; an empty dictionary is a complete empty read.
+    public func mediaTypeEvidence(volumeID: String) -> [String: String]? {
         var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
         guard
             sqlite3_prepare_v2(
                 db,
@@ -723,15 +794,30 @@ public final class TimelineMetadataStore {
                 &stmt,
                 nil
             ) == SQLITE_OK
-        else { return [:] }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, volumeID, -1, transient)
+        else { return nil }
+        guard sqlite3_bind_text(stmt, 1, volumeID, -1, transient) == SQLITE_OK else { return nil }
         var result: [String: String] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let node = sqlite3_column_text(stmt, 0), let mime = sqlite3_column_text(stmt, 1) else { continue }
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            guard let node = sqlite3_column_text(stmt, 0), let mime = sqlite3_column_text(stmt, 1) else { return nil }
             result[String(cString: node)] = String(cString: mime)
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { return nil }
         return result
+    }
+
+    /// Keeps cached photo types usable for display after a failed read, without authorizing new MIME requests.
+    public func mediaTypeEvidenceForDisplay(volumeID: String) -> (types: [String: String], canRefine: Bool) {
+        if let evidence = mediaTypeEvidence(volumeID: volumeID) { return (evidence, true) }
+        do {
+            let cached = try load().lazy.filter { $0.uid.volumeID == volumeID }
+            return (Dictionary(uniqueKeysWithValues: cached.map { ($0.uid.nodeID, $0.mediaType) }), false)
+        } catch {
+            PhotoDiagnostics.shared.emitDebug(
+                "timeline.cacheReadFailed", ["fallback": "display", "canRefine": "false"])
+            return ([:], false)
+        }
     }
 
     /// Upload completion records MIME evidence before the new node can appear in a timeline row.
@@ -1075,6 +1161,12 @@ public final class TimelineMetadataStore {
     @discardableResult
     public func markRelatedVideosChosen(by rule: String) -> Bool {
         writeMeta(Self.metaRelatedVideoRuleKey, relatedVideoRuleMark(rule))
+    }
+
+    /// Whether `rule` chose the related videos of the stored timeline (`markRelatedVideosChosen(by:)` after the last
+    /// save). False after a save that was not marked, so a load must read the types again.
+    public func relatedVideosChosen(by rule: String) -> Bool {
+        readMeta(Self.metaRelatedVideoRuleKey) == relatedVideoRuleMark(rule)
     }
 
     private func relatedVideoRuleMark(_ rule: String) -> String {

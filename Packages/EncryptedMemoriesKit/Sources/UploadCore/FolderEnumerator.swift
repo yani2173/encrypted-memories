@@ -78,19 +78,6 @@ public struct FolderEnumerationError: Error, LocalizedError, Sendable, Equatable
     }
 }
 
-/// Result of walking a folder for uploadable media.
-public struct FolderEnumerationResult: Sendable, Equatable {
-    /// Supported photo/video files, in deterministic (path-sorted) order.
-    public var mediaFiles: [URL]
-    /// Files that were found but skipped because their type isn't supported (reported, not silently dropped).
-    public var skippedUnsupported: [URL]
-
-    public init(mediaFiles: [URL] = [], skippedUnsupported: [URL] = []) {
-        self.mediaFiles = mediaFiles
-        self.skippedUnsupported = skippedUnsupported
-    }
-}
-
 /// Recursively discovers uploadable media inside a folder.
 ///
 /// Hidden entries and symbolic links are skipped. Package bundles are not traversed. Each directory
@@ -152,46 +139,6 @@ public enum FolderEnumerator {
         fileManager: FileManager = .default
     ) -> Stream {
         Stream(folder: folder, includeHidden: includeHidden, fileManager: fileManager)
-    }
-
-    /// Visits entries in deterministic path order without retaining the whole tree.
-    ///
-    /// Each directory is sorted before descent. This keeps a directory subtree contiguous in the
-    /// path order while bounding retained URLs to one directory plus the recursion depth.
-    static func walk(
-        _ folder: URL,
-        includeHidden: Bool = false,
-        fileManager: FileManager = .default,
-        visit: (URL, Bool) throws -> Void
-    ) throws {
-        let traversal = Traversal(
-            folder: folder,
-            includeHidden: includeHidden,
-            fileManager: fileManager
-        )
-        while let entry = try traversal.next() {
-            try visit(entry.url, entry.isSupported)
-        }
-    }
-
-    public static func enumerate(
-        _ folder: URL,
-        includeHidden: Bool = false,
-        fileManager: FileManager = .default
-    ) throws -> FolderEnumerationResult {
-        var media: [URL] = []
-        var skipped: [URL] = []
-        try walk(folder, includeHidden: includeHidden, fileManager: fileManager) { url, isSupported in
-            if isSupported {
-                media.append(url)
-            } else {
-                skipped.append(url)
-            }
-        }
-        return FolderEnumerationResult(
-            mediaFiles: media,
-            skippedUnsupported: skipped
-        )
     }
 
     fileprivate final class Traversal: @unchecked Sendable {

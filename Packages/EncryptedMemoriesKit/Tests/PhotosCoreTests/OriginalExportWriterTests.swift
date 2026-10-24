@@ -5,7 +5,7 @@ import Testing
 
 /// Behavior of the shared original export: staged destination writes, archive naming, failure cleanup, and
 /// the low-disk guard. The Mac export uses these writes; iOS and iPadOS share the naming.
-@Suite struct OriginalExportWriterTests {
+@Suite(.serialized) struct OriginalExportWriterTests {
     private static let heicHeader = Data([0, 0, 0, 0x18]) + Data("ftypheic".utf8) + Data(repeating: 0, count: 52)
     private static let jpegHeader = Data([0xFF, 0xD8, 0xFF, 0xE0]) + Data(repeating: 1, count: 60)
 
@@ -36,6 +36,20 @@ import Testing
         unzip.waitUntilExit()
         #expect(unzip.terminationStatus == 0)
         return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
+    }
+
+    /// These byte-preservation fixtures opt out of sanitizing their synthetic, undecodable media headers.
+    private func keepLocationForThisTest() -> () -> Void {
+        let defaults = UserDefaults.standard
+        let original = defaults.object(forKey: AppSettingsKey.removeLocationWhenSharing)
+        defaults.set(false, forKey: AppSettingsKey.removeLocationWhenSharing)
+        return {
+            if let original {
+                defaults.set(original, forKey: AppSettingsKey.removeLocationWhenSharing)
+            } else {
+                defaults.removeObject(forKey: AppSettingsKey.removeLocationWhenSharing)
+            }
+        }
     }
 
     // MARK: - Naming
@@ -84,6 +98,8 @@ import Testing
     // MARK: - Destination writes
 
     @Test func singleExportInstallsTheCompleteOriginalAndReplacesAnExistingFile() async throws {
+        let restorePreference = keepLocationForThisTest()
+        defer { restorePreference() }
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("IMG_0001.HEIC")
@@ -112,6 +128,8 @@ import Testing
     }
 
     @Test func archiveExportNamesEveryEntryUniquelyAndReportsCompletion() async throws {
+        let restorePreference = keepLocationForThisTest()
+        defer { restorePreference() }
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("Export.zip")
@@ -125,7 +143,7 @@ import Testing
                 second.uid: PhotoMetadata(filename: "IMG_0001.HEIC"),
             ]
         )
-        let progress = ProgressLog()
+        let progress = RecordLog<Double>()
 
         try await OriginalExportWriter.writeArchive(
             items: [first, second, third], to: destination, provider: provider
@@ -136,7 +154,40 @@ import Testing
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["Export.zip"])
     }
 
+    @Test func writeDataWritesTheBytesAndReplacesAnExistingFile() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("Support.json")
+
+        try OriginalExportWriter.writeData(Data("first".utf8), to: destination)
+        #expect(try Data(contentsOf: destination) == Data("first".utf8))
+
+        try OriginalExportWriter.writeData(Data("second".utf8), to: destination)
+        #expect(try Data(contentsOf: destination) == Data("second".utf8))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["Support.json"])
+    }
+
+    @Test func writeDataLeavesNoStagingDirectory() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("Support.json")
+        let staging = RecordLog<URL>()
+        defer {
+            for url in staging.values { try? FileManager.default.removeItem(at: url) }
+        }
+
+        try OriginalExportWriter.$stagingDirectoryObserver.withValue(
+            { staging.record($0) },
+            operation: { try OriginalExportWriter.writeData(Data("report".utf8), to: destination) })
+
+        #expect(try Data(contentsOf: destination) == Data("report".utf8))
+        try #require(staging.values.count == 1, "writeData stages through exactly one directory")
+        #expect(!FileManager.default.fileExists(atPath: staging.values[0].path))
+    }
+
     @Test func failedArchiveExportRemovesThePartialArchive() async throws {
+        let restorePreference = keepLocationForThisTest()
+        defer { restorePreference() }
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("Export.zip")
@@ -212,10 +263,10 @@ private final class FakeOriginalProvider: OriginalFileProvider, PhotoMetadataPro
     }
 }
 
-private final class ProgressLog: @unchecked Sendable {
+private final class RecordLog<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private var recorded: [Double] = []
+    private var recorded: [Value] = []
 
-    func record(_ value: Double) { lock.withLock { recorded.append(value) } }
-    var values: [Double] { lock.withLock { recorded } }
+    func record(_ value: Value) { lock.withLock { recorded.append(value) } }
+    var values: [Value] { lock.withLock { recorded } }
 }

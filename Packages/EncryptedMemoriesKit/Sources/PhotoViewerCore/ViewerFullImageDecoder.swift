@@ -7,9 +7,31 @@ private enum SequentialStreamControl: Error {
     case consumerFinished
 }
 
-private enum StreamOperationOutcome: @unchecked Sendable {
-    case producerFinished(Error?)
-    case decoderFinished(Result<CGImage?, Error>)
+/// Which of the producer and the decoder of one streamed decode finished first. A producer that the finished decoder
+/// stopped reports no error.
+private final class StreamRace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var producerDone = false
+    private var stoppedProducerAfterDecode = false
+    private var reportedError: (any Error)?
+
+    var producerError: (any Error)? { lock.withLock { reportedError } }
+
+    func producerFinished(_ error: (any Error)?) {
+        lock.withLock {
+            producerDone = true
+            if !stoppedProducerAfterDecode { reportedError = error }
+        }
+    }
+
+    /// True when the producer still runs, so the decode stops it.
+    func decoderFinished() -> Bool {
+        lock.withLock {
+            guard !producerDone else { return false }
+            stoppedProducerAfterDecode = true
+            return true
+        }
+    }
 }
 
 private func viewerSequentialGetBytes(
@@ -60,58 +82,53 @@ public enum ViewerFullImageDecoder {
             decoderResult.resolve(result)
         }
 
-        return try await withTaskCancellationHandler(
+        // The producer and the decoder run as unstructured tasks that this call joins before it returns. A task group
+        // child that catches the producer's error could complete into a destroyed group in Swift 6.4 optimized builds.
+        let race = StreamRace()
+        let producer = Task {
+            try await provider.streamOriginalBytes(
+                for: uid,
+                onChunk: { try await queue.append($0) },
+                onProgress: onProgress
+            )
+            queue.producerDidFinish()
+        }
+        let producerEnd = Task {
+            race.producerFinished(Self.producerError(of: await producer.result, queue: queue))
+        }
+        let decoderEnd = Task {
+            let result = await decoderResult.value()
+            // The decoder can finish before the provider emits every byte; the producer then stops.
+            if race.decoderFinished() { producer.cancel() }
+            return result
+        }
+
+        let decoderOutcome = await withTaskCancellationHandler(
             operation: {
-                try await withThrowingTaskGroup(of: StreamOperationOutcome.self) { group in
-                    group.addTask {
-                        do {
-                            try await provider.streamOriginalBytes(
-                                for: uid,
-                                onChunk: { try await queue.append($0) },
-                                onProgress: onProgress
-                            )
-                            queue.producerDidFinish()
-                            return .producerFinished(nil)
-                        } catch SequentialStreamControl.consumerFinished {
-                            // ImageIO can reject or finish a stream before the provider emits every byte.
-                            return .producerFinished(nil)
-                        } catch {
-                            queue.producerDidFail(error)
-                            return .producerFinished(error)
-                        }
-                    }
-                    group.addTask {
-                        .decoderFinished(await decoderResult.value())
-                    }
-
-                    var producerFinished = false
-                    var producerError: Error?
-                    var decoderOutcome: Result<CGImage?, Error>?
-                    var stoppedProducerAfterDecode = false
-
-                    while let outcome = try await group.next() {
-                        switch outcome {
-                        case .producerFinished(let error):
-                            producerFinished = true
-                            if !stoppedProducerAfterDecode { producerError = error }
-                        case .decoderFinished(let result):
-                            decoderOutcome = result
-                            if !producerFinished {
-                                stoppedProducerAfterDecode = true
-                                group.cancelAll()
-                            }
-                        }
-                    }
-
-                    if let producerError { throw producerError }
-                    try Task.checkCancellation()
-                    guard let decoderOutcome else { throw CancellationError() }
-                    return try decoderOutcome.get()
-                }
+                await producerEnd.value
+                return await decoderEnd.value
             },
             onCancel: {
                 queue.cancel()
+                producer.cancel()
             })
+        if let producerError = race.producerError { throw producerError }
+        try Task.checkCancellation()
+        return try decoderOutcome.get()
+    }
+
+    /// The error of a finished producer that the decode reports. A consumer that finished early is no failure. A failure
+    /// reaches the queue at once, so the blocking ImageIO consumer ends.
+    private static func producerError(of result: Result<Void, any Error>, queue: SequentialByteQueue) -> (any Error)? {
+        switch result {
+        case .success:
+            return nil
+        case .failure(let error as SequentialStreamControl) where error == .consumerFinished:
+            return nil
+        case .failure(let error):
+            queue.producerDidFail(error)
+            return error
+        }
     }
 
     private static func decodeFromSequentialProvider(

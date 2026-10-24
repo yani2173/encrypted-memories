@@ -24,6 +24,7 @@ final class PhotoKitResourceRequestLivenessGuard<RequestID: Sendable>: @unchecke
     private let automaticallyStartsWatchdog: Bool
     private let now: @Sendable () -> TimeInterval
     private let timeoutError: @Sendable () -> Error
+    private let requestAdmission: @Sendable () throws -> Void
     private let cancelRequest: @Sendable (RequestID) -> Void
 
     private var continuation: CheckedContinuation<Void, Error>?
@@ -37,6 +38,7 @@ final class PhotoKitResourceRequestLivenessGuard<RequestID: Sendable>: @unchecke
         stallTimeout: TimeInterval = PhotoKitResourceRequestLivenessGuard.defaultStallTimeout,
         pollInterval: TimeInterval = PhotoKitResourceRequestLivenessGuard.defaultPollInterval,
         automaticallyStartsWatchdog: Bool = true,
+        requestAdmission: @Sendable @escaping () throws -> Void = {},
         now: @Sendable @escaping () -> TimeInterval = {
             ProcessInfo.processInfo.systemUptime
         },
@@ -48,6 +50,7 @@ final class PhotoKitResourceRequestLivenessGuard<RequestID: Sendable>: @unchecke
         self.stallTimeout = max(0.01, stallTimeout)
         self.pollInterval = max(0.01, min(pollInterval, stallTimeout))
         self.automaticallyStartsWatchdog = automaticallyStartsWatchdog
+        self.requestAdmission = requestAdmission
         self.now = now
         self.timeoutError = timeoutError
         self.cancelRequest = cancelRequest
@@ -63,7 +66,12 @@ final class PhotoKitResourceRequestLivenessGuard<RequestID: Sendable>: @unchecke
             try Task.checkCancellation()
             try await withCheckedThrowingContinuation { continuation in
                 guard install(continuation) else { return }
-                register(request())
+                do {
+                    try requestAdmission()
+                    register(request())
+                } catch {
+                    complete(error: error)
+                }
             }
             try Task.checkCancellation()
         } onCancel: {

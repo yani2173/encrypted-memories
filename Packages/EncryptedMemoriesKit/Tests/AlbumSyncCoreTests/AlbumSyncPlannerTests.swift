@@ -5,8 +5,10 @@ import Testing
 @testable import AlbumSyncCore
 
 @Suite struct AlbumSyncPlannerTests {
-    private func link(_ id: String, sha1: String? = "aa", trashed: Bool = false) -> AlbumSyncRemoteLink {
-        AlbumSyncRemoteLink(uid: PhotoUID(volumeID: "vol1", nodeID: id), sha1Hex: sha1, isTrashed: trashed)
+    /// Each link has its own bytes unless the test names a SHA-1.
+    private func link(_ id: String, sha1: String? = nil, trashed: Bool = false) -> AlbumSyncRemoteLink {
+        AlbumSyncRemoteLink(
+            uid: PhotoUID(volumeID: "vol1", nodeID: id), sha1Hex: sha1 ?? "sha-\(id)", isTrashed: trashed)
     }
 
     @Test func emptyAlbumPlansNothing() {
@@ -93,5 +95,68 @@ import Testing
         #expect(plan.alreadyMember == 10_000)
         // O(n) set planning: generous bound so CI noise can't flake it, but O(n²) would blow it.
         #expect(elapsed < .seconds(2))
+    }
+
+    @Test func anotherCopyWithTheSameBytesInTheAlbumCountsAsMember() {
+        // Device B's copy of a shared photo: own link, same bytes as device A's member.
+        let plan = AlbumSyncPlanner.plan(
+            orderedLocalIdentifiers: ["a", "b"],
+            remoteLinks: ["a": link("copy-b", sha1: "shared"), "b": link("lb")],
+            existingChildLinkIDs: ["copy-a"],
+            memberWithSameContent: ["shared": "copy-a"]
+        )
+        #expect(plan.toAttach.map(\.uid.nodeID) == ["lb"])
+        #expect(plan.alreadyMember == 1)
+        #expect(plan.duplicatesCollapsed == 0)
+    }
+
+    @Test func aDirectMemberAndACopyOfItCountTheMemberOnce() {
+        let plan = AlbumSyncPlanner.plan(
+            orderedLocalIdentifiers: ["a", "b"],
+            remoteLinks: ["a": link("copy-a", sha1: "shared"), "b": link("copy-b", sha1: "shared")],
+            existingChildLinkIDs: ["copy-a"],
+            memberWithSameContent: ["shared": "copy-a"]
+        )
+        #expect(plan.toAttach.isEmpty)
+        #expect(plan.alreadyMember == 1)
+        #expect(plan.duplicatesCollapsed == 1)
+    }
+
+    @Test func twoLinksWithTheSameBytesAttachOnce() {
+        let plan = AlbumSyncPlanner.plan(
+            orderedLocalIdentifiers: ["b", "a", "c"],
+            remoteLinks: ["a": link("la", sha1: "same"), "b": link("lb", sha1: "same"), "c": link("lc")],
+            existingChildLinkIDs: []
+        )
+        #expect(plan.toAttach.map(\.uid.nodeID) == ["lb", "lc"], "the first photo in album order attaches")
+        #expect(plan.duplicatesCollapsed == 1)
+        #expect(
+            plan.sameBytesAlternates.mapValues { $0.map(\.uid.nodeID) } == ["lb": ["la"]],
+            "the other link stays ready in case the first one fails")
+    }
+
+    @Test func linksWithoutBytesKeepTheirOwnAttach() {
+        let noBytes = { (id: String) in
+            AlbumSyncRemoteLink(uid: PhotoUID(volumeID: "vol1", nodeID: id), sha1Hex: nil, isTrashed: false)
+        }
+        let plan = AlbumSyncPlanner.plan(
+            orderedLocalIdentifiers: ["a", "b"],
+            remoteLinks: ["a": noBytes("la"), "b": noBytes("lb")],
+            existingChildLinkIDs: ["member"],
+            memberWithSameContent: ["": "member"]
+        )
+        #expect(plan.toAttach.map(\.uid.nodeID) == ["la", "lb"])
+        #expect(plan.alreadyMember == 0)
+    }
+
+    @Test func aTrashedCopyIsNeverAMember() {
+        let plan = AlbumSyncPlanner.plan(
+            orderedLocalIdentifiers: ["a"],
+            remoteLinks: ["a": link("copy-b", sha1: "shared", trashed: true)],
+            existingChildLinkIDs: ["copy-a"],
+            memberWithSameContent: ["shared": "copy-a"]
+        )
+        #expect(plan.trashedRemote == 1)
+        #expect(plan.alreadyMember == 0)
     }
 }

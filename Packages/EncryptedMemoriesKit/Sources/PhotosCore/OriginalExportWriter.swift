@@ -63,7 +63,7 @@ public enum OriginalExportWriter {
         try await provider.writeOriginal(for: item.uid, to: stagedFile, onProgress: onProgress)
         if PrivacyExportPolicy.isEnabled() {
             let cleanFile = stagingDirectory.appendingPathComponent("clean-" + destination.lastPathComponent)
-            let written = try await LocationSanitizedCopy.write(from: stagedFile, to: cleanFile)
+            let written = try await completeDownloadedOriginal(from: stagedFile, to: cleanFile, removeLocation: true)
             try installCompletedFile(written, at: destination)
         } else {
             try installCompletedFile(stagedFile, at: destination)
@@ -121,7 +121,7 @@ public enum OriginalExportWriter {
             if PrivacyExportPolicy.isEnabled() {
                 let output = stagingDirectory.appendingPathComponent(
                     UUID().uuidString + "." + URL(fileURLWithPath: name).pathExtension)
-                let written = try await LocationSanitizedCopy.write(from: sidecar, to: output)
+                let written = try await completeDownloadedOriginal(from: sidecar, to: output, removeLocation: true)
                 cleanFile = written
                 archiveSource = written
                 // A RAW photo leaves as a JPEG; the entry name follows the written format.
@@ -139,18 +139,48 @@ public enum OriginalExportWriter {
         success = true
     }
 
+    /// Writes `data` to `destination` through a staging directory on the destination volume, so the destination
+    /// receives only a complete file. An existing file at `destination` is replaced.
+    public static func writeData(_ data: Data, to destination: URL) throws {
+        let stagingDirectory = try stagingDirectory(for: destination)
+        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
+        let stagedFile = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
+        try data.write(to: stagedFile, options: .atomic)
+        try installCompletedFile(stagedFile, at: destination)
+    }
+
+    /// Completes one downloaded original at a name reserved by its caller. Privacy sampling, name reservation,
+    /// disk admission, and staging cleanup remain with each export policy. A sanitized copy retains its source;
+    /// an unchanged original moves to the reserved name.
+    static func completeDownloadedOriginal(
+        from source: URL, to destination: URL, removeLocation: Bool
+    ) async throws -> URL {
+        if removeLocation {
+            return try await LocationSanitizedCopy.write(from: source, to: destination)
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
+        return destination
+    }
+
     /// A sandbox-safe staging directory on the destination volume.
     ///
     /// A save panel authorizes the selected file but not sibling files with generated names. Foundation's
     /// replacement directory is the location Apple provides for atomic-save staging on the destination volume.
     static func stagingDirectory(for destination: URL) throws -> URL {
-        try FileManager.default.url(
+        let directory = try FileManager.default.url(
             for: .itemReplacementDirectory,
             in: .userDomainMask,
             appropriateFor: destination,
             create: true
         )
+        stagingDirectoryObserver?(directory)
+        return directory
     }
+
+    /// Receives every staging directory created by the task that binds it and by the tasks that inherit the binding.
+    /// Tests check their own staging cleanup without listing the shared replacement-directory parent, which other
+    /// processes also use.
+    @TaskLocal static var stagingDirectoryObserver: (@Sendable (URL) -> Void)?
 
     static func installCompletedFile(_ stagedFile: URL, at destination: URL) throws {
         let fileManager = FileManager.default

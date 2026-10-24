@@ -449,11 +449,15 @@ public enum PhotoUploadMetadataEncoder {
         location: Location?,
         camera: Camera,
         media: Media,
-        iOSPhotos: IOSPhotos?
+        iOSPhotos: IOSPhotos?,
+        diagnostics: PhotoDiagnostics = .shared
     ) throws -> [PhotoUploadAdditionalMetadata] {
         let encoder = JSONEncoder()
         var output: [PhotoUploadAdditionalMetadata] = []
         if let location {
+            if location.latitude == location.longitude {
+                diagnostics.increment("backup.metadata.equalCoordinates")
+            }
             output.append(try encode(location, name: "Location", encoder: encoder))
         }
         output.append(try encode(camera, name: "Camera", encoder: encoder))
@@ -499,6 +503,12 @@ public struct PhotoUploadRequest: Sendable {
     /// core may only know the primary's link id (duplicate-check rows carry no volume), and the
     /// transport layer resolves the account's single photos volume for it.
     public let mainPhotoUID: PhotoUID?
+    /// False when this backup upload must not use cellular data or Personal Hotspot. The transport then lets the
+    /// system refuse the bytes on such a network. Uploads that the person starts keep the default.
+    public var allowsExpensiveNetwork = true
+    /// The upload's place in the account's `UploadNetworkAdmission`. The production uploader refuses a request without
+    /// an active reservation of its own admission and of the same network kind.
+    public var networkReservation: UploadNetworkReservation?
 
     public init(
         queueItemID: UploadQueueItemID,
@@ -533,25 +543,19 @@ public struct PhotoUploadRequest: Sendable {
     /// The same request with the dedupe pipeline's findings applied: the Proton-corrected name
     /// (what actually gets hashed remotely) and the integrity digest.
     public func applying(identity: UploadIdentity) -> PhotoUploadRequest {
-        PhotoUploadRequest(
-            queueItemID: queueItemID,
-            cancellationToken: cancellationToken,
-            fileURL: fileURL,
+        copy(
             name: identity.correctedName,
-            mediaType: mediaType,
-            fileSize: fileSize,
-            captureTime: captureTime,
-            modificationDate: modificationDate,
-            tags: tags,
-            additionalMetadata: additionalMetadata,
             expectedSHA1: identity.sha1Digest,
-            overrideExistingDraft: overrideExistingDraft,
-            mainPhotoUID: mainPhotoUID
+            overrideExistingDraft: overrideExistingDraft
         )
     }
 
     public func replacingExistingDraft(_ shouldReplace: Bool) -> PhotoUploadRequest {
-        PhotoUploadRequest(
+        copy(name: name, expectedSHA1: expectedSHA1, overrideExistingDraft: shouldReplace)
+    }
+
+    private func copy(name: String, expectedSHA1: Data?, overrideExistingDraft: Bool) -> PhotoUploadRequest {
+        var request = PhotoUploadRequest(
             queueItemID: queueItemID,
             cancellationToken: cancellationToken,
             fileURL: fileURL,
@@ -563,9 +567,12 @@ public struct PhotoUploadRequest: Sendable {
             tags: tags,
             additionalMetadata: additionalMetadata,
             expectedSHA1: expectedSHA1,
-            overrideExistingDraft: shouldReplace,
+            overrideExistingDraft: overrideExistingDraft,
             mainPhotoUID: mainPhotoUID
         )
+        request.allowsExpensiveNetwork = allowsExpensiveNetwork
+        request.networkReservation = networkReservation
+        return request
     }
 }
 
@@ -587,9 +594,27 @@ public enum UploadError: LocalizedError, Equatable {
     /// row due at `until` without counting an attempt; the finished file usually arrives sooner as a new
     /// revision, which the platform's change notification enqueues.
     case sourceNotReady(String, until: Date)
+    /// Photos cannot hand out the file now: it waits for iCloud, an offline library volume, or an interrupted read.
+    /// The runner checks the row again after a backoff without an attempt. This says nothing about the Proton
+    /// connection, so other uploads keep their concurrency.
+    case sourceUnavailable(String)
+    /// Photos reports the file as missing. A short iCloud fault can report that too, so the runner checks the row
+    /// a few more times, hours apart, before it treats the photo as gone.
+    case sourceReportedMissing(String)
     /// The account's remaining Proton storage cannot hold the file. The item waits; freeing space or a larger plan
     /// and Back Up Now take it up again.
     case accountStorageFull(String, requiredBytes: Int64, availableBytes: Int64)
+
+    /// Cancellation can cross the transport boundary without cancelling the enclosing Swift task.
+    public static func isCancellation(_ error: any Error) -> Bool {
+        if error is CancellationError || (error as? URLError)?.code == .cancelled { return true }
+        guard let uploadError = error as? UploadError else { return false }
+        switch uploadError {
+        case .cancelled: return true
+        case .transport(let code, _): return code == URLError.cancelled.rawValue
+        default: return false
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -602,6 +627,7 @@ public enum UploadError: LocalizedError, Equatable {
         case .albumStep(let message): L10n.string("error.upload_album_step \(message)")
         case .cancelled: L10n.string("error.upload_cancelled")
         case .sourceNotReady(let name, _): L10n.string("error.upload_source_not_ready \(name)")
+        case .sourceUnavailable, .sourceReportedMissing: L10n.string("backup.issue_source_unavailable")
         case .accountStorageFull(let name, let required, let available):
             L10n.string(
                 "error.upload_account_storage_full \(name) \(L10n.fileSize(required)) \(L10n.fileSize(available))")

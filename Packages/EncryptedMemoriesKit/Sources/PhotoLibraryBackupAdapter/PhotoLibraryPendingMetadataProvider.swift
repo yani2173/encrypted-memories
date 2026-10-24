@@ -38,7 +38,7 @@ public struct PhotoLibraryPendingMetadataProvider: PendingSourceMetadataProvidin
         return PendingPresentationMetadata(
             captureTime: entry.creationDate ?? entry.modificationDate ?? entry.firstSeenAt,
             mediaType: primary?.mimeType ?? (isVideo ? "video/quicktime" : "image/jpeg"),
-            isLivePhoto: entry.isLivePhoto,
+            isLivePhoto: entry.isLivePhoto && !entry.livePlaybackOff,
             durationSeconds: isVideo && entry.durationSeconds > 0 ? entry.durationSeconds : nil,
             displayName: primary?.originalFilename ?? ""
         )

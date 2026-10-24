@@ -16,6 +16,57 @@ import ProtonDriveBackend
 import TimelineCore
 import UploadCore
 
+@MainActor private struct MacAccountOwners {
+    let backend: Task<Void, Never>?
+    let scopeRecovery: Task<Void, Never>?
+    let facade: ProtonClientFacade?
+    let folderBackup: FolderBackupController?
+    let photoBackup: PhotoLibraryBackupController?
+    let pending: RetiredPendingGrid
+    let albumSync: AlbumSyncController?
+    let smartSearch: AppleSmartSearchSession
+    let sourceAnalysis: LibrarySourceAnalysisSession
+    let assets: MLAssetUniverse
+    var smartSearchShutdown: Task<Void, Never>?
+    var sourceAnalysisShutdown: Task<Void, Never>?
+
+    func makeCoordinator(
+        signingOut: Bool, purge: @escaping AccountOwnerGraphFactory.Shutdown
+    ) throws -> AccountTeardownCoordinator {
+        let location: AccountOwnerGraphFactory.Shutdown? =
+            signingOut
+            ? { @MainActor @Sendable in
+                await OfflineLibraryManager.shared.stopForAccountTeardown()
+            } : nil
+        let closePendingSession: AccountOwnerGraphFactory.Shutdown? = pending.session.map { session in
+            { @MainActor @Sendable in await session.close() }
+        }
+        // The purge deletes the account directory; the pending store must be closed first.
+        let closePendingStore: AccountOwnerGraphFactory.Shutdown? = pending.store.map { store in
+            { @MainActor @Sendable in store.close() }
+        }
+        return try AccountOwnerGraphFactory.makeCoordinator(
+            profile: signingOut ? .macSignOut : .macScopeRecovery,
+            platformTasks: {
+                await backend?.value
+                if signingOut {
+                    await scopeRecovery?.value
+                } else {
+                    await OfflineLibraryManager.shared.stopForAccountTeardown()
+                }
+            },
+            smartSearch: {
+                await smartSearchShutdown?.value
+                await sourceAnalysisShutdown?.value
+            }, locationCrawl: location, folderBackup: { await folderBackup?.shutdown() },
+            closePendingSession: closePendingSession,
+            photoBackup: { await photoBackup?.shutdown() }, closePendingStore: closePendingStore,
+            albumSync: { await albumSync?.shutdown() }, facade: { await facade?.shutdown() },
+            caches: { await OfflineLibraryManager.shared.purgeCachesForAccountTeardown() },
+            logs: { await DebugLog.flush() }, purge: purge)
+    }
+}
+
 /// Root application state + composition. Owns the session lifecycle and builds the SDK-backed
 /// services once the user is signed in.
 @MainActor
@@ -42,23 +93,37 @@ final class AppModel {
         case failed(String)
     }
 
+    /// Native Settings navigation; no persisted preference or account behavior.
+    var selectedSettingsTab: MacSettingsTabs.Tab.ID = .account
+
     private(set) var auth: AuthState = .checking
     private(set) var backend: BackendState = .idle
     /// High-level client composition (uploads + albums), built alongside the backend.
-    private(set) var facade: ProtonClientFacade?
+    private(set) var facade: ProtonClientFacade? {
+        didSet {
+            guard facade !== oldValue else { return }
+            duplicatesLifetime.retire()
+            // The Duplicates screen scans only when it opens, and a library window may not be open. A merge that the
+            // end of the app left open is checked now; a new account or a sign-out ends the check of the earlier one.
+            duplicatesLifetime.checkPendingMerges(of: facade?.exactDuplicates)
+        }
+    }
+    @ObservationIgnored private let duplicatesLifetime = ExactDuplicatesAccountLifetime()
     /// macOS folder-backup composition. This type owns folder access and lifecycle; sync semantics stay in core.
     private(set) var backupController: FolderBackupController?
     private(set) var photoBackupController: PhotoLibraryBackupController?
-    /// Local photos on their way to Proton, merged into the whole-library grid (shared with iOS).
-    private(set) var pendingGrid: PendingGridSession?
-    @ObservationIgnored private var pendingStore: PendingBackupManifestStore?
-    /// Local photos in "Zuletzt gelöscht", shown with the Proton trash.
-    private(set) var pendingTrash = PendingTrashPresentation.empty
-    /// Photos deleted before upload, for the Backup settings list.
-    private(set) var excludedPendingTiles: [PendingTile] = []
-    /// Changes when pending favorite intents change, so favorite displays refresh.
-    private(set) var pendingFavoriteRevision: UInt64 = 0
-    @ObservationIgnored private var lastFavoriteIntents: [PhotoUID: Bool] = [:]
+    /// The pending grid of this account and its lists, shared with iOS. `PendingGridConnection` describes each one.
+    @ObservationIgnored private let pendingGridConnection = PendingGridConnection()
+    var pendingGrid: PendingGridSession? { pendingGridConnection.session }
+    /// The presentation callback for `session`: it calls `apply` only while the connection shows that session.
+    func pendingPresentationHandler(
+        for session: PendingGridSession, apply: @escaping (PendingTimelinePresentation) -> Void
+    ) -> (PendingTimelinePresentation) -> Void {
+        pendingGridConnection.presentationHandler(for: session, apply: apply)
+    }
+    var pendingTrash: PendingTrashPresentation { pendingGridConnection.trash }
+    var excludedPendingTiles: [PendingTile] { pendingGridConnection.excludedTiles }
+    var pendingFavoriteRevision: UInt64 { pendingGridConnection.favoriteRevision }
     private(set) var albumSyncController: AlbumSyncController?
     /// Bumped after album sync creates or mutates Proton albums. Views use it only to refresh
     /// visible album lists; sync correctness lives in the shared controller.
@@ -114,8 +179,8 @@ final class AppModel {
 
     private let sessionStore: SessionKeychainStore
     private let authController: ProtonAuthController
-    private var startupPurgeBlocked: Bool
-    private var startupCleanupTask: Task<Void, Never>?
+    /// The startup and sign-in guard shared with iOS: no session starts before the sign-out purge and cleanup ended.
+    private let startupCleanup = ProtonAuthStartupCleanup()
     private var didBootstrap = false
     private let webAuthenticationSession = ManagedWebAuthenticationSession()
     private let webAuthenticationPresentationContext = ManagedWebAuthenticationPresentationContext {
@@ -130,6 +195,8 @@ final class AppModel {
     }
     private let photoBackupScheduler = MacPhotoBackupScheduler()
     private var backendTask: Task<Void, Never>?
+    /// One retry of the backend at a time; the failed preparation ends before the next one starts.
+    @ObservationIgnored private let backendRetry = BackendRetrySequence()
     private var scopeRecoveryTask: Task<Void, Never>?
 
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
@@ -139,26 +206,16 @@ final class AppModel {
             store: store,
             authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories)
         )
-        self.startupPurgeBlocked = true
-        self.startupCleanupTask = nil
         // Wire ProtonCore's CryptoGo to the patched GopenPGP implementation before any crypto runs.
         injectDefaultCryptoImplementation()
         beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)
     }
 
     private func beginStartupCleanup(plaintextPurgeSucceeded: Bool? = nil, signInAfterCleanup: Bool = false) {
-        guard startupCleanupTask == nil else { return }
-        let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
-        startupPurgeBlocked = true
+        guard !startupCleanup.isRunning else { return }
         auth = .checking
-        startupCleanupTask = Task { @MainActor [weak self] in
-            let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(
-                claim: purgeClaim,
-                plaintextPurgeSucceeded: plaintextPurgeSucceeded
-            )
+        startupCleanup.begin(plaintextPurgeSucceeded: plaintextPurgeSucceeded) { [weak self] succeeded in
             guard let self else { return }
-            self.startupPurgeBlocked = !succeeded
-            self.startupCleanupTask = nil
             if succeeded, signInAfterCleanup {
                 self.signIn()
             } else {
@@ -170,10 +227,10 @@ final class AppModel {
 
     /// Restore a persisted session on launch.
     func bootstrap() {
-        guard startupCleanupTask == nil else { return }
+        guard !startupCleanup.isRunning else { return }
         guard !didBootstrap else { return }
         didBootstrap = true
-        guard !startupPurgeBlocked else {
+        guard startupCleanup.succeeded else {
             auth = .signedOut(error: L10n.string("auth.sign_in_failed"))
             return
         }
@@ -182,10 +239,14 @@ final class AppModel {
 
     func signIn() {
         guard !signOutBarrier.isRunning else { return }
-        guard startupCleanupTask == nil else { return }
-        guard !startupPurgeBlocked, !BackupLocalDataPurge.isPurgePending() else {
+        switch startupCleanup.admitSignIn() {
+        case .waitForCleanup:
+            return
+        case .cleanUpFirst:
             beginStartupCleanup(signInAfterCleanup: true)
             return
+        case .proceed:
+            break
         }
         authController.signIn(
             openURL: { [weak self] url in
@@ -220,28 +281,11 @@ final class AppModel {
         LibraryRuntimeState.shared.beginNewGeneration()
         AccountInfo.shared.clear()
         OfflineLibraryManager.shared.prepareForAccountTeardown()
-        BackupLocalDataPurge.requestPurgeOnSignOut(
-            persistentDomainName: Bundle.main.bundleIdentifier
-        )
+        ProtonAuthStartupCleanup.armPurgeForSignOut()
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         pendingSignOutPurgeClaim = purgeClaim
         let signedOutState = authController.signOut()
-        let activeScopeRecovery = scopeRecoveryTask
-        activeScopeRecovery?.cancel()
-        scopeRecoveryTask = nil
-        let activeFacade = facade
-        let folderBackup = backupController
-        let photoBackup = photoBackupController
-        let activePendingGrid = retirePendingGrid()
-        let albumSync = albumSyncController
-        auth = .signingOut
-        let backendShutdown = backendTask
-        backendTask?.cancel()
-        backendTask = nil
-        backend = .idle
-        searchSuggestions.reset()
-        let smartSearchShutdown = smartSearchSession.stop()
-        let sourceAnalysisShutdown = stopSourceAnalysis()
+        let active = captureAndCancelTransientOwners(signingOut: true)
         backupController = nil
         photoBackupScheduler.invalidate()
         photoBackupController = nil
@@ -251,46 +295,12 @@ final class AppModel {
         libraryReady = false
         let teardownCoordinator: AccountTeardownCoordinator
         do {
-            teardownCoordinator = try AccountTeardownCoordinator(owners: [
-                AccountTeardownOwner(id: "mac.platform-build", stage: .platformTasks) {
-                    await backendShutdown?.value
-                    await activeScopeRecovery?.value
-                },
-                AccountTeardownOwner(id: "shared.smart-search", stage: .smartSearch) {
-                    await smartSearchShutdown?.value
-                    await sourceAnalysisShutdown?.value
-                },
-                AccountTeardownOwner(id: "mac.location-crawl", stage: .locationCrawl) {
-                    await OfflineLibraryManager.shared.stopForAccountTeardown()
-                },
-                AccountTeardownOwner(id: "mac.folder-backup", stage: .folderBackup) {
-                    await folderBackup?.shutdown()
-                },
-                AccountTeardownOwner(id: "shared.photo-backup", stage: .photoBackup) {
-                    await activePendingGrid.session?.close()
-                    await photoBackup?.shutdown()
-                    // The purge deletes the account directory; the pending store must be closed first.
-                    activePendingGrid.store?.close()
-                },
-                AccountTeardownOwner(id: "shared.album-sync", stage: .albumSync) {
-                    await albumSync?.shutdown()
-                },
-                AccountTeardownOwner(id: "shared.proton-facade", stage: .facade) {
-                    await activeFacade?.shutdown()
-                },
-                AccountTeardownOwner(id: "mac.offline-caches", stage: .caches) {
-                    await OfflineLibraryManager.shared.purgeCachesForAccountTeardown()
-                },
-                AccountTeardownOwner(id: "shared.debug-log", stage: .logs) {
-                    await DebugLog.flush()
-                },
-                AccountTeardownOwner(id: "shared.local-data-claim", stage: .purgeClaims) {
-                    guard let purgeClaim else { throw TeardownFailure.purgeClaimUnavailable }
-                    PendingReplacementLedger.clearForSignOut()
-                    let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
-                    guard succeeded else { throw TeardownFailure.purgeFailed }
-                },
-            ])
+            teardownCoordinator = try active.makeCoordinator(signingOut: true) {
+                guard let purgeClaim else { throw TeardownFailure.purgeClaimUnavailable }
+                PendingReplacementLedger.clearForSignOut()
+                let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
+                guard succeeded else { throw TeardownFailure.purgeFailed }
+            }
         } catch {
             preconditionFailure("Duplicate account teardown owner identifier")
         }
@@ -325,9 +335,32 @@ final class AppModel {
         }
     }
 
+    /// Retries a failed preparation. A failed preparation leaves no facade: `prepareBackend` assigns one only after
+    /// `makeFacade` succeeded, and a failed scope recovery shut its facade down first. So two backends never work on
+    /// the account's files, a retry starts only without a facade, and only after the failed preparation ended.
     func retryBackend() {
-        guard scopeRecoveryTask == nil else { return }
-        if case .signedIn(let session) = auth { prepareBackend(session) }
+        guard scopeRecoveryTask == nil, case .failed = backend, case .signedIn(let session) = auth else { return }
+        guard facade == nil else {
+            DebugLog.log("backend retry: a failed state still holds a facade; the retry starts nothing")
+            assertionFailure("A failed backend state must not hold a facade")
+            return
+        }
+        let failed = backendTask
+        Task {
+            await backendRetry.run(
+                retire: { [weak self] in
+                    // A sign-out must still find a preparation that replaced the failed one meanwhile.
+                    if self?.backendTask == failed { self?.backendTask = nil }
+                    await failed?.value
+                },
+                start: { [weak self] in
+                    // Another preparation that began meanwhile keeps running; the retry starts no second one.
+                    guard let self, self.scopeRecoveryTask == nil, self.facade == nil, self.backendTask == nil,
+                        case .signedIn(let current) = self.auth, current == session
+                    else { return }
+                    self.prepareBackend(session)
+                })
+        }
     }
 
     /// A terminal Drive scope event invalidates every local projection for that volume. Keep authentication,
@@ -337,24 +370,11 @@ final class AppModel {
             case .signedIn(let session) = auth
         else { return }
 
-        let activeBackendTask = backendTask
-        let activeFacade = facade
-        let folderBackup = backupController
-        let photoBackup = photoBackupController
-        let activePendingGrid = retirePendingGrid()
-        let albumSync = albumSyncController
-        searchSuggestions.reset()
-        let smartSearchShutdown = smartSearchSession.stop()
-        let sourceAnalysisShutdown = stopSourceAnalysis()
+        let active = captureAndCancelTransientOwners(signingOut: false)
         let policy = ProtonDriveBackendPolicy.standard(
             libraryDatabasePolicy: ProtonDriveBackendPolicy.desktopLibraryDatabasePolicy
         )
 
-        LibraryRuntimeState.shared.beginNewGeneration()
-        OfflineLibraryManager.shared.prepareForAccountTeardown()
-        activeBackendTask?.cancel()
-        backendTask = nil
-        backend = .preparing(String(localized: "loading.building_library"))
         backupController = nil
         photoBackupScheduler.invalidate()
         photoBackupController = nil
@@ -365,41 +385,11 @@ final class AppModel {
 
         let coordinator: AccountTeardownCoordinator
         do {
-            coordinator = try AccountTeardownCoordinator(owners: [
-                AccountTeardownOwner(id: "mac.scope-recovery.platform", stage: .platformTasks) {
-                    await activeBackendTask?.value
-                    await OfflineLibraryManager.shared.stopForAccountTeardown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.smart-search", stage: .smartSearch) {
-                    await smartSearchShutdown?.value
-                    await sourceAnalysisShutdown?.value
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.folder-backup", stage: .folderBackup) {
-                    await folderBackup?.shutdown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.photo-backup", stage: .photoBackup) {
-                    await activePendingGrid.session?.close()
-                    await photoBackup?.shutdown()
-                    activePendingGrid.store?.close()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.album-sync", stage: .albumSync) {
-                    await albumSync?.shutdown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.facade", stage: .facade) {
-                    await activeFacade?.shutdown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.caches", stage: .caches) {
-                    await OfflineLibraryManager.shared.purgeCachesForAccountTeardown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.logs", stage: .logs) {
-                    await DebugLog.flush()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.account-data", stage: .purgeClaims) {
-                    await Task.detached(priority: .utility) {
-                        ProtonDriveBackendFactory.purgeLocalAccountData(uid: session.uid, policy: policy)
-                    }.value
-                },
-            ])
+            coordinator = try active.makeCoordinator(signingOut: false) {
+                await Task.detached(priority: .utility) {
+                    ProtonDriveBackendFactory.purgeLocalAccountData(uid: session.uid, policy: policy)
+                }.value
+            }
         } catch {
             preconditionFailure("Duplicate scope recovery owner identifier")
         }
@@ -421,6 +411,38 @@ final class AppModel {
         }
         scopeRecoveryTask = task
         await task.value
+    }
+
+    /// Captures every native owner before cancellation can clear an account slot.
+    private func captureAndCancelTransientOwners(signingOut: Bool) -> MacAccountOwners {
+        AccountOwnerGraphFactory.captureAndCancel(
+            {
+                MacAccountOwners(
+                    backend: backendTask, scopeRecovery: signingOut ? scopeRecoveryTask : nil,
+                    facade: facade, folderBackup: backupController, photoBackup: photoBackupController,
+                    pending: pendingGridConnection.retire(), albumSync: albumSyncController,
+                    smartSearch: smartSearchSession, sourceAnalysis: sourceAnalysis, assets: smartSearchAssets)
+            },
+            cancel: { active in
+                if signingOut {
+                    active.scopeRecovery?.cancel()
+                    scopeRecoveryTask = nil
+                    auth = .signingOut
+                    active.backend?.cancel()
+                    backendTask = nil
+                    backend = .idle
+                }
+                searchSuggestions.reset()
+                active.smartSearchShutdown = active.smartSearch.stop()
+                active.sourceAnalysisShutdown = stopSourceAnalysis()
+                if !signingOut {
+                    LibraryRuntimeState.shared.beginNewGeneration()
+                    OfflineLibraryManager.shared.prepareForAccountTeardown()
+                    active.backend?.cancel()
+                    backendTask = nil
+                    backend = .preparing(String(localized: "loading.building_library"))
+                }
+            })
     }
 
     @discardableResult
@@ -494,7 +516,20 @@ final class AppModel {
         Task { await runtime.refresh() }
     }
 
+    func makeDuplicatesModel(
+        for facade: ProtonClientFacade,
+        didTrash: @escaping @MainActor ([PhotoUID], ExactDuplicatesAccountLifetime.Token) async -> Void
+    ) -> ExactDuplicatesModel? {
+        guard self.facade === facade, case .ready = backend else { return nil }
+        return duplicatesLifetime.replace(with: facade.exactDuplicates, didTrash: didTrash)
+    }
+
+    func isCurrentDuplicatesAccount(_ token: ExactDuplicatesAccountLifetime.Token) -> Bool {
+        duplicatesLifetime.isCurrent(token)
+    }
+
     private func prepareBackend(_ session: ProtonSession) {
+        duplicatesLifetime.retire()
         LibraryRuntimeState.shared.beginNewGeneration()
         backendTask?.cancel()
         libraryReady = false
@@ -518,22 +553,20 @@ final class AppModel {
                     return
                 }
                 facade = client
-                let pendingStore = PendingGridSession.openStore(
+                // The pending store, the photo backup and album sync are built the same way on iOS.
+                let stack = AccountBackupStack(
                     accountDataDirectory: client.accountDataDirectory,
-                    policy: client.accountDatabasePolicy
-                )
-                let photoBackup = PhotoLibraryBackupController(
-                    configuration: .init(
-                        accountDataDirectory: client.accountDataDirectory,
-                        databasePolicy: client.accountDatabasePolicy
-                    ),
+                    databasePolicy: client.accountDatabasePolicy,
                     identityResolver: client.uploadIdentityResolver,
                     uploader: client.photoUploader,
                     tagAdder: client.photoTagAdder,
                     editReplacement: client.editedPhotoReplacement,
-                    pendingStore: pendingStore,
-                    requiresPendingStore: true
+                    albumOperations: client.albumSyncRemoteOps
                 )
+                let pendingStore = stack.pendingStore
+                let photoBackup = stack.photoBackup
+                let previousPhotoBackup = photoBackupController
+                let previousFolderBackup = backupController
                 photoBackupController = photoBackup
                 photoBackupScheduler.configure(controller: photoBackup)
                 // Watched folders share the pending store and the photo backup's event stream.
@@ -541,22 +574,20 @@ final class AppModel {
                     facade: client, pendingStore: pendingStore, pendingRecorder: photoBackup.pendingRecorder,
                     requiresPendingStore: true)
                 backupController = folderBackup
-                configurePendingGrid(
+                let replacedPendingGrid = configurePendingGrid(
                     store: pendingStore, photoBackup: photoBackup, folderBackup: folderBackup, client: client)
-                let albumSync = AlbumSyncController(
-                    configuration: .init(
-                        accountDataDirectory: client.accountDataDirectory,
-                        databasePolicy: client.accountDatabasePolicy
-                    ),
-                    identityResolver: client.uploadIdentityResolver,
-                    uploader: client.photoUploader,
-                    remoteOps: client.albumSyncRemoteOps
-                )
+                let albumSync = stack.albumSync
                 albumSync.setRemoteAlbumsChangedHandler { [weak self] in
                     self?.albumCatalogRevision &+= 1
                 }
                 albumSyncController = albumSync
                 await client.uploadCoordinator.start()
+                // No current flow is known to hand back a non-empty pair here; a second sign-in is not proven
+                // unreachable. A pair that a replacing start left is closed here, after every assignment of this
+                // block and right before the guard that re-checks the account.
+                await replacedPendingGrid.close(
+                    beforeSession: { await previousFolderBackup?.shutdown() },
+                    whileStoreOpen: { await previousPhotoBackup?.shutdown() })
                 guard !Task.isCancelled, facade === client, authController.currentSession == session else { return }
                 backend = .ready(client.backend)
                 // Register account caches after construction so pressure events can manage their budgets.
@@ -573,60 +604,32 @@ final class AppModel {
 
     // MARK: - Pending grid
 
+    /// Starts the pending grid and returns the session and store that this start replaced. The caller closes them
+    /// (`RetiredPendingGrid.close`). The previous folder backup and photo backup controllers, which also write to
+    /// that store, shut down only in that close; without a replaced pair nothing shuts them down here.
     private func configurePendingGrid(
         store: PendingBackupManifestStore?,
         photoBackup: PhotoLibraryBackupController,
         folderBackup: FolderBackupController,
         client: ProtonClientFacade
-    ) {
-        pendingStore = store
-        guard let store,
-            let session = PendingGridSession(
-                store: store,
-                photoBackup: photoBackup,
-                remote: ProtonPendingRemoteEffects(facade: client),
-                files: folderBackup.pendingFileSource
-            )
-        else { return }
-        session.onListsChange = { [weak self, weak session] in
-            guard let self, let session else { return }
-            pendingTrash = session.trash
-            excludedPendingTiles = session.excludedTiles
-        }
-        session.onPendingChange = { [weak self] snapshot in
-            guard let self, snapshot.favoriteIntents != lastFavoriteIntents else { return }
-            lastFavoriteIntents = snapshot.favoriteIntents
-            pendingFavoriteRevision &+= 1
-        }
+    ) -> RetiredPendingGrid {
         let albums = client.albums
-        Task { [weak session] in
-            await albums.setPendingAlbumAdds { [weak session] uids, albumID in
-                await session?.addToAlbum(uids, albumID: albumID) ?? false
-            }
-        }
-        pendingGrid = session
-        session.start()
-    }
-
-    /// Detaches the pending grid from the model. The caller closes the session before the backup controller
-    /// shuts down, and the store after it.
-    private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
-        let retired = (pendingGrid, pendingStore)
-        pendingGrid = nil
-        pendingStore = nil
-        pendingTrash = .empty
-        excludedPendingTiles = []
-        lastFavoriteIntents = [:]
-        pendingFavoriteRevision &+= 1
-        return retired
+        return pendingGridConnection.start(
+            store: store,
+            makeSession: { store in
+                PendingGridSession(
+                    store: store,
+                    photoBackup: photoBackup,
+                    remote: ProtonPendingRemoteEffects(facade: client),
+                    files: folderBackup.pendingFileSource
+                )
+            },
+            albumAdds: { await albums.setPendingAlbumAdds($0) }
+        ).replaced
     }
 
     private func apply(_ state: ProtonAuthState, prepareBackendOnSignedIn: Bool) {
-        if case .authenticating = state {
-            // Keep the managed browser alive while the shared fork flow polls Proton.
-        } else {
-            webAuthenticationSession.cancel()
-        }
+        webAuthenticationSession.follow(state)
         switch state {
         case .checking:
             auth = .checking

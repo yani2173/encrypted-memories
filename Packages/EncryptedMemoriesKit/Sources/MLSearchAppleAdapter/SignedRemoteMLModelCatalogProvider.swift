@@ -74,12 +74,9 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
     }
 
     public static let catalogURL = URL(string: "https://models.oncloud.at/catalog-v1.json")!
-    public static let activePairURL = URL(string: "https://models.oncloud.at/active-pair.json")!
-    public static let catalogV2URL = URL(string: "https://models.oncloud.at/catalog-v2.json")!
     public static let artifactBaseURL = URL(string: "https://models.oncloud.at/models/")!
 
     private static let defaultSignatureURL = URL(string: "https://models.oncloud.at/catalog-v1.sig")!
-    private static let defaultV2SignatureURL = URL(string: "https://models.oncloud.at/catalog-v2.sig")!
     private static let publicKeyBase64 = "qXMyoYhp7TbPPXPAyEKDoy+kkl8He7I5RNXWgjNc5Kk="
     private static let maximumCatalogBytes = 1 << 20
     private static let acceptedStateLock = NSLock()
@@ -105,29 +102,8 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
     public init(
         trustedCatalog: MLModelCatalog,
         cacheDirectory: URL,
-        session: URLSession = .shared,
-        legacyCacheDirectory: URL? = nil
-    ) {
-        self.init(
-            trustedCatalog: trustedCatalog,
-            cacheDirectory: cacheDirectory,
-            session: session,
-            catalogVersion: .v2,
-            catalogURL: Self.activePairURL,
-            signatureURL: Self.defaultV2SignatureURL,
-            legacyCatalogURL: Self.catalogURL,
-            legacySignatureURL: Self.defaultSignatureURL,
-            legacyCacheDirectory: legacyCacheDirectory,
-            artifactBaseURL: Self.artifactBaseURL,
-            publicKey: Data(base64Encoded: Self.publicKeyBase64) ?? Data()
-        )
-    }
-
-    public init(
-        trustedCatalog: MLModelCatalog,
-        cacheDirectory: URL,
         endpoint: AppleSmartSearchCatalogEndpoint,
-        session: URLSession = .shared,
+        session: URLSession = MLModelNetworkSession.shared,
         legacyCacheDirectory: URL? = nil
     ) {
         self.init(
@@ -144,7 +120,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         trustedCatalog: MLModelCatalog,
         cacheDirectory: URL,
         endpoint: AppleSmartSearchCatalogEndpoint,
-        session: URLSession = .shared,
+        session: URLSession = MLModelNetworkSession.shared,
         legacyCacheDirectory: URL? = nil,
         publicKey: Data
     ) {
@@ -192,7 +168,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         trustedCatalog: MLModelCatalog,
         cacheDirectory: URL,
         version: MLRemoteCatalogVersion,
-        session: URLSession = .shared,
+        session: URLSession = MLModelNetworkSession.shared,
         catalogURL: URL,
         signatureURL: URL,
         legacyCatalogURL: URL? = nil,
@@ -257,6 +233,9 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
             self.pointerCacheURL = nil
         }
     }
+
+    /// The configuration of the session that fetches signed catalogs.
+    var sessionConfiguration: URLSessionConfiguration { session.configuration }
 
     public func catalog() async throws -> MLModelCatalog {
         switch catalogVersion {

@@ -58,6 +58,8 @@ public struct BackupSyncProgress: Sendable, Equatable {
     public var failed = 0
     /// Permanent failures the user acknowledged. Still not backed up, but no longer attention work.
     public var dismissedFailures = 0
+    /// Work still owed for acknowledged missing photos, already counted in dismissedFailures.
+    public var pendingSourceRechecks = 0
     public var paused = 0
     /// The file currently being processed, for "wird geprüft: IMG_0042.HEIC" style rows.
     public var currentItemName: String?
@@ -66,6 +68,9 @@ public struct BackupSyncProgress: Sendable, Equatable {
     /// True while the throttle policy holds the running pass at zero concurrency
     /// (e.g. critical thermal pressure) - "paused", not "working".
     public var isPausedByPolicy = false
+    /// True while that policy pause holds only because mobile data is off for backups on an expensive network.
+    /// The device is online; the status says "Waiting for Wi-Fi", never "offline".
+    public var isWaitingForWiFi = false
     /// Remote duplicate-index preparation runs before item work so a large encrypted metadata
     /// refresh is visible and resumable instead of looking like a frozen backup counter.
     public var remoteIndexPreparation: UploadRemoteIndexPreparationProgress?
@@ -77,9 +82,9 @@ public struct BackupSyncProgress: Sendable, Equatable {
     public var remoteContentIndexHealth: UploadRemoteContentIndexHealth = .complete(indexedCount: 0)
     /// In-memory only; see `BackupActiveTransferProgress`.
     public var activeTransfer: BackupActiveTransferProgress?
-    /// Bytes the runner has sent since it started: finished transfers and the sent share of active ones. It only
-    /// grows while the runner lives. In-memory only; the upload speed is its growth over time (`BackupTransferRate`).
-    public var transferredBytes: Int64 = 0
+    /// Bytes sent by the runner so far. In-memory only. It never decreases while the runner lives, also not when
+    /// an item ends; the upload speed is the rate of this counter.
+    public var transferredByteCount: Int64 = 0
     /// Fractional item-equivalents across identity reads, deferred exports and SDK uploads. The runner
     /// combines stages per item monotonically; OS progress can move before upload bytes exist.
     public var activeExecutionItemEquivalents: Double = 0
@@ -108,7 +113,7 @@ public struct BackupSyncProgress: Sendable, Equatable {
     public var needsAttention: Int { failed + sourceMissing }
 
     public var hasOutstandingWork: Bool {
-        waiting + checking + uploading + blocked > 0
+        waiting + checking + uploading + blocked + pendingSourceRechecks > 0
     }
 
     /// Seeds the queue-derived counters from a summary; live fields stay as set by the runner.
@@ -130,6 +135,7 @@ public struct BackupSyncProgress: Sendable, Equatable {
         blocked = summary.blocked
         failed = summary.failed
         dismissedFailures = summary.dismissedFailures
+        pendingSourceRechecks = summary.pendingSourceRechecks
         paused = summary.paused
         self.currentItemName = currentItemName
         self.isRunning = isRunning

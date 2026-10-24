@@ -1,5 +1,10 @@
 import Foundation
 import Photos
+import os
+
+#if ENCRYPTED_MEMORIES_UPGRADE_TEST
+    import PhotosCore
+#endif
 
 struct PhotoLibraryLiveChangeBuffer {
     struct Snapshot: Equatable {
@@ -86,18 +91,97 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         /// The stored token no longer resolves (expired history / first run) - callers fall back
         /// to a full cheap rescan, which preflight keeps mostly read-only.
         public var requiresFullRescan: Bool
+
+        public init(changedIdentifiers: [String], deletedIdentifiers: [String], requiresFullRescan: Bool) {
+            self.changedIdentifiers = changedIdentifiers
+            self.deletedIdentifiers = deletedIdentifiers
+            self.requiresFullRescan = requiresFullRescan
+        }
     }
 
     public struct PreparedChangeSet: @unchecked Sendable {
         public let changes: ChangeSet
-        fileprivate let commitToken: PHPersistentChangeToken
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            fileprivate let commitToken: PHPersistentChangeToken?
+        #else
+            fileprivate let commitToken: PHPersistentChangeToken
+        #endif
         fileprivate let liveGeneration: UInt64
     }
 
+    private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "Backup")
     private let tokenURL: URL
-    private let fetchObservedAssets: @Sendable () -> PHFetchResult<PHAsset>
+    struct LiveChange: @unchecked Sendable {
+        let assets: PHFetchResult<PHAsset>
+        let changed: Set<String>
+        let deleted: Set<String>
+        let requiresFullRescan: Bool
+    }
+
+    struct Operations: Sendable {
+        var fetch: @Sendable () -> PHFetchResult<PHAsset> = {
+            let options = PHFetchOptions()
+            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            return PHAsset.fetchAssets(with: options)
+        }
+        var register: @Sendable (any PHPhotoLibraryChangeObserver) -> Void = { PHPhotoLibrary.shared().register($0) }
+        var unregister: @Sendable (any PHPhotoLibraryChangeObserver) -> Void = {
+            PHPhotoLibrary.shared().unregisterChangeObserver($0)
+        }
+        var details: @Sendable (PHChange, PHFetchResult<PHAsset>) -> LiveChange? = { change, assets in
+            guard let details = change.changeDetails(for: assets) else { return nil }
+            return LiveChange(
+                assets: details.fetchResultAfterChanges,
+                changed: details.hasIncrementalChanges
+                    ? Set((details.insertedObjects + details.changedObjects).map(\.localIdentifier)) : [],
+                deleted: details.hasIncrementalChanges ? Set(details.removedObjects.map(\.localIdentifier)) : [],
+                requiresFullRescan: !details.hasIncrementalChanges)
+        }
+    }
+
+    private let operations: Operations
     private let lock = NSLock()
-    private var onLibraryChange: (@Sendable () -> Void)?
+    private final class Callback: Sendable {
+        let handler: @Sendable () -> Void
+        init(_ handler: @escaping @Sendable () -> Void) { self.handler = handler }
+    }
+
+    /// Cancelling a subscription leaves every other consumer observing. Retain it for the consumer's lifetime.
+    public final class Subscription: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancellation: (@Sendable () -> Void)?
+
+        fileprivate init(_ cancellation: @escaping @Sendable () -> Void) { self.cancellation = cancellation }
+
+        public func cancel() {
+            let action = lock.withLock {
+                let action = cancellation
+                cancellation = nil
+                return action
+            }
+            action?()
+        }
+
+        deinit { cancel() }
+    }
+
+    private final class Registration: NSObject, PHPhotoLibraryChangeObserver, @unchecked Sendable {
+        weak var monitor: PhotoLibraryChangeMonitor?
+        let generation: UInt64
+
+        init(monitor: PhotoLibraryChangeMonitor, generation: UInt64) {
+            self.monitor = monitor
+            self.generation = generation
+        }
+
+        func photoLibraryDidChange(_ changeInstance: PHChange) {
+            monitor?.receive(changeInstance, generation: generation)
+        }
+    }
+
+    private let legacyID = UUID()
+    private var callbacks: [UUID: Callback] = [:]
+    private var registration: Registration?
     private var observedAssets: PHFetchResult<PHAsset>?
     private var liveChanges = PhotoLibraryLiveChangeBuffer()
     private var isObserving = false
@@ -105,40 +189,57 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
     private var observationGeneration: UInt64 = 0
 
     public convenience init(tokenURL: URL) {
-        self.init(tokenURL: tokenURL) {
-            let options = PHFetchOptions()
-            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-            return PHAsset.fetchAssets(with: options)
-        }
+        self.init(tokenURL: tokenURL, operations: Operations())
     }
 
-    init(
+    convenience init(
         tokenURL: URL,
         fetchObservedAssets: @escaping @Sendable () -> PHFetchResult<PHAsset>
     ) {
+        var operations = Operations()
+        operations.fetch = fetchObservedAssets
+        self.init(tokenURL: tokenURL, operations: operations)
+    }
+
+    init(tokenURL: URL, operations: Operations) {
         self.tokenURL = tokenURL
-        self.fetchObservedAssets = fetchObservedAssets
+        self.operations = operations
         super.init()
     }
 
     deinit {
-        if isObserving { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
+        if let registration { operations.unregister(registration) }
     }
 
-    /// Starts the in-session observer. `handler` fires (debounced by the caller) whenever the
-    /// library changes while the app runs. The initial full-library fetch runs on a utility task
-    /// so a foreground controller never blocks its actor while PhotoKit creates the snapshot.
+    /// Starts or replaces the legacy subscription. Its stop never cancels another consumer.
     public func startObserving(_ handler: @Sendable @escaping () -> Void) {
-        let generation: UInt64? = lock.withLock {
-            onLibraryChange = handler
-            guard !isObserving, !isStarting else { return nil }
+        addSubscriber(id: legacyID, handler: handler)
+    }
+
+    public func stopObserving() { removeSubscriber(id: legacyID) }
+
+    public func subscribe(_ handler: @Sendable @escaping () -> Void) -> Subscription {
+        let id = UUID()
+        addSubscriber(id: id, handler: handler)
+        return Subscription { [weak self] in self?.removeSubscriber(id: id) }
+    }
+
+    private func addSubscriber(id: UUID, handler: @Sendable @escaping () -> Void) {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested { return }
+        #endif
+        let (generation, replaced): (UInt64?, Callback?) = lock.withLock {
+            let replaced = callbacks.updateValue(Callback(handler), forKey: id)
+            guard !isObserving, !isStarting else { return (nil, replaced) }
             isStarting = true
             observationGeneration &+= 1
-            return observationGeneration
+            return (observationGeneration, replaced)
         }
+        // Releasing a client closure can destroy another subscription and re-enter cancellation.
+        withExtendedLifetime(replaced) {}
         guard let generation else { return }
 
-        let fetchObservedAssets = self.fetchObservedAssets
+        let fetchObservedAssets = operations.fetch
         Task.detached(priority: .utility) { [weak self] in
             let assets = ObservedAssetsBox(fetchObservedAssets())
             guard !Task.isCancelled else { return }
@@ -146,76 +247,82 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         }
     }
 
-    public func stopObserving() {
-        let shouldUnregister = lock.withLock {
-            onLibraryChange = nil
+    private func removeSubscriber(id: UUID) {
+        let (removed, retired): (Callback?, Registration?) = lock.withLock {
+            let removed = callbacks.removeValue(forKey: id)
+            guard callbacks.isEmpty else { return (removed, nil) }
             observationGeneration &+= 1
             isStarting = false
-            guard isObserving else { return false }
             isObserving = false
             observedAssets = nil
             liveChanges.reset()
-            return true
+            let retired = registration
+            registration = nil
+            return (removed, retired)
         }
-        if shouldUnregister {
-            PHPhotoLibrary.shared().unregisterChangeObserver(self)
-        }
+        if let retired { operations.unregister(retired) }
+        withExtendedLifetime(removed) {}
     }
 
     private func finishStarting(with assets: ObservedAssetsBox, generation: UInt64) {
-        let shouldRegister: Bool = lock.withLock {
-            guard isStarting, generation == observationGeneration, onLibraryChange != nil else { return false }
+        let admitted: Registration? = lock.withLock {
+            guard isStarting, generation == observationGeneration, !callbacks.isEmpty else { return nil }
             observedAssets = assets.fetchResult
             isStarting = false
             isObserving = true
-            return true
+            let admitted = Registration(monitor: self, generation: generation)
+            registration = admitted
+            return admitted
         }
-        guard shouldRegister else { return }
+        guard let admitted else { return }
 
-        // PhotoKit owns this external callback boundary. Never call it while holding our state lock:
-        // registration may synchronously re-enter the observer. A stop that races registration is
-        // repaired by the post-registration generation check.
-        PHPhotoLibrary.shared().register(self)
+        // Registration may re-enter a consumer. A distinct observer per generation keeps late cleanup
+        // from unregistering a replacement that started while the external call was suspended.
+        operations.register(admitted)
         let registrationIsCurrent = lock.withLock {
-            isObserving && generation == observationGeneration
+            isObserving && generation == observationGeneration && registration === admitted
         }
-        if !registrationIsCurrent {
-            PHPhotoLibrary.shared().unregisterChangeObserver(self)
-        }
+        if !registrationIsCurrent { operations.unregister(admitted) }
     }
 
     public func photoLibraryDidChange(_ changeInstance: PHChange) {
-        let handler: (@Sendable () -> Void)? = lock.withLock {
-            guard isObserving,
+        receive(changeInstance, generation: lock.withLock { observationGeneration })
+    }
+
+    private func receive(_ changeInstance: PHChange, generation: UInt64) {
+        let handlers: [(UUID, Callback)] = lock.withLock {
+            guard isObserving, generation == observationGeneration,
                 let observedAssets,
-                let details = changeInstance.changeDetails(for: observedAssets)
-            else {
-                return nil
-            }
-            self.observedAssets = details.fetchResultAfterChanges
-            if details.hasIncrementalChanges {
-                liveChanges.record(
-                    changedIdentifiers: Set(
-                        (details.insertedObjects + details.changedObjects).map(\.localIdentifier)
-                    ),
-                    deletedIdentifiers: Set(details.removedObjects.map(\.localIdentifier)),
-                    requiresFullRescan: false
-                )
-            } else {
-                liveChanges.record(
-                    changedIdentifiers: [],
-                    deletedIdentifiers: [],
-                    requiresFullRescan: true
-                )
-            }
-            return onLibraryChange
+                let details = operations.details(changeInstance, observedAssets)
+            else { return [] }
+            self.observedAssets = details.assets
+            liveChanges.record(
+                changedIdentifiers: details.changed,
+                deletedIdentifiers: details.deleted,
+                requiresFullRescan: details.requiresFullRescan)
+            return Array(callbacks)
         }
-        handler?()
+        for (id, callback) in handlers {
+            let isCurrent = lock.withLock {
+                generation == observationGeneration && callbacks[id] === callback
+            }
+            // A callback admitted before cancellation can finish; consumers retain their lifecycle fences.
+            if isCurrent { callback.handler() }
+        }
     }
 
     /// Changes since the stored token. This deliberately does not advance the stored token. Callers
     /// must commit the returned value only after their durable scan/enqueue work succeeds.
     public func prepareChanges() -> PreparedChangeSet {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                return PreparedChangeSet(
+                    changes: ChangeSet(
+                        changedIdentifiers: [], deletedIdentifiers: [],
+                        requiresFullRescan: !FileManager.default.fileExists(atPath: tokenURL.path)),
+                    commitToken: nil, liveGeneration: 0)
+            }
+        #endif
         let library = PHPhotoLibrary.shared()
         let live = lock.withLock { liveChanges.snapshot() }
         let currentToken = library.currentChangeToken
@@ -278,12 +385,26 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         }
     }
 
-    /// Advances the persistent token after the caller has durably handled the prepared changes.
-    public func commit(_ prepared: PreparedChangeSet) {
-        store(token: prepared.commitToken)
+    /// Advances the persistent token after the caller has durably handled the prepared changes. When the token cannot
+    /// be written, the stored token and the live changes stay, so the next pass reports the changes again.
+    @discardableResult
+    public func commit(_ prepared: PreparedChangeSet) -> Bool {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                do { try Data("synthetic-token".utf8).write(to: tokenURL, options: .atomic) } catch {
+                    fatalError("The synthetic PhotoKit token was not saved")
+                }
+                return true
+            }
+            guard let token = prepared.commitToken else { fatalError("Missing PhotoKit token") }
+        #else
+            let token = prepared.commitToken
+        #endif
+        guard store(token: token) else { return false }
         lock.withLock {
             liveChanges.commit(through: prepared.liveGeneration)
         }
+        return true
     }
 
     private func loadToken() -> PHPersistentChangeToken? {
@@ -291,10 +412,16 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         return try? NSKeyedUnarchiver.unarchivedObject(ofClass: PHPersistentChangeToken.self, from: data)
     }
 
-    private func store(token: PHPersistentChangeToken) {
-        guard let data = try? NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true) else {
-            return
+    private func store(token: PHPersistentChangeToken) -> Bool {
+        do {
+            let data = try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
+            try data.write(to: tokenURL, options: .atomic)
+            return true
+        } catch {
+            let error = error as NSError
+            Self.logger.error(
+                "Photo library change token could not be saved: \(error.domain, privacy: .public) \(error.code)")
+            return false
         }
-        try? data.write(to: tokenURL, options: .atomic)
     }
 }

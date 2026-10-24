@@ -62,6 +62,10 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
     public var hasAdjustments: Bool
     /// When the photo was last edited or reverted (`PHAsset.adjustmentTimestamp`); nil for a photo never edited.
     public var adjustmentTimestamp: Date?
+    /// The person turned the Live effect off in Photos (`playbackStyle == .image` on a photo that lists a paired video).
+    /// Photos then drops `.photoLive`, so `isLivePhoto` is false. The photo backs up as a still photo: its paired video
+    /// stays a related original file without the Live Photo tag.
+    public var livePlaybackOff: Bool
 
     public init(
         localIdentifier: String,
@@ -75,7 +79,8 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
         resources: [Resource],
         cloudIdentifier: String? = nil,
         hasAdjustments: Bool = false,
-        adjustmentTimestamp: Date? = nil
+        adjustmentTimestamp: Date? = nil,
+        livePlaybackOff: Bool = false
     ) {
         self.localIdentifier = localIdentifier
         self.creationDate = creationDate
@@ -89,6 +94,7 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
         self.cloudIdentifier = cloudIdentifier
         self.hasAdjustments = hasAdjustments
         self.adjustmentTimestamp = adjustmentTimestamp
+        self.livePlaybackOff = livePlaybackOff
     }
 
     public var hasEditEvidence: Bool {
@@ -342,7 +348,7 @@ public enum PhotoBackupAssetPlanner {
                     ordinal: resource.ordinal,
                     uploadFilename: filename,
                     mimeType: resource.mimeType,
-                    sourceResource: sourceResource(for: resource)
+                    sourceResource: sourceResource(for: resource, livePlaybackOff: info.livePlaybackOff)
                 ))
         }
         // Related files upload in this order, and Proton lists the newest related file first. The Live Photo video
@@ -387,8 +393,11 @@ public enum PhotoBackupAssetPlanner {
             && lhs.mimeType == rhs.mimeType
     }
 
-    private static func sourceResource(for resource: PhotoBackupAssetInfo.Resource) -> UploadSourceIdentity.Resource {
-        if resource.role == .pairedVideo && resource.ordinal == 0 {
+    private static func sourceResource(
+        for resource: PhotoBackupAssetInfo.Resource, livePlaybackOff: Bool
+    ) -> UploadSourceIdentity.Resource {
+        // Only this identity carries the Live Photo tag. With Live off, the video stays a plain PhotoKit resource.
+        if resource.role == .pairedVideo && resource.ordinal == 0 && !livePlaybackOff {
             return .livePairedVideo
         }
         if resource.role == .burstMember {

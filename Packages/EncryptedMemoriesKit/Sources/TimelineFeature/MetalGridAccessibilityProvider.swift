@@ -1,6 +1,7 @@
 import AppKit
 import GridCore
 import PhotosCore
+import TimelineCore
 
 /// Exposes visible Metal grid cells as accessibility elements because the renderer has no per-cell views.
 /// Each element provides its media type, capture date, selection state, and an action that opens the viewer.
@@ -76,7 +77,8 @@ final class MetalGridAccessibilityProvider {
             let element = MetalGridA11yElement()
             element.setAccessibilityParent(host)
             element.setAccessibilityRole(.image)
-            element.setAccessibilityLabel(Self.label(for: item))
+            element.setAccessibilityLabel(
+                Self.label(for: item, backupState: coordinator.uploadBadges.accessibilityDescription(for: item.uid)))
             element.setAccessibilityFrame(screen)
             element.setAccessibilitySelected(selected.contains(item.uid))
             element.uid = item.uid
@@ -96,10 +98,17 @@ final class MetalGridAccessibilityProvider {
         return df
     }()
 
-    /// VoiceOver label for a photo: kind + capture date.
-    static func label(for item: PhotoItem) -> String {
+    /// VoiceOver label for a photo: kind + capture date, then its backup state when it has one.
+    static func label(for item: PhotoItem, backupState: String? = nil) -> String {
         let kind = item.isVideo ? L10n.string("a11y.video") : L10n.string("a11y.photo")
-        return "\(kind), \(labelFormatter.string(from: item.captureTime))"
+        let label = "\(kind), \(labelFormatter.string(from: item.captureTime))"
+        return backupState.map { "\(label), \($0)" } ?? label
+    }
+
+    /// Whether new badges can change a label: the pause starts or ends, or a photo changes its badge while
+    /// paused, for example when it finishes.
+    static func badgesChangeLabels(from old: PendingUploadBadges, to new: PendingUploadBadges) -> Bool {
+        new != old && (new.isPaused || old.isPaused)
     }
 }
 

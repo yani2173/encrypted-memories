@@ -47,7 +47,14 @@ if [[ ${#source_files[@]} -eq 0 ]]; then
   exit 0
 fi
 
-xcrun swift-format lint \
+# CI on Linux passes its own swift-format; everywhere else the tool of the selected Xcode runs.
+if [[ -n "${SWIFT_FORMAT_EXECUTABLE:-}" ]]; then
+  swift_format=("$SWIFT_FORMAT_EXECUTABLE")
+else
+  swift_format=(xcrun swift-format)
+fi
+
+"${swift_format[@]}" lint \
   --strict \
   --parallel \
   --configuration "$ROOT/.swift-format" \

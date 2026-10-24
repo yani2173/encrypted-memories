@@ -31,12 +31,18 @@ struct SettingsView: View {
     let signOut: () -> Void
 
     var body: some View {
+        @Bindable var appModel = appModel
         VStack(spacing: 0) {
-            MacSettingsTabs(tabs: tabs)
+            MacSettingsTabs(tabs: tabs, selectedTab: $appModel.selectedSettingsTab)
             Divider()
-            AppBuildInfoLabel()
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 7)
+            VStack(spacing: 2) {
+                AppBuildInfoLabel()
+                Text(ProductBrand.madeInAustria)
+                    .font(.caption2)
+                    .foregroundStyle(ProtonColor.textHint)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7)
         }
         .navigationTitle("sidebar.settings")
         .onChange(of: mapAndPlacesEnabled) { _, enabled in
@@ -104,18 +110,15 @@ struct SettingsView: View {
             }
             tabs.append(
                 .init(id: .privacy, title: L10n.string("settings.privacy_tab"), systemImage: "hand.raised") {
-                    Form { PrivacySettingsContent() }
-                        .formStyle(.grouped)
+                    Form {
+                        PrivacySettingsContent()
+                        BugReportSettingsSection()
+                    }
+                    .formStyle(.grouped)
                 })
             tabs.append(
                 .init(id: .labs, title: L10n.string("labs.title"), systemImage: "flask") {
                     LabsSettingsTab()
-                })
-            tabs.append(
-                .init(
-                    id: .diagnostics, title: String(localized: "settings.diagnostics_tab"), systemImage: "internaldrive"
-                ) {
-                    CacheStatusTab()
                 })
         }
         return tabs
@@ -217,6 +220,8 @@ private struct BackupSettingsTab: View {
                 Text("settings.backup_folders_section")
             }
 
+            BackupMobileDataSection { photoBackup?.mobileDataSettingDidChange() }
+
             // Show manual-upload status only while it is actionable or contains results.
             if let uploadCoordinator {
                 let manualStatus = BackupStatus(manualUploadCheck: uploadCoordinator.preparationStatus)
@@ -239,6 +244,10 @@ private struct BackupSettingsTab: View {
     private var folderSyncStatus: some View {
         let status = backup.status
         HStack(alignment: .firstTextBaseline) {
+            if status.phase == .waitingForWiFi {
+                Image(systemName: BackupStatus.waitingForWiFiSymbolName)
+                    .foregroundStyle(.secondary)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(status.localizedTitle)
                     .font(.system(size: 12, weight: .medium))
@@ -258,9 +267,9 @@ private struct BackupSettingsTab: View {
         }
         if status.isActive || status.phase == .paused {
             if let fraction = status.fractionCompleted {
-                ProgressView(value: fraction)
+                ActivityProgressBar(fraction: fraction, accessibilityLabel: status.localizedTitle)
             } else {
-                ProgressView()  // Totals are unknown during scanning.
+                ProgressSpinner()  // Totals are unknown during scanning.
             }
             if let name = status.currentItemName {
                 Text(name)
@@ -353,7 +362,9 @@ private struct AccountSettingsTab: View {
                                 .font(.system(size: 11).monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
-                        ProgressView(value: Double(min(used, max)), total: Double(max))
+                        ActivityProgressBar(
+                            fraction: Double(min(used, max)) / Double(max),
+                            accessibilityLabel: String(localized: "settings.storage_used"))
                     }
                 } else {
                     Text("settings.storage_unavailable")
@@ -465,7 +476,7 @@ private struct LibrarySettingsTab: View {
                         confirmDelete = true
                     } label: {
                         if deleting {
-                            ProgressView().controlSize(.small)
+                            ProgressSpinner()
                         } else {
                             Text("settings.delete_offline_cache_button")
                         }
@@ -486,13 +497,8 @@ private struct LibrarySettingsTab: View {
         }
         .formStyle(.grouped)
         .observesStoragePressure($storagePressure)
-        .task {
-            await refreshSize()
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(300))
-                guard !Task.isCancelled else { return }
-                await refreshSize()
-            }
+        .task(id: offline.diskCaches) {
+            await offline.diskCaches.followDiskChanges { await refreshSize() }
         }
         .alert("alert.delete_offline_cache_title", isPresented: $confirmDelete) {
             Button(L10n.string("action.cancel"), role: .cancel) {}
@@ -592,6 +598,14 @@ private struct PhotoLibraryBackupSection: View {
                             .contentTransition(.opacity)
                         subtitleSlot(display)
                         transferSlot(display)
+                        leftSlot(display)
+                        if let reason = display.localizedWaitingForWiFiDetail {
+                            Text(reason)
+                                .font(.caption)
+                                .foregroundStyle(ProtonColor.textWeak)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                         if let retry = display.localizedRetryDetail {
                             Text(retry)
                                 .font(.caption)
@@ -725,15 +739,27 @@ private struct PhotoLibraryBackupSection: View {
         }
     }
 
+    /// Items left and upload speed. The progress layout reserves the slot, so a changing speed cannot move the bar.
+    @ViewBuilder private func leftSlot(_ display: BackupStatusPresentation) -> some View {
+        if display.detailLayout == .progress {
+            let left = display.localizedLeftLine
+            Text(verbatim: left ?? "\u{00a0}")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(ProtonColor.textWeak)
+                .contentTransition(.numericText())
+                .accessibilityLabel(display.localizedLeftAccessibilityLabel ?? "")
+                .accessibilityAddTraits(.updatesFrequently)
+                .accessibilityHidden(left == nil)
+        }
+    }
+
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
         Group {
             if let fraction = display.progressBarFraction,
                 display.isActive || display.accessory == .paused
             {
-                ProgressView(value: fraction)
-                    .tint(ProtonColor.primary)
+                ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel)
                     .controlSize(.small)
-                    .accessibilityLabel(display.localizedProgressBarLabel ?? "")
             } else {
                 Color.clear
             }
@@ -749,7 +775,7 @@ private struct PhotoLibraryBackupSection: View {
         case .activity:
             Image(systemName: "arrow.trianglehead.2.clockwise")
                 .foregroundStyle(ProtonColor.primary)
-                .spinsWhileActive(true, period: 1.7)
+                .spinsWhileActive(true)
         case .attention:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -758,6 +784,9 @@ private struct PhotoLibraryBackupSection: View {
                 .foregroundStyle(.secondary)
         case .waiting:
             Image(systemName: "clock.arrow.circlepath")
+                .foregroundStyle(.secondary)
+        case .waitingForWiFi:
+            Image(systemName: BackupStatus.waitingForWiFiSymbolName)
                 .foregroundStyle(.secondary)
         case .notice:
             Image(systemName: "info.circle")
@@ -783,7 +812,9 @@ private struct MacFailedBackupSheet: View {
 
     let source: Source
     @Environment(\.dismiss) private var dismiss
-    @State private var backupItems: [BackupFailedItem] = []
+    @State private var problemList = BackupProblemListModel()
+    @State private var personReadTask: Task<Void, Never>?
+    @State private var readOrder = BackupProblemListReadOrder()
 
     init(controller: PhotoLibraryBackupController) {
         source = .backup(controller)
@@ -799,10 +830,18 @@ private struct MacFailedBackupSheet: View {
 
     private var items: [BackupFailedItem] {
         switch source {
-        case .backup: backupItems
+        case .backup: problemList.items
         case .album(let albumSync, let albumID):
             albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
         }
+    }
+
+    /// What the sheet shows. The backup list never says that nothing needs attention while the summary counts items.
+    private var presentation: BackupProblemListModel.Presentation {
+        if let controller {
+            return problemList.presentation(expectsItems: controller.status.needsAttentionCount > 0)
+        }
+        return items.isEmpty ? .empty : .list
     }
 
     var body: some View {
@@ -810,12 +849,13 @@ private struct MacFailedBackupSheet: View {
             HStack {
                 Text(
                     controller == nil
-                        ? L10n.string("albumsync.problem_sheet_title") : L10n.string("backup.failed_sheet_title")
+                        ? AlbumSyncController.SelectedAlbum.localizedProblemSheetTitle(for: items)
+                        : L10n.string("backup.failed_sheet_title")
                 )
                 .font(.headline)
                 Spacer()
                 if let controller, items.offersUserRetry {
-                    Button(L10n.string("backup.failed_sheet_retry")) {
+                    RetryButton(.system) {
                         Task {
                             await controller.retryUserResolvableWork()
                             dismiss()
@@ -830,70 +870,55 @@ private struct MacFailedBackupSheet: View {
 
             Divider()
 
-            if items.isEmpty {
+            switch presentation {
+            case .loading:
+                ProgressView(L10n.string("loading.content"))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityIdentifier("backup.failedSheet.loading")
+            case .unavailable:
+                ContentUnavailableView {
+                    Label(L10n.string("backup.failed_sheet_unavailable"), systemImage: "exclamationmark.triangle")
+                } actions: {
+                    Button(L10n.string("action.retry")) {
+                        guard let controller else { return }
+                        problemList.beginReading()
+                        readList(of: controller)
+                    }
+                    .accessibilityIdentifier("backup.failedSheet.retry")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .empty:
                 ContentUnavailableView(
                     L10n.string("backup.failed_sheet_empty"),
                     systemImage: "checkmark.shield"
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
+            case .list:
                 List {
-                    ForEach(BackupIssueSection.allCases) { section in
-                        let sectionItems = items.filter { $0.category.section == section }
-                        if !sectionItems.isEmpty {
-                            Section {
-                                ForEach(sectionItems) { item in
-                                    HStack(alignment: .top, spacing: 10) {
-                                        Image(systemName: item.category.symbolName)
-                                            .foregroundStyle(item.isPermanent ? Color.secondary : Color.orange)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(item.filename)
-                                                .lineLimit(1)
-                                                .truncationMode(.middle)
-                                            Text(item.reason)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .fixedSize(horizontal: false, vertical: true)
-                                            if let retryDescription = item.retryDescription {
-                                                Text(retryDescription)
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        Spacer(minLength: 8)
-                                        if let controller, item.issue == .deletedElsewhere {
-                                            Button(L10n.string("backup.keep_deleted")) {
-                                                controller.keepDeleted(item)
-                                                Task { backupItems = await controller.problemItems() }
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .help(L10n.string("backup.keep_deleted"))
-                                            Button(L10n.string("backup.back_up_again")) {
-                                                controller.backUpAgain(item)
-                                                Task {
-                                                    backupItems = await controller.problemItems().filter {
-                                                        $0.id != item.id || $0.issue == .deletedElsewhere
-                                                    }
-                                                }
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .help(L10n.string("backup.back_up_again"))
-                                        } else if let controller, item.isPermanent {
-                                            Button {
-                                                controller.dismissFailedItem(item)
-                                                backupItems.removeAll { $0.id == item.id }
-                                            } label: {
-                                                Image(systemName: "xmark.circle")
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .help(L10n.string("backup.failed_item_dismiss"))
-                                        }
-                                    }
-                                    .padding(.vertical, 2)
+                    BackupProblemSections(items: items) { item in
+                        BackupProblemRow(item: item) {
+                            if let controller, item.issue == .deletedElsewhere {
+                                Button(L10n.string("backup.keep_deleted")) {
+                                    controller.keepDeleted(item)
+                                    readList(of: controller)
                                 }
-                            } header: {
-                                Text(section.localizedTitle)
-                                    .accessibilityIdentifier("backup.issueSection.\(section.rawValue)")
+                                .buttonStyle(.borderless)
+                                .help(L10n.string("backup.keep_deleted"))
+                                Button(L10n.string("backup.back_up_again")) {
+                                    controller.backUpAgain(item)
+                                    readList(of: controller, afterDecision: item)
+                                }
+                                .buttonStyle(.borderless)
+                                .help(L10n.string("backup.back_up_again"))
+                            } else if let controller, item.isPermanent {
+                                Button {
+                                    controller.dismissFailedItem(item)
+                                    problemList.dismissItem(id: item.id)
+                                } label: {
+                                    Image(systemName: "xmark.circle")
+                                }
+                                .buttonStyle(.borderless)
+                                .help(L10n.string("backup.failed_item_dismiss"))
                             }
                         }
                     }
@@ -912,7 +937,20 @@ private struct MacFailedBackupSheet: View {
         // A photo can need the person while the list is open; Try again then appears.
         .task(id: controller?.status.problemListKey) {
             guard let controller else { return }
-            await controller.followProblemList { backupItems = $0 }
+            await controller.followProblemList(
+                order: readOrder, { problemList.replaceItems($0) }, ifUnavailable: { problemList.markUnavailable() })
+        }
+        .onDisappear { personReadTask?.cancel() }
+    }
+
+    /// A person's action reads the list like the automatic follow does. The sheet keeps the task, so closing the
+    /// sheet or a newer action ends it.
+    private func readList(of controller: PhotoLibraryBackupController, afterDecision item: BackupFailedItem? = nil) {
+        personReadTask?.cancel()
+        personReadTask = Task {
+            await controller.readProblemList(
+                order: readOrder, afterDecision: item, { problemList.replaceItems($0) },
+                ifUnavailable: { problemList.markUnavailable() })
         }
     }
 }
@@ -950,7 +988,7 @@ private struct AlbumSyncSection: View {
             if let message = controller.lastMessage {
                 Text(message)
                     .font(.system(size: 11))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(controller.lastMessageStyle == .information ? Color.secondary : Color.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
@@ -1040,8 +1078,7 @@ private struct AlbumSyncSection: View {
             }
             Spacer()
             if isActive {
-                ProgressView()
-                    .controlSize(.small)
+                ProgressSpinner()
             } else if album.state == .needsDecision {
                 Button(L10n.string("settings.albumsync_decide")) { controller.presentConflict(albumID: album.id) }
                     .controlSize(.small)
@@ -1075,8 +1112,7 @@ private struct AlbumSyncSection: View {
                     .font(.system(size: 11).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            ProgressView()
-                .controlSize(.small)
+            ProgressSpinner()
         }
     }
 
@@ -1221,9 +1257,9 @@ private struct BackupStatusSummaryRow: View {
 
             if let total = status.totalConsidered, total > 0 {
                 if let fraction = status.fractionCompleted {
-                    ProgressView(value: fraction)
+                    ActivityProgressBar(fraction: fraction, accessibilityLabel: status.localizedTitle)
                 } else {
-                    ProgressView()
+                    ProgressSpinner()
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     if status.alreadyBackedUp > 0 {
@@ -1265,90 +1301,25 @@ private struct LabsSettingsTab: View {
     }
 }
 
-// MARK: - Diagnostics
+// MARK: - Report a problem
 
-private struct CacheStatusTab: View {
-    @State private var status = OfflineCacheStatus()
-    @State private var refreshing = false
+/// The entry to the support report, at the bottom of the Privacy tab.
+private struct BugReportSettingsSection: View {
     @State private var showsBugReport = false
 
     var body: some View {
-        Form {
-            Section {
-                row(String(localized: "settings.dev_total_assets"), "\(status.totalAssets)")
-                row(String(localized: "settings.dev_metadata_rows"), "\(status.metadataRows)")
-                row(String(localized: "settings.dev_thumbnails_on_disk"), "\(status.thumbnailsOnDisk)")
-                row(String(localized: "settings.dev_thumbnails_missing"), "\(status.thumbnailsMissing)")
-                row(String(localized: "settings.dev_disk_coverage"), percent(status.thumbnailCoverage))
-            } header: {
-                Text("settings.coverage_section")
+        Section {
+            Button {
+                showsBugReport = true
+            } label: {
+                Label(L10n.string("settings.bug_report_action"), systemImage: "ladybug")
             }
-
-            Section {
-                row(String(localized: "settings.dev_ram_decoded"), "\(status.ramDecodedEstimate)")
-                row(String(localized: "settings.dev_prefetch_queue"), "\(status.prefetchQueueDepth)")
-                row(String(localized: "settings.dev_active_prefetch"), "\(status.activePrefetchJobs)")
-                row(String(localized: "settings.dev_prefetch_pause_reason"), status.prefetchPausedReason)
-                row(String(localized: "settings.dev_failed_thumbnails"), "\(status.failedThumbnailCount)")
-            } header: {
-                Text("settings.prefetch_section")
+            .sheet(isPresented: $showsBugReport) {
+                MacBugReportSheet()
             }
-
-            Section {
-                row(String(localized: "settings.dev_cache_size_disk"), L10n.fileSize(status.cacheSizeBytes))
-                row(String(localized: "settings.dev_preview_cache_disk"), L10n.fileSize(status.previewCacheSizeBytes))
-                row(
-                    String(localized: "settings.dev_originals_cache_disk"),
-                    L10n.fileSize(status.originalsCacheSizeBytes))
-                row(String(localized: "settings.dev_last_error"), status.lastError ?? "-")
-            } header: {
-                Text("settings.storage_section")
-            }
-
-            Section {
-                Button {
-                    Task { await refresh() }
-                } label: {
-                    if refreshing { ProgressView().controlSize(.small) } else { Text("action.refresh") }
-                }
-                .disabled(refreshing)
-            }
-
-            Section {
-                Button {
-                    showsBugReport = true
-                } label: {
-                    Label(L10n.string("settings.bug_report_action"), systemImage: "ladybug")
-                }
-            } footer: {
-                Text(L10n.string("settings.bug_report_privacy"))
-            }
+        } footer: {
+            Text(L10n.string("settings.bug_report_privacy"))
         }
-        .formStyle(.grouped)
-        .task { await refresh() }
-        .sheet(isPresented: $showsBugReport) {
-            MacBugReportSheet()
-        }
-    }
-
-    private func refresh() async {
-        guard !refreshing else { return }
-        refreshing = true
-        status = await OfflineLibraryManager.shared.refreshStatus()
-        refreshing = false
-    }
-
-    private func row(_ label: String, _ value: String) -> some View {
-        LabeledContent(label) {
-            Text(value)
-                .font(.body.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-        }
-    }
-
-    private func percent(_ fraction: Double) -> String {
-        String(format: "%.1f %%", fraction * 100)
     }
 }
 
@@ -1382,7 +1353,7 @@ private struct MacBugReportSheet: View {
                     Task { await exportSupportReport() }
                 } label: {
                     if isPreparingReport {
-                        ProgressView().controlSize(.small)
+                        ProgressSpinner()
                     } else {
                         Text(L10n.string("settings.bug_report_download"))
                     }
@@ -1415,28 +1386,9 @@ private struct MacBugReportSheet: View {
             defer {
                 if hasScopedAccess { url.stopAccessingSecurityScopedResource() }
             }
-            try Self.writeSupportReport(data, to: url)
+            try OriginalExportWriter.writeData(data, to: url)
         } catch {
             errorMessage = L10n.string("settings.bug_report_export_failed")
-        }
-    }
-
-    private static func writeSupportReport(_ data: Data, to destination: URL) throws {
-        let fileManager = FileManager.default
-        let stagingDirectory = try fileManager.url(
-            for: .itemReplacementDirectory,
-            in: .userDomainMask,
-            appropriateFor: destination,
-            create: true
-        )
-        defer { try? fileManager.removeItem(at: stagingDirectory) }
-
-        let stagedFile = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
-        try data.write(to: stagedFile, options: .atomic)
-        if fileManager.fileExists(atPath: destination.path) {
-            _ = try fileManager.replaceItemAt(destination, withItemAt: stagedFile)
-        } else {
-            try fileManager.moveItem(at: stagedFile, to: destination)
         }
     }
 }

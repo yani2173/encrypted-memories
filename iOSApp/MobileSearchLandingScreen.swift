@@ -31,7 +31,15 @@ struct MobileSearchLandingContent {
 
 struct MobileSearchLandingScreen: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     let content: MobileSearchLandingContent
+    /// With compact width or height, the search field floats above the keyboard outside its safe area. Keep
+    /// 48 pt for the field plus its 8 pt gap, without scaling that space with text. Only regular width and height
+    /// place the field at the top, so narrow iPad windows and landscape phones keep the clearance.
+    private var searchFieldClearance: CGFloat {
+        horizontalSizeClass == .regular && verticalSizeClass == .regular ? 0 : 56
+    }
 
     private var discovery: SmartSearchDiscoveryModel? { content.discovery }
 
@@ -68,6 +76,7 @@ struct MobileSearchLandingScreen: View {
             .padding(.top, 12)
             .padding(.bottom, 24)
         }
+        .contentMargins(.bottom, searchFieldClearance, for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
         .background(ProtonColor.backgroundNorm)
     }

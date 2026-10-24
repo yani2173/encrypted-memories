@@ -19,33 +19,41 @@ final class FolderEnumerationTests: XCTestCase {
         return root
     }
 
-    func testDiscoversMediaRecursivelyAndSkipsHiddenAndUnsupported() throws {
-        let root = try makeTree()
-        let result = try FolderEnumerator.enumerate(root)
-        let names = Set(result.mediaFiles.map(\.lastPathComponent))
-        XCTAssertEqual(names, ["photo1.jpg", "photo2.png", "clip.mov"])
-        XCTAssertFalse(names.contains(".hidden.jpg"))
-        XCTAssertEqual(result.skippedUnsupported.map(\.lastPathComponent), ["note.txt"])
+    private func collect(_ folder: URL, includeHidden: Bool = false) async throws -> [FolderEnumerator.Entry] {
+        var entries: [FolderEnumerator.Entry] = []
+        for try await entry in FolderEnumerator.stream(folder, includeHidden: includeHidden) {
+            entries.append(entry)
+        }
+        return entries
     }
 
-    func testDeterministicOrdering() throws {
+    func testDiscoversMediaRecursivelyAndSkipsHiddenAndUnsupported() async throws {
         let root = try makeTree()
-        let a = try FolderEnumerator.enumerate(root).mediaFiles.map(\.path)
-        let b = try FolderEnumerator.enumerate(root).mediaFiles.map(\.path)
+        let entries = try await collect(root)
+        let names = Set(entries.filter(\.isSupported).map { $0.url.lastPathComponent })
+        XCTAssertEqual(names, ["photo1.jpg", "photo2.png", "clip.mov"])
+        XCTAssertFalse(names.contains(".hidden.jpg"))
+        XCTAssertEqual(entries.filter { !$0.isSupported }.map { $0.url.lastPathComponent }, ["note.txt"])
+    }
+
+    func testDeterministicOrdering() async throws {
+        let root = try makeTree()
+        let a = try await collect(root).filter(\.isSupported).map { $0.url.path }
+        let b = try await collect(root).filter(\.isSupported).map { $0.url.path }
         XCTAssertEqual(a, b)
         XCTAssertEqual(a, a.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending })
     }
 
-    func testWalkDoesNotPreEnumerateLaterDirectories() throws {
+    func testStreamDoesNotPreEnumerateLaterDirectories() async throws {
         let root = try makeTree()
         let lateDirectory = root.appendingPathComponent("z")
         try FileManager.default.createDirectory(at: lateDirectory, withIntermediateDirectories: true)
 
         var visited: [String] = []
-        try FolderEnumerator.walk(root) { url, isSupported in
-            guard isSupported else { return }
-            visited.append(url.lastPathComponent)
-            if url.lastPathComponent == "photo1.jpg" {
+        for try await entry in FolderEnumerator.stream(root) {
+            guard entry.isSupported else { continue }
+            visited.append(entry.url.lastPathComponent)
+            if entry.url.lastPathComponent == "photo1.jpg" {
                 try Data("late".utf8).write(to: lateDirectory.appendingPathComponent("late.jpg"))
             }
         }
@@ -53,7 +61,7 @@ final class FolderEnumerationTests: XCTestCase {
         XCTAssertEqual(visited, ["photo1.jpg", "clip.mov", "photo2.png", "late.jpg"])
     }
 
-    func testDoesNotTraverseSymbolicLinkDirectories() throws {
+    func testDoesNotTraverseSymbolicLinkDirectories() async throws {
         let root = try makeTree()
         let target = root.appendingPathComponent("target")
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
@@ -63,14 +71,15 @@ final class FolderEnumerationTests: XCTestCase {
             withDestinationURL: target
         )
 
-        let media = try FolderEnumerator.enumerate(root).mediaFiles.map(\.lastPathComponent)
+        let media = try await collect(root).filter(\.isSupported).map { $0.url.lastPathComponent }
 
         XCTAssertEqual(media.filter { $0 == "linked.jpg" }.count, 1)
     }
 
-    func testIncludeHiddenOptIn() throws {
+    func testIncludeHiddenOptIn() async throws {
         let root = try makeTree()
-        let names = Set(try FolderEnumerator.enumerate(root, includeHidden: true).mediaFiles.map(\.lastPathComponent))
+        let entries = try await collect(root, includeHidden: true)
+        let names = Set(entries.filter(\.isSupported).map { $0.url.lastPathComponent })
         XCTAssertTrue(names.contains(".hidden.jpg"))
     }
 

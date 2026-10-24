@@ -2,11 +2,29 @@
 
 ## iPhone and iPad
 
-Open the **Photos** tab and select the account button. Settings shows your account and storage, optional tips, and the **Features** Smart Search, Backup, and Album Sync. Each feature opens its own page. Its row shows the current state, for example **On**, **Paused**, or **3 albums**. Below follow **Labs**, the cache controls, support-report export, build information, and sign out.
+Open the **Photos** tab and select the account button. Settings shows your account and storage, optional tips, and the **Features** Smart Search, Backup, and Album Sync. Each feature opens its own page. Its row shows the current state, for example **On**, **Paused**, or **3 albums**. Below follow **Privacy**, **Labs**, the cache controls, support-report export, sign out, and build information.
 
 ## Mac
 
-Open **Encrypted Memories → Settings…**. Native tabs separate Account, Support, Library, Smart Search, Backup, Labs, and Cache diagnostics.
+Open **Encrypted Memories → Settings…**. Native tabs separate Proton Account, Support, Library, Smart Search, Backup, Privacy, and Labs.
+
+## Privacy
+
+The **Privacy** page (iPhone and iPad) or tab (Mac) has these switches:
+
+| Switch | Default | What it does |
+|---|---|---|
+| **Map and Places** | On | When off, maps and place names stop contacting Apple. The Map tab (iPhone and iPad) and the Map item in the sidebar (Mac) disappear. Coordinates remain encrypted on this device. |
+| **Remove location when sharing** | On | When on, shared and exported copies have no standard GPS metadata. Originals remain unchanged. |
+| **Blur App Preview** | On | iPhone and iPad only. Hides app content in the App Switcher. |
+
+The page also links to the Privacy Policy.
+
+On the Mac, **Report a problem** is at the bottom of the Privacy tab. It exports the support report.
+
+**Use Cellular Data** for backups is on the Backup page. It is off by default. See [[Backup and Photo Library Sync|Backup-and-Album-Sync]].
+
+These defaults apply when you did not choose a value yet. A choice that you saved stays.
 
 ## Labs
 
@@ -28,7 +46,7 @@ When the device is almost full, the app stops saving new offline copies of origi
 - Credentials use the platform Keychain with device-only accessibility.
 - Local photo and search data is encrypted at rest.
 - Search queries are not sent to a separate search service.
-- Place names in the viewer, on the Map, and in search suggestions come from Apple MapKit. The app sends location coordinates to Apple for this. For search suggestions, it sends only the rounded center of a group of photos, precise to about 1 km. These requests contain no photos, file names, or search text.
+- Place names in the viewer, on the Map, and in search suggestions come from Apple MapKit. The app sends location coordinates to Apple for this. For search suggestions, it sends only the rounded center of a group of photos, precise to about 1 km. These requests contain no photos, file names, or search text. Turn off **Map and Places** to stop these requests.
 - Release builds do not write file debug logs. Runtime-gated unified logging is disabled unless explicitly enabled for a local investigation.
 - Support reports must be reviewed before sharing. Never attach passwords, API keys, private links, or photo content to GitHub.
 

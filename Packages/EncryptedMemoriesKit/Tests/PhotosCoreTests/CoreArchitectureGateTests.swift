@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 /// Central architecture gate for universal Core targets.
@@ -106,6 +107,7 @@ final class CoreArchitectureGateTests: XCTestCase {
             // These dependencies remain platform-neutral so dedupe stays in shared Core.
             allowedImports: [
                 "AVFoundation", "CryptoKit", "Foundation", "ImageIO", "Observation", "PhotosCore", "SQLite3",
+                "Synchronization",
             ],
             expectedDependencies: ["PhotosCore"],
             extraForbiddenTokens: []
@@ -431,9 +433,8 @@ final class CoreArchitectureGateTests: XCTestCase {
             XCTAssertFalse(files.isEmpty, "Expected source files for \(rule.name)")
 
             for file in files {
-                let source = try String(contentsOf: file, encoding: .utf8)
-                let code = stripCommentsAndStringLiterals(from: source)
-                for token in forbidden where contains(token, in: code) {
+                let code = try strippedCode(of: file)
+                for token in try references(to: forbidden, in: code) {
                     violations.append("\(rule.name)/\(file.lastPathComponent): \(token)")
                 }
             }
@@ -505,8 +506,7 @@ final class CoreArchitectureGateTests: XCTestCase {
 
         for file in try swiftFiles(in: sourcesRoot) {
             guard !file.standardizedFileURL.path.hasPrefix(allowedRoot.path + "/") else { continue }
-            let source = try String(contentsOf: file, encoding: .utf8)
-            let code = stripCommentsAndStringLiterals(from: source)
+            let code = try strippedCode(of: file)
             for token in tokens where code.contains(token) {
                 violations.append("\(file.path): direct \(token) must use AppleSecurityCore")
             }
@@ -586,9 +586,8 @@ final class CoreArchitectureGateTests: XCTestCase {
                     "MetalRenderingCore/\(file.lastPathComponent): forbidden imports \(forbiddenImports.sorted())")
             }
 
-            let source = try String(contentsOf: file, encoding: .utf8)
-            let code = stripCommentsAndStringLiterals(from: source)
-            for token in Self.renderingCoreForbiddenTokens where contains(token, in: code) {
+            let code = try strippedCode(of: file)
+            for token in try references(to: Self.renderingCoreForbiddenTokens, in: code) {
                 violations.append("MetalRenderingCore/\(file.lastPathComponent): forbidden token \(token)")
             }
         }
@@ -657,9 +656,8 @@ final class CoreArchitectureGateTests: XCTestCase {
                     "MetalGridTextureCore/\(file.lastPathComponent): forbidden imports \(forbiddenImports.sorted())")
             }
 
-            let source = try String(contentsOf: file, encoding: .utf8)
-            let code = stripCommentsAndStringLiterals(from: source)
-            for token in Self.textureCoreForbiddenTokens where contains(token, in: code) {
+            let code = try strippedCode(of: file)
+            for token in try references(to: Self.textureCoreForbiddenTokens, in: code) {
                 violations.append("MetalGridTextureCore/\(file.lastPathComponent): forbidden token \(token)")
             }
         }
@@ -746,9 +744,8 @@ final class CoreArchitectureGateTests: XCTestCase {
                 violations.append(
                     "MetalGridComposeCore/\(file.lastPathComponent): forbidden imports \(forbiddenImports.sorted())")
             }
-            let source = try String(contentsOf: file, encoding: .utf8)
-            let code = stripCommentsAndStringLiterals(from: source)
-            for token in Self.composeCoreForbiddenTokens where contains(token, in: code) {
+            let code = try strippedCode(of: file)
+            for token in try references(to: Self.composeCoreForbiddenTokens, in: code) {
                 violations.append("MetalGridComposeCore/\(file.lastPathComponent): forbidden token \(token)")
             }
         }
@@ -843,10 +840,10 @@ final class CoreArchitectureGateTests: XCTestCase {
         }
 
         for file in try swiftFiles(in: textureRoot) {
-            let textureSource = try String(contentsOf: file, encoding: .utf8)
-            let code = stripCommentsAndStringLiterals(from: textureSource)
-            for token in ["UIKitMetalGridGlyphRasterizer", "UIImage", "UIColor", "UIGraphicsImageRenderer"]
-            where contains(token, in: code) {
+            let code = try strippedCode(of: file)
+            for token in try references(
+                to: ["UIKitMetalGridGlyphRasterizer", "UIImage", "UIColor", "UIGraphicsImageRenderer"], in: code)
+            {
                 violations.append(
                     "MetalGridTextureCore/\(file.lastPathComponent): UIKit adapter leaked into texture core via \(token)"
                 )
@@ -924,11 +921,11 @@ final class CoreArchitectureGateTests: XCTestCase {
             ] where imports.contains(forbidden) {
                 violations.append("PhotoViewerUIKitAdapter/\(file.lastPathComponent): must not import \(forbidden)")
             }
-            let source = try String(contentsOf: file, encoding: .utf8)
-            let code = stripCommentsAndStringLiterals(from: source)
-            for forbidden in [
-                "NSImage", "NSView", "AVPlayerView", "NSViewRepresentable", "ThumbnailFeed", "PhotoViewerModel",
-            ] where contains(forbidden, in: code) {
+            let code = try strippedCode(of: file)
+            for forbidden in try references(
+                to: ["NSImage", "NSView", "AVPlayerView", "NSViewRepresentable", "ThumbnailFeed", "PhotoViewerModel"],
+                in: code)
+            {
                 violations.append(
                     "PhotoViewerUIKitAdapter/\(file.lastPathComponent): forbidden macOS/feature reference \(forbidden)")
             }
@@ -1111,7 +1108,7 @@ final class CoreArchitectureGateTests: XCTestCase {
             }
 
             let source = try String(contentsOf: file, encoding: .utf8)
-            let code = stripCommentsAndStringLiterals(from: source)
+            let code = try strippedCode(of: file)
 
             // No non-policy source may reference .all or .cpuOnly as compute units outside debug guards.
             let hasAllComputeUnitsToken =
@@ -1165,10 +1162,15 @@ final class CoreArchitectureGateTests: XCTestCase {
             #"\bRENAME\s+COLUMN\b"#,
             #"\bDROP\s+COLUMN\b"#,
         ]
+        let anyPattern = try NSRegularExpression(
+            pattern: forbiddenPatterns.map { "(?:\($0))" }.joined(separator: "|"), options: .caseInsensitive)
         var violations: [String] = []
 
         for file in try swiftFiles(in: sourcesRoot) {
             let source = try String(contentsOf: file, encoding: .utf8)
+            // One search rules out the usual file; only a hit names each pattern.
+            guard anyPattern.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) != nil
+            else { continue }
             for pattern in forbiddenPatterns
             where source.range(
                 of: pattern,
@@ -1298,6 +1300,38 @@ final class CoreArchitectureGateTests: XCTestCase {
         }
 
         return nil
+    }
+
+    /// The entries of `tokens` that `code` references, in list order. One precompiled search over every plain
+    /// token rules out the usual file; only a hit checks each token with `contains(_:in:)`.
+    private func references(to tokens: [String], in code: String) throws -> [String] {
+        let words = tokens.filter { !$0.contains(".") }
+        let anyWord = try Self.alternation(of: words)
+        let hasWord = anyWord.firstMatch(in: code, range: NSRange(code.startIndex..., in: code)) != nil
+        return tokens.filter { token in (hasWord || token.contains(".")) && contains(token, in: code) }
+    }
+
+    private static let alternations = Mutex<[[String]: NSRegularExpression]>([:])
+
+    private static func alternation(of words: [String]) throws -> NSRegularExpression {
+        if let cached = alternations.withLock({ $0[words] }) { return cached }
+        let pattern = #"\b(?:"# + words.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|") + #")\b"#
+        let regex = try NSRegularExpression(pattern: pattern)
+        alternations.withLock { $0[words] = regex }
+        return regex
+    }
+
+    /// Stripped sources by path, so each file is read and stripped once per test process although several tests
+    /// scan it.
+    private static let strippedSources = Mutex<[String: String]>([:])
+
+    /// The code of `file` on disk without comments and string literals.
+    private func strippedCode(of file: URL) throws -> String {
+        let key = file.standardizedFileURL.path
+        if let cached = Self.strippedSources.withLock({ $0[key] }) { return cached }
+        let code = stripCommentsAndStringLiterals(from: try String(contentsOf: file, encoding: .utf8))
+        Self.strippedSources.withLock { $0[key] = code }
+        return code
     }
 
     private func contains(_ token: String, in code: String) -> Bool {

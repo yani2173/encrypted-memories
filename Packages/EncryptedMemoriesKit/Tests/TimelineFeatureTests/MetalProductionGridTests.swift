@@ -86,4 +86,38 @@ private func uids(_ n: Int) -> [PhotoUID] { (0..<n).map { PhotoUID(volumeID: "v"
         #expect(MetalGridAccessibilityProvider.label(for: video).hasPrefix(L10n.string("a11y.video") + ", "))
         #expect(MetalGridAccessibilityProvider.label(for: photo).hasPrefix(L10n.string("a11y.photo") + ", "))
     }
+
+    @Test func labelOfAWaitingPhotoSaysThatTheBackupIsPaused() {
+        let waiting = PhotoItem(
+            uid: PhotoUID(localPending: .photoLibrary, identifier: "asset"),
+            captureTime: Date(timeIntervalSince1970: 0),
+            mediaType: "image/heic")
+        let badges = PendingUploadBadges(base: [waiting.uid: .waiting], isPaused: true)
+        let label = MetalGridAccessibilityProvider.label(
+            for: waiting, backupState: badges.accessibilityDescription(for: waiting.uid))
+        #expect(
+            label == MetalGridAccessibilityProvider.label(for: waiting) + ", " + L10n.string("a11y.upload_badge.paused")
+        )
+        #expect(
+            MetalGridAccessibilityProvider.label(
+                for: waiting, backupState: badges.replacing(isPaused: false).accessibilityDescription(for: waiting.uid))
+                == MetalGridAccessibilityProvider.label(for: waiting))
+    }
+
+    @Test func labelsRebuildWhenAPhotoChangesItsBadgeDuringThePause() {
+        let uid = PhotoUID(localPending: .photoLibrary, identifier: "asset")
+        let running = PendingUploadBadges(base: [uid: .waiting])
+        let paused = running.replacing(isPaused: true)
+        let finished = PendingUploadBadges(base: [uid: .done], isPaused: true)
+        #expect(MetalGridAccessibilityProvider.badgesChangeLabels(from: running, to: paused))
+        #expect(MetalGridAccessibilityProvider.badgesChangeLabels(from: paused, to: running))
+        #expect(
+            MetalGridAccessibilityProvider.badgesChangeLabels(from: paused, to: finished),
+            "the finished photo no longer says that the backup is paused")
+        #expect(!MetalGridAccessibilityProvider.badgesChangeLabels(from: paused, to: paused))
+        #expect(
+            !MetalGridAccessibilityProvider.badgesChangeLabels(
+                from: running, to: running.replacing(progress: [uid: 4])),
+            "progress without a pause leaves the labels alone")
+    }
 }

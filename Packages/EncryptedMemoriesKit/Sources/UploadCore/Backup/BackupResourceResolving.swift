@@ -45,9 +45,55 @@ public struct BackupResourcePreparationReporter: Sendable {
     }
 }
 
+/// A resource whose upload descriptor can be materialized late. Primary and secondary resources share
+/// one implementation: a progress materializer wins, a plain one runs without progress, and without
+/// either the descriptor is already readable.
+public protocol BackupResourceMaterializing: Sendable {
+    var descriptor: UploadResourceDescriptor { get }
+    var materializeWithProgress:
+        (@Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor)?
+    { get }
+}
+
+public extension BackupResourceMaterializing {
+    func materializedDescriptor() async throws -> UploadResourceDescriptor {
+        try await materializedDescriptor(onPreparationProgress: { _ in })
+    }
+
+    func materializedDescriptor(
+        onPreparationProgress: @escaping BackupResourcePreparationHandler
+    ) async throws -> UploadResourceDescriptor {
+        if let materializeWithProgress {
+            return try await materializeWithProgress(BackupResourcePreparationReporter(onPreparationProgress))
+        }
+        return descriptor
+    }
+
+    var hasDeferredMaterialization: Bool {
+        materializeWithProgress != nil
+    }
+}
+
+extension BackupResourceMaterializing {
+    static func materializer(
+        _ materialize: (@Sendable () async throws -> UploadResourceDescriptor)?,
+        withProgress materializeWithProgress: (
+            @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor
+        )?
+    ) -> (@Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor)? {
+        if let materializeWithProgress {
+            return materializeWithProgress
+        }
+        if let materialize {
+            return { _ in try await materialize() }
+        }
+        return nil
+    }
+}
+
 /// One secondary resource of a compound (a Live Photo's paired video): uploaded after the
 /// primary with `mainPhotoUID` pointing at it, deduped through the same pipeline.
-public struct BackupSecondaryResource: Sendable {
+public struct BackupSecondaryResource: BackupResourceMaterializing {
     /// `descriptor.source.resource` must be a secondary role (e.g. `.livePairedVideo`).
     public let descriptor: UploadResourceDescriptor
     public let mediaType: String
@@ -69,37 +115,14 @@ public struct BackupSecondaryResource: Sendable {
         self.descriptor = descriptor
         self.mediaType = mediaType
         self.additionalMetadata = additionalMetadata
-        if let materializeWithProgress {
-            self.materializeWithProgress = materializeWithProgress
-        } else if let materialize {
-            self.materializeWithProgress = { _ in try await materialize() }
-        } else {
-            self.materializeWithProgress = nil
-        }
-    }
-
-    public func materializedDescriptor() async throws -> UploadResourceDescriptor {
-        try await materializedDescriptor(onPreparationProgress: { _ in })
-    }
-
-    public func materializedDescriptor(
-        onPreparationProgress: @escaping BackupResourcePreparationHandler
-    ) async throws -> UploadResourceDescriptor {
-        if let materializeWithProgress {
-            return try await materializeWithProgress(BackupResourcePreparationReporter(onPreparationProgress))
-        }
-        return descriptor
-    }
-
-    public var hasDeferredMaterialization: Bool {
-        materializeWithProgress != nil
+        self.materializeWithProgress = Self.materializer(materialize, withProgress: materializeWithProgress)
     }
 }
 
 /// A queue entry rematerialized into everything the pipeline and uploader need. The queue stores
 /// only identities and revisions; adapters rebuild the concrete resource when work actually runs
 /// (after a relaunch the original export/URL may be gone, so this is the resume seam).
-public struct BackupResolvedResource: Sendable {
+public struct BackupResolvedResource: BackupResourceMaterializing {
     /// Snapshot of the source revision recorded after a successful backup.
     /// It can be newer than the queued revision when the source changed after scanning.
     public let candidate: UploadBackupAssetCandidate
@@ -167,33 +190,13 @@ public struct BackupResolvedResource: Sendable {
         self.tags = tags
         self.captureDate = captureDate
         self.secondaries = secondaries
-        if let materializeWithProgress {
-            self.materializeWithProgress = materializeWithProgress
-        } else if let materialize {
-            self.materializeWithProgress = { _ in try await materialize() }
-        } else {
-            self.materializeWithProgress = nil
-        }
+        self.materializeWithProgress = Self.materializer(materialize, withProgress: materializeWithProgress)
         self.cleanup = cleanup
     }
-
-    public func materializedDescriptor() async throws -> UploadResourceDescriptor {
-        try await materializedDescriptor(onPreparationProgress: { _ in })
-    }
-
-    public func materializedDescriptor(
-        onPreparationProgress: @escaping BackupResourcePreparationHandler
-    ) async throws -> UploadResourceDescriptor {
-        if let materializeWithProgress {
-            return try await materializeWithProgress(BackupResourcePreparationReporter(onPreparationProgress))
-        }
-        return descriptor
-    }
-
-    public var hasDeferredMaterialization: Bool {
-        materializeWithProgress != nil
-    }
 }
+
+/// Rechecks the runner's admission immediately before a source read starts network access.
+public typealias BackupResourceReadAdmission = @Sendable () throws -> Void
 
 /// Platform seam: turn a persisted queue entry back into a readable local resource.
 /// Contract: return `nil` when the source is verifiably gone, which removes its queue work.
@@ -204,9 +207,23 @@ public protocol BackupResourceResolving: Sendable {
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> BackupResolvedResource?
+    func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission
+    ) async throws -> BackupResolvedResource?
 }
 
 public extension BackupResourceResolving {
+    func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission
+    ) async throws -> BackupResolvedResource? {
+        try readAdmission()
+        return try await resolve(entry, onPreparationProgress: onPreparationProgress)
+    }
+
     func resolve(
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler
@@ -225,20 +242,30 @@ public struct CompositeBackupResourceResolver: BackupResourceResolving {
     }
 
     public func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
-        guard let resolver = resolvers[entry.source.kind] else {
-            throw UploadError.backend("no backup resolver registered for source kind \(entry.source.kind.rawValue)")
-        }
-        return try await resolver.resolve(entry)
+        try await resolver(for: entry).resolve(entry)
     }
 
     public func resolve(
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> BackupResolvedResource? {
+        try await resolver(for: entry).resolve(entry, onPreparationProgress: onPreparationProgress)
+    }
+
+    public func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission
+    ) async throws -> BackupResolvedResource? {
+        try await resolver(for: entry).resolve(
+            entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission)
+    }
+
+    private func resolver(for entry: UploadBackupSyncQueueEntry) throws -> any BackupResourceResolving {
         guard let resolver = resolvers[entry.source.kind] else {
             throw UploadError.backend("no backup resolver registered for source kind \(entry.source.kind.rawValue)")
         }
-        return try await resolver.resolve(entry, onPreparationProgress: onPreparationProgress)
+        return resolver
     }
 }
 

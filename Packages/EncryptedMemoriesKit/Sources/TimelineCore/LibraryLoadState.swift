@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// Shared first-load presentation state.
 ///
@@ -55,7 +56,13 @@ public extension LibraryLoadState {
     }
 
     /// True once loading settled on a truly empty library - the only case where a blank grid is acceptable.
-    var isEmpty: Bool {
+    var isEmpty: Bool { isCompletelyEmpty }
+
+    /// Completely empty means a successful, complete authoritative listing has zero known items,
+    /// or this app initialized the account library empty. Only those outcomes may publish `.empty`.
+    /// An unknown first page, a partial listing, cancellation, failure and an unvalidated empty cache
+    /// provide no such proof. This rule uses known metadata, never an estimated total.
+    var isCompletelyEmpty: Bool {
         if case .empty = self { return true }
         return false
     }
@@ -79,7 +86,7 @@ public extension LibraryLoadState {
 /// testable value transform with no dependency on the feed/backend/crawl machinery.
 public enum LibraryLoadEvent: Equatable, Sendable {
     /// The inventory count became known - from either a cached snapshot (`cached: true`) or a fresh server load
-    /// (`cached: false`). A count of `0` means the library is empty.
+    /// (`cached: false`). A fresh count requires a successful complete listing, or app-owned empty initialization.
     case inventoryResolved(count: Int, cached: Bool)
 
     /// The initial server refresh completed. `requiresNewFrame` is true only when the ordered photo identities
@@ -128,10 +135,13 @@ public enum LibraryLoadPolicy {
             case .loadingContent, .contentReady, .empty:
                 return state
             case .validatingCachedContent(let count):
-                return count == 0 ? .empty : .contentReady(count: count)
+                return count == 0
+                    ? .failed(message: message, retryable: retryable)
+                    : .contentReady(count: count)
             }
 
         case .inventoryResolved(let count, let cached):
+            guard count >= 0 else { return .preparingInventory }
             guard count > 0 else {
                 // A persisted empty inventory is still provisional until its paired server token validates.
                 // Presenting `.empty` immediately would flash an empty state before a changed server library
@@ -143,6 +153,7 @@ public enum LibraryLoadPolicy {
             return .loadingContent(count: count, usingCachedInventory: cached)
 
         case .authoritativeInventoryResolved(let count, let requiresNewFrame):
+            guard count >= 0 else { return .preparingInventory }
             guard count > 0 else { return .empty }
             if case .contentReady = state { return .contentReady(count: count) }
             if case .validatingCachedContent = state, !requiresNewFrame {
@@ -167,5 +178,14 @@ public enum LibraryLoadPolicy {
                 return state
             }
         }
+    }
+}
+
+/// The library is completely empty only when complete, authoritative known metadata contains zero items.
+/// App-owned empty initialization establishes that same authority. Cached, partial, failed, cancelled and
+/// offline first reads cannot establish it. A missing first page has no known count. Totals are never estimated.
+public enum LibraryEmptyPolicy {
+    public static func isCompletelyEmpty(knownItemCount: Int?, authority: SourceInventoryAuthority) -> Bool {
+        knownItemCount == 0 && authority == .authoritative
     }
 }

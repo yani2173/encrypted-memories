@@ -14,6 +14,7 @@
 - [[Smart Search|Smart-Search]]
 - [[Viewer|Photo-and-Video-Viewer]]
 - [[Media Information|Media-Information]]
+- [[Duplicates]]
 - [[Recently Deleted|Recently-Deleted]]
 - [[Backup and Photo Library Sync|Backup-and-Album-Sync]]
 - [[Uploads and Upload Queue|Uploads-and-Queue]]

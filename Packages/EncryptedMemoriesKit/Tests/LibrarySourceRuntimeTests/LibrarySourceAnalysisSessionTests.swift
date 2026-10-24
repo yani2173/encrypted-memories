@@ -169,7 +169,9 @@ private final class FailureCounter {
     var count = 0
 
     func waitForCount(_ expected: Int) async {
-        for _ in 0..<10_000 where count < expected { await Task.yield() }
+        // The limit only ends a hung test. Machine load never reaches it.
+        let deadline = ContinuousClock.now + .seconds(300)
+        while count < expected, ContinuousClock.now < deadline { await Task.yield() }
     }
 }
 

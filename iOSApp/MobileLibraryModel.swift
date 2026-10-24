@@ -23,25 +23,92 @@ import TimelineCore
 import UIKit
 import UploadCore
 
-struct MobileRetryOwnerGraph {
-    typealias Shutdown = @MainActor @Sendable () async -> Void
+@MainActor private struct MobileAccountOwners {
+    let previousTeardown: Task<Void, Never>?
+    let facade: ProtonClientFacade?
+    let load: Task<Void, Never>?
+    let transition: Task<Void, Never>?
+    let prefetch: Task<Void, Never>?
+    let favorites: Task<Void, Never>?
+    let series: Task<Void, Never>?
+    let retry: Task<Void, Never>?
+    let scopeRecovery: Task<Void, Never>?
+    let photoBackup: PhotoLibraryBackupController?
+    let pending: RetiredPendingGrid
+    let albumSync: AlbumSyncController?
+    let feed: UIKitThumbnailFeed?
+    let refresh: LibraryRefreshCoalescer
+    let uploadRefresh: TimelineUploadRefreshCoordinator
+    let changeMonitor: LibraryChangeMonitor
+    let locationSession: LocationCrawlSession
+    let crawl: LocationCrawl
+    let crawlStarter: Task<Void, Never>?
+    let locationIndex: PhotoLocationIndex
+    let originalsCache: ThumbnailCache?
+    let smartSearch: AppleSmartSearchSession
+    let sourceAnalysis: LibrarySourceAnalysisSession
+    let assets: MLAssetUniverse
+    let thumbnailUpdates: LibraryThumbnailUpdateCoordinator
+    var smartSearchShutdown: Task<Void, Never>?
+    var sourceAnalysisShutdown: Task<Void, Never>?
+    var thumbnailShutdown: Task<Void, Never>?
 
-    static func makeCoordinator(
-        platformTasks: @escaping Shutdown,
-        smartSearch: @escaping Shutdown,
-        locationCrawl: @escaping Shutdown,
-        photoBackup: @escaping Shutdown,
-        albumSync: @escaping Shutdown,
-        facade: @escaping Shutdown
+    mutating func stopSearch(stopSourceAnalysis: () -> Task<Void, Never>?) {
+        smartSearchShutdown = smartSearch.stop()
+        sourceAnalysisShutdown = stopSourceAnalysis()
+    }
+
+    func makeCoordinator(
+        signingOut: Bool, purge: AccountOwnerGraphFactory.Shutdown?
     ) throws -> AccountTeardownCoordinator {
-        try AccountTeardownCoordinator(owners: [
-            AccountTeardownOwner(id: "mobile.retry.platform-tasks", stage: .platformTasks, shutdown: platformTasks),
-            AccountTeardownOwner(id: "mobile.retry.smart-search", stage: .smartSearch, shutdown: smartSearch),
-            AccountTeardownOwner(id: "mobile.retry.location-crawl", stage: .locationCrawl, shutdown: locationCrawl),
-            AccountTeardownOwner(id: "mobile.retry.photo-backup", stage: .photoBackup, shutdown: photoBackup),
-            AccountTeardownOwner(id: "mobile.retry.album-sync", stage: .albumSync, shutdown: albumSync),
-            AccountTeardownOwner(id: "mobile.retry.facade", stage: .facade, shutdown: facade),
-        ])
+        let caches: AccountOwnerGraphFactory.Shutdown? =
+            signingOut
+            ? { @MainActor @Sendable in
+                guard let originalsCache else { return }
+                await Task.detached(priority: .utility) { originalsCache.clearForSignOut() }.value
+            } : nil
+        let logs: AccountOwnerGraphFactory.Shutdown? =
+            signingOut ? { @MainActor @Sendable in await DebugLog.flush() } : nil
+        let closePendingSession: AccountOwnerGraphFactory.Shutdown? = pending.session.map { session in
+            { @MainActor @Sendable in await session.close() }
+        }
+        // The purge deletes the account directory; the pending store must be closed first.
+        let closePendingStore: AccountOwnerGraphFactory.Shutdown? = pending.store.map { store in
+            { @MainActor @Sendable in store.close() }
+        }
+        return try AccountOwnerGraphFactory.makeCoordinator(
+            profile: signingOut ? .mobileSignOut : .mobileRetry,
+            platformTasks: {
+                await previousTeardown?.value
+                // Capture is the single retry policy: both owners are nil for a plain retry.
+                await retry?.value
+                await scopeRecovery?.value
+                await transition?.value
+                await load?.value
+                await prefetch?.value
+                await favorites?.value
+                await thumbnailShutdown?.value
+                await refresh.cancel()
+                await uploadRefresh.cancel()
+                await changeMonitor.reset()
+                await feed?.stopPrefetch()
+            },
+            smartSearch: {
+                await smartSearchShutdown?.value
+                await sourceAnalysisShutdown?.value
+            },
+            locationCrawl: {
+                await crawlStarter?.value
+                await crawl.cancel()
+                if signingOut {
+                    locationIndex.replaceAll([])
+                    locationIndex.updateScanProgress(PhotoLocationScanProgress())
+                }
+            }, folderBackup: nil,
+            closePendingSession: closePendingSession,
+            photoBackup: { await photoBackup?.shutdown() }, closePendingStore: closePendingStore,
+            albumSync: { await albumSync?.shutdown() }, facade: { await facade?.shutdown() },
+            caches: caches, logs: logs, purge: purge)
     }
 }
 
@@ -168,6 +235,13 @@ final class MobileLibraryModel {
 
     /// Shared onboarding and loading policy. See `LibraryLoadState`.
     private(set) var loadState: LibraryLoadState = .initial
+
+    var isCompletelyEmpty: Bool {
+        loadState.isCompletelyEmpty
+            && LibraryEmptyPolicy.isCompletelyEmpty(
+                knownItemCount: snapshot.count, authority: primaryInventoryAuthority
+            )
+    }
     /// Immutable timeline snapshot prepared off the main actor. Its index provides O(1) and O(k) lookups
     /// for viewer, share, and trash actions without scanning the library.
     private(set) var snapshot = TimelineSnapshot() {
@@ -223,27 +297,30 @@ final class MobileLibraryModel {
     private(set) var facade: ProtonClientFacade? {
         didSet {
             guard facade !== oldValue else { return }
-            duplicates = facade?.exactDuplicates.map { makeDuplicatesModel($0) }
+            replaceDuplicates(using: facade?.exactDuplicates)
+            // The Collections tab scans for duplicates only when it appears. A merge that the end of the app left open
+            // is checked now, so a group whose copies both left the library comes back without that visit. A new
+            // account or a sign-out ends the check of the earlier one; its merges stay open in its journal.
+            duplicatesLifetime.checkPendingMerges(of: facade?.exactDuplicates)
         }
     }
     /// The Duplicates screen of this account. Nil while the account cannot merge duplicates.
     private(set) var duplicates: ExactDuplicatesModel?
+    @ObservationIgnored private let duplicatesLifetime = ExactDuplicatesAccountLifetime()
+    /// The merger of the Duplicates screen, which Empty Recently Deleted asks before it deletes anything.
+    @ObservationIgnored private var duplicateFinder: (any ExactDuplicateMerging)?
     /// Shared create/list/add state machine used by every native album presentation in this session.
     private(set) var albumActions: AlbumActionCoordinator?
     /// Account-scoped Photos-library backup controller shared with macOS.
     private(set) var photoBackup: PhotoLibraryBackupController?
-    /// Local photos on their way to Proton, merged into the whole-library grid (shared with macOS).
-    private(set) var pendingGrid: PendingGridSession?
-    @ObservationIgnored private var pendingStore: PendingBackupManifestStore?
-    @ObservationIgnored private var lastFavoriteIntents: [PhotoUID: Bool] = [:]
+    /// The pending grid of this account and its lists, shared with macOS. `PendingGridConnection` describes each one.
+    @ObservationIgnored private let pendingGridConnection = PendingGridConnection()
+    var pendingGrid: PendingGridSession? { pendingGridConnection.session }
     /// The grid's view of the library: Proton photos plus pending local photos.
     private(set) var pendingPresentation = PendingTimelinePresentation.empty
-    /// Local photos in "Zuletzt gelöscht", shown with the Proton trash.
-    private(set) var pendingTrash = PendingTrashPresentation.empty
-    /// Photos deleted before upload, for the Backup settings list.
-    private(set) var excludedPendingTiles: [PendingTile] = []
-    /// Changes when pending favorite intents change, so favorite displays refresh.
-    private(set) var pendingFavoriteRevision: UInt64 = 0
+    var pendingTrash: PendingTrashPresentation { pendingGridConnection.trash }
+    var excludedPendingTiles: [PendingTile] { pendingGridConnection.excludedTiles }
+    var pendingFavoriteRevision: UInt64 { pendingGridConnection.favoriteRevision }
     /// Offers to undo the last delete of pending photos.
     var undoNotice: UndoNoticeContent?
     /// Favorites as the app shows them, including the intents of pending photos.
@@ -288,18 +365,13 @@ final class MobileLibraryModel {
     }
 
     /// Encrypted GPS index shared with the Map tab. The per-account key protects it at rest.
-    let locationIndex = PhotoLocationIndex()
+    var locationIndex: PhotoLocationIndex { locationCrawl.index }
     /// Loads the area the map opens at into MapKit's cache, so the map draws at once.
     @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
-    private var locationPrivacyStopTask: Task<Void, Never>?
-    private let locationStore = PhotoLocationStore()
-    private let locationCrawl = LocationCrawl()
-    private var locationCrawlStarted = false
-    private var locationCrawlGeneration: UInt64 = 0
-    private var locationCrawlStartTask: Task<Void, Never>?
-    private var locationInventoryRevision: UInt64 = 0
-    private var locationCrawlInventoryRevision: UInt64 = 0
-    private var locationInventoryTask: Task<LocationCrawlInventory, Never>?
+    private var locationStore: PhotoLocationStore { locationCrawl.store }
+    /// The GPS crawl session shared with macOS. Startup restores the location cache before a crawl can start.
+    @ObservationIgnored private let locationCrawl = LocationCrawlSession(
+        platform: .init(headStart: .seconds(3), requiresStoreSession: true))
 
     /// Encrypted thumbnail cache retained for Settings diagnostics and clear actions. Decoded previews remain
     /// in RAM, while video bytes are managed by the backend.
@@ -343,72 +415,75 @@ final class MobileLibraryModel {
     /// Wakes analysis-only presentation after a source inventory becomes readable.
     private(set) var sourceAnalysisRevision: UInt64 = 0
     private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
-    @ObservationIgnored private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
+    private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
     /// Successful trash and restore mutations of this session, laid over every later listing.
     @ObservationIgnored private var timelineRemovals = TimelineRemovalOverlay()
     @ObservationIgnored private var timelineMutationGeneration = 0
     @ObservationIgnored private let sourceAnalysis = LibrarySourceAnalysisSession()
     private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime? { sourceAnalysis.runtime }
     /// Coalesces repeated retry taps into one ordered transient retirement and one replacement load.
-    @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private let retrySequence = BackendRetrySequence()
     /// Coalesces terminal Drive scope recovery. This path keeps authentication but purges all lost-scope data.
     @ObservationIgnored private let scopeRecoveryCoordinator = MobileScopeRecoveryCoordinator()
     @ObservationIgnored private var nextScopeRecoveryID: UInt64 = 0
 
     // MARK: - Pending grid
 
+    /// Starts the pending grid and returns the session and store that this start replaced. The caller closes them
+    /// (`RetiredPendingGrid.close`). The previous photo backup controller shuts down only in that close; without a
+    /// replaced pair nothing shuts it down here.
     private func configurePendingGrid(
         store: PendingBackupManifestStore?,
         photoBackup: PhotoLibraryBackupController,
         client: ProtonClientFacade,
         feed: UIKitThumbnailFeed
-    ) {
-        pendingStore = store
-        guard let store,
-            let session = PendingGridSession(
-                store: store,
-                photoBackup: photoBackup,
-                remote: ProtonPendingRemoteEffects(facade: client)
-            )
-        else { return }
-        session.presenter.onChange = { [weak self] presentation in
-            self?.pendingPresentation = presentation
-        }
-        session.onListsChange = { [weak self, weak session] in
-            guard let self, let session else { return }
-            pendingTrash = session.trash
-            excludedPendingTiles = session.excludedTiles
-        }
-        session.onPendingChange = { [weak self] snapshot in
-            guard let self, snapshot.favoriteIntents != lastFavoriteIntents else { return }
-            lastFavoriteIntents = snapshot.favoriteIntents
-            pendingFavoriteRevision &+= 1
-        }
+    ) -> RetiredPendingGrid {
         let albums = client.albums
-        Task { [weak session] in
-            await albums.setPendingAlbumAdds { [weak session] uids, albumID in
-                await session?.addToAlbum(uids, albumID: albumID) ?? false
-            }
-        }
-        session.attachFeed(feed.feedCore, imageRequest: PhotoKitPlatformImages.request)
-        pendingGrid = session
-        session.setRemote(snapshot)
-        session.start()
+        return startPendingGrid(
+            store: store, photoBackup: photoBackup, remote: ProtonPendingRemoteEffects(facade: client), feed: feed,
+            albumAdds: { await albums.setPendingAlbumAdds($0) }
+        ).replaced
     }
 
-    /// Detaches the pending grid from the model. The caller closes the session before the backup controller
-    /// shuts down, and the store after it.
-    private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
-        let retired = (pendingGrid, pendingStore)
-        pendingGrid = nil
-        pendingStore = nil
-        pendingPresentation = .empty
-        pendingTrash = .empty
-        excludedPendingTiles = []
-        undoNotice = nil
-        lastFavoriteIntents = [:]
-        pendingFavoriteRevision &+= 1
+    /// Shows the pending photos of `photoBackup` in the grid. Without `feed`, their thumbnails do not load. A live
+    /// session that this start replaces leaves its presentation and undo notice behind, so they are cleared first,
+    /// as `retirePendingGrid()` does. The caller closes `replaced` of the result.
+    private func startPendingGrid(
+        store: PendingBackupManifestStore?,
+        photoBackup: PhotoLibraryBackupController,
+        remote: any PendingRemoteEffects,
+        feed: UIKitThumbnailFeed?,
+        albumAdds: (@Sendable (@escaping @Sendable ([PhotoUID], String) async -> Bool) async -> Void)? = nil
+    ) -> PendingGridStart {
+        if pendingGridConnection.session != nil { clearPendingPresentation() }
+        return pendingGridConnection.start(
+            store: store,
+            makeSession: { PendingGridSession(store: $0, photoBackup: photoBackup, remote: remote) },
+            albumAdds: albumAdds,
+            prepare: { session in
+                // A replaced or retired session still publishes when it closes. Only the session that the connection
+                // shows may change the presentation.
+                session.presenter.onChange = pendingGridConnection.presentationHandler(for: session) {
+                    [weak self] presentation in
+                    self?.pendingPresentation = presentation
+                }
+                if let feed { session.attachFeed(feed.feedCore, imageRequest: PhotoKitPlatformImages.request) }
+                session.setRemote(snapshot)
+            }
+        )
+    }
+
+    /// Retires the pending grid (`PendingGridConnection.retire()`) and clears the iOS grid presentation and the
+    /// undo notice.
+    private func retirePendingGrid() -> RetiredPendingGrid {
+        let retired = pendingGridConnection.retire()
+        clearPendingPresentation()
         return retired
+    }
+
+    private func clearPendingPresentation() {
+        pendingPresentation = .empty
+        undoNotice = nil
     }
 
     func configure(session: ProtonSession?, store: SessionKeychainStore) {
@@ -462,8 +537,8 @@ final class MobileLibraryModel {
         }
         guard !split.remote.isEmpty else { return }
         try await removeFromVisibleLibrary(Set(split.remote)) { try await backend.trash(split.remote) }
-        // A copy that the person trashed, for example in the viewer of Duplicates, leaves its group.
-        duplicates?.photosLeftLibrary(Set(split.remote))
+        // A copy trashed in the viewer of a group, or anywhere else, leaves the Duplicates screen at once.
+        duplicates?.didTrashElsewhere(split.remote)
     }
 
     private func offerUndo(forDeleted uids: [PhotoUID]) {
@@ -499,6 +574,8 @@ final class MobileLibraryModel {
                 onProgress: onProgress
             )
         }
+        // The main photo of a series can be a copy in a group of duplicates; it leaves the Duplicates screen at once.
+        duplicates?.didTrashElsewhere(seriesUIDs)
         // The standalone copies are new library photos; the refresh brings them into the timeline.
         refreshAfterLocalUpload()
     }
@@ -574,9 +651,10 @@ final class MobileLibraryModel {
         try requireCurrentMutation(mutationLease)
     }
 
-    private func makeDuplicatesModel(_ finder: any ExactDuplicateMerging) -> ExactDuplicatesModel {
-        ExactDuplicatesModel(finder: finder) { [weak self] trashed in
-            await self?.removeMergedDuplicates(Set(trashed))
+    private func replaceDuplicates(using finder: (any ExactDuplicateMerging)?) {
+        duplicateFinder = finder
+        duplicates = duplicatesLifetime.replace(with: finder) { [weak self] trashed, token in
+            await self?.removeMergedDuplicates(Set(trashed), account: token)
         }
     }
 
@@ -584,14 +662,18 @@ final class MobileLibraryModel {
     /// photos show the favorite tag that the merge carried over. The optimistic removal advances the timeline
     /// mutation generation, which rejects an initial load in flight, so it waits for that load. The overlay hides
     /// the photos from every listing that starts meanwhile.
-    private func removeMergedDuplicates(_ uids: Set<PhotoUID>) async {
+    private func removeMergedDuplicates(_ uids: Set<PhotoUID>, account: ExactDuplicatesAccountLifetime.Token) async {
+        guard duplicatesLifetime.isCurrent(account) else { return }
         timelineRemovals.trashed(uids)
         var awaitedLoad: Task<Void, Never>?
         while !initialLibraryLoadSettled, let load = loadTask, load != awaitedLoad {
             awaitedLoad = load
             await load.value
+            guard duplicatesLifetime.isCurrent(account) else { return }
         }
+        guard duplicatesLifetime.isCurrent(account) else { return }
         try? await removeFromVisibleLibrary(uids) {}
+        guard duplicatesLifetime.isCurrent(account) else { return }
         await reloadFavorites(trashed: uids)
     }
 
@@ -633,7 +715,7 @@ final class MobileLibraryModel {
         }.value
         try requireCurrentMutation(mutationLease)
         guard generation == timelineMutationGeneration else { return }
-        let shouldRestartLocationCrawl = locationCrawlStarted
+        let shouldRestartLocationCrawl = locationCrawl.isStarted
         publish(result.0, locationInventoryChanged: true)
         apply(.inventoryResolved(count: result.0.snapshot.count, cached: false))
         await locationIndex.retainOnly(
@@ -643,7 +725,7 @@ final class MobileLibraryModel {
         )
         try requireCurrentMutation(mutationLease)
         if shouldRestartLocationCrawl {
-            locationCrawlStarted = false
+            locationCrawl.prepareRestart()
             startLocationCrawlIfNeeded()
         }
     }
@@ -693,12 +775,13 @@ final class MobileLibraryModel {
     /// backup and stay in Apple Photos.
     func emptyTrash(includesProtonTrash: Bool = true) async throws {
         guard let backend else { return }
-        if let pendingGrid, !pendingTrash.isEmpty {
-            guard await pendingGrid.removeFromTrashList(pendingTrash.items.map(\.uid)) else {
-                throw CancellationError()
-            }
+        let removePending: (([PhotoUID]) async -> Bool)? = pendingGrid.map { pendingGrid in
+            { await pendingGrid.removeFromTrashList($0) }
         }
-        if includesProtonTrash { try await backend.emptyTrash() }
+        try await TrashEmptying.empty(
+            backend, pendingUIDs: pendingTrash.items.map(\.uid), removePending: removePending,
+            includesProtonTrash: includesProtonTrash, checkingMergesWith: duplicateFinder,
+            accountDataDirectory: facade?.accountDataDirectory, commit: {})
     }
 
     /// Deletes only the album container through the shared AlbumCore facade. The backend deliberately uses
@@ -733,11 +816,8 @@ final class MobileLibraryModel {
     /// The whole-library grid's snapshot: it also holds pending photos, so selections of them resolve.
     private var gridSnapshot: TimelineSnapshot { showsPendingPhotos ? pendingPresentation.snapshot : snapshot }
 
-    /// Returns the encrypted thumbnail-cache size without blocking the main actor on file I/O.
-    func cacheDiskSizeBytes() async -> Int64 {
-        guard let cache = thumbnailCache else { return 0 }
-        return await Task.detached { cache.diskSizeBytes() }.value
-    }
+    /// The cache whose size Settings shows. An account reload replaces it, which restarts the Settings observation.
+    var diskCaches: ThumbnailCacheGroup { ThumbnailCacheGroup(thumbnailCache.map { [$0] } ?? []) }
 
     /// Clears the thumbnail cache and restarts prefetch. The feed keeps decoded thumbnails, and only the
     /// cache-owned directory is removed.
@@ -767,20 +847,13 @@ final class MobileLibraryModel {
     func retry() async {
         guard let session, let store else { return }
         if await scopeRecoveryCoordinator.joinIfActive() { return }
-        if let retryTask {
-            await retryTask.value
-            return
-        }
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.retryTask = nil }
-            await self.retireForRetry()
-            guard !Task.isCancelled, self.session == session else { return }
-            self.configuredUID = nil
-            self.start(session: session, store: store, preserveVisibleSnapshot: true)
-        }
-        retryTask = task
-        await task.value
+        await retrySequence.run(
+            retire: { [weak self] in await self?.retireForRetry() },
+            start: { [weak self] in
+                guard let self, self.session == session else { return }
+                self.configuredUID = nil
+                self.start(session: session, store: store, preserveVisibleSnapshot: true)
+            })
     }
 
     /// Schedules a Drive-scope recovery for the exact session and load that observed the terminal result. The
@@ -801,7 +874,7 @@ final class MobileLibraryModel {
             failedLoadGeneration: failedLoadGeneration,
             requestID: nextScopeRecoveryID
         )
-        let activeRetry = retryTask
+        let activeRetry = retrySequence.current
         let activeThumbnailCache = thumbnailCache
         let activeOriginalsCache = originalsCache
         let locationStore = locationStore
@@ -877,13 +950,23 @@ final class MobileLibraryModel {
         expectedSession: ProtonSession? = nil,
         expectedLoadGeneration: Int? = nil
     ) async {
-        guard let currentSession = session, let store else { return }
+        let task = scheduleScopeRecovery(
+            expectedSession: expectedSession, expectedLoadGeneration: expectedLoadGeneration)
+        await task?.value
+    }
+
+    /// Attempts synchronous recovery admission and returns the retained task, if any; callers choose whether to join.
+    @discardableResult
+    private func scheduleScopeRecovery(
+        expectedSession: ProtonSession?, expectedLoadGeneration: Int?
+    ) -> Task<Void, Never>? {
+        guard let currentSession = session, let store else { return nil }
         scheduleScopeRecovery(
             failedSession: expectedSession ?? currentSession,
             failedStore: store,
             failedLoadGeneration: expectedLoadGeneration ?? loadToken
         )
-        _ = await scopeRecoveryCoordinator.joinIfActive()
+        return scopeRecoveryCoordinator.task
     }
 
     private func scopeRecoveryIsCurrent(_ identity: MobileScopeRecoveryIdentity) -> Bool {
@@ -931,7 +1014,8 @@ final class MobileLibraryModel {
                 },
                 observer: { [weak self] attempt in
                     guard attempt.failureReason == .scopeAccessLost else { return }
-                    await self?.recoverAfterScopeAccessLoss(
+                    // Retirement joins this refresh worker, so return after registering recovery.
+                    await self?.scheduleScopeRecovery(
                         expectedSession: recoverySession,
                         expectedLoadGeneration: refreshLease.loadToken
                     )
@@ -955,11 +1039,12 @@ final class MobileLibraryModel {
         Task { await sourceAnalysisRuntime.refresh() }
     }
 
-    /// Unknown favorites can recover through existing refresh signals without reloading the account.
-    /// The task owner coalesces startup and refresh calls; known membership needs no further server read.
+    /// Unknown favorites can recover through existing refresh signals without reloading the account. Known
+    /// favorites are read again only after a refresh returned a new library token. The task owner coalesces
+    /// startup and refresh calls.
     private func loadFavoritesIfNeeded() {
         guard favoriteLoadTask == nil,
-            favoriteFilterAvailability != .available,
+            favoriteState.needsRead,
             !isSigningOut, !isRecoveringScope,
             let backend, let session
         else { return }
@@ -974,6 +1059,8 @@ final class MobileLibraryModel {
             else { return }
             self.favoriteLoadTask = nil
             self.favoriteState.finishLoad(loaded, for: read)
+            // A refresh may have returned a newer token while this read ran. A failed read waits for the next signal.
+            if loaded != nil { self.loadFavoritesIfNeeded() }
         }
     }
 
@@ -1034,127 +1121,28 @@ final class MobileLibraryModel {
         guard
             MapAndPlacesPolicy.allowsLocationCrawl(
                 enabled: MapAndPlacesPolicy.isEnabled(), itemCount: items.count),
-            !locationCrawlStarted, let backend, let cacheContext
+            !locationCrawl.isStarted, let backend, let cacheContext
         else { return }
-        locationCrawlStarted = true
-        locationCrawlGeneration &+= 1
-        let crawlGeneration = locationCrawlGeneration
         let loadGeneration = loadToken
         let accountUID = cacheContext.accountUID
-        let previousStarter = locationCrawlStartTask
-        let previousPrivacyStop = locationPrivacyStopTask
-        previousStarter?.cancel()
-
-        // Reuse the latest off-actor projection when available. The fallback covers tests or an early Map open.
-        let initialItems = items
-        let inventoryTask =
-            locationInventoryTask
-            ?? Task.detached(priority: .utility) {
-                LocationCrawlInventory(items: initialItems)
-            }
-        locationInventoryTask = inventoryTask
-        locationCrawlInventoryRevision = locationInventoryRevision
-        let index = locationIndex
-        let store = locationStore
-        let crawl = locationCrawl
         let feed = thumbnailFeed
-        let governor = LibraryWorkloadGovernorPolicy()
-        locationCrawlStartTask = Task { @MainActor [weak self, previousStarter, previousPrivacyStop] in
-            await previousPrivacyStop?.value
-            await previousStarter?.value
-            guard let self,
-                !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            // Startup already restored the account's location cache. Map entry only resumes its crawl.
-            await crawl.cancel()
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            guard let sessionLease = store.captureSessionLease() else { return }
-            let initialInventory = await inventoryTask.value
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            // Give thumbnail crawling a head start, then yield to visible demand. Do not use
-            // `hasPendingThumbnailWork()` because it includes whole-library fill and can starve map indexing.
-            do {
-                try await Task.sleep(for: .seconds(3))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled,
-                store.isCurrentSessionLease(sessionLease),
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            await crawl.start(
-                uids: initialInventory.uids,
-                captureDates: initialInventory.captureDates,
+        locationCrawl.start(
+            items: items,
+            LocationCrawlSession.Start(
                 accountUID: accountUID,
                 location: LocationCrawl.metadataProbe(backend),
-                index: index,
-                store: store,
-                shouldYield: {
-                    let applicationIsActive = await MainActor.run { self.applicationIsActive }
-                    guard applicationIsActive else { return true }
-                    let visibleDemand = await feed?.hasVisibleThumbnailPressure() ?? false
-                    return governor.budget(
-                        for: .backgroundLocationCrawl,
-                        signals: LibraryWorkloadSignals(hasVisibleMediaDemand: visibleDemand)
-                    ).shouldYield
-                },
+                visibleDemand: { await feed?.hasVisibleThumbnailPressure() ?? false },
+                yieldsAlways: { [weak self] in await MainActor.run { !(self?.applicationIsActive ?? false) } },
                 log: { DebugLog.log($0) },
-                inventory: { @MainActor [weak self] in
-                    guard let self, let task = self.locationInventoryTask else {
-                        return LocationCrawlInventory()
-                    }
-                    let revision = self.locationInventoryRevision
-                    let inventory = await task.value
-                    self.locationCrawlInventoryRevision = max(
-                        self.locationCrawlInventoryRevision,
-                        revision
-                    )
-                    return inventory
-                }
+                isCurrent: { [weak self] in loadGeneration == self?.loadToken && self?.session?.uid == accountUID },
+                restartForNewerInventory: { [weak self] in self?.startLocationCrawlIfNeeded() }
             )
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID
-            else {
-                await crawl.cancel()
-                return
-            }
-            if self.locationCrawlInventoryRevision != self.locationInventoryRevision {
-                self.locationCrawlStarted = false
-                self.startLocationCrawlIfNeeded()
-            }
-        }
+        )
     }
 
     func pauseMapAndPlaces() {
         mapPrewarmer.cancel()
-        locationCrawlGeneration &+= 1
-        locationCrawlStarted = false
-        locationCrawlStartTask?.cancel()
-        let previousStop = locationPrivacyStopTask
-        let crawl = locationCrawl
-        locationPrivacyStopTask = Task {
-            await previousStop?.value
-            await crawl.cancel()
-        }
+        locationCrawl.pause()
     }
 
     func resumeMapAndPlaces() {
@@ -1165,7 +1153,7 @@ final class MobileLibraryModel {
 
     func restartLocationCrawlIfNeeded() {
         guard !items.isEmpty else { return }
-        locationCrawlStarted = false
+        locationCrawl.prepareRestart()
         startLocationCrawlIfNeeded()
     }
 
@@ -1221,52 +1209,64 @@ final class MobileLibraryModel {
         return sourceAnalysis.stop()
     }
 
+    /// Captures native owners before cancellation can detach their live slots. The core retains this snapshot.
+    private func captureAndCancelTransientOwners(
+        signingOut: Bool, advanceLoadToken: Bool
+    ) -> MobileAccountOwners {
+        AccountOwnerGraphFactory.captureAndCancel(
+            {
+                MobileAccountOwners(
+                    previousTeardown: teardownTask, facade: facade, load: loadTask, transition: transitionTask,
+                    prefetch: prefetchStartTask, favorites: favoriteLoadTask, series: seriesDissolutionTask,
+                    retry: signingOut ? retrySequence.current : nil,
+                    scopeRecovery: signingOut ? scopeRecoveryCoordinator.task : nil,
+                    photoBackup: photoBackup, pending: retirePendingGrid(), albumSync: albumSync, feed: thumbnailFeed,
+                    refresh: libraryRefreshCoalescer, uploadRefresh: uploadRefreshCoordinator,
+                    changeMonitor: libraryChangeMonitor, locationSession: locationCrawl, crawl: locationCrawl.crawl,
+                    crawlStarter: locationCrawl.startingTask, locationIndex: locationIndex,
+                    originalsCache: originalsCache,
+                    smartSearch: smartSearchSession, sourceAnalysis: sourceAnalysis, assets: smartSearchAssets,
+                    thumbnailUpdates: thumbnailUpdateCoordinator)
+            },
+            cancel: { active in
+                if signingOut {
+                    retrySequence.cancel()
+                    _ = scopeRecoveryCoordinator.cancel()
+                } else {
+                    searchSuggestions.reset()
+                    active.stopSearch(stopSourceAnalysis: stopSourceAnalysis)
+                }
+                if advanceLoadToken { loadToken &+= 1 }
+                if signingOut { isRecoveringScope = false }
+                active.load?.cancel()
+                loadTask = nil
+                active.transition?.cancel()
+                transitionTask = nil
+                active.prefetch?.cancel()
+                prefetchStartTask = nil
+                isThumbnailPrefetchLoading = false
+                active.favorites?.cancel()
+                favoriteLoadTask = nil
+                if !signingOut {
+                    active.series?.cancel()
+                    seriesDissolutionTask = nil
+                }
+                favoriteState.reset(keepingFavorites: true)
+                active.thumbnailShutdown = active.thumbnailUpdates.cancel()
+            })
+    }
+
     /// Retires transient retry owners without deleting account data. Every replacement load waits for this
     /// barrier, so a retry never opens a second owner graph while the previous graph still owns SQLite handles.
     private func retireForRetry(advanceLoadToken: Bool = true) async {
-        let previousTeardown = teardownTask
-        let activeFacade = facade
-        let activeLoadTask = loadTask
-        let activeTransitionTask = transitionTask
-        let activePrefetchStartTask = prefetchStartTask
-        let activeFavoriteLoadTask = favoriteLoadTask
-        let activePhotoBackup = photoBackup
-        let activePendingGrid = retirePendingGrid()
-        let activeAlbumSync = albumSync
-        let activeThumbnailFeed = thumbnailFeed
-        let activeRefreshCoalescer = libraryRefreshCoalescer
-        let activeUploadRefreshCoordinator = uploadRefreshCoordinator
-        let activeChangeMonitor = libraryChangeMonitor
-        let activeLocationCrawl = locationCrawl
-        let activeLocationCrawlStarter = locationCrawlStartTask
-        searchSuggestions.reset()
-        let smartSearchShutdown = smartSearchSession.stop()
-        let sourceAnalysisShutdown = stopSourceAnalysis()
-
-        if advanceLoadToken { loadToken &+= 1 }
-        activeLoadTask?.cancel()
-        loadTask = nil
-        transitionTask?.cancel()
-        transitionTask = nil
-        prefetchStartTask?.cancel()
-        prefetchStartTask = nil
-        isThumbnailPrefetchLoading = false
-        favoriteLoadTask?.cancel()
-        favoriteLoadTask = nil
-        seriesDissolutionTask?.cancel()
-        seriesDissolutionTask = nil
-        favoriteState.reset(keepingFavorites: true)
-        let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
-        locationCrawlGeneration &+= 1
-        activeLocationCrawlStarter?.cancel()
-        locationCrawlStartTask = nil
-        locationCrawlStarted = false
-        locationInventoryTask?.cancel()
-        locationInventoryTask = nil
+        let active = captureAndCancelTransientOwners(
+            signingOut: false, advanceLoadToken: advanceLoadToken)
+        active.locationSession.retire()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
         primaryInventoryAuthority = .hydrating
         backend = nil
+        replaceDuplicates(using: nil)
         facade = nil
         albumActions = nil
         PhotoBackupBackgroundCoordinator.shared.backupStopped()
@@ -1276,39 +1276,7 @@ final class MobileLibraryModel {
 
         let coordinator: AccountTeardownCoordinator
         do {
-            coordinator = try MobileRetryOwnerGraph.makeCoordinator(
-                platformTasks: {
-                    await previousTeardown?.value
-                    await activeTransitionTask?.value
-                    await activeLoadTask?.value
-                    await activePrefetchStartTask?.value
-                    await activeFavoriteLoadTask?.value
-                    await activeThumbnailUpdateTask?.value
-                    await activeRefreshCoalescer.cancel()
-                    await activeUploadRefreshCoordinator.cancel()
-                    await activeChangeMonitor.reset()
-                    await activeThumbnailFeed?.stopPrefetch()
-                },
-                smartSearch: {
-                    await smartSearchShutdown?.value
-                    await sourceAnalysisShutdown?.value
-                },
-                locationCrawl: {
-                    await activeLocationCrawlStarter?.value
-                    await activeLocationCrawl.cancel()
-                },
-                photoBackup: {
-                    await activePendingGrid.session?.close()
-                    await activePhotoBackup?.shutdown()
-                    activePendingGrid.store?.close()
-                },
-                albumSync: {
-                    await activeAlbumSync?.shutdown()
-                },
-                facade: {
-                    await activeFacade?.shutdown()
-                }
-            )
+            coordinator = try active.makeCoordinator(signingOut: false, purge: nil)
         } catch {
             preconditionFailure("Duplicate transient retry owner identifier")
         }
@@ -1317,45 +1285,11 @@ final class MobileLibraryModel {
 
     private func teardown() {
         LibraryRuntimeState.shared.beginNewGeneration()
-        let previousTeardown = teardownTask
-        let activeFacade = facade
-        let activeLoadTask = loadTask
-        let activeTransitionTask = transitionTask
-        let activePrefetchStartTask = prefetchStartTask
-        let activeFavoriteLoadTask = favoriteLoadTask
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         isSigningOut = purgeClaim != nil
         pendingSignOutPurgeClaim = purgeClaim
         signOutCleanupFailed = false
-        let activePhotoBackup = photoBackup
-        let activePendingGrid = retirePendingGrid()
-        let activeAlbumSync = albumSync
-        let activeThumbnailFeed = thumbnailFeed
-        let activeOriginalsCache = originalsCache
-        let activeRefreshCoalescer = libraryRefreshCoalescer
-        let activeUploadRefreshCoordinator = uploadRefreshCoordinator
-        let activeChangeMonitor = libraryChangeMonitor
-        let activeLocationCrawl = locationCrawl
-        let activeLocationCrawlStarter = locationCrawlStartTask
-        let activeLocationIndex = locationIndex
-        let activeRetry = retryTask
-        let activeScopeRecovery = scopeRecoveryCoordinator.cancel()
-
-        loadToken &+= 1  // supersede any in-flight snapshot sort
-        activeRetry?.cancel()
-        retryTask = nil
-        isRecoveringScope = false
-        activeLoadTask?.cancel()
-        loadTask = nil
-        transitionTask?.cancel()
-        transitionTask = nil
-        prefetchStartTask?.cancel()
-        prefetchStartTask = nil
-        isThumbnailPrefetchLoading = false
-        favoriteLoadTask?.cancel()
-        favoriteLoadTask = nil
-        favoriteState.reset(keepingFavorites: true)
-        let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
+        var active = captureAndCancelTransientOwners(signingOut: true, advanceLoadToken: true)
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
         primaryInventoryAuthority = .hydrating
@@ -1363,6 +1297,7 @@ final class MobileLibraryModel {
         session = nil
         cacheContext = nil
         backend = nil
+        replaceDuplicates(using: nil)
         facade = nil
         albumActions = nil
         PhotoBackupBackgroundCoordinator.shared.backupStopped()
@@ -1377,81 +1312,32 @@ final class MobileLibraryModel {
         timelineRevision &+= 1
         thumbnailFeed = nil
         searchSuggestions.reset()
-        let smartSearchShutdown = smartSearchSession.stop()
-        let sourceAnalysisShutdown = stopSourceAnalysis()
+        active.stopSearch(stopSourceAnalysis: stopSourceAnalysis)
         thumbnailCache = nil
         originalsCache = nil
         loadState = .initial
-        locationCrawlStarted = false
-        locationInventoryTask?.cancel()
-        locationInventoryTask = nil
-        locationIndex.replaceAll([])
-        locationIndex.updateScanProgress(PhotoLocationScanProgress())
-        var teardownOwners = [
-            AccountTeardownOwner(id: "mobile.platform-tasks", stage: .platformTasks) {
-                await previousTeardown?.value
-                await activeRetry?.value
-                await activeScopeRecovery?.value
-                await activeTransitionTask?.value
-                await activeLoadTask?.value
-                await activePrefetchStartTask?.value
-                await activeFavoriteLoadTask?.value
-                await activeThumbnailUpdateTask?.value
-                await activeRefreshCoalescer.cancel()
-                await activeUploadRefreshCoordinator.cancel()
-                await activeChangeMonitor.reset()
-                await activeThumbnailFeed?.stopPrefetch()
-            },
-            AccountTeardownOwner(id: "shared.smart-search", stage: .smartSearch) {
-                await smartSearchShutdown?.value
-                await sourceAnalysisShutdown?.value
-            },
-            AccountTeardownOwner(id: "mobile.location-crawl", stage: .locationCrawl) {
-                await activeLocationCrawlStarter?.value
-                await activeLocationCrawl.cancel()
-                activeLocationIndex.replaceAll([])
-                activeLocationIndex.updateScanProgress(PhotoLocationScanProgress())
-            },
-            AccountTeardownOwner(id: "shared.photo-backup", stage: .photoBackup) {
-                await activePendingGrid.session?.close()
-                await activePhotoBackup?.shutdown()
-                // The purge deletes the account directory; the pending store must be closed first.
-                activePendingGrid.store?.close()
-            },
-            AccountTeardownOwner(id: "shared.album-sync", stage: .albumSync) {
-                await activeAlbumSync?.shutdown()
-            },
-            AccountTeardownOwner(id: "shared.proton-facade", stage: .facade) {
-                await activeFacade?.shutdown()
-            },
-            AccountTeardownOwner(id: "mobile.originals-cache", stage: .caches) {
-                guard let activeOriginalsCache else { return }
-                await Task.detached(priority: .utility) {
-                    activeOriginalsCache.clearForSignOut()
-                }.value
-            },
-            AccountTeardownOwner(id: "shared.debug-log", stage: .logs) {
-                await DebugLog.flush()
-            },
-        ]
+        active.locationSession.resetForTeardown()
+        active.locationIndex.replaceAll([])
+        active.locationIndex.updateScanProgress(PhotoLocationScanProgress())
+        let purge: AccountOwnerGraphFactory.Shutdown?
         // Transient teardown must not delete account data. Only a claimed sign-out purge may do so.
         if let purgeClaim {
-            teardownOwners.append(
-                AccountTeardownOwner(id: "shared.local-data-claim", stage: .purgeClaims) {
-                    PendingReplacementLedger.clearForSignOut()
-                    let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
-                    guard succeeded else { throw TeardownFailure.purgeFailed }
-                }
-            )
+            purge = {
+                PendingReplacementLedger.clearForSignOut()
+                let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
+                guard succeeded else { throw TeardownFailure.purgeFailed }
+            }
+        } else {
+            purge = nil
         }
 
         let teardownCoordinator: AccountTeardownCoordinator
         do {
-            teardownCoordinator = try AccountTeardownCoordinator(owners: teardownOwners)
+            teardownCoordinator = try active.makeCoordinator(signingOut: true, purge: purge)
         } catch {
             preconditionFailure("Duplicate account teardown owner identifier")
         }
-        teardownTask = Task { @MainActor in
+        teardownTask = Task { @MainActor [purgeClaim] in
             let report = await teardownCoordinator.teardown()
             guard purgeClaim != nil else { return }
             if report.succeeded {
@@ -1505,8 +1391,11 @@ final class MobileLibraryModel {
         backend = nil
         facade = nil
         albumActions = nil
+        let previousPhotoBackup = photoBackup
         photoBackup = nil
-        _ = retirePendingGrid()
+        // No current flow is known to leave a pair here. A pair that is still there is closed by the load below, in
+        // the teardown order.
+        let retiredPendingGrid = retirePendingGrid()
         albumSync = nil
         timelineRemovals = TimelineRemovalOverlay()
         timelineMutationGeneration &+= 1
@@ -1546,8 +1435,8 @@ final class MobileLibraryModel {
         UIKitMemoryPressureCoordinator.shared.attachByteCache(cache)
 
         loadTask = Task { [weak self] in
+            await retiredPendingGrid.close(whileStoreOpen: { await previousPhotoBackup?.shutdown() })
             guard let self else { return }
-            var hadCachedInventory = false
             do {
                 // Suggestions validate locations as part of their content identity. Restore the existing
                 // encrypted store before publishing settled inventory, even if Map is never opened.
@@ -1586,31 +1475,19 @@ final class MobileLibraryModel {
                     dimensions: PhotoDimensionCoalescer(store: backend),
                     targetPixels: 288
                 )
-                let pendingStore = PendingGridSession.openStore(
+                // The pending store, the photo backup and album sync are built the same way on macOS.
+                let stack = AccountBackupStack(
                     accountDataDirectory: client.accountDataDirectory,
-                    policy: client.accountDatabasePolicy
-                )
-                let photoBackup = PhotoLibraryBackupController(
-                    configuration: .init(
-                        accountDataDirectory: client.accountDataDirectory,
-                        databasePolicy: client.accountDatabasePolicy
-                    ),
+                    databasePolicy: client.accountDatabasePolicy,
                     identityResolver: client.uploadIdentityResolver,
                     uploader: client.photoUploader,
                     tagAdder: client.photoTagAdder,
                     editReplacement: client.editedPhotoReplacement,
-                    pendingStore: pendingStore,
-                    requiresPendingStore: true
+                    albumOperations: client.albumSyncRemoteOps
                 )
-                let albumSync = AlbumSyncController(
-                    configuration: .init(
-                        accountDataDirectory: client.accountDataDirectory,
-                        databasePolicy: client.accountDatabasePolicy
-                    ),
-                    identityResolver: client.uploadIdentityResolver,
-                    uploader: client.photoUploader,
-                    remoteOps: client.albumSyncRemoteOps
-                )
+                let pendingStore = stack.pendingStore
+                let photoBackup = stack.photoBackup
+                let albumSync = stack.albumSync
                 albumSync.setRemoteAlbumsChangedHandler { [weak self] in
                     guard let self,
                         loadGeneration == self.loadToken,
@@ -1623,9 +1500,7 @@ final class MobileLibraryModel {
                     loadGeneration == self.loadToken,
                     self.session == session
                 else {
-                    await photoBackup.shutdown()
-                    pendingStore?.close()
-                    await albumSync.shutdown()
+                    await stack.shutdownUnused()
                     await client.shutdown()
                     return
                 }
@@ -1637,12 +1512,14 @@ final class MobileLibraryModel {
                     }
                 }
                 self.albumActions = AlbumActionCoordinator(repository: client.albums)
+                let replacedPhotoBackup = self.photoBackup
                 self.photoBackup = photoBackup
                 PhotoBackupBackgroundCoordinator.shared.configure(controller: photoBackup)
                 self.albumSync = albumSync
                 self.backend = backend
                 self.thumbnailFeed = feed
-                self.configurePendingGrid(store: pendingStore, photoBackup: photoBackup, client: client, feed: feed)
+                let replacedPendingGrid = self.configurePendingGrid(
+                    store: pendingStore, photoBackup: photoBackup, client: client, feed: feed)
                 if self.isRecoveringScope {
                     self.isRecoveringScope = false
                 }
@@ -1651,71 +1528,15 @@ final class MobileLibraryModel {
                 UIKitMemoryPressureCoordinator.shared.attachFeed(feed)
                 self.configureSourceAnalysis(client: client, feed: feed)
                 self.configureSmartSearch(session: session, client: client, feed: feed)
-                // Show the persisted snapshot while Core validates its event token. A match avoids row
-                // enumeration; a mismatch falls back to the authoritative load.
-                var cacheValidation = TimelineCacheValidation.refreshRequired(monitorBaseline: nil)
-                if let cached = await backend.cachedTimelineSnapshot() {
-                    hadCachedInventory = true
-                    guard !Task.isCancelled,
-                        loadGeneration == self.loadToken,
-                        self.session == session
-                    else { return }
-                    try await applyItems(cached.sections, cached: true)
-                    guard !Task.isCancelled,
-                        loadGeneration == self.loadToken,
-                        self.session == session
-                    else { return }
-                    scheduleThumbnailPrefetch(using: feed)
-                    cacheValidation = await TimelineCacheValidationPolicy.validate(
-                        snapshot: cached,
-                        repository: backend
-                    )
-                    guard !Task.isCancelled,
-                        loadGeneration == self.loadToken,
-                        self.session == session
-                    else { return }
-                    if case .terminalFailure = cacheValidation {
-                        throw TimelineCacheValidationTerminalError()
-                    }
-                    if case .validated(let token) = cacheValidation {
-                        publishSmartSearchInventory(
-                            snapshot.items,
-                            authority: .authoritative
-                        )
-                        apply(.authoritativeInventoryResolved(count: items.count, requiresNewFrame: false))
-                        initialLibraryLoadSettled = true
-                        startLibraryChangeMonitorIfPossible(
-                            resetBaseline: true,
-                            initialToken: token
-                        )
-                        return
-                    }
-                }
-
-                let refreshed = try await backend.loadTimelineSnapshot()
-                guard !Task.isCancelled,
-                    loadGeneration == self.loadToken,
-                    self.session == session
-                else { return }
-                let shownBefore = snapshot
-                let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
-                guard !Task.isCancelled,
-                    loadGeneration == self.loadToken,
-                    self.session == session
-                else { return }
-                scheduleThumbnailPrefetch(using: feed)
-                if hadCachedInventory {
-                    reconcileNewAssetThumbnails(since: shownBefore, change: change, using: feed)
-                }
-                initialLibraryLoadSettled = true
-                self.startLibraryChangeMonitorIfPossible(
-                    resetBaseline: true,
-                    initialToken: refreshed.validationToken ?? cacheValidation.monitorBaseline
-                )
-            } catch is CancellationError {
-                // A newer session/configuration replaced this task.
+                // No current flow is known to hand back a non-empty pair here. A pair that a replacing start left is
+                // closed here, after every assignment of this block. The guard re-checks the load, as the guard after
+                // the earlier await does.
+                await replacedPendingGrid.close(whileStoreOpen: { await replacedPhotoBackup?.shutdown() })
+                guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
+                try await loadInitialTimeline(
+                    backend: backend, feed: feed, session: session, loadGeneration: loadGeneration)
             } catch let error as any LibraryChangeTerminalError {
-                guard loadGeneration == self.loadToken, self.session == session else { return }
+                guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 DebugLog.log("timeline: terminal scope failure during initial load - \(error)")
                 // The recovery task must not join the load task that schedules it. Remove this completed owner
                 // first, then synchronously register recovery before this main-actor turn ends.
@@ -1726,7 +1547,7 @@ final class MobileLibraryModel {
                     failedLoadGeneration: loadGeneration
                 )
             } catch {
-                guard loadGeneration == self.loadToken, self.session == session else { return }
+                guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 if self.isRecoveringScope {
                     self.isRecoveringScope = false
                 }
@@ -1741,6 +1562,75 @@ final class MobileLibraryModel {
                 startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: "")
             }
         }
+    }
+
+    private func loadInitialTimeline(
+        backend: any PhotosRepository,
+        feed: UIKitThumbnailFeed,
+        session: ProtonSession,
+        loadGeneration: Int
+    ) async throws {
+        var hadCachedInventory = false
+        // Show the persisted snapshot while Core validates its event token. A match avoids row
+        // enumeration; a mismatch falls back to the authoritative load.
+        var cacheValidation = TimelineCacheValidation.refreshRequired(monitorBaseline: nil)
+        if let cached = await backend.cachedTimelineSnapshot() {
+            hadCachedInventory = true
+            guard !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            _ = try await applyItems(cached.sections, cached: true)
+            guard !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            scheduleThumbnailPrefetch(using: feed)
+            let mutationGeneration = timelineMutationGeneration
+            let validation = await TimelineCacheValidationPolicy.validateForPublication(
+                snapshot: cached,
+                repository: backend
+            )
+            cacheValidation = validation.validation
+            guard !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            if case .terminalFailure = cacheValidation {
+                throw TimelineCacheValidationTerminalError()
+            }
+            let change = try await applyValidatedCacheForCurrentMutation(
+                validation, generation: mutationGeneration)
+            guard !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            guard mutationGeneration == timelineMutationGeneration else {
+                initialLibraryLoadSettled = true
+                startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: "")
+                return
+            }
+            if settleValidatedCachedTimeline(change: change, validation: cacheValidation) {
+                return
+            }
+        }
+
+        let refreshed = try await backend.loadTimelineSnapshot()
+        guard !Task.isCancelled,
+            loadGeneration == self.loadToken,
+            self.session == session
+        else { return }
+        let shownBefore = snapshot
+        let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
+        guard !Task.isCancelled,
+            loadGeneration == self.loadToken,
+            self.session == session
+        else { return }
+        scheduleThumbnailPrefetch(using: feed)
+        if hadCachedInventory {
+            reconcileNewAssetThumbnails(since: shownBefore, change: change, using: feed)
+        }
+        settleInitialTimelineLoad(refreshed, change: change)
     }
 
     /// Builds an immutable `TimelineSnapshot` off the main actor and publishes it only for the current load.
@@ -1811,26 +1701,16 @@ final class MobileLibraryModel {
         publishPrimaryInventory: Bool = true
     ) {
         if locationInventoryChanged {
-            let locationItems = projection.snapshot.items
-            locationInventoryTask?.cancel()
-            locationInventoryTask = Task.detached(priority: .utility) {
-                LocationCrawlInventory(items: locationItems)
-            }
+            locationCrawl.updateInventory(projection.snapshot.items)
         }
         snapshot = projection.snapshot
         sections = projection.sections
         timelineRevision &+= 1
-        if locationInventoryChanged {
-            locationInventoryRevision &+= 1
-        }
         if publishPrimaryInventory {
             publishSmartSearchInventory(projection.snapshot.items)
         }
-        if locationCrawlStarted,
-            locationCrawlInventoryRevision != locationInventoryRevision,
-            locationIndex.scanProgress.phase == .completed || locationIndex.scanProgress.phase == .failed
-        {
-            locationCrawlStarted = false
+        if locationCrawl.finishedWithOutdatedInventory {
+            locationCrawl.prepareRestart()
             startLocationCrawlIfNeeded()
         }
     }
@@ -1853,12 +1733,36 @@ final class MobileLibraryModel {
         )
     }
 
+    private func applyValidatedCacheForCurrentMutation(
+        _ validation: TimelineCacheValidationResult, generation: Int
+    ) async throws -> TimelineProjectionChange? {
+        guard generation == timelineMutationGeneration, let current = validation.snapshot else { return nil }
+        return try await applyItems(current.sections, cached: false, authoritative: true)
+    }
+
+    private func settleValidatedCachedTimeline(
+        change: TimelineProjectionChange?, validation: TimelineCacheValidation
+    ) -> Bool {
+        guard change != nil, case .validated(let token) = validation else { return false }
+        publishSmartSearchInventory(snapshot.items, authority: .authoritative)
+        initialLibraryLoadSettled = true
+        startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: token)
+        return true
+    }
+
+    private func settleInitialTimelineLoad(
+        _ refreshed: TimelineLoadSnapshot, change: TimelineProjectionChange?
+    ) {
+        initialLibraryLoadSettled = true
+        startLibraryChangeMonitorIfPossible(
+            resetBaseline: true, initialToken: refreshed.monitorBaseline(afterPublishing: change != nil))
+    }
+
     private func startLibraryChangeMonitorIfPossible(
         resetBaseline: Bool = false,
         initialToken: String? = nil
     ) {
-        guard applicationIsActive,
-            initialLibraryLoadSettled,
+        guard initialLibraryLoadSettled,
             let provider = backend as? any LibraryChangeTokenProvider,
             let recoverySession = session,
             let refreshLease = currentMutationLease()
@@ -1873,6 +1777,7 @@ final class MobileLibraryModel {
             else { return }
             await self.libraryChangeMonitor.restart(
                 provider: provider,
+                isActive: self.applicationIsActive,
                 resetBaseline: resetBaseline,
                 initialToken: initialToken,
                 onTerminal: { [weak self] _ in
@@ -1917,11 +1822,13 @@ final class MobileLibraryModel {
         isRefreshingLibrary = true
         defer { isRefreshingLibrary = false }
         do {
-            let refreshed = try await backend.loadTimeline()
+            let refreshed = try await backend.loadTimelineSnapshot()
             try Task.checkCancellation()
             try requireCurrentMutation(refreshLease)
             let shownBefore = snapshot
-            let change = try await applyItems(refreshed, cached: false, authoritative: true)
+            guard let change = try await applyItems(refreshed.sections, cached: false, authoritative: true) else {
+                return .init(outcome: .retry, failureReason: .superseded)
+            }
             try requireCurrentMutation(refreshLease)
             if let thumbnailFeed {
                 scheduleThumbnailPrefetch(using: thumbnailFeed)
@@ -1930,8 +1837,10 @@ final class MobileLibraryModel {
             // The same opaque server event token covers album mutations. Reuse this central foreground
             // refresh instead of adding a second poller; Collections reloads through its existing revision key.
             albumCatalogRevision &+= 1
+            // Another device's favorite change moves the same token, so refreshLibrarySources reads them again.
+            favoriteState.observeLibraryToken(refreshed.validationToken)
             refreshLibrarySources()
-            return .init(outcome: .refreshed, failureReason: nil)
+            return .init(outcome: .refreshed(token: refreshed.validationToken), failureReason: nil)
         } catch is CancellationError {
             return .init(outcome: .retry, failureReason: .cancelled)
         } catch is any LibraryChangeTerminalError {
@@ -1985,11 +1894,66 @@ final class MobileLibraryModel {
             // Unread favorites, so the first library refresh reads them like a signed-in account.
             favoriteState.reset(keepingFavorites: false)
             timelineRevision &+= 1
-            loadState = .contentReady(count: projection.snapshot.items.count)
+            primaryInventoryAuthority = .authoritative
+            loadState = LibraryLoadPolicy.reduce(
+                .initial, .authoritativeInventoryResolved(count: projection.snapshot.count, requiresNewFrame: true)
+            )
+            loadState = LibraryLoadPolicy.reduce(loadState, .firstContentReady)
+        }
+
+        /// Settles the installed library like a completed initial load and reads its favorites, so search
+        /// suggestions compute as they do for a signed-in account.
+        func settleIsolatedLibraryForTesting(initialToken: String? = nil) {
+            initialLibraryLoadSettled = true
+            loadFavoritesIfNeeded()
+            if let initialToken {
+                startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: initialToken)
+            }
+        }
+
+        func publishIsolatedValidatedCacheForTesting(_ cached: CachedTimelineSnapshot) async throws -> Bool {
+            let change = try await applyItems(cached.sections, cached: false, authoritative: true)
+            return settleValidatedCachedTimeline(change: change, validation: .validated(token: "b"))
+        }
+
+        func validateIsolatedCacheForTesting(_ cached: CachedTimelineSnapshot) async throws -> Bool {
+            guard let backend else { return false }
+            let generation = timelineMutationGeneration
+            let validation = await TimelineCacheValidationPolicy.validateForPublication(
+                snapshot: cached, repository: backend)
+            let change = try await applyValidatedCacheForCurrentMutation(validation, generation: generation)
+            return settleValidatedCachedTimeline(change: change, validation: validation.validation)
+        }
+
+        func publishIsolatedInitialSnapshotForTesting(_ refreshed: TimelineLoadSnapshot) async throws {
+            let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
+            settleInitialTimelineLoad(refreshed, change: change)
+        }
+
+        func refreshIsolatedLibraryForTesting() async -> LibraryChangeRefreshOutcome {
+            guard let lease = currentMutationLease() else { return .retry }
+            return await performLibraryRefresh(lease: lease).outcome
         }
 
         func installIsolatedDuplicatesForTesting(_ finder: any ExactDuplicateMerging) {
-            duplicates = makeDuplicatesModel(finder)
+            replaceDuplicates(using: finder)
+        }
+
+        var isolatedInventoryAuthorityForTesting: SourceInventoryAuthority { primaryInventoryAuthority }
+
+        /// Drives the shipping startup read sequence with an already installed isolated account.
+        func loadIsolatedInitialTimelineForTesting(repository: any PhotosRepository) async throws {
+            guard let thumbnailFeed, let session else { throw CancellationError() }
+            primaryInventoryAuthority = .hydrating
+            loadState = .preparingInventory
+            initialLibraryLoadSettled = false
+            try await loadInitialTimeline(
+                backend: repository, feed: thumbnailFeed, session: session, loadGeneration: loadToken)
+        }
+
+        /// Replays first-load outcomes through the shipping reducer without a real account request.
+        func applyIsolatedLibraryLoadEventsForTesting(_ events: [LibraryLoadEvent]) {
+            loadState = events.reduce(.initial) { LibraryLoadPolicy.reduce($0, $1) }
         }
 
         /// Stands for an initial library load that runs until `load` returns and settles then.
@@ -2003,6 +1967,16 @@ final class MobileLibraryModel {
 
         func installIsolatedBackupForTesting(_ controller: PhotoLibraryBackupController) {
             photoBackup = controller
+        }
+
+        /// Also shows the pending photos of `controller` in the grid, without Apple Photos thumbnails.
+        func installIsolatedPendingBackupForTesting(
+            _ controller: PhotoLibraryBackupController, store: PendingBackupManifestStore,
+            remote: any PendingRemoteEffects
+        ) {
+            photoBackup = controller
+            let replaced = startPendingGrid(store: store, photoBackup: controller, remote: remote, feed: nil).replaced
+            precondition(replaced.isEmpty, "A test installs the pending grid into a model that has none.")
         }
 
         func installIsolatedAlbumSyncForTesting(_ controller: AlbumSyncController) {

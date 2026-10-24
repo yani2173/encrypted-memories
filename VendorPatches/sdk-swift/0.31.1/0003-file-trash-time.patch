@@ -1,0 +1,41 @@
+diff --git a/Sources/Plumbing/PublicTypes.swift b/Sources/Plumbing/PublicTypes.swift
+index b29bf93..ae06391 100644
+--- a/Sources/Plumbing/PublicTypes.swift
++++ b/Sources/Plumbing/PublicTypes.swift
+@@ -500 +500 @@ public struct FileNode: Sendable {
+-        self.trashTime = sdkFileNode.trashTime.timeIntervalSince1970
++        self.trashTime = sdkFileNode.hasTrashTime ? sdkFileNode.trashTime.timeIntervalSince1970 : nil
+diff --git a/Tests/FileNodeTrashTimeTests.swift b/Tests/FileNodeTrashTimeTests.swift
+new file mode 100644
+index 0000000..cc7eebe
+--- /dev/null
++++ b/Tests/FileNodeTrashTimeTests.swift
+@@ -0,0 +1,28 @@
++import SwiftProtobuf
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("File trash-time decoding")
++struct FileNodeTrashTimeTests {
++    @Test func absentTrashTimeStaysNil() throws {
++        let file = try FileNode(sdkFileNode: makeFile())
++        #expect(file.trashTime == nil)
++    }
++
++    @Test func presentTrashTimeIsPreserved() throws {
++        var source = makeFile()
++        source.trashTime = Google_Protobuf_Timestamp(seconds: 42)
++        let file = try FileNode(sdkFileNode: source)
++        #expect(file.trashTime == 42)
++    }
++
++    private func makeFile() -> Proton_Drive_Sdk_FileNode {
++        var file = Proton_Drive_Sdk_FileNode()
++        file.uid = "volume~file"
++        file.name = Proton_Drive_Sdk_StringResult.with { $0.value = "claim.json" }
++        file.directRole = .inherited
++        file.activeRevision.uid = "volume~file~revision"
++        file.activeRevision.state = .active
++        return file
++    }
++}

@@ -1,6 +1,6 @@
 # Device and Feature Support
 
-Last reviewed: 25 August 2026.
+Last reviewed: 11 October 2026.
 
 ## Three separate checks
 
@@ -35,9 +35,12 @@ Unsupported hardware receives a localized in-app explanation before the main lib
 | Feature | Every supported app device | Additional requirement or behavior |
 |---|:---:|---|
 | Library, Metal timeline, albums, viewer, map, trash, cache | Yes | Requires the app baseline above. |
-| Apple Photos library backup | Yes | Requires Photos permission. Background execution is scheduled by the operating system and is not continuous. |
+| Apple Photos library backup | Yes | Requires Photos permission. Background execution is scheduled by the operating system and is not continuous. Backups use cellular data only when **Use Cellular Data** is on. |
 | Folder backup | Mac only | Requires access to a user-selected folder. |
 | Album sync | Yes | Requires Photos permission and selected local albums. |
+| Duplicates and Merge All | Yes | Merged copies move to Recently Deleted. |
+| Map and Places, Remove location when sharing | Yes | Switches in Settings under **Privacy**. |
+| Blur App Preview | iPhone and iPad | The switch exists only on iPhone and iPad. |
 | OCR and document-text indexing | Usually | Apple Vision support is checked at runtime. The visible Text scope appears only when its local index is available. |
 | Smart Search model | Model-dependent | Core ML can use CPU, GPU, or Neural Engine. A compatible signed catalog model and enough free space for its download must be available. |
 | Neural Engine | No | It is not a requirement for the app or generic Apple Vision search requests. |

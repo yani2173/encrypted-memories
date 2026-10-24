@@ -10,11 +10,11 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
     private static let schemaVersion = 2
     private static let catalogReplayStateKey = "catalog_replay_state"
-    private var db: OpaquePointer?
-    private var operationFailed = false
-    private let lock = NSLock()
+    private let connection: SQLiteStoreConnection
+    private var db: OpaquePointer? { connection.database }
     private let observerLock = NSLock()
-    private var changeObserver: (@Sendable (UploadBackupSyncQueueChange) -> Void)?
+    private let legacyObserverID = UUID()
+    private var changeObservers: [UUID: @Sendable (UploadBackupSyncQueueChange) -> Void] = [:]
     private let supportTrail: SupportEventTrail
 
     public init?(
@@ -26,89 +26,120 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         // Open failures must therefore fail closed and leave the database untouched for a
         // compatible future build or explicit recovery. Never replace it with an empty queue.
         guard let handle = Self.openOnce(url: url, policy: policy) else { return nil }
-        db = handle
+        // An automatic checkpoint can copy frames before `synchronizeToDisk()` runs; they need the same sync.
+        SQLiteStoreSchemaGate.enableFullSyncCheckpoints(handle)
+        connection = SQLiteStoreConnection(database: handle)
         SupportDiagnosticsSources.shared.registerQueue(self, key: url.standardizedFileURL.path)
     }
 
     deinit { close() }
 
-    public func isOperational() -> Bool {
-        lock.withLock {
-            guard db != nil, !operationFailed else { return false }
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT 1;", -1, &stmt, nil) == SQLITE_OK else {
-                operationFailed = true
-                return false
-            }
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_step(stmt) == SQLITE_ROW else {
-                operationFailed = true
-                return false
-            }
-            return true
+    public func isOperational() -> Bool { connection.isOperational() }
+
+    /// A full checkpoint moves every committed transaction from the WAL into the database file and syncs that file;
+    /// `checkpoint_fullfsync`, set when the store opens, makes the sync an `F_FULLFSYNC`. A busy or partial checkpoint
+    /// returns false.
+    public func synchronizeToDisk() -> Bool {
+        connection.withLock {
+            SQLiteStoreSchemaGate.synchronizeToDisk(db, operationFailed: connection.operationFailed)
         }
     }
 
-    public func close() {
-        lock.withLock {
-            guard db != nil else { return }
-            sqlite3_exec(db, "PRAGMA optimize;", nil, nil, nil)
-            sqlite3_close(db)
-            db = nil
-        }
-    }
+    public func close() { connection.close() }
 
-    @discardableResult
-    private func upsertUnobserved(_ entry: UploadBackupSyncQueueEntry) -> Bool {
-        lock.withLock {
-            var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK) else {
-                return false
-            }
-            defer { sqlite3_finalize(stmt) }
-            bind(entry, to: stmt)
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
-        }
-    }
+    /// A new queue row survives a power loss once its commit returns. A catalog row written after it marks the photo
+    /// as seen, so a lost queue row would leave the photo out of the backup (#352).
+    /// Classifies new work inside the same transaction that commits the upserts. An offered runnable state alone
+    /// is not an enqueue: an advanced row can keep its state, and an unchanged waiting row adds no work.
+    private func upsertBatchUnobserved(_ entries: [UploadBackupSyncQueueEntry]) -> UploadBackupSyncQueueChange? {
+        connection.withLock {
+            let change =
+                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> UploadBackupSyncQueueChange? in
+                    var write: OpaquePointer?
+                    var prior: OpaquePointer?
+                    guard
+                        connection.requireOperational(
+                            sqlite3_prepare_v2(db, Self.upsertSQL, -1, &write, nil) == SQLITE_OK),
+                        connection.requireOperational(
+                            sqlite3_prepare_v2(
+                                db,
+                                """
+                                SELECT state IN (\(Self.runnableStateList)), updated_at,
+                                       state IN (\(Self.upsertReplaceableStateList)), state, last_error
+                                FROM backup_sync_queue
+                                WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
+                                """, -1, &prior, nil) == SQLITE_OK),
+                        connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                    else {
+                        sqlite3_finalize(write)
+                        sqlite3_finalize(prior)
+                        return nil
+                    }
+                    defer {
+                        sqlite3_finalize(write)
+                        sqlite3_finalize(prior)
+                    }
 
-    @discardableResult
-    private func upsertBatchUnobserved(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
-        guard !entries.isEmpty else { return true }
-        return lock.withLock {
-            var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK),
-                requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
-            else {
-                sqlite3_finalize(stmt)
-                return false
-            }
-            defer { sqlite3_finalize(stmt) }
-
-            var didPersist = true
-            for entry in entries {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                bind(entry, to: stmt)
-                guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
-                    didPersist = false
-                    break
-                }
-            }
-            guard didPersist,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
+                    var enqueued = false
+                    var didPersist = true
+                    for entry in entries {
+                        sqlite3_reset(prior)
+                        sqlite3_clear_bindings(prior)
+                        bindText(prior, 1, entry.source.kind.rawValue)
+                        bindText(prior, 2, entry.source.identifier)
+                        bindText(prior, 3, entry.source.resource.rawValue)
+                        sqlite3_bind_int64(prior, 4, entry.revision.rawValue)
+                        let result = sqlite3_step(prior)
+                        if result == SQLITE_ROW {
+                            let priorState = columnText(prior, 3).flatMap(UploadBackupSyncQueueState.init(rawValue:))
+                            if let priorState,
+                                UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
+                                    sourceKind: entry.source.kind, state: priorState, lastError: columnText(prior, 4))
+                            {
+                                sqlite3_reset(prior)
+                                continue
+                            }
+                            if Self.runnableStates.contains(entry.state.rawValue) {
+                                let wasRunnable = sqlite3_column_int(prior, 0) != 0
+                                let wasReplaceable = sqlite3_column_int(prior, 2) != 0
+                                let becomesEarlier =
+                                    entry.updatedAt.timeIntervalSince1970 < sqlite3_column_double(prior, 1)
+                                enqueued = enqueued || (wasReplaceable && (!wasRunnable || becomesEarlier))
+                            }
+                        } else if result == SQLITE_DONE {
+                            enqueued = enqueued || Self.runnableStates.contains(entry.state.rawValue)
+                        } else {
+                            _ = connection.requireOperational(false)
+                            didPersist = false
+                            break
+                        }
+                        sqlite3_reset(prior)
+                        sqlite3_reset(write)
+                        sqlite3_clear_bindings(write)
+                        bind(entry, to: write)
+                        guard connection.requireOperational(sqlite3_step(write) == SQLITE_DONE) else {
+                            didPersist = false
+                            break
+                        }
+                    }
+                    guard didPersist,
+                        connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                    else {
+                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                        return nil
+                    }
+                    return UploadBackupSyncQueueChange(sources: entries.map(\.source), enqueued: enqueued)
+                } ?? nil
+            if change == nil { _ = connection.requireOperational(false) }
+            return change
         }
     }
 
     public func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry? {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -129,19 +160,19 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             if result == SQLITE_ROW {
                 return row(stmt, source: source, revision: revision)
             }
-            if result != SQLITE_DONE { operationFailed = true }
+            if result != SQLITE_DONE { connection.markFailed() }
             return nil
         }
     }
 
     public func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry] {
-        try lock.withLock {
-            guard db != nil, !operationFailed else {
+        try connection.withLock {
+            guard db != nil, !connection.operationFailed else {
                 throw UploadRemoteCommitRecoveryError.storeUnavailable
             }
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -162,12 +193,12 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             var result = sqlite3_step(stmt)
             while result == SQLITE_ROW {
                 guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
-                    operationFailed = true
+                    connection.markFailed()
                     throw UploadRemoteCommitRecoveryError.storeUnavailable
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
-                guard let reconciliation = strictReconciliation(stmt, column: 10) else {
-                    operationFailed = true
+                guard let reconciliation = reconciliation(stmt, column: 10) else {
+                    connection.markFailed()
                     throw UploadRemoteCommitRecoveryError.malformedReceipt(source, revision)
                 }
                 entries.append(
@@ -185,7 +216,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     ))
                 result = sqlite3_step(stmt)
             }
-            guard requireOperational(result == SQLITE_DONE) else {
+            guard connection.requireOperational(result == SQLITE_DONE) else {
                 throw UploadRemoteCommitRecoveryError.storeUnavailable
             }
             return entries
@@ -194,10 +225,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
     public func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] {
         let clampedLimit = max(1, limit)
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -217,7 +248,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
                 guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
-                    operationFailed = true
+                    connection.markFailed()
                     return []
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
@@ -225,26 +256,28 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 entries.append(entry)
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else { return [] }
             return entries
         }
     }
 
-    public func nextRunnableDate() -> Date? {
-        lock.withLock {
+    public func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
+        let exclusion = SourceExclusion(excludedSources)
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "SELECT MIN(updated_at) FROM backup_sync_queue "
-                            + "WHERE state IN (\(Self.runnableStateList));",
+                            + "WHERE state IN (\(Self.runnableStateList))\(exclusion.clause);",
                         -1, &stmt, nil
                     ) == SQLITE_OK)
             else { return nil }
             defer { sqlite3_finalize(stmt) }
+            _ = bind(exclusion, to: stmt, from: 1)
             let result = sqlite3_step(stmt)
-            guard requireOperational(result == SQLITE_ROW) else { return nil }
+            guard connection.requireOperational(result == SQLITE_ROW) else { return nil }
             guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else {
                 return nil
             }
@@ -279,10 +312,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     public func containsAny(in states: [UploadBackupSyncQueueState]) -> Bool {
         guard !states.isEmpty else { return false }
         let values = states.map { "'\($0.rawValue)'" }.joined(separator: ",")
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db, "SELECT 1 FROM backup_sync_queue WHERE state IN (\(values)) LIMIT 1;", -1, &stmt, nil
                     ) == SQLITE_OK)
@@ -290,21 +323,24 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             defer { sqlite3_finalize(stmt) }
             let result = sqlite3_step(stmt)
             if result == SQLITE_ROW { return true }
-            if result != SQLITE_DONE { operationFailed = true }
+            if result != SQLITE_DONE { connection.markFailed() }
             return false
         }
     }
 
-    private func claimRunnableUnobserved(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+    private func claimRunnableUnobserved(
+        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry] {
         let clampedLimit = max(1, limit)
-        return lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        let exclusion = SourceExclusion(excludedSources)
+        return connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return []
             }
             var selected: [UploadBackupSyncQueueEntry] = []
             var selectStmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -312,7 +348,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                                state, attempts, last_error, updated_at, remote_commit_reconciliation
                         FROM backup_sync_queue
                         WHERE state IN (\(Self.runnableStateList))
-                          AND updated_at <= ?
+                          AND updated_at <= ?\(exclusion.clause)
                         ORDER BY revision_us DESC, updated_at ASC
                         LIMIT ?;
                         """,
@@ -323,11 +359,12 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 return []
             }
             sqlite3_bind_double(selectStmt, 1, claimedAt.timeIntervalSince1970)
-            sqlite3_bind_int(selectStmt, 2, Int32(clampedLimit))
+            let limitParameter = bind(exclusion, to: selectStmt, from: 2)
+            sqlite3_bind_int(selectStmt, limitParameter, Int32(clamping: clampedLimit))
             var selectResult = sqlite3_step(selectStmt)
             while selectResult == SQLITE_ROW {
                 guard let source = sourceFromColumns(selectStmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
-                    operationFailed = true
+                    connection.markFailed()
                     sqlite3_finalize(selectStmt)
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                     return []
@@ -342,13 +379,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 selectResult = sqlite3_step(selectStmt)
             }
             sqlite3_finalize(selectStmt)
-            guard requireOperational(selectResult == SQLITE_DONE) else {
+            guard connection.requireOperational(selectResult == SQLITE_DONE) else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return []
             }
 
             guard !selected.isEmpty else {
-                guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+                guard connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                     return []
                 }
@@ -357,7 +394,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
             var updateStmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -383,8 +420,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 bindText(updateStmt, 3, entry.source.identifier)
                 bindText(updateStmt, 4, entry.source.resource.rawValue)
                 sqlite3_bind_int64(updateStmt, 5, entry.revision.rawValue)
-                guard requireOperational(sqlite3_step(updateStmt) == SQLITE_DONE),
-                    requireOperational(sqlite3_changes(db) > 0)
+                guard connection.requireOperational(sqlite3_step(updateStmt) == SQLITE_DONE),
+                    connection.requireOperational(sqlite3_changes(db) > 0)
                 else {
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                     return []
@@ -392,7 +429,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 claimed.append(entry)
             }
 
-            guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return []
             }
@@ -404,10 +441,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// A waiting row counts only when its text is an issue record; an older build's message is no problem.
     /// `body` runs under the store's lock and must not call the store.
     public func forEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -427,16 +464,66 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
                 guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
-                    operationFailed = true
+                    connection.markFailed()
                     return
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
                 guard let entry = row(stmt, source: source, revision: revision, offset: 4) else { return }
-                guard body(entry) else { return }
+                if !entry.isDismissedSourceRecheck, !body(entry) { return }
                 stepResult = sqlite3_step(stmt)
             }
-            _ = requireOperational(stepResult == SQLITE_DONE)
+            _ = connection.requireOperational(stepResult == SQLITE_DONE)
         }
+    }
+
+    public func updateDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+    ) -> Bool? {
+        let changed: Int? = connection.withLock {
+            let changed =
+                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Int? in
+                    var stmt: OpaquePointer?
+                    guard
+                        connection.requireOperational(
+                            sqlite3_prepare_v2(
+                                db,
+                                """
+                                UPDATE backup_sync_queue
+                                SET original_filename=?, byte_count=?, state=?, attempts=?, last_error=?, updated_at=?
+                                WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
+                                  AND state=? AND last_error=? AND remote_commit_reconciliation IS NULL;
+                                """, -1, &stmt, nil) == SQLITE_OK)
+                    else { return nil }
+                    defer { sqlite3_finalize(stmt) }
+                    bindText(stmt, 1, entry.originalFilename)
+                    if let byteCount = entry.byteCount {
+                        sqlite3_bind_int64(stmt, 2, byteCount)
+                    } else {
+                        sqlite3_bind_null(stmt, 2)
+                    }
+                    bindText(stmt, 3, entry.state.rawValue)
+                    sqlite3_bind_int(stmt, 4, Int32(clamping: entry.attempts))
+                    bindNullableText(stmt, 5, entry.lastError)
+                    sqlite3_bind_double(stmt, 6, entry.updatedAt.timeIntervalSince1970)
+                    bindText(stmt, 7, entry.source.kind.rawValue)
+                    bindText(stmt, 8, entry.source.identifier)
+                    bindText(stmt, 9, entry.source.resource.rawValue)
+                    sqlite3_bind_int64(stmt, 10, entry.revision.rawValue)
+                    bindText(stmt, 11, matchingState.rawValue)
+                    bindText(stmt, 12, matchingLastError)
+                    guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+                    return Int(sqlite3_changes(db))
+                } ?? nil
+            if changed == nil { _ = connection.requireOperational(false) }
+            return changed
+        }
+        guard let changed else { return nil }
+        if changed > 0 {
+            notify(
+                UploadBackupSyncQueueChange(
+                    sources: [entry.source], enqueued: Self.runnableStates.contains(entry.state.rawValue)))
+        }
+        return changed > 0
     }
 
     /// Makes one row due now only while it still has the state and reason the caller saw, so a row that the
@@ -444,10 +531,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     public func reopenForUserRetry(
         _ entry: UploadBackupSyncQueueEntry, attempts: Int, updatedAt: Date
     ) -> Bool {
-        let changed: Int? = lock.withLock {
+        let changed: Int? = connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -467,7 +554,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             sqlite3_bind_int64(stmt, 6, entry.revision.rawValue)
             bindText(stmt, 7, entry.state.rawValue)
             bindNullableText(stmt, 8, entry.lastError)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
             return Int(sqlite3_changes(db))
         }
         guard let changed else { return false }
@@ -481,10 +568,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         limit: Int
     ) -> [UploadBackupSyncQueueEntry] {
         let clampedLimit = max(1, limit)
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -506,7 +593,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
                 guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
-                    operationFailed = true
+                    connection.markFailed()
                     return []
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
@@ -514,17 +601,17 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 entries.append(entry)
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else { return [] }
             return entries
         }
     }
 
     @discardableResult
     private func requeueStaleActiveUnobserved(before cutoff: Date, updatedAt: Date) -> Int {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -550,7 +637,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_double(stmt, 1, updatedAt.timeIntervalSince1970)
             sqlite3_bind_double(stmt, 2, cutoff.timeIntervalSince1970)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return 0 }
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return 0 }
             return Int(sqlite3_changes(db))
         }
     }
@@ -561,10 +648,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// The reason stays, so the photo keeps its place in the problem list until the runner tries it again.
     @discardableResult
     private func requeueFailedUnobserved(updatedAt: Date) -> Int {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -577,7 +664,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             else { return 0 }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_double(stmt, 1, updatedAt.timeIntervalSince1970)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return 0 }
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return 0 }
             return Int(sqlite3_changes(db))
         }
     }
@@ -586,32 +673,86 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// work keeps its attempt history but becomes due now. Successful and non-retryable rows never move.
     @discardableResult
     private func makeRetryableWorkEligibleUnobserved(updatedAt: Date) -> Int {
-        lock.withLock {
-            var stmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        UPDATE backup_sync_queue SET
-                          state = CASE
-                            WHEN state IN ('failed', 'blockedByDraft') THEN 'discovered'
-                            ELSE state
-                          END,
-                          attempts = CASE WHEN state = 'failed' THEN 0 ELSE attempts END,
-                          updated_at = ?
-                        WHERE state IN (
-                          'failed', 'blockedByDraft', 'discovered', 'queuedForUpload',
-                          'needsRemoteReconciliation'
-                        );
-                        """,
-                        -1, &stmt, nil
-                    ) == SQLITE_OK)
-            else { return 0 }
-            defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_double(stmt, 1, updatedAt.timeIntervalSince1970)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return 0 }
-            return Int(sqlite3_changes(db))
+        connection.withLock {
+            let changed =
+                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Int? in
+                    guard
+                        connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                    else {
+                        return nil
+                    }
+                    var committed = false
+                    defer { if !committed { sqlite3_exec(db, "ROLLBACK;", nil, nil, nil) } }
+                    guard let markers = dismissedSourceRecheckRowIDsLocked() else { return nil }
+                    let exclusion =
+                        markers.isEmpty ? "" : "AND rowid NOT IN (\(markers.map(String.init).joined(separator: ",")))"
+                    var stmt: OpaquePointer?
+                    guard
+                        connection.requireOperational(
+                            sqlite3_prepare_v2(
+                                db,
+                                """
+                                UPDATE backup_sync_queue SET
+                                  state = CASE
+                                    WHEN state IN ('failed', 'blockedByDraft') THEN 'discovered'
+                                    ELSE state
+                                  END,
+                                  attempts = CASE WHEN state = 'failed' THEN 0 ELSE attempts END,
+                                  updated_at = ?
+                                WHERE state IN (
+                                  'failed', 'blockedByDraft', 'discovered', 'queuedForUpload',
+                                  'needsRemoteReconciliation'
+                                ) \(exclusion);
+                                """, -1, &stmt, nil) == SQLITE_OK)
+                    else { return nil }
+                    defer { sqlite3_finalize(stmt) }
+                    sqlite3_bind_double(stmt, 1, updatedAt.timeIntervalSince1970)
+                    guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+                    let count = Int(sqlite3_changes(db))
+                    guard connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+                        return nil
+                    }
+                    committed = true
+                    return count
+                } ?? nil
+            if changed == nil { _ = connection.requireOperational(false) }
+            return changed ?? 0
+        }
+    }
+
+    /// Decode the existing reason under the caller's write transaction. Raw discovered/checking states also
+    /// contain real pending uploads, so SQL cannot identify acknowledged-source checks from state alone.
+    private func dismissedSourceRecheckRowIDsLocked(
+        matching scope: String = "1", bindScope: (OpaquePointer?) -> Void = { _ in }
+    ) -> [Int64]? {
+        var stmt: OpaquePointer?
+        guard
+            connection.requireOperational(
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    SELECT rowid, state, last_error FROM backup_sync_queue
+                    WHERE source_kind='photoLibraryAsset' AND state IN ('discovered','checking')
+                      AND last_error IS NOT NULL AND (\(scope));
+                    """, -1, &stmt, nil) == SQLITE_OK)
+        else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        bindScope(stmt)
+        var result: [Int64] = []
+        while true {
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_DONE { return result }
+            guard connection.requireOperational(step == SQLITE_ROW),
+                let state = columnText(stmt, 1).flatMap(UploadBackupSyncQueueState.init(rawValue:))
+            else {
+                _ = connection.requireOperational(false)
+                return nil
+            }
+            if UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
+                sourceKind: .photoLibraryAsset, state: state, lastError: columnText(stmt, 2))
+            {
+                result.append(sqlite3_column_int64(stmt, 0))
+            }
         }
     }
 
@@ -624,10 +765,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         lastError: String?,
         updatedAt: Date
     ) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -659,7 +800,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             bindText(stmt, 7, source.identifier)
             bindText(stmt, 8, source.resource.rawValue)
             sqlite3_bind_int64(stmt, 9, revision.rawValue)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
             return sqlite3_changes(db) > 0
         }
     }
@@ -673,10 +814,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         updatedAt: Date
     ) -> Bool {
         guard let payload = try? JSONEncoder().encode(reconciliation) else { return false }
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -700,43 +841,45 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             bindText(stmt, 5, source.identifier)
             bindText(stmt, 6, source.resource.rawValue)
             sqlite3_bind_int64(stmt, 7, revision.rawValue)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
             return sqlite3_changes(db) > 0
         }
     }
 
     @discardableResult
     private func removeUnobserved(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
-        lock.withLock {
-            var stmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        DELETE FROM backup_sync_queue
-                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
-                        """,
-                        -1, &stmt, nil
-                    ) == SQLITE_OK)
-            else { return false }
-            defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, source.kind.rawValue)
-            bindText(stmt, 2, source.identifier)
-            bindText(stmt, 3, source.resource.rawValue)
-            sqlite3_bind_int64(stmt, 4, revision.rawValue)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
-            return sqlite3_changes(db) > 0
-        }
+        connection.withLock { removeLocked(source: source, revision: revision) }
+    }
+
+    private func removeLocked(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        var stmt: OpaquePointer?
+        guard
+            connection.requireOperational(
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    DELETE FROM backup_sync_queue
+                    WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK)
+        else { return false }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, source.kind.rawValue)
+        bindText(stmt, 2, source.identifier)
+        bindText(stmt, 3, source.resource.rawValue)
+        sqlite3_bind_int64(stmt, 4, revision.rawValue)
+        guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
+        return sqlite3_changes(db) > 0
     }
 
     private func removeSettledRevisionsUnobserved(
         of source: UploadSourceIdentity, except revision: UploadBackupRevision
     ) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -752,36 +895,74 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             bindText(stmt, 2, source.identifier)
             bindText(stmt, 3, source.resource.rawValue)
             sqlite3_bind_int64(stmt, 4, revision.rawValue)
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }
 
-    /// Returns the number of removed rows, or nil when the store failed.
+    private struct ObsoleteRevisionScope {
+        let source: UploadSourceIdentity
+        let through: UploadBackupRevision
+        let kept: UploadBackupRevision
+    }
+
+    /// Returns changed sources only after the whole cleanup batch commits, or nil on failure.
     private func removeUnsavedEarlierRevisionsUnobserved(
-        of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
-    ) -> Int? {
-        lock.withLock {
-            var stmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        DELETE FROM backup_sync_queue
-                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us<=? AND revision_us<>?
-                          AND state IN ('skippedRemoteDeletion','failedPermanent','dismissedFailure');
-                        """,
-                        -1, &stmt, nil
-                    ) == SQLITE_OK)
-            else { return nil }
-            defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, source.kind.rawValue)
-            bindText(stmt, 2, source.identifier)
-            bindText(stmt, 3, source.resource.rawValue)
-            sqlite3_bind_int64(stmt, 4, revision.rawValue)
-            sqlite3_bind_int64(stmt, 5, kept.rawValue)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
-            return Int(sqlite3_changes(db))
+        _ scopes: [ObsoleteRevisionScope]
+    ) -> Set<UploadSourceIdentity>? {
+        guard !scopes.isEmpty else { return [] }
+        return connection.withLock {
+            let changed =
+                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Set<UploadSourceIdentity>? in
+                    guard
+                        connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                    else {
+                        return nil
+                    }
+                    var committed = false
+                    defer { if !committed { sqlite3_exec(db, "ROLLBACK;", nil, nil, nil) } }
+                    var changed: Set<UploadSourceIdentity> = []
+                    for cleanup in scopes {
+                        let scope = """
+                            source_kind=? AND source_id=? AND resource=? AND revision_us<=? AND revision_us<>?
+                            AND remote_commit_reconciliation IS NULL
+                            """
+                        let bindScope: (OpaquePointer?) -> Void = { stmt in
+                            self.bindText(stmt, 1, cleanup.source.kind.rawValue)
+                            self.bindText(stmt, 2, cleanup.source.identifier)
+                            self.bindText(stmt, 3, cleanup.source.resource.rawValue)
+                            sqlite3_bind_int64(stmt, 4, cleanup.through.rawValue)
+                            sqlite3_bind_int64(stmt, 5, cleanup.kept.rawValue)
+                        }
+                        guard let markers = dismissedSourceRecheckRowIDsLocked(matching: scope, bindScope: bindScope)
+                        else {
+                            return nil
+                        }
+                        let markerMatch =
+                            markers.isEmpty ? "0" : "rowid IN (\(markers.map(String.init).joined(separator: ",")))"
+                        var stmt: OpaquePointer?
+                        guard
+                            connection.requireOperational(
+                                sqlite3_prepare_v2(
+                                    db,
+                                    """
+                                    DELETE FROM backup_sync_queue WHERE \(scope)
+                                      AND (state IN ('skippedRemoteDeletion','sourceMissing','failedPermanent','dismissedFailure')
+                                           OR \(markerMatch));
+                                    """, -1, &stmt, nil) == SQLITE_OK)
+                        else { return nil }
+                        defer { sqlite3_finalize(stmt) }
+                        bindScope(stmt)
+                        guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+                        if sqlite3_changes(db) > 0 { changed.insert(cleanup.source) }
+                    }
+                    guard connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+                        return nil
+                    }
+                    committed = true
+                    return changed
+                } ?? nil
+            if changed == nil { _ = connection.requireOperational(false) }
+            return changed
         }
     }
 
@@ -789,16 +970,16 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private func removeSourcesUnobserved(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         let identifiers = Array(Set(identifiers))
         guard !identifiers.isEmpty else { return 0 }
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "DELETE FROM backup_sync_queue WHERE source_kind=? AND source_id=?;",
                         -1, &stmt, nil
                     ) == SQLITE_OK),
-                requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_finalize(stmt)
                 return 0
@@ -811,13 +992,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 sqlite3_clear_bindings(stmt)
                 bindText(stmt, 1, kind.rawValue)
                 bindText(stmt, 2, identifier)
-                guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
+                guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                     return 0
                 }
                 removed += Int(sqlite3_changes(db))
             }
-            guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return 0
             }
@@ -836,7 +1017,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 }))
         if roots.contains("/") { return 0 }
 
-        return lock.withLock {
+        return connection.withLock {
             var sql = "DELETE FROM backup_sync_queue WHERE source_kind=?"
             if !roots.isEmpty {
                 let retainedRootClauses = Array(
@@ -848,7 +1029,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             sql += ";"
 
             var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK) else {
                 return 0
             }
             defer { sqlite3_finalize(stmt) }
@@ -861,19 +1042,23 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 bindText(stmt, binding + 2, root)
                 binding += 3
             }
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return 0 }
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return 0 }
             return Int(sqlite3_changes(db))
         }
     }
 
     public func summary() -> UploadBackupSyncQueueSummary {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
-                        "SELECT state, COUNT(*) FROM backup_sync_queue GROUP BY state;",
+                        """
+                        SELECT state, source_kind,
+                               CASE WHEN state IN ('discovered','checking') THEN last_error END AS check_reason, COUNT(*)
+                        FROM backup_sync_queue GROUP BY state, source_kind, check_reason;
+                        """,
                         -1, &stmt, nil
                     ) == SQLITE_OK)
             else { return UploadBackupSyncQueueSummary() }
@@ -884,27 +1069,38 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 guard let raw = columnText(stmt, 0),
                     let state = UploadBackupSyncQueueState(rawValue: raw)
                 else {
-                    operationFailed = true
+                    connection.markFailed()
                     return UploadBackupSyncQueueSummary()
                 }
-                summary.include(state, count: Int(sqlite3_column_int(stmt, 1)))
+                let count = Int(sqlite3_column_int(stmt, 3))
+                if let kind = columnText(stmt, 1).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
+                    UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
+                        sourceKind: kind, state: state, lastError: columnText(stmt, 2))
+                {
+                    summary.include(.dismissedFailure, count: count)
+                    summary.pendingSourceRechecks += count
+                } else {
+                    summary.include(state, count: count)
+                }
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return UploadBackupSyncQueueSummary() }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else {
+                return UploadBackupSyncQueueSummary()
+            }
             return summary
         }
     }
 
     public func count() -> Int {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM backup_sync_queue;", -1, &stmt, nil) == SQLITE_OK
                 )
             else { return 0 }
             defer { sqlite3_finalize(stmt) }
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_ROW) else { return 0 }
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_ROW) else { return 0 }
             return Int(sqlite3_column_int(stmt, 0))
         }
     }
@@ -913,10 +1109,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// the durable photo catalog. Stored in the queue DB itself: a reset naturally clears the marker
     /// and requests another rebuild, while ordinary row removal does not.
     public func catalogReplayState() -> UploadBackupCatalogReplayState {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db, "SELECT value FROM backup_sync_queue_info WHERE key=?;", -1, &stmt, nil
                     ) == SQLITE_OK)
@@ -925,17 +1121,17 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             bindText(stmt, 1, Self.catalogReplayStateKey)
             let result = sqlite3_step(stmt)
             if result == SQLITE_DONE { return .notStarted }
-            guard requireOperational(result == SQLITE_ROW) else { return .notStarted }
+            guard connection.requireOperational(result == SQLITE_ROW) else { return .notStarted }
             return UploadBackupCatalogReplayState(rawValue: Int(sqlite3_column_int(stmt, 0))) ?? .notStarted
         }
     }
 
     @discardableResult
     public func setCatalogReplayState(_ state: UploadBackupCatalogReplayState) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "INSERT INTO backup_sync_queue_info(key, value) VALUES(?, ?) "
@@ -946,15 +1142,135 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             defer { sqlite3_finalize(stmt) }
             bindText(stmt, 1, Self.catalogReplayStateKey)
             sqlite3_bind_int(stmt, 2, Int32(state.rawValue))
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }
 
-    public func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? {
-        lock.withLock {
+    public func missingSourceDiscardGeneration() -> Int64? {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        "SELECT value FROM backup_sync_queue_info WHERE key='missing_source_discard_generation';",
+                        -1, &stmt, nil) == SQLITE_OK)
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_DONE { return 0 }
+            guard connection.requireOperational(step == SQLITE_ROW) else { return nil }
+            return sqlite3_column_int64(stmt, 0)
+        }
+    }
+
+    public func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? {
+        connection.withLock {
+            var stmt: OpaquePointer?
+            guard
+                connection.requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        "SELECT 1 FROM backup_sync_queue WHERE source_kind=? AND source_id=? LIMIT 1;",
+                        -1, &stmt, nil) == SQLITE_OK)
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            var result: Set<UploadSourceIdentity> = []
+            for source in sources {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindText(stmt, 1, source.kind.rawValue)
+                bindText(stmt, 2, source.identifier)
+                let step = sqlite3_step(stmt)
+                guard connection.requireOperational(step == SQLITE_ROW || step == SQLITE_DONE) else { return nil }
+                if step == SQLITE_ROW { result.insert(source) }
+            }
+            return result
+        }
+    }
+
+    public func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        guard !entries.isEmpty else { return true }
+        var enqueued = false
+        let result = connection.withLock {
+            SQLiteStoreSchemaGate.withDurableCommits(db) {
+                var stmt: OpaquePointer?
+                guard
+                    connection.requireOperational(
+                        sqlite3_prepare_v2(
+                            db,
+                            """
+                            INSERT INTO backup_sync_queue(
+                                source_kind, source_id, resource, revision_us, original_filename,
+                                byte_count, state, attempts, last_error, updated_at, remote_commit_reconciliation
+                            ) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (
+                                SELECT 1 FROM backup_sync_queue WHERE source_kind=? AND source_id=?
+                            );
+                            """, -1, &stmt, nil) == SQLITE_OK),
+                    connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                else {
+                    sqlite3_finalize(stmt)
+                    return false
+                }
+                defer { sqlite3_finalize(stmt) }
+                for entry in entries {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    bind(entry, to: stmt)
+                    bindText(stmt, 12, entry.source.kind.rawValue)
+                    bindText(stmt, 13, entry.source.identifier)
+                    guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
+                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                        return false
+                    }
+                    if sqlite3_changes(db) > 0, Self.runnableStates.contains(entry.state.rawValue) {
+                        enqueued = true
+                    }
+                }
+                guard connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                    return false
+                }
+                return true
+            } ?? connection.requireOperational(false)
+        }
+        if result { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source), enqueued: enqueued)) }
+        return result
+    }
+
+    public func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        guard source.kind == .photoLibraryAsset else { return remove(source: source, revision: revision) }
+        let result = connection.withLock {
+            SQLiteStoreSchemaGate.withDurableCommits(db) {
+                guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                else {
+                    return false
+                }
+                guard removeLocked(source: source, revision: revision),
+                    connection.requireOperational(
+                        sqlite3_exec(
+                            db,
+                            """
+                            INSERT INTO backup_sync_queue_info(key, value) VALUES('missing_source_discard_generation', 1)
+                            ON CONFLICT(key) DO UPDATE SET value=value+1;
+                            """, nil, nil, nil) == SQLITE_OK),
+                    connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                else {
+                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                    return false
+                }
+                return true
+            } ?? connection.requireOperational(false)
+        }
+        if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        return result
+    }
+
+    public func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? {
+        connection.withLock {
+            var stmt: OpaquePointer?
+            guard
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db, "SELECT value FROM backup_sync_runtime_issue WHERE key=?;", -1, &stmt, nil
                     ) == SQLITE_OK)
@@ -963,18 +1279,18 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             bindText(stmt, 1, key.rawValue)
             let result = sqlite3_step(stmt)
             if result == SQLITE_ROW { return BackupIssueRecord.decode(columnText(stmt, 0)) }
-            if result != SQLITE_DONE { operationFailed = true }
+            if result != SQLITE_DONE { connection.markFailed() }
             return nil
         }
     }
 
     @discardableResult
     public func setRuntimeIssue(_ issue: BackupIssueRecord?, for key: BackupRuntimeIssueKey) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             if let issue {
                 guard
-                    requireOperational(
+                    connection.requireOperational(
                         sqlite3_prepare_v2(
                             db,
                             "INSERT INTO backup_sync_runtime_issue(key, value) VALUES(?, ?) "
@@ -986,7 +1302,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 bindText(stmt, 2, issue.persistedValue)
             } else {
                 guard
-                    requireOperational(
+                    connection.requireOperational(
                         sqlite3_prepare_v2(
                             db, "DELETE FROM backup_sync_runtime_issue WHERE key=?;", -1, &stmt, nil
                         ) == SQLITE_OK)
@@ -994,9 +1310,12 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 bindText(stmt, 1, key.rawValue)
             }
             defer { sqlite3_finalize(stmt) }
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }
+
+    private static let upsertReplaceableStateList =
+        "'discovered','queuedForUpload','failed','paused','sourceMissing','blockedByDraft','skippedRemoteDeletion'"
 
     private static let upsertSQL = """
         INSERT INTO backup_sync_queue(
@@ -1007,24 +1326,15 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
           original_filename=excluded.original_filename,
           byte_count=excluded.byte_count,
           state=CASE
-            WHEN backup_sync_queue.state IN (
-              'discovered','queuedForUpload','failed','paused',
-              'sourceMissing','blockedByDraft','skippedRemoteDeletion'
-            ) THEN excluded.state
+            WHEN backup_sync_queue.state IN (\(upsertReplaceableStateList)) THEN excluded.state
             ELSE backup_sync_queue.state
           END,
           attempts=CASE
-            WHEN backup_sync_queue.state IN (
-              'discovered','queuedForUpload','failed','paused',
-              'sourceMissing','blockedByDraft','skippedRemoteDeletion'
-            ) THEN excluded.attempts
+            WHEN backup_sync_queue.state IN (\(upsertReplaceableStateList)) THEN excluded.attempts
             ELSE backup_sync_queue.attempts
           END,
           last_error=CASE
-            WHEN backup_sync_queue.state IN (
-              'discovered','queuedForUpload','failed','paused',
-              'sourceMissing','blockedByDraft','skippedRemoteDeletion'
-            ) THEN excluded.last_error
+            WHEN backup_sync_queue.state IN (\(upsertReplaceableStateList)) THEN excluded.last_error
             ELSE backup_sync_queue.last_error
           END,
           remote_commit_reconciliation=CASE
@@ -1134,7 +1444,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         let hasReconciliation = sqlite3_column_type(stmt, reconciliationColumn) != SQLITE_NULL
         let decodedReconciliation = reconciliation(stmt, column: reconciliationColumn)
         guard !hasReconciliation || decodedReconciliation != nil else {
-            operationFailed = true
+            connection.markFailed()
             return nil
         }
         return UploadBackupSyncQueueEntry(
@@ -1169,17 +1479,19 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     private func earliestEntry(sql: String) -> UploadBackupSyncQueueEntry? {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK) else { return nil }
+            guard connection.requireOperational(sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK) else {
+                return nil
+            }
             defer { sqlite3_finalize(stmt) }
             let result = sqlite3_step(stmt)
             guard result == SQLITE_ROW else {
-                if result != SQLITE_DONE { operationFailed = true }
+                if result != SQLITE_DONE { connection.markFailed() }
                 return nil
             }
             guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
-                operationFailed = true
+                connection.markFailed()
                 return nil
             }
             return row(
@@ -1195,20 +1507,21 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
     @discardableResult
     public func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool {
-        let result = upsertUnobserved(entry)
-        if result { notify(UploadBackupSyncQueueChange(sources: [entry.source])) }
-        return result
+        upsertBatch([entry])
     }
 
     @discardableResult
     public func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
-        let result = upsertBatchUnobserved(entries)
-        if result, !entries.isEmpty { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source))) }
-        return result
+        guard !entries.isEmpty else { return true }
+        guard let change = upsertBatchUnobserved(entries) else { return false }
+        notify(change)
+        return true
     }
 
-    public func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
-        let claimed = claimRunnableUnobserved(limit: limit, claimedAt: claimedAt)
+    public func claimRunnable(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry] {
+        let claimed = claimRunnableUnobserved(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources)
         if !claimed.isEmpty { notify(UploadBackupSyncQueueChange(sources: claimed.map(\.source))) }
         return claimed
     }
@@ -1291,10 +1604,18 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     public func removeUnsavedEarlierRevisions(
         of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
     ) -> Bool {
-        guard let removed = removeUnsavedEarlierRevisionsUnobserved(of: source, through: revision, except: kept)
-        else { return false }
-        // Most backups remove nothing; only a real change reaches the observers.
-        if removed > 0 { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        removeUnsavedEarlierRevisions([.init(source: source, through: revision, kept: kept)])
+    }
+
+    @discardableResult
+    public func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        removeUnsavedEarlierRevisions(entries.map { .init(source: $0.source, through: $0.revision, kept: $0.revision) })
+    }
+
+    private func removeUnsavedEarlierRevisions(_ scopes: [ObsoleteRevisionScope]) -> Bool {
+        guard let changed = removeUnsavedEarlierRevisionsUnobserved(scopes) else { return false }
+        // Most backups remove nothing; only committed changes reach the observers.
+        if !changed.isEmpty { notify(UploadBackupSyncQueueChange(sources: Array(changed))) }
         return true
     }
 
@@ -1322,11 +1643,36 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     private func notify(_ change: UploadBackupSyncQueueChange) {
-        let observer = observerLock.withLock { changeObserver }
-        observer?(change)
+        let observers = observerLock.withLock { Array(changeObservers.values) }
+        for observer in observers { observer(change) }
     }
 
     private let transient = SQLiteStoreSchemaGate.transientDestructor
+
+    /// Rows of these sources (same kind and identifier, any resource or revision) stay out of a runnable-set query.
+    private struct SourceExclusion {
+        var keys: [(kind: String, identifier: String)] = []
+
+        init(_ sources: [UploadSourceIdentity]) {
+            var seen: Set<String> = []
+            for source in sources where seen.insert(source.kind.rawValue + "|" + source.identifier).inserted {
+                keys.append((source.kind.rawValue, source.identifier))
+            }
+        }
+
+        var clause: String { String(repeating: "\n  AND NOT (source_kind=? AND source_id=?)", count: keys.count) }
+    }
+
+    /// Binds the exclusion's parameters from `first` on and returns the next free parameter index.
+    private func bind(_ exclusion: SourceExclusion, to stmt: OpaquePointer?, from first: Int32) -> Int32 {
+        var parameter = first
+        for key in exclusion.keys {
+            bindText(stmt, parameter, key.kind)
+            bindText(stmt, parameter + 1, key.identifier)
+            parameter += 2
+        }
+        return parameter
+    }
 
     private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
         sqlite3_bind_text(stmt, index, value, -1, transient)
@@ -1361,30 +1707,22 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(stmt, column)))
         return try? JSONDecoder().decode(UploadRemoteCommitReconciliation.self, from: data)
     }
-
-    private func strictReconciliation(
-        _ stmt: OpaquePointer?,
-        column: Int32
-    ) -> UploadRemoteCommitReconciliation? {
-        guard sqlite3_column_type(stmt, column) != SQLITE_NULL,
-            let bytes = sqlite3_column_blob(stmt, column)
-        else {
-            return nil
-        }
-        let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(stmt, column)))
-        return try? JSONDecoder().decode(UploadRemoteCommitReconciliation.self, from: data)
-    }
-
-    @discardableResult
-    private func requireOperational(_ condition: Bool) -> Bool {
-        if !condition { operationFailed = true }
-        return condition
-    }
 }
 
 extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
     public func setChangeObserver(_ observer: (@Sendable (UploadBackupSyncQueueChange) -> Void)?) {
-        observerLock.withLock { changeObserver = observer }
+        observerLock.withLock { changeObservers[legacyObserverID] = observer }
+    }
+
+    public func changes() -> AsyncStream<UploadBackupSyncQueueChange> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            observerLock.withLock { changeObservers[id] = { continuation.yield($0) } }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                _ = self.observerLock.withLock { self.changeObservers.removeValue(forKey: id) }
+            }
+        }
     }
 
     public func unsettledRows() -> [UploadBackupQueueRowState] {
@@ -1394,7 +1732,7 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
                               'dismissedFailure')
                 """,
             bindings: [nil]
-        )
+        ).filter { $0.state != .dismissedFailure }
     }
 
     /// Rows that upload now or wait their turn. A waiting row with an issue record belongs to the problem list
@@ -1431,7 +1769,7 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
 
     /// Cosmetic admission read: failure must not change the queue's operational health.
     public func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -1467,14 +1805,14 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
         where condition: String,
         bindings: [((OpaquePointer?) -> Void)?]
     ) -> [UploadBackupQueueRowState] {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
-                        SELECT source_kind, source_id, resource, revision_us, state, original_filename, updated_at
+                        SELECT source_kind, source_id, resource, revision_us, state, original_filename, updated_at, last_error
                         FROM backup_sync_queue WHERE \(condition);
                         """,
                         -1, &stmt, nil
@@ -1495,16 +1833,18 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
                             UploadBackupQueueRowState(
                                 source: source,
                                 revision: UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3)),
-                                state: state,
+                                state: UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
+                                    sourceKind: source.kind, state: state, lastError: columnText(stmt, 7))
+                                    ? .dismissedFailure : state,
                                 originalFilename: columnText(stmt, 5) ?? "",
                                 updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6))
                             ))
                     } else {
-                        operationFailed = true
+                        connection.markFailed()
                     }
                     step = sqlite3_step(stmt)
                 }
-                if step != SQLITE_DONE { operationFailed = true }
+                if step != SQLITE_DONE { connection.markFailed() }
             }
             return result
         }
@@ -1512,15 +1852,18 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
 }
 
 extension UploadBackupSyncQueueManifestStore: BackupQueueSupportSource {
-    /// Group only local scalar columns. No source, filename, receipt, or backend detail can leave this method.
+    /// Group only local scalar columns. No source identifier, filename, receipt, or backend detail leaves this method.
     public func backupSupportSnapshot() -> BackupQueueSupportSnapshot {
-        lock.withLock {
-            guard db != nil, !operationFailed else { return BackupQueueSupportSnapshot() }
+        connection.withLock {
+            guard db != nil, !connection.operationFailed else { return BackupQueueSupportSnapshot() }
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
                     db,
-                    "SELECT state, resource, last_error, COUNT(*) FROM backup_sync_queue GROUP BY state, resource, last_error;",
+                    """
+                    SELECT state, resource, last_error, source_kind, COUNT(*) FROM backup_sync_queue
+                    GROUP BY state, resource, last_error, source_kind;
+                    """,
                     -1, &stmt, nil
                 ) == SQLITE_OK
             else { return BackupQueueSupportSnapshot() }
@@ -1532,10 +1875,19 @@ extension UploadBackupSyncQueueManifestStore: BackupQueueSupportSource {
             var total = 0
             var step = sqlite3_step(stmt)
             while step == SQLITE_ROW {
-                let state = BackupQueueSupportSnapshot.State(rawValue: columnText(stmt, 0) ?? "") ?? .unknown
+                let rawState = columnText(stmt, 0) ?? ""
+                let lastError = columnText(stmt, 2)
+                var state = BackupQueueSupportSnapshot.State(rawValue: rawState) ?? .unknown
+                if let sourceKind = columnText(stmt, 3).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
+                    let queueState = UploadBackupSyncQueueState(rawValue: rawState),
+                    UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
+                        sourceKind: sourceKind, state: queueState, lastError: lastError)
+                {
+                    state = .dismissedFailure
+                }
                 let resource = Self.supportResourceKind(columnText(stmt, 1) ?? "")
-                let reason = Self.supportReason(columnText(stmt, 2))
-                let count = Int(sqlite3_column_int64(stmt, 3))
+                let reason = Self.supportReason(lastError)
+                let count = Int(sqlite3_column_int64(stmt, 4))
                 total += count
                 states[state, default: 0] += count
                 resources[resource, default: 0] += count

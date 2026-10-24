@@ -5,7 +5,7 @@ import Testing
 
 @testable import ProtonDriveBackend
 
-/// SDK 0.29.1 sends small files as one buffered multipart request through `requestSmallUpload`.
+/// SDK 0.31.1 sends small files as one buffered multipart request through `requestSmallUpload`.
 /// The transport must keep the opaque body byte-identical, authenticate with the session, never
 /// resend after an ambiguous failure, and keep the existing one-shot refresh after an explicit 401.
 @Suite("SDK small upload transport", .serialized)
@@ -175,7 +175,46 @@ struct SDKSmallUploadTests {
         #expect(SmallUploadURLProtocol.requests.isEmpty)
     }
 
-    private func makeClient() -> SDKHttpClient {
+    @Test func backupUploadLetsTheSystemRefuseCellularDataWhileMobileDataIsOff() async throws {
+        SmallUploadURLProtocol.reset(uploadStatuses: [200])
+        let access = ExpensiveUploadAccess()
+        access.begin(allowsExpensiveNetwork: false)
+
+        _ = try await makeClient(expensiveUploadAccess: access).requestSmallUpload(
+            method: "POST", url: endpoint, content: multipartBody, metadata: metadata, headers: []
+        ).get()
+
+        #expect(SmallUploadURLProtocol.uploads.only?.allowsExpensiveNetworkAccess == false)
+        let storage = makeClient(expensiveUploadAccess: access).storageUploadRequest(
+            method: "POST", url: URL(string: "https://storage.invalid/block")!, headers: [],
+            body: InputStream(data: Data([1])))
+        #expect(!storage.allowsExpensiveNetworkAccess, "encrypted blocks are upload bytes, too")
+    }
+
+    @Test func apiRequestsKeepEveryNetworkDuringABackupUpload() async throws {
+        SmallUploadURLProtocol.reset(uploadStatuses: [200])
+        let access = ExpensiveUploadAccess()
+        access.begin(allowsExpensiveNetwork: false)
+
+        _ = try await makeClient(expensiveUploadAccess: access).requestDriveApi(
+            method: "GET", relativePath: "drive/https://drive-api.proton.me/v2/shares/photos", content: Data(),
+            headers: []
+        ).get()
+
+        #expect(SmallUploadURLProtocol.requests.only?.allowsExpensiveNetworkAccess == true)
+    }
+
+    @Test func uploadsUseEveryNetworkWithoutARestrictedUpload() async throws {
+        SmallUploadURLProtocol.reset(uploadStatuses: [200])
+
+        _ = try await makeClient().requestSmallUpload(
+            method: "POST", url: endpoint, content: multipartBody, metadata: metadata, headers: []
+        ).get()
+
+        #expect(SmallUploadURLProtocol.uploads.only?.allowsExpensiveNetworkAccess == true)
+    }
+
+    private func makeClient(expensiveUploadAccess: ExpensiveUploadAccess? = nil) -> SDKHttpClient {
         let governor = ProtonRequestGovernor()
         let session = DriveSession(
             session: ProtonSession(
@@ -190,7 +229,7 @@ struct SDKSmallUploadTests {
             urlProtocolClasses: [SmallUploadURLProtocol.self]
         )
         return SDKHttpClient(
-            driveSession: session, requestGovernor: governor,
+            driveSession: session, requestGovernor: governor, expensiveUploadAccess: expensiveUploadAccess,
             urlProtocolClasses: [SmallUploadURLProtocol.self]
         )
     }
@@ -203,6 +242,7 @@ private final class SmallUploadURLProtocol: URLProtocol {
         let path: String
         let body: Data
         let headers: [String: String]
+        let allowsExpensiveNetworkAccess: Bool
     }
 
     static let refreshPath = "/auth/v4/refresh"
@@ -243,7 +283,10 @@ private final class SmallUploadURLProtocol: URLProtocol {
             uniquingKeysWith: { _, last in last }
         )
         let outcome: (status: Int, body: Data, failure: URLError.Code?, location: String?) = Self.lock.withLock {
-            Self.recorded.append(Recorded(path: url.path, body: body, headers: headers))
+            Self.recorded.append(
+                Recorded(
+                    path: url.path, body: body, headers: headers,
+                    allowsExpensiveNetworkAccess: request.allowsExpensiveNetworkAccess))
             if url.path == Self.refreshPath {
                 return (Self.refresh.status, Data(Self.refresh.json.utf8), nil, nil)
             }

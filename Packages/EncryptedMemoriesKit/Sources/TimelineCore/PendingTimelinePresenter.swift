@@ -18,18 +18,32 @@ public struct PendingUploadBadges: Sendable, Equatable {
     /// Proton photos that took over a pending tile this session -> that tile's local UID. Grids let the
     /// Proton photo draw the pending tile's texture, so the handover shows no upload and no fade.
     package let handovers: [PhotoUID: PhotoUID]
+    /// The person paused the Apple Photos backup: its waiting and uploading photos show the pause badge.
+    /// Watched Mac folders do not pause with it.
+    package let isPaused: Bool
 
     package init(
         base: [PhotoUID: GridUploadBadge] = [:],
         progress: [PhotoUID: Int] = [:],
         contentEpochs: [PhotoUID: UInt64] = [:],
-        handovers: [PhotoUID: PhotoUID] = [:]
+        handovers: [PhotoUID: PhotoUID] = [:],
+        isPaused: Bool = false
     ) {
         id = UUID()
         self.base = base
         self.progress = progress
         self.contentEpochs = contentEpochs
         self.handovers = handovers
+        self.isPaused = isPaused
+    }
+
+    /// A new value that keeps the base map and handovers.
+    package func replacing(
+        progress: [PhotoUID: Int]? = nil, contentEpochs: [PhotoUID: UInt64]? = nil, isPaused: Bool? = nil
+    ) -> Self {
+        Self(
+            base: base, progress: progress ?? self.progress, contentEpochs: contentEpochs ?? self.contentEpochs,
+            handovers: handovers, isPaused: isPaused ?? self.isPaused)
     }
 
     public static let empty = PendingUploadBadges()
@@ -38,7 +52,18 @@ public struct PendingUploadBadges: Sendable, Equatable {
 
     package subscript(uid: PhotoUID) -> GridUploadBadge? {
         guard let badge = base[uid] else { return nil }
-        return progress[uid].map { .uploading(step: $0) } ?? badge
+        let shown = progress[uid].map { .uploading(step: $0) } ?? badge
+        switch shown {
+        case .waiting, .uploading:
+            return isPaused && (handovers[uid] ?? uid).localPendingNamespace == .photoLibrary ? .paused : shown
+        case .done, .attention, .notBackedUp, .paused:
+            return shown
+        }
+    }
+
+    /// The spoken backup state of `uid`, when VoiceOver should hear one.
+    package func accessibilityDescription(for uid: PhotoUID) -> String? {
+        self[uid] == .paused ? L10n.string("a11y.upload_badge.paused") : nil
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
@@ -164,6 +189,7 @@ public final class PendingTimelinePresenter {
     private var remote = TimelineSnapshot()
     private var pending = PendingBackupSnapshot.empty
     private var isEnabled = false
+    package private(set) var isBackupPaused = false
     private var hasPendingInput = false
     /// Session anchors: Proton photo -> the sort key and the UID of the pending tile it replaced.
     private var anchors: [PhotoUID: Anchor] = [:]
@@ -177,6 +203,8 @@ public final class PendingTimelinePresenter {
     private var restored: [PhotoUID: Set<Replacement>] = [:]
     private var waitingForTile: [Replacement: Date] = [:]
     private var tileWaitTask: Task<Void, Never>?
+    /// The tile wait was already over when it started, so its rebuild follows without a timer.
+    private var tileWaitIsDue = false
     package nonisolated static let tileWaitLimit: TimeInterval = 5
     private let now: @Sendable () -> Date
     private let sleep: @Sendable (Duration) async throws -> Void
@@ -213,6 +241,24 @@ public final class PendingTimelinePresenter {
 
     public var current: PendingTimelinePresentation { presentation }
 
+    /// Tests: returns when no merge runs and no tile wait that is already over still has to rebuild. A tile
+    /// wait that is not over yet does not count. Gives up after `rounds` merges, so a rebuild that never stops
+    /// shows up in the caller's checks instead of hanging the test.
+    package func waitUntilIdle(rounds: Int = 64) async {
+        for _ in 0..<rounds {
+            if let task = computeTask {
+                await task.value
+                // A merge that ended without applying leaves its task; nothing else will clear it.
+                guard computeTask != task else { return }
+            } else if tileWaitIsDue, let task = tileWaitTask {
+                await task.value
+                guard computeTask != nil || tileWaitTask != task else { return }
+            } else {
+                return
+            }
+        }
+    }
+
     /// The canonical Proton timeline of the whole-library route.
     public func setRemote(_ snapshot: TimelineSnapshot) {
         guard snapshot != remote else { return }
@@ -236,6 +282,15 @@ public final class PendingTimelinePresenter {
         }
     }
 
+    /// The person paused or resumed the Apple Photos backup. Only the badges change; the tiles stay.
+    public func setBackupPaused(_ paused: Bool) {
+        guard paused != isBackupPaused else { return }
+        isBackupPaused = paused
+        // Without badges, the next merge carries the flag.
+        guard !presentation.uploadBadges.isEmpty else { return }
+        publish(presentation.uploadBadges.replacing(isPaused: paused))
+    }
+
     /// Ends the session: pending tiles and anchors belong to one account.
     public func reset() {
         computeTask?.cancel()
@@ -244,6 +299,7 @@ public final class PendingTimelinePresenter {
         remote = TimelineSnapshot()
         pending = .empty
         isEnabled = false
+        isBackupPaused = false
         hasPendingInput = false
         anchors.removeAll()
         tileKeys.removeAll()
@@ -251,6 +307,7 @@ public final class PendingTimelinePresenter {
         waitingForTile.removeAll()
         tileWaitTask?.cancel()
         tileWaitTask = nil
+        tileWaitIsDue = false
         restored.removeAll()
         tileRevisions.removeAll()
         contentEpochs.removeAll()
@@ -328,8 +385,10 @@ public final class PendingTimelinePresenter {
         waitingForTile = result.waitingForTile
         tileWaitTask?.cancel()
         tileWaitTask = nil
+        tileWaitIsDue = false
         if let deadline = result.heldTileDeadlines.min() {
             let remaining = max(0, deadline.timeIntervalSince(now()))
+            tileWaitIsDue = remaining == 0
             tileWaitTask = Task { [weak self, sleep] in
                 try? await sleep(.seconds(remaining))
                 guard !Task.isCancelled else { return }
@@ -352,7 +411,7 @@ public final class PendingTimelinePresenter {
             favoriteIntents: shown.favoriteIntents.filter { result.localUIDs.contains($0.key) },
             uploadBadges: PendingUploadBadges(
                 base: result.baseBadges, progress: Self.progress(of: shown, gridUIDs: result.presentLocal),
-                contentEpochs: contentEpochs, handovers: anchors.mapValues(\.tile)),
+                contentEpochs: contentEpochs, handovers: anchors.mapValues(\.tile), isPaused: isBackupPaused),
             isCanonical: result.localUIDs.isEmpty && anchors.isEmpty && !result.hidesRemote,
             replacements: Self.viewerReplacements(result.replacedBy, anchors: anchors, shown: result.snapshot)
         )
@@ -412,21 +471,7 @@ public final class PendingTimelinePresenter {
             contentEpoch &+= 1
             contentEpochs[uid] = contentEpoch
         }
-        let badges = PendingUploadBadges(
-            base: presentation.uploadBadges.base, progress: presentation.uploadBadges.progress,
-            contentEpochs: contentEpochs, handovers: presentation.uploadBadges.handovers)
-        revision &+= 1
-        presentation = PendingTimelinePresentation(
-            revision: revision,
-            membershipRevision: membershipRevision,
-            snapshot: presentation.snapshot,
-            localUIDs: presentation.localUIDs,
-            favoriteIntents: presentation.favoriteIntents,
-            uploadBadges: badges,
-            isCanonical: presentation.isCanonical,
-            replacements: presentation.replacements
-        )
-        onChange?(presentation)
+        publish(presentation.uploadBadges.replacing(contentEpochs: contentEpochs))
     }
 
     /// Local UIDs of tiles whose Proton photo is listed -> that photo, from the last merge.
@@ -436,9 +481,11 @@ public final class PendingTimelinePresenter {
     private func refreshBadges() {
         let progress = Self.progress(of: isEnabled ? pending : .empty, gridUIDs: presentLocal)
         guard progress != presentation.uploadBadges.progress else { return }
-        let badges = PendingUploadBadges(
-            base: presentation.uploadBadges.base, progress: progress,
-            contentEpochs: presentation.uploadBadges.contentEpochs, handovers: presentation.uploadBadges.handovers)
+        publish(presentation.uploadBadges.replacing(progress: progress))
+    }
+
+    /// Publishes new badges with the same tiles.
+    private func publish(_ badges: PendingUploadBadges) {
         revision &+= 1
         presentation = PendingTimelinePresentation(
             revision: revision,

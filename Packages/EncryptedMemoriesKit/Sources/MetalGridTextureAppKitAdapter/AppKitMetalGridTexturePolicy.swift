@@ -1,15 +1,8 @@
 import CoreGraphics
 import GridCore
+import MetalGridTextureCore
 
-package struct AppKitMetalGridTexturePolicy: Equatable, Sendable {
-    package let budget: GridTextureBudget
-    package let maxTexturePixels: Int
-
-    package init(budget: GridTextureBudget, maxTexturePixels: Int) {
-        self.budget = budget
-        self.maxTexturePixels = maxTexturePixels
-    }
-}
+package typealias AppKitMetalGridTexturePolicy = MetalGridTexturePolicy
 
 package enum AppKitMetalGridTexturePolicies {
     package static let defaultMaxTexturePixels = 320

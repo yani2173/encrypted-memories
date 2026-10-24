@@ -108,30 +108,88 @@ struct TimelineContextMenuTests {
     }
 
     @Test func copiedProviderOutlivesItsGridController() async throws {
-        let pasteboard = UIPasteboard.withUniqueName()
-        defer { UIPasteboard.remove(withName: pasteboard.name) }
-        var host: UIKitTimelineGridHostView? = UIKitTimelineGridHostView()
-        host?.dragOutProvider = TestOriginalProvider()
-        weak let weakController = host?.dragOutController
-        let photo = PhotoItem(
-            uid: PhotoUID(volumeID: "menu-test", nodeID: "copy"),
-            captureTime: Date(), mediaType: "image/jpeg")
-        host?.dragOutController?.copyToPasteboard(items: [photo], pasteboard: pasteboard)
-        host = nil
-        #expect(weakController == nil)
-        let provider = try #require(pasteboard.itemProviders.first)
-        let data: Data = try await withCheckedThrowingContinuation { continuation in
-            _ = provider.loadFileRepresentation(forTypeIdentifier: "public.jpeg") { url, error in
-                do {
-                    if let error { throw error }
-                    guard let url else { throw CocoaError(.fileNoSuchFile) }
-                    continuation.resume(returning: try Data(contentsOf: url))
-                } catch {
-                    continuation.resume(throwing: error)
+        // Synthetic JPEG bytes are not decodable; this test keeps location to test the copied provider.
+        try await SharingLocationPreferenceLease.with(storedValue: false) {
+            let pasteboard = UIPasteboard.withUniqueName()
+            defer { UIPasteboard.remove(withName: pasteboard.name) }
+            var host: UIKitTimelineGridHostView? = UIKitTimelineGridHostView()
+            host?.dragOutProvider = TestOriginalProvider()
+            weak let weakController = host?.dragOutController
+            let photo = PhotoItem(
+                uid: PhotoUID(volumeID: "menu-test", nodeID: "copy"),
+                captureTime: Date(), mediaType: "image/jpeg")
+            host?.dragOutController?.copyToPasteboard(items: [photo], pasteboard: pasteboard)
+            host = nil
+            #expect(weakController == nil)
+            let provider = try #require(pasteboard.itemProviders.first)
+            let data: Data = try await withCheckedThrowingContinuation { continuation in
+                _ = provider.loadFileRepresentation(forTypeIdentifier: "public.jpeg") { url, error in
+                    do {
+                        if let error { throw error }
+                        guard let url else { throw CocoaError(.fileNoSuchFile) }
+                        continuation.resume(returning: try Data(contentsOf: url))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
+            #expect(data == Data([1, 2, 3]))
         }
-        #expect(data == Data([1, 2, 3]))
+    }
+
+    @Test(arguments: ["share", "copy", "drag"])
+    func outboundProvidersWithUnsetPreferenceRemoveGPSAndKeepLens(route: String) async throws {
+        try await SharingLocationPreferenceLease.with(storedValue: nil) {
+            #expect(UserDefaults.standard.object(forKey: AppSettingsKey.removeLocationWhenSharing) == nil)
+            let original = try LocatedShareTestImage.makeLocatedJPEG()
+            #expect(LocatedShareTestImage.locationProperties(of: original) != nil)
+            let fixture = try await Fixture()
+            defer { fixture.close() }
+            fixture.host.dragOutProvider = LocatedOriginalProvider(bytes: original)
+            let controller = try #require(fixture.host.dragOutController)
+            let provider: NSItemProvider
+            let pasteboard = UIPasteboard.withUniqueName()
+            defer { UIPasteboard.remove(withName: pasteboard.name) }
+            switch route {
+            case "share":
+                var configuration: UIActivityItemsConfiguration?
+                controller.makeActivityViewController = { items in
+                    configuration = items
+                    return UIActivityViewController(activityItemsConfiguration: items)
+                }
+                let sections = controller.makeActionMenu(items: [fixture.photos[0]]).children.compactMap {
+                    $0 as? UIMenu
+                }
+                let share = try #require(
+                    sections.flatMap(\.children).compactMap { $0 as? UIAction }.first {
+                        $0.identifier.rawValue == "share"
+                    })
+                UIButton().sendAction(share)
+                provider = try #require(configuration?.itemProvidersForActivityItemsConfiguration.first)
+            case "copy":
+                controller.copyToPasteboard(items: [fixture.photos[0]], pasteboard: pasteboard)
+                provider = try #require(pasteboard.itemProviders.first)
+            default:
+                let drag = UIDragInteraction(delegate: controller)
+                let session = TestDragSession(point: try fixture.center(of: 0))
+                provider = try #require(
+                    controller.dragInteraction(drag, itemsForBeginning: session).first?.itemProvider)
+            }
+            let shared: Data = try await withCheckedThrowingContinuation { continuation in
+                _ = provider.loadFileRepresentation(forTypeIdentifier: "public.jpeg") { url, error in
+                    do {
+                        if let error { throw error }
+                        guard let url else { throw CocoaError(.fileNoSuchFile) }
+                        continuation.resume(returning: try Data(contentsOf: url))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+            #expect(LocatedShareTestImage.locationProperties(of: shared) == nil)
+            #expect(LocatedShareTestImage.lensModel(of: shared) == LocatedShareTestImage.lensModel)
+            #expect(LocatedShareTestImage.locationProperties(of: original) != nil)
+        }
     }
 
     @Test func contextActionsPresentExplicitItems() {
@@ -325,4 +383,14 @@ private struct TestOriginalProvider: OriginalFileProvider {
     func location(in view: UIView) -> CGPoint { point }
     func hasItemsConforming(toTypeIdentifiers typeIdentifiers: [String]) -> Bool { false }
     func canLoadObjects(ofClass aClass: any NSItemProviderReading.Type) -> Bool { false }
+}
+
+private struct LocatedOriginalProvider: OriginalFileProvider {
+    let bytes: Data
+    func writeOriginal(
+        for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        try bytes.write(to: destination)
+        onProgress(1)
+    }
 }

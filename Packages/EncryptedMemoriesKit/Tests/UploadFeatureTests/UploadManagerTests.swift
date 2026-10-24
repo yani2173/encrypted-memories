@@ -124,6 +124,24 @@ private final class CancellationAwareAlbumResolver: AlbumAttaching, @unchecked S
     func setCover(albumID: String, photo: PhotoUID) async throws {}
 }
 
+/// Waits for a latch and reports whether it fired before `timeout`. The timeout only bounds a failing run.
+private func waitForSignal(_ latch: UploadManagerTestLatch, timeout: Duration = .seconds(5)) async -> Bool {
+    let timeouts = UploadChangeCounter()
+    await withTaskGroup(of: Void.self) { group in
+        group.addTask { await latch.wait() }
+        group.addTask {
+            try? await Task.sleep(for: timeout)
+            if await !latch.isSignaled() {
+                timeouts.increment()
+                await latch.signal()
+            }
+        }
+        await group.next()
+        group.cancelAll()
+    }
+    return timeouts.count == 0
+}
+
 final class UploadManagerTests: XCTestCase {
     private func jpegs(_ names: [String]) throws -> (URL, [URL]) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -141,6 +159,75 @@ final class UploadManagerTests: XCTestCase {
         // Snapshot order also stable by ordinal.
         let snap = await manager.snapshot()
         XCTAssertEqual(snap.map(\.displayName), ["a.jpg", "b.jpg", "c.jpg", "d.jpg"])
+    }
+
+    func testAManualUploadWaitsForARunningBackupTransferAndThenCompletes() async throws {
+        let (directory, urls) = try jpegs(["after-backup"])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let uploader = MockUploader(workDuration: .milliseconds(5), deliverProgress: false)
+        let backup = try await uploader.admission.reserve(allowsExpensiveNetwork: false)
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        await manager.enqueueFiles(urls, destination: .library)
+        try await waitUntilWaiting(uploader.admission)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(uploader.requests.count, 0, "no byte goes out beside the backup transfer")
+        let waiting = await manager.snapshot()
+        XCTAssertFalse(waiting.contains { $0.state.isTerminal }, "the upload waits; it does not fail")
+
+        backup.release()
+        let finished = await waitForAllTerminal(manager)
+
+        XCTAssertEqual(finished.map(\.state), [.completed])
+        XCTAssertEqual(uploader.uploadsWithoutTheirReservation, [])
+        XCTAssertEqual(uploader.requests.map(\.allowsExpensiveNetwork), [true])
+        XCTAssertFalse(
+            uploader.requests.contains { $0.networkReservation?.isActive == true },
+            "the manager releases the reservation")
+        await manager.shutdown()
+    }
+
+    func testCancellingAManualUploadEndsItsWaitForTheNetwork() async throws {
+        let (directory, urls) = try jpegs(["cancelled-while-waiting"])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let uploader = MockUploader(workDuration: .milliseconds(5), deliverProgress: false)
+        let backup = try await uploader.admission.reserve(allowsExpensiveNetwork: false)
+        defer { backup.release() }
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        let ids = await manager.enqueueFiles(urls, destination: .library)
+        try await waitUntilWaiting(uploader.admission)
+
+        await manager.cancel(try XCTUnwrap(ids.first))
+        let finished = await waitForAllTerminal(manager)
+
+        XCTAssertEqual(finished.map(\.state), [.cancelled])
+        XCTAssertEqual(uploader.requests.count, 0)
+        XCTAssertEqual(uploader.admission.waitingCount, 0, "the wait ended")
+        await manager.shutdown()
+    }
+
+    func testShutdownEndsAManualUploadThatWaitsForTheNetwork() async throws {
+        let (directory, urls) = try jpegs(["shut-down-while-waiting"])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let uploader = MockUploader(workDuration: .milliseconds(5), deliverProgress: false)
+        let backup = try await uploader.admission.reserve(allowsExpensiveNetwork: false)
+        defer { backup.release() }
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        await manager.enqueueFiles(urls, destination: .library)
+        try await waitUntilWaiting(uploader.admission)
+
+        await manager.shutdown()
+
+        XCTAssertEqual(uploader.requests.count, 0)
+        XCTAssertEqual(uploader.admission.waitingCount, 0, "the shutdown ended the wait")
+    }
+
+    private func waitUntilWaiting(_ admission: UploadNetworkAdmission) async throws {
+        let clock = ContinuousClock()
+        let start = clock.now
+        while admission.waitingCount == 0, clock.now - start < .seconds(10) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(admission.waitingCount, 1, "the upload waits for its network reservation")
     }
 
     func testActiveManualUploadOwnsTransferDemandUntilItFinishes() async throws {
@@ -475,6 +562,178 @@ final class UploadManagerTests: XCTestCase {
         if case .failed = snap.first?.state {} else { XCTFail("should fail fast") }
         XCTAssertTrue(
             uploader.startedOrder.isEmpty, "must not upload to library when album destination can't be honoured")
+    }
+
+    func testUnsupportedNewAlbumFailsEveryFileWithTheResolverMessage() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let urls = try makeTempFiles(["a.jpg", "note.txt"], in: dir)
+        let uploader = MockUploader(deliverProgress: false)
+        let albums = MockAlbumAttaching(canCreate: false)
+        let manager = UploadManager(uploader: uploader, albums: albums, maxConcurrent: 1)
+        let ids = await manager.enqueueFiles(urls, destination: UploadDestination(target: .newAlbum(name: "Nope")))
+        let snapshot = await manager.snapshot()
+
+        let message = try XCTUnwrap(UploadError.albumStep("create unsupported").errorDescription)
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertEqual(snapshot.map(\.state), [.failed(message: message), .failed(message: message)])
+        XCTAssertTrue(uploader.startedOrder.isEmpty)
+    }
+
+    func testAlbumDestinationWithoutAdapterFailsEveryFileWithoutUploading() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let urls = try makeTempFiles(["a.jpg", "note.txt"], in: dir)
+        let uploader = MockUploader(deliverProgress: false)
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        let ids = await manager.enqueueFiles(
+            urls, destination: UploadDestination(target: .existingAlbum(id: "alb", title: "Trip")))
+        let snapshot = await manager.snapshot()
+
+        let message = try XCTUnwrap(UploadError.albumStep("no album backend is wired").errorDescription)
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertEqual(snapshot.map(\.state), [.failed(message: message), .failed(message: message)])
+        XCTAssertTrue(uploader.startedOrder.isEmpty)
+    }
+
+    func testFolderEnqueueWithExistingAlbumAddsUploadedPhotos() async throws {
+        let folder = try albumFolder(["p1.jpg", "p2.png", "notes.txt"])
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let uploader = MockUploader(deliverProgress: false)
+        let albums = MockAlbumAttaching()
+        let manager = UploadManager(uploader: uploader, albums: albums, maxConcurrent: 1)
+        let ids = try await manager.enqueueFolder(
+            folder, destination: UploadDestination(target: .existingAlbum(id: "alb", title: "Trip")))
+        let snapshot = await waitForAllTerminal(manager)
+
+        XCTAssertEqual(ids.count, 2, "the unsupported file never becomes an entry")
+        XCTAssertEqual(snapshot.map(\.state), [.completed, .completed])
+        XCTAssertEqual(albums.addedSnapshot.map(\.1), ["alb", "alb"])
+    }
+
+    func testFolderEnqueueWithUnsupportedNewAlbumFailsSupportedEntriesWithoutUploading() async throws {
+        let folder = try albumFolder(["a.jpg", "note.txt", "b.png"])
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let uploader = MockUploader(deliverProgress: false)
+        let albums = MockAlbumAttaching(canCreate: false)
+        let manager = UploadManager(uploader: uploader, albums: albums, maxConcurrent: 1)
+        let ids = try await manager.enqueueFolder(
+            folder, destination: UploadDestination(target: .newAlbum(name: "Nope")))
+        let snapshot = await waitForAllTerminal(manager)
+
+        let message = try XCTUnwrap(UploadError.albumStep("create unsupported").errorDescription)
+        XCTAssertEqual(ids.count, 2, "the unsupported file is filtered, not failed")
+        XCTAssertEqual(snapshot.map(\.state), [.failed(message: message), .failed(message: message)])
+        XCTAssertTrue(uploader.startedOrder.isEmpty)
+    }
+
+    func testFolderEnqueueWithAlbumDestinationWithoutAdapterFailsEntriesWithoutUploading() async throws {
+        let folder = try albumFolder(["a.jpg", "note.txt"])
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let uploader = MockUploader(deliverProgress: false)
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        let ids = try await manager.enqueueFolder(
+            folder, destination: UploadDestination(target: .existingAlbum(id: "alb", title: "Trip")))
+        let snapshot = await waitForAllTerminal(manager)
+
+        let message = try XCTUnwrap(UploadError.albumStep("no album backend is wired").errorDescription)
+        XCTAssertEqual(ids.count, 1)
+        XCTAssertEqual(snapshot.map(\.state), [.failed(message: message)])
+        XCTAssertTrue(uploader.startedOrder.isEmpty)
+    }
+
+    func testUnavailableSettlementFailsEveryFileAndCreatesNoAlbum() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let urls = try makeTempFiles(["a.jpg", "note.txt"], in: dir)
+        let uploader = MockUploader(deliverProgress: false)
+        let albums = MockAlbumAttaching()
+        let manager = UploadManager(
+            uploader: uploader, albums: albums, requiresDurableSettlement: true, maxConcurrent: 1)
+        let ids = await manager.enqueueFiles(
+            urls, destination: UploadDestination(target: .newAlbum(name: "Holiday")))
+        let snapshot = await manager.snapshot()
+
+        let message = try settlementUnavailableMessage()
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertEqual(snapshot.map(\.state), [.failed(message: message), .failed(message: message)])
+        XCTAssertEqual(albums.createdNames, [], "no album is created while every item fails")
+        XCTAssertTrue(uploader.startedOrder.isEmpty)
+    }
+
+    func testFolderEnqueueWithUnavailableSettlementFailsEntriesAndCreatesNoAlbum() async throws {
+        let folder = try albumFolder(["a.jpg", "note.txt", "b.png"])
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let uploader = MockUploader(deliverProgress: false)
+        let albums = MockAlbumAttaching()
+        let manager = UploadManager(
+            uploader: uploader, albums: albums, requiresDurableSettlement: true, maxConcurrent: 1)
+        let ids = try await manager.enqueueFolder(
+            folder, destination: UploadDestination(target: .newAlbum(name: "Holiday")))
+        let snapshot = await waitForAllTerminal(manager)
+
+        let message = try settlementUnavailableMessage()
+        XCTAssertEqual(ids.count, 2, "the unsupported file is filtered, not failed")
+        XCTAssertEqual(snapshot.map(\.state), [.failed(message: message), .failed(message: message)])
+        XCTAssertEqual(albums.createdNames, [], "no album is created while every entry fails")
+        XCTAssertTrue(uploader.startedOrder.isEmpty)
+    }
+
+    private func settlementUnavailableMessage() throws -> String {
+        try XCTUnwrap(UploadError.backend("Durable manual upload settlement is unavailable.").errorDescription)
+    }
+
+    func testShutdownCancelsAndJoinsPendingAlbumResolutionOfFileEnqueue() async throws {
+        let (_, urls) = try jpegs(["pending-file-resolution"])
+        try await assertShutdownCancelsAndJoinsPendingAlbumResolution { manager, destination in
+            await manager.enqueueFiles(urls, destination: destination)
+        }
+    }
+
+    func testShutdownCancelsAndJoinsPendingAlbumResolutionOfFolderEnqueue() async throws {
+        let folder = try albumFolder(["pending-folder-resolution.jpg"])
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try await assertShutdownCancelsAndJoinsPendingAlbumResolution { manager, destination in
+            try await manager.enqueueFolder(folder, destination: destination)
+        }
+    }
+
+    private func albumFolder(_ names: [String]) throws -> URL {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-folder-\(UUID().uuidString)", isDirectory: true)
+        _ = try makeTempFiles(names, in: folder)
+        return folder
+    }
+
+    private func assertShutdownCancelsAndJoinsPendingAlbumResolution(
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        enqueue: @escaping @Sendable (UploadManager, UploadDestination) async throws -> [UploadQueueItemID]
+    ) async throws {
+        let uploader = ShutdownControlledUploader()
+        let albums = CancellationAwareAlbumResolver()
+        let manager = UploadManager(uploader: uploader, albums: albums, maxConcurrent: 1)
+        let destination = UploadDestination(target: .existingAlbum(id: "album", title: "Album"))
+        let pending = Task { try await enqueue(manager, destination) }
+        await albums.resolveStarted.wait()
+
+        let returned = UploadManagerTestLatch()
+        let shutdown = Task {
+            await manager.shutdown()
+            await returned.signal()
+        }
+        let cancelled = await waitForSignal(albums.resolveCancelled)
+        XCTAssertTrue(cancelled, "shutdown must cancel the pending album resolution", file: file, line: line)
+        for _ in 0..<20 { await Task.yield() }
+        let didReturnBeforeResolution = await returned.isSignaled()
+        XCTAssertFalse(
+            didReturnBeforeResolution, "shutdown must join the pending album resolution", file: file, line: line)
+
+        await albums.resolveRelease.signal()
+        let ids = try await pending.value
+        await shutdown.value
+
+        XCTAssertTrue(ids.isEmpty, "a late album resolution must not add a job", file: file, line: line)
+        let snapshot = await manager.snapshot()
+        XCTAssertTrue(snapshot.isEmpty, file: file, line: line)
+        XCTAssertEqual(uploader.requestCount, 0, file: file, line: line)
     }
 
     func testFirstUploadedPhotoBecomesCover() async throws {

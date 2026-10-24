@@ -25,6 +25,7 @@ final class DragOutTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
     }
 
+    /// These byte-staging fixtures explicitly keep location; their payloads are not decodable images.
     /// Fake `OriginalFileProvider`: writes a temp file at the given destination, records
     /// concurrent-write peaks, and reports progress in bounded chunks.
     private final class FakeFileProvider: OriginalFileProvider, @unchecked Sendable {
@@ -136,7 +137,9 @@ final class DragOutTests: XCTestCase {
     func testBeginPreflightStagesFilesWithUniqueNamesAndNoDownloadSuffix() async throws {
         let directory = stagingDirectory
         let provider = FakeFileProvider(bytes: 32)
-        let stager = DragOutStager(fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0)
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
 
         let decision = await stager.beginPrefetch(items: [item(1), item(2)])
         XCTAssertTrue(decision.isAllowed)
@@ -156,7 +159,9 @@ final class DragOutTests: XCTestCase {
     func testProgressHandlerReachesOneMonotonically() async throws {
         let directory = stagingDirectory
         let provider = FakeFileProvider(bytes: 64 * 1024)
-        let stager = DragOutStager(fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0)
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
 
         let recorder = ProgressRecorder()
         await stager.setProgressHandler(recorder.handler)
@@ -179,7 +184,9 @@ final class DragOutTests: XCTestCase {
         let directory = stagingDirectory
         // 512 MiB fake size vs a 128 KiB safety margin: preflight must refuse and never write.
         let provider = OversizedFakeProvider(sizeBytes: 512 * 1024 * 1024)
-        let stager = DragOutStager(fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 128 * 1024)
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 128 * 1024,
+            removeLocationWhenSharing: { false })
 
         let decision = await stager.beginPrefetch(items: [item(4)])
         XCTAssertFalse(decision.isAllowed)
@@ -222,7 +229,7 @@ final class DragOutTests: XCTestCase {
         let runtimeState = LibraryRuntimeState()
         let stager = DragOutStager(
             fileProvider: provider, stagingDirectory: directory,
-            safetyMarginBytes: 0, runtimeState: runtimeState)
+            safetyMarginBytes: 0, runtimeState: runtimeState, removeLocationWhenSharing: { false })
         _ = await stager.beginPrefetch(items: [item(5)])
         _ = await provider.started.first { _ in true }
         XCTAssertEqual(runtimeState.snapshot().activeUserTransferCount, 1)
@@ -236,7 +243,9 @@ final class DragOutTests: XCTestCase {
     func testCancelAllFailsAwaitStagedWithCancelled() async throws {
         let directory = stagingDirectory
         let provider = SlowFileProvider()
-        let stager = DragOutStager(fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0)
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
 
         _ = await stager.beginPrefetch(items: [item(5)])
 
@@ -251,7 +260,9 @@ final class DragOutTests: XCTestCase {
     func testFinishAndCleanupSparesDeliveredAndDeletesOthers() async throws {
         let directory = stagingDirectory
         let provider = FakeFileProvider(bytes: 32)
-        let stager = DragOutStager(fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0)
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
 
         _ = await stager.beginPrefetch(items: [item(6), item(7)])
         let deliveredURL = try await stager.awaitStaged(uid: uid(6)).get()
@@ -270,7 +281,9 @@ final class DragOutTests: XCTestCase {
     func testPeakConcurrentWritesRespectCap() async throws {
         let directory = stagingDirectory
         let provider = FakeFileProvider(bytes: 8 * 1024, chunkDelay: 5_000_000)
-        let stager = DragOutStager(fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0)
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
 
         let items = (1...6).map { item($0 + 10) }
         _ = await stager.beginPrefetch(items: items)

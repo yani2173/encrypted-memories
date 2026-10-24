@@ -3,7 +3,8 @@ import GridCore
 
 /// Draws upload badges with CoreGraphics only, for every platform alike. A dark translucent disc with a white
 /// outline keeps the badge legible on bright photos. Progress fills the disc with white like a pie until it is
-/// solid; the checkmark then draws itself on that white disc. `GridUploadBadgeAnimator` picks the steps.
+/// solid; the checkmark then draws itself on that white disc. A paused upload shows two white bars in the empty
+/// circle. `GridUploadBadgeAnimator` picks the steps.
 package enum MetalGridUploadBadgeImage {
     /// The SF Symbol a platform rasterizer renders for `glyph`, when the glyph carries one.
     package static func symbolName(for glyph: GridUploadBadgeGlyph) -> String? { glyph.symbolName }
@@ -35,6 +36,9 @@ package enum MetalGridUploadBadgeImage {
             context.fillEllipse(in: disc)
             let steps = GridUploadBadgeGlyph.checkSteps
             drawCheckmark(context, in: disc, drawn: Double(min(max(step, 0), steps)) / Double(steps))
+        case .paused:
+            drawPie(context, in: disc, fraction: 0)
+            drawPauseBars(context, in: disc)
         case .attention:
             drawDisc(context, disc)
             drawExclamation(context, in: disc)
@@ -102,6 +106,21 @@ package enum MetalGridUploadBadgeImage {
             remaining -= length
         }
         context.strokePath()
+    }
+
+    /// Two vertical bars with round ends, centered on the disc.
+    private static func drawPauseBars(_ context: CGContext, in disc: CGRect) {
+        let width = disc.width
+        let bar = CGSize(width: width * 0.11, height: width * 0.36)
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        for offset in [-width * 0.1, width * 0.1] {
+            let rect = CGRect(
+                x: disc.midX + offset - bar.width / 2, y: disc.midY - bar.height / 2, width: bar.width,
+                height: bar.height)
+            context.addPath(
+                CGPath(roundedRect: rect, cornerWidth: bar.width / 2, cornerHeight: bar.width / 2, transform: nil))
+        }
+        context.fillPath()
     }
 
     private static func drawExclamation(_ context: CGContext, in disc: CGRect) {

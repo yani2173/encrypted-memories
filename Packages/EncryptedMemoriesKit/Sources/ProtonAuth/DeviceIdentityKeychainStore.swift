@@ -6,7 +6,12 @@ import PhotosCore
 /// not an account credential and never synchronizes through iCloud Keychain. A full app logout removes
 /// it together with interrupted upload state; the next authenticated session creates a fresh identity.
 public struct DeviceIdentityKeychainStore: Sendable {
-    public static let defaultService = "at.oncloud.encryptedmemories.device-identity"
+    private static let productionService = "at.oncloud.encryptedmemories.device-identity"
+    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+        public static let defaultService = productionService + ".upgrade-test"
+    #else
+        public static let defaultService = productionService
+    #endif
     private let item: AppleKeychainItem
     private let keychain: any AppleKeychainStoring
 

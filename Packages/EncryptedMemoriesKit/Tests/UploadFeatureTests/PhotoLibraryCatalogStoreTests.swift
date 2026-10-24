@@ -1,8 +1,8 @@
 import Foundation
-import PhotoLibraryBackupAdapter
 import SQLite3
 import XCTest
 
+@testable import PhotoLibraryBackupAdapter
 @testable import UploadCore
 
 /// Persistent local photo-library catalog: round-trips, change classification, removed handling,
@@ -110,6 +110,57 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         let temporarilyUnmapped = photoInfo(id: "cloud")
         XCTAssertEqual(store.upsert(entry(from: temporarilyUnmapped, at: 20)), .unchanged)
         XCTAssertEqual(store.entry(for: "cloud")?.cloudIdentifier, "icloud-stable")
+    }
+
+    func testAV105RowOfALiveOffPhotoKeepsItsLiveEffectOffAfterAScanWithoutASchemaChange() throws {
+        let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        let resources: [PhotoBackupAssetInfo.Resource] = [
+            .init(role: .originalPhoto, originalFilename: "IMG_L.HEIC", mimeType: "image/heic"),
+            .init(role: .pairedVideo, originalFilename: "IMG_L.MOV", mimeType: "video/quicktime"),
+        ]
+        // Photos drops `.photoLive` when the Live effect is off and still lists the paired video.
+        var still = info(id: "L", live: false, resources: resources)
+        still.livePlaybackOff = true
+        // v1.0.5 did not read the Live effect: it wrote 0 for this photo.
+        var v105 = still
+        v105.livePlaybackOff = false
+        do {
+            let store = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
+            XCTAssertEqual(store.upsert(entry(from: v105, at: 10)), .inserted)
+            let on = info(id: "on", live: true, resources: resources)
+            XCTAssertEqual(store.upsert(entry(from: on, at: 10)), .inserted)
+            store.close()
+        }
+        XCTAssertEqual(liveColumn(url: url, id: "L"), 0)
+        XCTAssertEqual(liveColumn(url: url, id: "on"), 1)
+
+        let store = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
+        let scanned = entry(from: still, at: 20)
+        XCTAssertEqual(store.classifyBatch([scanned]), [.unchanged], "the Live effect alone does not re-open a photo")
+        XCTAssertTrue(store.upsertBatch([scanned]))
+        let recorded = try XCTUnwrap(store.entry(for: "L"))
+        XCTAssertFalse(recorded.isLivePhoto, "the fingerprint keeps the value of v1.0.5")
+        XCTAssertTrue(recorded.livePlaybackOff)
+        XCTAssertFalse(PhotoLibraryPendingMetadataProvider.metadata(for: recorded).isLivePhoto)
+        XCTAssertTrue(PhotoLibraryCatalogMapper.info(for: recorded).livePlaybackOff, "a replay plans the still photo")
+        XCTAssertEqual(PhotoLibraryCatalogMapper.info(for: recorded), PhotoLibraryCatalogMapper.info(for: scanned))
+        let live = try XCTUnwrap(store.entry(for: "on"))
+        XCTAssertTrue(live.isLivePhoto)
+        XCTAssertFalse(live.livePlaybackOff)
+        XCTAssertTrue(PhotoLibraryPendingMetadataProvider.metadata(for: live).isLivePhoto)
+        store.close()
+        XCTAssertEqual(liveColumn(url: url, id: "L"), 2, "v1.0.5 reads any value other than 0 as a Live Photo")
+    }
+
+    private func liveColumn(url: URL, id: String) -> Int? {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK else { return nil }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        let sql = "SELECT is_live_photo FROM photo_catalog WHERE local_id='\(id)';"
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int(statement, 0)) : nil
     }
 
     func testPresentEntryPagesAreStableAndExcludeRemovedRows() throws {
@@ -333,78 +384,6 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertNotNil(store.entry(for: "D"))
     }
 
-    /// The controller saves the change token when the first scan reports that it can resume. Without the token, the
-    /// next pass after a closed app or a pause started the scan of the whole library over.
-    func testFirstFullScanReportsResumableBeforeItsChunksAndAgainWhenItResumes() async throws {
-        let store = try makeStore()
-        let resumable = ResumableBox(store: store, probe: "A")
-        let aborting = AbortingEnumerator(
-            snapshotIdentifiers: ["A", "B"],
-            chunks: [[photoInfo(id: "A")]],
-            thenThrow: CancellationError()
-        )
-        do {
-            _ = try await PhotoLibraryCatalogSync(
-                store: store, enumerator: aborting, chunkSize: 1, now: { Date(timeIntervalSince1970: 100) },
-                onFirstScanResumable: { resumable.record() }
-            ).run(engine: RecordingEnqueuer())
-            XCTFail("an aborted scan must rethrow")
-        } catch is CancellationError {
-            // expected
-        }
-
-        XCTAssertEqual(
-            resumable.calls, [.init(hasResumePoint: true, probeCatalogued: false)],
-            "the scan reports once its snapshot is durable, before it catalogues a photo")
-        XCTAssertNotNil(store.fullScanProgress(), "the aborted first scan keeps its snapshot and cursor")
-
-        let enqueuer = RecordingEnqueuer()
-        _ = try await PhotoLibraryCatalogSync(
-            store: store, enumerator: StubEnumerator(infos: [photoInfo(id: "A"), photoInfo(id: "B")]), chunkSize: 1,
-            now: { Date(timeIntervalSince1970: 200) },
-            onFirstScanResumable: { resumable.record() }
-        ).run(engine: enqueuer)
-
-        XCTAssertEqual(enqueuer.enqueued, ["B"], "the resumed scan continues with the photo it had not reached")
-        XCTAssertEqual(resumable.calls.last, ResumableBox.Call(hasResumePoint: true, probeCatalogued: true))
-        XCTAssertEqual(resumable.calls.count, 2)
-        XCTAssertTrue(store.hasCompletedFullScan())
-    }
-
-    /// A full scan after a completed one is a rescan for an expired or unreadable change history. The controller
-    /// starts it over, so a saved token must not let a later pass skip it.
-    func testLaterFullScanNeverReportsResumable() async throws {
-        let store = try makeStore()
-        let enumerator = StubEnumerator(infos: [photoInfo(id: "A")])
-        let resumable = ResumableBox(store: store, probe: "A")
-        for seconds in [100.0, 200.0] {
-            _ = try await PhotoLibraryCatalogSync(
-                store: store, enumerator: enumerator, now: { Date(timeIntervalSince1970: seconds) },
-                onFirstScanResumable: { resumable.record() }
-            ).run(engine: RecordingEnqueuer())
-        }
-
-        XCTAssertEqual(resumable.calls.count, 1, "only the first scan of the library reports")
-    }
-
-    /// A snapshot that never completed resumes nothing: the next pass builds a new one, so no token may be saved.
-    func testInterruptedSnapshotNeverReportsResumable() async throws {
-        let store = try makeStore()
-        let resumable = ResumableBox(store: store, probe: "A")
-        do {
-            _ = try await PhotoLibraryCatalogSync(
-                store: store, enumerator: SnapshotFailingEnumerator(), now: { Date(timeIntervalSince1970: 100) },
-                onFirstScanResumable: { resumable.record() }
-            ).run(engine: RecordingEnqueuer())
-            XCTFail("an interrupted snapshot must rethrow")
-        } catch is CancellationError {
-            // expected
-        }
-
-        XCTAssertTrue(resumable.calls.isEmpty)
-        XCTAssertNil(store.fullScanProgress())
-    }
-
     func testDriverEnqueuesOnlyNewAndChangedAssets() async throws {
         let store = try makeStore()
         let enumerator = StubEnumerator(infos: [photoInfo(id: "A"), photoInfo(id: "B")])
@@ -469,6 +448,136 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
 
         XCTAssertNil(store.entry(for: "A"), "an unqueued asset must remain unseen and re-yield")
         XCTAssertEqual(store.fullScanProgress()?.cursor, 0, "the stable frontier must not pass unqueued work")
+    }
+
+    func testOpenCatalogDecodeFailureStaysStickyAcrossSuccessfulSQLAndRejectsDurabilityAndAppend() throws {
+        let store = try makeStore()
+        defer { store.close() }
+        XCTAssertTrue(store.upsertBatch([entry(from: photoInfo(id: "corrupt"), at: 100)]))
+        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["kept"]))
+        XCTAssertTrue(store.isOperational())
+        XCTAssertTrue(store.synchronizeToDisk())
+
+        let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        do {
+            var handle: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+            let database = try XCTUnwrap(handle)
+            defer { sqlite3_close(database) }
+            XCTAssertEqual(
+                sqlite3_exec(
+                    database, "UPDATE photo_catalog SET resources_json=X'7B' WHERE local_id='corrupt';",
+                    nil, nil, nil), SQLITE_OK)
+        }
+
+        XCTAssertNil(store.entry(for: "corrupt"), "a malformed resource blob must fail decoding on the open store")
+        XCTAssertFalse(store.isOperational())
+        XCTAssertFalse(store.synchronizeToDisk(), "an open handle with a recorded failure cannot prove durability")
+        XCTAssertFalse(store.appendFullScanSnapshotIdentifiers(["rejected"]))
+        XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept"])
+
+        let later = entry(from: photoInfo(id: "later"), at: 200)
+        XCTAssertTrue(store.upsertBatch([later]), "successful SQL predicates retain their existing result")
+        XCTAssertEqual(store.entry(for: "later"), later, "the handle remains open and can execute SQL")
+        XCTAssertFalse(store.isOperational(), "successful SQL must not reset the recorded failure")
+        XCTAssertFalse(store.synchronizeToDisk())
+    }
+
+    func testSnapshotAppendRejectsEmptyIdentifiersWithoutAppendingOrRecordingFailure() throws {
+        let store = try makeStore()
+        defer { store.close() }
+        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["kept"]))
+
+        for identifiers in [[""], ["candidate", ""]] {
+            XCTAssertFalse(store.appendFullScanSnapshotIdentifiers(identifiers))
+            XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept"])
+            XCTAssertTrue(store.isOperational(), "invalid input is rejected before SQL without recording failure")
+            XCTAssertTrue(store.synchronizeToDisk())
+        }
+
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["later"]))
+        XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept", "later"])
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testEmptyClassifyBatchReturnsEmptyOnOpenAndClosedStore() throws {
+        try assertEmptyBatchPreservesCallerState { $0.classifyBatch([]).isEmpty }
+    }
+
+    func testEmptyPresentEntriesReturnsEmptyOnOpenAndClosedStore() throws {
+        try assertEmptyBatchPreservesCallerState { $0.presentEntries(for: []).isEmpty }
+    }
+
+    func testEmptyUpsertBatchStillSucceedsAfterCloseWithoutChangingCallerState() throws {
+        try assertEmptyBatchPreservesCallerState { $0.upsertBatch([]) }
+    }
+
+    func testEmptyMarkRemovedStillSucceedsAfterCloseWithoutChangingCallerState() throws {
+        try assertEmptyBatchPreservesCallerState { store in
+            let result = store.markRemoved([], removedAt: Date(timeIntervalSince1970: 100))
+            XCTAssertEqual(result.affectedRows, 0)
+            let filtered = store.markRemoved(["", ""], removedAt: Date(timeIntervalSince1970: 100))
+            XCTAssertTrue(filtered.succeeded)
+            XCTAssertEqual(filtered.affectedRows, 0)
+            return result.succeeded
+        }
+    }
+
+    func testEmptySnapshotAppendStillSucceedsAfterCloseWithoutChangingCallerState() throws {
+        try assertEmptyBatchPreservesCallerState { $0.appendFullScanSnapshotIdentifiers([]) }
+    }
+
+    private func assertEmptyBatchPreservesCallerState(
+        _ operation: (PhotoLibraryCatalogManifestStore) -> Bool
+    ) throws {
+        for closed in [false, true] {
+            let url = tempDir.appendingPathComponent("\(UUID().uuidString).sqlite")
+            let store = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
+            defer { store.close() }
+            let original = entry(from: photoInfo(id: "kept"), at: 100)
+            XCTAssertTrue(store.upsertBatch([original]))
+            if closed { store.close() }
+            let wasOperational = store.isOperational()
+            XCTAssertEqual(wasOperational, !closed)
+
+            XCTAssertTrue(operation(store), "an empty batch still succeeds on a closed store")
+            XCTAssertEqual(store.isOperational(), wasOperational, "a no-op must preserve operational state")
+            XCTAssertTrue(store.classifyBatch([]).isEmpty)
+            XCTAssertTrue(store.presentEntries(for: []).isEmpty)
+            XCTAssertEqual(store.isOperational(), wasOperational)
+            XCTAssertEqual(store.entry(for: "kept"), closed ? nil : original)
+            let later = entry(from: photoInfo(id: "later"), at: 200)
+            XCTAssertEqual(store.upsertBatch([later]), !closed, "a following real write keeps its normal result")
+            XCTAssertEqual(store.isOperational(), wasOperational)
+            store.close()
+
+            let reopened = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
+            defer { reopened.close() }
+            XCTAssertEqual(reopened.entry(for: "kept"), original)
+            XCTAssertEqual(reopened.entry(for: "later"), closed ? nil : later)
+            XCTAssertTrue(reopened.isOperational())
+        }
+    }
+
+    func testCloseRejectsReadsAndWritesAndPreservesPersistedRows() throws {
+        let store = try makeStore()
+        let original = entry(from: photoInfo(id: "kept"), at: 100)
+        XCTAssertEqual(store.upsert(original), .inserted)
+        store.close()
+
+        XCTAssertFalse(store.isOperational())
+        XCTAssertNil(store.entry(for: "kept"))
+        XCTAssertFalse(store.upsertBatch([entry(from: photoInfo(id: "rejected"), at: 200)]))
+        XCTAssertFalse(store.synchronizeToDisk())
+        store.close()
+
+        let reopened = try makeStore()
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.entry(for: "kept"), original)
+        XCTAssertNil(reopened.entry(for: "rejected"))
+        XCTAssertTrue(reopened.isOperational())
     }
 
     func testUnavailableCatalogCannotMasqueradeAsAnEmptyCompletedScan() async throws {
@@ -690,6 +799,100 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertEqual(engine.enqueued, ["a", "b"], "re-opened revisions are queued")
     }
 
+    /// A failed proof read keeps the pages before it checked: the next pass, also after a relaunch, starts at the
+    /// failed page and repeats no lookups for the earlier pages (#343).
+    func testLateRenderReconciliationContinuesAtThePageWhoseProofReadFailed() async throws {
+        var store = try makeStore()
+        let infos = ["a", "b", "c", "d"].map(editInfo) + [photoInfo(id: "e")]
+        XCTAssertTrue(store.upsertBatch(infos.map { entry(from: $0, at: 100) }))
+        let engine = ReopeningEnqueuer(proofUnavailableAt: ["c", "c"])
+
+        try await PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+            .reconcileLateRendersOnce(engine: engine)
+        XCTAssertFalse(store.hasReconciledLateRenders())
+        XCTAssertEqual(engine.reopened, ["a", "b", "c"])
+
+        store.close()
+        store = try makeStore()
+        let sync = PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertFalse(store.hasReconciledLateRenders(), "the failed page stays pending")
+        XCTAssertEqual(engine.reopened, ["a", "b", "c", "c"])
+
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertTrue(store.hasReconciledLateRenders())
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertEqual(engine.reopened, ["a", "b", "c", "c", "c", "d"], "each page is checked until its proof is read")
+        XCTAssertEqual(engine.enqueued, ["a", "b", "c", "d"])
+    }
+
+    /// A cancelled pass keeps the pages it finished: the next pass, also after a relaunch, continues after them and
+    /// checks the cancelled page again (#356).
+    func testLateRenderReconciliationContinuesAfterTheFinishedPagesOfACancelledPass() async throws {
+        let first = try makeStore()
+        let infos = ["a", "b", "c"].map(editInfo) + [photoInfo(id: "d")]
+        XCTAssertTrue(first.upsertBatch(infos.map { entry(from: $0, at: 100) }))
+        let engine = ReopeningEnqueuer(cancelsAt: "c")
+
+        do {
+            try await Task {
+                try await PhotoLibraryCatalogSync(store: first, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+                    .reconcileLateRendersOnce(engine: engine)
+            }.value
+            XCTFail("the first pass is cancelled at the page of c")
+        } catch is CancellationError {}
+        XCTAssertFalse(first.hasReconciledLateRenders())
+        XCTAssertEqual(engine.reopened, ["a", "b", "c"])
+
+        first.close()
+        let store = try makeStore()
+        try await PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+            .reconcileLateRendersOnce(engine: engine)
+        XCTAssertTrue(store.hasReconciledLateRenders())
+        XCTAssertEqual(engine.reopened, ["a", "b", "c", "c"], "the finished pages are not checked again")
+        XCTAssertEqual(engine.enqueued, ["a", "b", "c"], "the cancelled page is queued in the next pass")
+    }
+
+    /// A failed first page leaves nothing behind; the retry starts at the first page and completes.
+    func testLateRenderReconciliationRetriesAFailedFirstPage() async throws {
+        let store = try makeStore()
+        XCTAssertTrue(store.upsertBatch(["a", "b"].map { entry(from: editInfo($0), at: 100) }))
+        let sync = PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+        let engine = ReopeningEnqueuer(proofUnavailableAt: ["a"])
+
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertFalse(store.hasReconciledLateRenders())
+        XCTAssertNil(store.lateRenderSweepResumePoint())
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertTrue(store.hasReconciledLateRenders())
+        XCTAssertNil(store.lateRenderSweepResumePoint(), "a complete pass leaves no resume point")
+        XCTAssertEqual(engine.reopened, ["a", "a", "b"])
+        XCTAssertEqual(engine.enqueued, ["a", "b"])
+    }
+
+    /// The resume point survives a relaunch, and only the completing pass removes it.
+    func testLateRenderResumePointIsClearedWhenTheSweepCompletes() throws {
+        var store = try makeStore()
+        XCTAssertNil(store.lateRenderSweepResumePoint(), "a store without a resume point starts at the first page")
+        XCTAssertTrue(store.recordLateRenderSweepResumePoint("0042/L0/001"))
+        store.close()
+        store = try makeStore()
+        XCTAssertEqual(store.lateRenderSweepResumePoint(), "0042/L0/001")
+        XCTAssertFalse(store.hasReconciledLateRenders())
+        XCTAssertTrue(store.markLateRendersReconciled())
+        XCTAssertNil(store.lateRenderSweepResumePoint())
+        XCTAssertTrue(store.hasReconciledLateRenders())
+    }
+
+    private func editInfo(_ id: String) -> PhotoBackupAssetInfo {
+        info(
+            id: id,
+            resources: [
+                .init(role: .originalPhoto, originalFilename: "IMG_\(id).HEIC", mimeType: "image/heic"),
+                .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.JPG", mimeType: "image/jpeg"),
+            ])
+    }
+
     private func runDriver(
         store: any PhotoLibraryCatalogStore,
         enumerator: any PhotoLibraryAssetEnumerator,
@@ -726,22 +929,49 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
             lock.withLock { _enqueued.append(candidate.snapshot.source.identifier) }
             return UploadBackupSyncScanResult()
         }
+
+        func synchronizeQueueToDisk() -> Bool { true }
     }
 
-    /// Re-opens every offered revision. Its first call cancels the pass that called it.
+    /// Re-opens every offered revision and records each offered photo, which the real engine looks up in the
+    /// state and identity stores. Without failures, its first call cancels the pass that called it. With failures,
+    /// each listed photo makes one call throw `UploadBackupRemoteProofUnavailable` in turn.
     private final class ReopeningEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendable {
         private let lock = NSLock()
         private var _reopened: [String] = []
         private var _enqueued: [String] = []
+        private var proofUnavailableAt: [String]
+        private let cancelsFirstCall: Bool
+        private var cancelsAt: String?
         var reopened: [String] { lock.withLock { _reopened } }
         var enqueued: [String] { lock.withLock { _enqueued } }
 
-        func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async -> [UploadBackupAssetCandidate] {
-            let isFirstCall = lock.withLock { () -> Bool in
-                defer { _reopened += reopenings.map(\.candidate.snapshot.source.identifier) }
-                return _reopened.isEmpty
+        /// Without arguments, the first call cancels its task. `cancelsAt` cancels the call that offers that photo.
+        init(proofUnavailableAt: [String] = [], cancelsAt: String? = nil) {
+            self.proofUnavailableAt = proofUnavailableAt
+            self.cancelsAt = cancelsAt
+            cancelsFirstCall = proofUnavailableAt.isEmpty && cancelsAt == nil
+        }
+
+        func reopenBackedUpRevisions(
+            _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+        ) async throws -> [UploadBackupAssetCandidate] {
+            let identifiers = reopenings.map(\.candidate.snapshot.source.identifier)
+            let cancels = lock.withLock { () -> Bool in
+                guard let cancelsAt, identifiers.contains(cancelsAt) else { return false }
+                self.cancelsAt = nil
+                return true
             }
-            if isFirstCall { withUnsafeCurrentTask { $0?.cancel() } }
+            let (isFirstCall, proofUnavailable) = lock.withLock { () -> (Bool, Bool) in
+                defer { _reopened += identifiers }
+                guard let next = proofUnavailableAt.first, identifiers.contains(next) else {
+                    return (_reopened.isEmpty, false)
+                }
+                proofUnavailableAt.removeFirst()
+                return (_reopened.isEmpty, true)
+            }
+            if proofUnavailable { throw UploadBackupRemoteProofUnavailable() }
+            if (isFirstCall && cancelsFirstCall) || cancels { withUnsafeCurrentTask { $0?.cancel() } }
             return reopenings.map(\.candidate)
         }
 
@@ -749,6 +979,8 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
             lock.withLock { _enqueued.append(candidate.snapshot.source.identifier) }
             return UploadBackupSyncScanResult()
         }
+
+        func synchronizeQueueToDisk() -> Bool { true }
     }
 
     /// Ignores cancellation until explicitly released, matching a PhotoKit/SDK callback that returns late.
@@ -757,6 +989,8 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         private var entryWaiters: [CheckedContinuation<Void, Never>] = []
         private var isReleased = false
         private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func synchronizeQueueToDisk() -> Bool { true }
 
         func enqueue(_ candidate: UploadBackupAssetCandidate) async -> UploadBackupSyncScanResult {
             entered = true
@@ -805,12 +1039,16 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
             lock.withLock { _absent[id] = absent }
             return UploadBackupSyncScanResult()
         }
+
+        func synchronizeQueueToDisk() -> Bool { true }
     }
 
     private struct FailingEnqueuer: UploadBackupCandidateEnqueueing {
         func enqueue(_ candidate: UploadBackupAssetCandidate) async throws -> UploadBackupSyncScanResult {
             throw UploadError.backend("forced queue failure")
         }
+
+        func synchronizeQueueToDisk() -> Bool { true }
     }
 
     private final class MemoryBackupStateStore: UploadBackupStateStore, @unchecked Sendable {
@@ -868,47 +1106,6 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
                 for chunk in chunks { continuation.yield(chunk) }
                 continuation.finish(throwing: error)
             }
-        }
-    }
-
-    /// Delivers part of the identifier snapshot, then stops like a cancelled PhotoKit fetch.
-    private struct SnapshotFailingEnumerator: PhotoLibraryAssetEnumerator {
-        func identifierChunks(chunkSize: Int) -> AsyncThrowingStream<PhotoLibraryIdentifierChunk, any Error> {
-            AsyncThrowingStream { continuation in
-                continuation.yield(PhotoLibraryIdentifierChunk(identifiers: ["A"], totalCount: 2))
-                continuation.finish(throwing: CancellationError())
-            }
-        }
-
-        func infoChunks(
-            identifiers: [String]?, startOffset: Int, chunkSize: Int
-        ) -> AsyncThrowingStream<[PhotoBackupAssetInfo], any Error> {
-            AsyncThrowingStream { $0.finish() }
-        }
-    }
-
-    /// Records what the catalog held each time a first scan reported that it can resume.
-    private final class ResumableBox: @unchecked Sendable {
-        struct Call: Equatable {
-            var hasResumePoint: Bool
-            var probeCatalogued: Bool
-        }
-
-        private let store: any PhotoLibraryCatalogStore
-        private let probe: String
-        private let lock = NSLock()
-        private var values: [Call] = []
-        var calls: [Call] { lock.withLock { values } }
-
-        init(store: any PhotoLibraryCatalogStore, probe: String) {
-            self.store = store
-            self.probe = probe
-        }
-
-        func record() {
-            let call = Call(
-                hasResumePoint: store.fullScanProgress() != nil, probeCatalogued: store.entry(for: probe) != nil)
-            lock.withLock { values.append(call) }
         }
     }
 

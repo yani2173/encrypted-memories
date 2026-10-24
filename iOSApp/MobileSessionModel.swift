@@ -20,8 +20,8 @@ final class MobileSessionModel: ObservableObject {
 
     let sessionStore = SessionKeychainStore()
     private let authController: ProtonAuthController
-    private var startupPurgeSucceeded: Bool
-    private var startupCleanupTask: Task<Void, Never>?
+    /// The startup and sign-in guard shared with macOS: no session starts before the sign-out purge and cleanup ended.
+    private let startupCleanup = ProtonAuthStartupCleanup()
     private var protectedDataObserver: NSObjectProtocol?
     private let webAuthenticationSession = ManagedWebAuthenticationSession()
     /// The window of the scene that started sign-in. The managed browser must appear in that window, not in
@@ -49,10 +49,8 @@ final class MobileSessionModel: ObservableObject {
             store: sessionStore,
             authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories)
         )
-        self.startupPurgeSucceeded = false
-        self.startupCleanupTask = nil
         isCheckingSession = true
-        statusText = String(localized: "auth.checking_session")
+        statusText = L10n.string("auth.checking_session")
         protectedDataObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.protectedDataDidBecomeAvailableNotification,
             object: nil,
@@ -60,7 +58,7 @@ final class MobileSessionModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if !self.startupPurgeSucceeded {
+                if !self.startupCleanup.succeeded {
                     self.beginStartupCleanup()
                 } else {
                     self.bootstrapSessionIfNeeded()
@@ -71,7 +69,7 @@ final class MobileSessionModel: ObservableObject {
     }
 
     private func beginStartupCleanup(plaintextPurgeSucceeded: Bool? = nil, signInAfterCleanup: Bool = false) {
-        guard startupCleanupTask == nil else { return }
+        guard !startupCleanup.isRunning else { return }
         #if DEBUG
             // UI tests run on the offline fixture account. A saved real account must never start behind it.
             guard !MobileUITestLaunch.isRequested else {
@@ -81,16 +79,8 @@ final class MobileSessionModel: ObservableObject {
         #endif
         apply(.checking)
         guard UIApplication.shared.isProtectedDataAvailable else { return }
-        let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
-        startupPurgeSucceeded = false
-        startupCleanupTask = Task { @MainActor [weak self] in
-            let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(
-                claim: purgeClaim,
-                plaintextPurgeSucceeded: plaintextPurgeSucceeded
-            )
+        startupCleanup.begin(plaintextPurgeSucceeded: plaintextPurgeSucceeded) { [weak self] succeeded in
             guard let self else { return }
-            self.startupPurgeSucceeded = succeeded
-            self.startupCleanupTask = nil
             if succeeded, signInAfterCleanup {
                 self.signIn()
             } else {
@@ -112,10 +102,14 @@ final class MobileSessionModel: ObservableObject {
         if let presentationAnchor {
             presentationAnchorProvider = presentationAnchor
         }
-        guard startupCleanupTask == nil else { return }
-        guard startupPurgeSucceeded, !BackupLocalDataPurge.isPurgePending() else {
+        switch startupCleanup.admitSignIn() {
+        case .waitForCleanup:
+            return
+        case .cleanUpFirst:
             beginStartupCleanup(signInAfterCleanup: true)
             return
+        case .proceed:
+            break
         }
         authController.signIn(
             openURL: { [weak self] url in
@@ -136,9 +130,7 @@ final class MobileSessionModel: ObservableObject {
         // Explicit user sign-out arms the local-data purge before tearing down the session, so the
         // post-teardown and next-launch checks wipe every account container. It stays unarmed for transient
         // session re-check; only here (see BackupLocalDataPurge).
-        BackupLocalDataPurge.requestPurgeOnSignOut(
-            persistentDomainName: Bundle.main.bundleIdentifier
-        )
+        ProtonAuthStartupCleanup.armPurgeForSignOut()
         apply(authController.signOut())
     }
 
@@ -157,11 +149,7 @@ final class MobileSessionModel: ObservableObject {
     }
 
     private func apply(_ state: ProtonAuthState) {
-        if case .authenticating = state {
-            // Keep the managed browser alive while the shared fork flow polls Proton.
-        } else {
-            webAuthenticationSession.cancel()
-        }
+        webAuthenticationSession.follow(state)
         switch state {
         case .checking:
             session = nil
@@ -169,7 +157,7 @@ final class MobileSessionModel: ObservableObject {
             isCheckingSession = true
             isSigningOut = false
             errorText = nil
-            statusText = String(localized: "auth.checking_session")
+            statusText = L10n.string("auth.checking_session")
         case .signedOut(let error):
             session = nil
             isSigningIn = false
@@ -197,12 +185,12 @@ final class MobileSessionModel: ObservableObject {
     /// protected data. Keep the session in the checking state and retry when the OS announces that
     /// the existing item can be read; this must never look like an account sign-out.
     private func bootstrapSessionIfNeeded() {
-        guard startupCleanupTask == nil, session == nil, !isSigningIn, !isSigningOut else { return }
+        guard !startupCleanup.isRunning, session == nil, !isSigningIn, !isSigningOut else { return }
         guard UIApplication.shared.isProtectedDataAvailable else {
             apply(.checking)
             return
         }
-        guard startupPurgeSucceeded else {
+        guard startupCleanup.succeeded else {
             apply(.signedOut(error: L10n.string("auth.sign_in_failed")))
             return
         }

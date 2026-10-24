@@ -70,6 +70,7 @@ public actor BackupStatusProjector {
     private var latestRunnerProgress: BackupSyncProgress?
     private var lastRawPhase: BackupStatus.Phase?
     private var lastPublishedAt = Date.distantPast
+    private var speedEstimator = BackupUploadSpeedEstimator()
 
     public init(
         queue: any UploadBackupSyncQueueStore,
@@ -116,6 +117,7 @@ public actor BackupStatusProjector {
         latestRunnerProgress = nil
         lastRawPhase = nil
         lastPublishedAt = .distantPast
+        speedEstimator.reset()
 
         let stream = self.stream
         streamTask = Task { [weak self] in
@@ -172,6 +174,11 @@ public actor BackupStatusProjector {
             isUserPaused: context.isUserPaused,
             executionOpportunityIssue: context.executionOpportunityIssue
         )
+        if Self.sendsBytes(rawStatus.phase) {
+            speedEstimator.record(bytes: event.progress.transferredByteCount, at: now())
+        } else {
+            speedEstimator.reset()
+        }
         let phaseChanged = rawStatus.phase != lastRawPhase
         lastRawPhase = rawStatus.phase
         let issueChanged =
@@ -180,10 +187,10 @@ public actor BackupStatusProjector {
             || previous?.sourceMissing != event.progress.sourceMissing
         let previousOutstanding =
             (previous?.waiting ?? 0) + (previous?.checking ?? 0)
-            + (previous?.uploading ?? 0) + (previous?.blocked ?? 0)
+            + (previous?.uploading ?? 0) + (previous?.blocked ?? 0) + (previous?.pendingSourceRechecks ?? 0)
         let currentOutstanding =
             event.progress.waiting + event.progress.checking
-            + event.progress.uploading + event.progress.blocked
+            + event.progress.uploading + event.progress.blocked + event.progress.pendingSourceRechecks
         let drained = previousOutstanding > 0 && currentOutstanding == 0
         let terminal = !event.progress.isRunning
 
@@ -232,6 +239,7 @@ public actor BackupStatusProjector {
         progress.blocked = summary.blocked
         progress.failed = summary.failed
         progress.dismissedFailures = summary.dismissedFailures
+        progress.pendingSourceRechecks = summary.pendingSourceRechecks
         progress.paused = summary.paused
         // A Photo Library pass repeatedly invokes short eligible-only runner drains while its scan
         // runs concurrently. The controller's run context is therefore the stable activity truth;
@@ -265,12 +273,17 @@ public actor BackupStatusProjector {
             )
         }
 
-        let status = BackupStatus(
+        var status = BackupStatus(
             progress: progress,
             isScanning: context.isScanning,
             isUserPaused: context.isUserPaused,
             executionOpportunityIssue: context.executionOpportunityIssue
         )
+        if Self.sendsBytes(status.phase) {
+            status.uploadSpeedBytesPerSecond = speedEstimator.speed(at: now())
+        } else {
+            speedEstimator.reset()
+        }
         let projection = BackupStatusProjection(
             generation: generation,
             revision: contextRevision,
@@ -284,11 +297,16 @@ public actor BackupStatusProjector {
         return projection
     }
 
+    /// Only these phases can show an upload speed. Every other phase makes the next resume start fresh.
+    private static func sendsBytes(_ phase: BackupStatus.Phase) -> Bool {
+        phase == .checking || phase == .uploading
+    }
+
     private func outstandingSnapshot(
         summary: UploadBackupSyncQueueSummary,
         isRunning: Bool
     ) -> BackupOutstandingSnapshot {
-        let count = summary.waiting + summary.active + summary.blocked
+        let count = summary.waiting + summary.active + summary.blocked + summary.pendingSourceRechecks
         guard count > 0 else { return BackupOutstandingSnapshot() }
         guard !isRunning else { return BackupOutstandingSnapshot(count: count) }
 

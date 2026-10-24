@@ -199,6 +199,24 @@ final class UploadIdentityManifestTests: XCTestCase {
         )
     }
 
+    func testMergeMovesNeverPromoteADiagnosticTrashLinkToAnActiveCopy() throws {
+        let store = try makeStore()
+        var saved = makeRecord(identifier: "trashed-source")
+        saved.remoteLinkID = "trashed-link"
+        saved.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
+        XCTAssertTrue(store.upsert(saved))
+        XCTAssertTrue(
+            store.rebindRemoteLinks(
+                [.init(from: "trashed-link", to: "kept", contentHash: saved.contentHash)],
+                hashKeyEpoch: saved.hashKeyEpoch))
+        XCTAssertEqual(store.record(for: saved.source), saved)
+        XCTAssertTrue(store.forgetRemoteLinks(["trashed-link"], of: saved.source))
+        let forgotten = try XCTUnwrap(store.record(for: saved.source))
+        XCTAssertNil(forgotten.remoteLinkID)
+        XCTAssertNil(forgotten.outcome)
+        XCTAssertEqual(forgotten.sha1Hex, saved.sha1Hex)
+    }
+
     func testSourcesOfARemoteLinkListOnlyTrustworthyRows() throws {
         let store = try makeStore()
         var uploaded = makeRecord(identifier: "asset-a")
@@ -240,6 +258,45 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertEqual(reopened.record(for: duplicate.source), duplicate)
         XCTAssertEqual(
             Set(try XCTUnwrap(reopened.sources(withRemoteLinkID: "shared"))), [uploaded.source, duplicate.source])
+    }
+
+    func testCloseRejectsLaterCallsAndKeepsRowsForTheNextOpen() throws {
+        let store = try makeStore()
+        var uploaded = makeRecord(identifier: "asset-a")
+        uploaded.remoteVolumeID = "vol"
+        uploaded.remoteLinkID = "link-a"
+        uploaded.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+        XCTAssertTrue(store.upsert(uploaded))
+
+        store.close()
+        store.close()
+
+        XCTAssertNil(store.record(for: uploaded.source))
+        XCTAssertEqual(store.trustedRecords(contentHash: "contenthash-1", hashKeyEpoch: "epoch-1", limit: 5), [])
+        XCTAssertNil(store.sources(withRemoteLinkIDs: ["link-a"]))
+        XCTAssertEqual(store.sources(withRemoteLinkIDs: []), [:], "an empty lookup needs no handle")
+        XCTAssertFalse(store.forgetRemoteLinks(["link-a"], of: uploaded.source))
+        XCTAssertFalse(store.upsert(makeRecord(identifier: "asset-b")))
+        XCTAssertFalse(
+            store.rebindRemoteLinks(
+                [UploadRemoteLinkMove(from: "link-a", to: "link-b", contentHash: "contenthash-1")],
+                hashKeyEpoch: "epoch-1"))
+        XCTAssertEqual(store.remoteContentIndexHealth(hashKeyEpoch: "epoch-1"), .unavailable)
+        XCTAssertNil(store.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch-1"))
+        XCTAssertNil(
+            store.beginRemoteContentIndexBuild(
+                hashKeyEpoch: "epoch-1", eventID: "event-1", sourceFingerprint: "source-a", total: 1,
+                updatedAt: Date(timeIntervalSince1970: 1)))
+        XCTAssertEqual(store.count(), 0)
+
+        let reopened = try makeStore()
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.record(for: uploaded.source), uploaded)
+        XCTAssertNil(reopened.record(for: makeRecord(identifier: "asset-b").source))
+        XCTAssertEqual(reopened.sources(withRemoteLinkID: "link-a"), [uploaded.source])
+        XCTAssertEqual(reopened.count(), 1)
+        XCTAssertTrue(reopened.upsert(makeRecord(identifier: "asset-b")))
+        XCTAssertEqual(reopened.count(), 2)
     }
 
     func testForgettingTrashedLinksKeepsTheHashesButNoLongerProvesABackup() throws {

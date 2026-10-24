@@ -269,22 +269,19 @@ import Testing
             level: 3, width: width, columnPhase: 3)!
         #expect(tx.anchorGlobalIndex == displayed, "begin anchor must equal the displayed item")
         for target in [1, 2] {  // adjacent + multi-level detents within the normal band, mid-content (no edge clamp)
-            // Replicate pinchDetentParams(target): cursor-aligned phase + anchored scroll, clamped exactly as the
-            // segment build and the release commit do.
-            let col = e.cursorColumn(viewportX: tx.anchorViewportPoint.x, level: target, width: width)
-            let phase = e.columnPhase(forItem: tx.anchorGlobalIndex, targetColumn: col, level: target, width: width)
+            // The cursor-aligned detent frame both hosts build a lattice segment and the lattice chain commit from.
+            let detent = GridPinchDetentGeometry.cursorAlignedFrame(
+                level: target, transaction: tx, engine: e, width: width, viewportHeight: viewport.height)
             let rawY = e.anchoredScrollOffset(
                 flatIndex: tx.anchorGlobalIndex, localFraction: tx.anchorLocalFraction,
-                viewportPoint: tx.anchorViewportPoint, level: target, width: width, columnPhase: phase
+                viewportPoint: tx.anchorViewportPoint, level: target, width: width, columnPhase: detent.phase
             ).y
-            let clampedY = e.clampScrollOffsetY(
-                rawY, level: target, width: width, viewportHeight: viewport.height, columnPhase: phase)
             #expect(
-                abs(clampedY - rawY) < 0.5,
+                abs(detent.scrollY - rawY) < 0.5,
                 "scenario must be mid-content (no edge clamp) for a clean endpoint check at level \(target)")
             let plan = e.framePlan(
-                level: target, viewportSize: viewport, scrollOffset: CGPoint(x: 0, y: clampedY), overscan: 0,
-                columnPhase: phase)
+                level: target, viewportSize: viewport, scrollOffset: CGPoint(x: 0, y: detent.scrollY), overscan: 0,
+                columnPhase: detent.phase)
             let underCursor = plan.visibleSlots.first { $0.viewportRect.contains(cursorVP) }?.index
             #expect(
                 underCursor == tx.anchorGlobalIndex,

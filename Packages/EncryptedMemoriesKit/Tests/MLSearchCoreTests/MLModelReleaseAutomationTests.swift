@@ -2,12 +2,13 @@ import CryptoKit
 import Foundation
 import Testing
 
-@Suite(.serialized) struct MLModelReleaseAutomationTests {
+@Suite(.serialized, CompiledReleaseScript()) struct MLModelReleaseAutomationTests {
     @Test func qualifiedCandidateProducesSignedCatalogAndEvidenceWithoutPublishing() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-        let result = try runRelease(fixture)
+        // The release workflows run the script with `xcrun swift`; this test keeps that form.
+        let result = try runRelease(fixture, interpreted: true)
 
         #expect(result.status == 0, Comment(rawValue: result.error))
         let catalog = try Data(contentsOf: fixture.output.appendingPathComponent("catalog-v1.json"))
@@ -731,7 +732,8 @@ import Testing
         retiredModelIDs: [String] = [],
         channel: String? = nil,
         allowEmptyV1: Bool = false,
-        compatibility: URL? = nil
+        compatibility: URL? = nil,
+        interpreted: Bool = false
     ) throws -> (status: Int32, output: String, error: String) {
         var arguments = [
             "--private-key", fixture.privateKey.path,
@@ -786,10 +788,15 @@ import Testing
         if let compatibility {
             arguments += ["--compatibility", compatibility.path]
         }
-        let script = Self.repositoryRoot.appendingPathComponent("scripts/prepare-ml-model-release.swift")
+        guard interpreted else {
+            guard let binary = CompiledReleaseScript.binary else {
+                throw CompiledReleaseScript.Failure(description: "the suite did not compile the release script")
+            }
+            return try Self.run(executable: binary, arguments: arguments)
+        }
         return try Self.run(
             executable: URL(fileURLWithPath: "/usr/bin/xcrun"),
-            arguments: ["swift", script.path] + arguments
+            arguments: ["swift", CompiledReleaseScript.source.path] + arguments
         )
     }
 
@@ -813,7 +820,7 @@ import Testing
         )
     }
 
-    private static var repositoryRoot: URL {
+    fileprivate static var repositoryRoot: URL {
         var url = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { url.deleteLastPathComponent() }
         return url
@@ -836,5 +843,40 @@ import Testing
         let start = try #require(source.range(of: "<<'PY'\n")?.upperBound)
         let end = try #require(source.range(of: "\nPY\n", range: start..<source.endIndex)?.lowerBound)
         return String(source[start..<end])
+    }
+}
+
+/// Compiles `prepare-ml-model-release.swift` once for the suite, so each release run starts a binary instead of
+/// compiling 1,900 lines again. The binary lives in a temporary directory that the suite removes afterwards.
+private struct CompiledReleaseScript: SuiteTrait, TestScoping {
+    static let source = MLModelReleaseAutomationTests.repositoryRoot.appendingPathComponent(
+        "scripts/prepare-ml-model-release.swift")
+
+    @TaskLocal static var binary: URL?
+
+    struct Failure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    func provideScope(
+        for test: Test, testCase: Test.Case?, performing function: @Sendable () async throws -> Void
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MLModelReleaseAutomationTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let binary = directory.appendingPathComponent("prepare-ml-model-release")
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        compiler.arguments = ["swiftc", Self.source.path, "-o", binary.path]
+        let errors = Pipe()
+        compiler.standardError = errors
+        try compiler.run()
+        let diagnostics = errors.fileHandleForReading.readDataToEndOfFile()
+        compiler.waitUntilExit()
+        guard compiler.terminationStatus == 0 else {
+            throw Failure(description: String(decoding: diagnostics, as: UTF8.self))
+        }
+        try await Self.$binary.withValue(binary, operation: function)
     }
 }

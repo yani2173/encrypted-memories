@@ -2,6 +2,7 @@ import Foundation
 import PhotosCore
 import ProtonAuth
 import ProtonCoreDataModel
+import UploadCore
 
 /// Holds the live Proton session and performs authenticated requests against the Drive API,
 /// transparently refreshing the access token on 401. Shared by the SDK HTTP client and the
@@ -98,13 +99,14 @@ final class DriveSession: @unchecked Sendable {
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
 
-        let permit = try await requestGovernor.acquire(scope: .api)
+        let permit = try await requestGovernor.acquire(scope: .api, label: .api(method: method, path: path))
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await urlSession.data(for: req)
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             throw error
         }
         guard let http = response as? HTTPURLResponse else {
@@ -169,7 +171,9 @@ final class DriveSession: @unchecked Sendable {
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "ResponseType": "token", "GrantType": "refresh_token", "RefreshToken": s.refreshToken,
         ])
-        guard let permit = try? await requestGovernor.acquire(scope: .api, priority: .immediate)
+        guard
+            let permit = try? await requestGovernor.acquire(
+                scope: .api, priority: .immediate, label: .api(method: "POST", path: "/auth/v4/refresh"))
         else { return false }
         guard let (data, response) = try? await urlSession.data(for: req),
             let http = response as? HTTPURLResponse
@@ -310,26 +314,30 @@ extension DriveSession {
         url: String,
         token: String?,
         priority: ProtonRequestPriority = ProtonRequestContext.priority,
-        priorityHandle: ProtonRequestGovernor.PriorityHandle? = nil
+        priorityHandle: ProtonRequestGovernor.PriorityHandle? = nil,
+        allowsExpensiveNetwork: Bool = true
     ) async throws -> Data {
         guard let u = URL(string: url), u.scheme == "https", u.host != nil else {
             throw ProtonAuthError.invalidResponse
         }
         var req = URLRequest(url: u)
         req.httpMethod = "GET"
+        req.allowsExpensiveNetworkAccess = allowsExpensiveNetwork
         if let token {
             req.setValue(token, forHTTPHeaderField: "pm-storage-token")
         } else if isTrustedAPIURL(u) {
             for (k, v) in authHeaders() { req.setValue(v, forHTTPHeaderField: k) }
         }
         let permit = try await requestGovernor.acquire(
-            scope: .storageDownload, priority: priority, priorityHandle: priorityHandle)
+            scope: .storageDownload, priority: priority, priorityHandle: priorityHandle,
+            label: .storage(method: "GET"))
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await storageSession.data(for: req)
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             throw error
         }
         guard let http = response as? HTTPURLResponse else {
@@ -447,24 +455,53 @@ extension DriveSession {
     /// in `Responses[].Response`. A failed move must be detected from the body; ignoring it turns every
     /// failure into a silent "success" (photo gone from the grid, never in Recently Deleted).
     /// The state and the main photo of each link. A link that the server no longer knows is absent from the result.
+    /// `retryOnRateLimit` false answers a rate limit with an error at once, for a read that has a cheaper fallback.
     func fetchLinkVisibility(
-        shareID: String, linkIDs: [String]
+        shareID: String, linkIDs: [String], retryOnRateLimit: Bool = true
     ) async throws -> [String: TimelineRemoteVisibilityRequirement.Link] {
         var result: [String: TimelineRemoteVisibilityRequirement.Link] = [:]
         for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
             try Task.checkCancellation()
-            let data = try await send(
-                "/drive/shares/\(shareID)/links/fetch_metadata", method: "POST", body: ["LinkIDs": chunk],
-                retryOnRateLimit: true)
-            for link in try JSONDecoder().decode(LinkVisibilityResponse.self, from: data).links {
+            let response = try await linkVisibilityResponse(
+                shareID: shareID, linkIDs: chunk, retryOnRateLimit: retryOnRateLimit)
+            for link in response.links {
                 guard let id = link.linkID else { continue }
                 result[id] = .init(
                     isActive: link.state == nil || link.state == 1,
                     mainPhotoLinkID: link.fileProperties?.activeRevision?.photo?.mainPhotoLinkID,
-                    trashTime: link.trashed)
+                    trashTime: link.trashed,
+                    hasExplicitPhotoState: link.state != nil && link.fileProperties?.activeRevision?.photo != nil)
             }
         }
         return result
+    }
+
+    private func linkVisibilityResponse(
+        shareID: String, linkIDs: [String], retryOnRateLimit: Bool
+    ) async throws -> LinkVisibilityResponse {
+        let data = try await send(
+            "/drive/shares/\(shareID)/links/fetch_metadata", method: "POST", body: ["LinkIDs": linkIDs],
+            retryOnRateLimit: retryOnRateLimit)
+        return try JSONDecoder().decode(LinkVisibilityResponse.self, from: data)
+    }
+
+    func fetchLinkStateSnapshot(shareID: String, linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        var states: [String: Int] = [:]
+        var complete = true
+        for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
+            try Task.checkCancellation()
+            let response = try await linkVisibilityResponse(shareID: shareID, linkIDs: chunk, retryOnRateLimit: true)
+            complete = complete && response.code == 1000 && response.hasKnownEnvelope
+            let requested = Set(chunk)
+            for link in response.links {
+                guard let id = link.linkID, requested.contains(id), let state = link.state, states[id] == nil else {
+                    complete = false
+                    continue
+                }
+                states[id] = state
+            }
+        }
+        return UploadLinkStateSnapshot(states: states, complete: complete)
     }
 
     func trash(volumeID: String, linkIDs: [String]) async throws {
@@ -672,6 +709,15 @@ private struct VolumeTrashResponse: Decodable {
 /// `POST /drive/shares/{shareID}/links/fetch_metadata` response.
 /// `links/fetch_metadata` fields that decide whether a photos listing can show a link.
 private struct LinkVisibilityResponse: Decodable {
+    let code: Int?
+    let hasKnownEnvelope: Bool
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        code = try container.decodeIfPresent(Int.self, forKey: .code)
+        links = try container.decode([Body].self, forKey: .links)
+        hasKnownEnvelope = try protonResponseContainsOnly(["Code", "Links"], decoder: decoder)
+    }
     /// Required: a response without it is incomplete, not a list of deleted links.
     let links: [Body]
     struct Body: Decodable {
@@ -686,7 +732,10 @@ private struct LinkVisibilityResponse: Decodable {
             case trashed = "Trashed"
         }
     }
-    enum CodingKeys: String, CodingKey { case links = "Links" }
+    enum CodingKeys: String, CodingKey {
+        case code = "Code"
+        case links = "Links"
+    }
 }
 
 private struct LinkMetaBatchResponse: Decodable {

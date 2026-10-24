@@ -50,6 +50,37 @@ final class TimelineMetadataStoreTests: XCTestCase {
         )
     }
 
+    func testRefinedSameSecondSavesKeepTheLegacyDigestWithoutAFullLibrarySort() throws {
+        let (store, url) = try makeStore(in: makeTempDir())
+        defer { store.close() }
+        let items = (0..<10_000).map { makeItem(node: String(format: "%06d", $0), t: Double(1000 + $0 / 2)) }
+        XCTAssertTrue(store.save(items).succeeded)
+        let digestSQL = "SELECT value FROM store_meta WHERE key='timeline.digest';"
+        let legacyDigest = rawRows(url, digestSQL)
+        XCTAssertEqual(legacyDigest, [["c6fffba523f8ba6359231d501cab22c03da0bb0d7421cfb1c01a2918f51768d3"]])
+        #if DEBUG
+            let fullSorts = store.fullSaveSortCount
+        #endif
+        var refined = items
+        for index in stride(from: 0, to: items.count, by: 2) {
+            refined[index].timelineOrder = .init(exactCaptureTime: items[index].captureTime.addingTimeInterval(0.8))
+            refined[index + 1].timelineOrder = .init(exactCaptureTime: items[index].captureTime.addingTimeInterval(0.1))
+            refined.swapAt(index, index + 1)
+        }
+        let saved = store.save(refined, validationToken: "cursor")
+        XCTAssertTrue(saved.succeeded)
+        XCTAssertTrue(saved.skippedUnchanged)
+        #if DEBUG
+            XCTAssertEqual(store.fullSaveSortCount, fullSorts, "same-second correction must not sort the full library")
+        #endif
+        XCTAssertEqual(rawRows(url, digestSQL), legacyDigest)
+        XCTAssertEqual(try store.load(), items)
+        XCTAssertEqual(store.validationToken(), "cursor")
+        // Truly unordered seconds still need the original canonical fallback.
+        XCTAssertTrue(store.save(Array(refined.reversed())).skippedUnchanged)
+        XCTAssertEqual(rawRows(url, digestSQL), legacyDigest)
+    }
+
     func testStoredCursorTimestampSurvivesReopenAndUnchangedSaves() throws {
         let directory = try makeTempDir()
         let (store, url) = try makeStore(in: directory)
@@ -281,12 +312,12 @@ final class TimelineMetadataStoreTests: XCTestCase {
             makeItem(vol: "volB", node: "node3", t: 501),
         ]
         store.save([expectedOrder[2], expectedOrder[0], expectedOrder[3], expectedOrder[1]])
-        let first = store.load()
+        let first = try store.load()
         XCTAssertEqual(first, expectedOrder, "load must return (t, vol, node) order")
 
         // A second save from a differently-shuffled array must not reshuffle equal-t rows.
         store.save([expectedOrder[3], expectedOrder[1], expectedOrder[0], expectedOrder[2]])
-        XCTAssertEqual(store.load(), expectedOrder, "order must be stable across save/load cycles")
+        XCTAssertEqual(try store.load(), expectedOrder, "order must be stable across save/load cycles")
         store.close()
     }
 
@@ -301,7 +332,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         ]
         store.save(items)
         XCTAssertEqual(
-            store.load(),
+            try store.load(),
             items.sorted(by: TimelineOrder.areInIncreasingOrder),
             "TimelineOrder must be exactly the order the DB index produces"
         )
@@ -328,7 +359,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         XCTAssertFalse(photoColumns.contains("tags"), "photos must not carry a serialized tags blob")
         XCTAssertFalse(photoColumns.contains("burst"), "photos must not carry a serialized burst blob")
 
-        let loaded = store.load()
+        let loaded = try store.load()
         XCTAssertEqual(loaded, [video, plain])
         XCTAssertEqual(loaded.first?.tags, [.videos, .favorites])
         XCTAssertEqual(loaded.first?.durationSeconds, 12.5)
@@ -350,7 +381,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         XCTAssertEqual(rows, [["member-c", "0"], ["member-a", "1"], ["member-b", "2"]])
 
         for _ in 0..<2 {  // stable across repeated save/load cycles
-            let loaded = store.load()
+            let loaded = try store.load()
             XCTAssertEqual(loaded.first?.burstMemberIDs, members)
             store.save(loaded)
         }
@@ -379,7 +410,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         let reopened = try XCTUnwrap(TimelineMetadataStore(url: url))
         let afterReopen = reopened.save(items)
         XCTAssertTrue(afterReopen.skippedUnchanged, "digest short-circuit must persist across launches")
-        XCTAssertEqual(reopened.load(), items.sorted(by: TimelineOrder.areInIncreasingOrder))
+        XCTAssertEqual(try reopened.load(), items.sorted(by: TimelineOrder.areInIncreasingOrder))
 
         // Any real change breaks the short-circuit again - but only the new row is written; the
         // 50 unchanged survivors are not rewritten (O(changes)).
@@ -408,7 +439,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         XCTAssertEqual(second.sweptRows, 1, "exactly the vanished row is swept")
         // O(changes): a and c are unchanged survivors, so nothing is rewritten for them.
         XCTAssertEqual(second.upsertedRows, 0, "unchanged survivors must not be rewritten")
-        XCTAssertEqual(store.load(), [a, c])
+        XCTAssertEqual(try store.load(), [a, c])
 
         // Feature tables follow: b's tag rows must not orphan.
         XCTAssertTrue(rawRows(url, "SELECT * FROM photo_tags WHERE node='b';").isEmpty)
@@ -428,7 +459,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         store.close()
 
         let (relaunched, _) = try makeStore(in: dir)
-        XCTAssertEqual(relaunched.load(), [a, c])
+        XCTAssertEqual(try relaunched.load(), [a, c])
         XCTAssertTrue(rawRows(url, "SELECT * FROM photo_tags WHERE node='b';").isEmpty)
         XCTAssertTrue(rawRows(url, "SELECT * FROM burst_members WHERE anchor_node='b';").isEmpty)
         XCTAssertEqual(relaunched.validationToken(), "event-a")
@@ -436,7 +467,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         // A restore lists the same photos as before the removal; that listing must still be written.
         let restored = relaunched.save([a, b, c], validationToken: "event-b")
         XCTAssertFalse(restored.skippedUnchanged)
-        XCTAssertEqual(relaunched.load(), [a, b, c])
+        XCTAssertEqual(try relaunched.load(), [a, b, c])
         relaunched.close()
     }
 
@@ -453,13 +484,13 @@ final class TimelineMetadataStoreTests: XCTestCase {
         let s1 = store.save([a, bChanged, c])
         XCTAssertEqual(s1.upsertedRows, 1, "only the row whose content changed is rewritten")
         XCTAssertEqual(s1.sweptRows, 0)
-        XCTAssertEqual(store.load(), [a, bChanged, c])
+        XCTAssertEqual(try store.load(), [a, bChanged, c])
 
         // null-safe: clearing a nullable field (relvid "v1" becomes nil) is a real change.
         let bNulled = makeItem(node: "b", t: 200, mime: "video/quicktime", relvid: nil, dur: 9)
         let s2 = store.save([a, bNulled, c])
         XCTAssertEqual(s2.upsertedRows, 1, "NULL-safe guard must detect a value -> NULL transition")
-        XCTAssertNil(store.load().first { $0.uid == b.uid }?.relatedVideoID)
+        XCTAssertNil(try store.load().first { $0.uid == b.uid }?.relatedVideoID)
 
         // Re-saving identical content is a full no-op (digest short-circuit).
         XCTAssertTrue(store.save([a, bNulled, c]).skippedUnchanged)
@@ -518,8 +549,8 @@ final class TimelineMetadataStoreTests: XCTestCase {
         XCTAssertEqual(firstSave.sweptRows, 0)
         XCTAssertEqual(store.count(), 20_000)
 
-        let (loaded, loadMs) = timed("20k.load") {
-            store.load()
+        let (loaded, loadMs) = try timed("20k.load") {
+            try store.load()
         }
         XCTAssertEqual(loaded.count, 20_000)
         XCTAssertEqual(loaded.first, ordered.first)
@@ -555,8 +586,8 @@ final class TimelineMetadataStoreTests: XCTestCase {
         XCTAssertEqual(changedSave.sweptRows, 100)
         XCTAssertEqual(store.count(), 19_925)
 
-        let (changedLoaded, changedLoadMs) = timed("20k.changedLoad") {
-            store.load()
+        let (changedLoaded, changedLoadMs) = try timed("20k.changedLoad") {
+            try store.load()
         }
         XCTAssertEqual(changedLoaded.count, 19_925)
         XCTAssertEqual(changedLoaded, changedItems.sorted(by: TimelineOrder.areInIncreasingOrder))
@@ -669,7 +700,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         let learned = store.updateDurations([videoWithoutDuration.uid: 42.75])
         XCTAssertTrue(learned.succeeded)
         XCTAssertEqual(learned.updatedRows, 1)
-        XCTAssertEqual(store.load().first?.durationSeconds, 42.75)
+        XCTAssertEqual(try store.load().first?.durationSeconds, 42.75)
         XCTAssertEqual(rawRows(url, "SELECT dur FROM photos WHERE node='video';"), [["42.75"]])
 
         // A later changed enumeration still omits duration. It may update other timeline fields, but must not
@@ -682,7 +713,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         )
         let refresh = store.save([changedEnumeration])
         XCTAssertTrue(refresh.succeeded)
-        XCTAssertEqual(store.load().first?.durationSeconds, 42.75)
+        XCTAssertEqual(try store.load().first?.durationSeconds, 42.75)
         store.close()
     }
 
@@ -698,7 +729,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         XCTAssertEqual(store.updateDurations([video.uid: .nan]).updatedRows, 0)
         let unknown = PhotoUID(volumeID: "vol1", nodeID: "unknown")
         XCTAssertEqual(store.updateDurations([unknown: 99]).updatedRows, 0)
-        XCTAssertEqual(store.load().first?.durationSeconds, 12.5)
+        XCTAssertEqual(try store.load().first?.durationSeconds, 12.5)
         store.close()
     }
 
@@ -828,7 +859,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
                 "missed-video": "video/quicktime",
                 "false-video": "image/heic",
             ])
-        let loaded = Dictionary(uniqueKeysWithValues: store.load().map { ($0.uid.nodeID, $0) })
+        let loaded = Dictionary(uniqueKeysWithValues: try store.load().map { ($0.uid.nodeID, $0) })
         XCTAssertEqual(loaded["missed-video"]?.mediaType, "video/quicktime")
         XCTAssertTrue(loaded["missed-video"]?.tags.contains(.videos) == true)
         XCTAssertEqual(loaded["false-video"]?.mediaType, "image/heic")
@@ -849,19 +880,19 @@ final class TimelineMetadataStoreTests: XCTestCase {
                 publishRevision: false
             ).changedRows, 1)
         XCTAssertEqual(store.mediaTypeEvidenceRevision(), 1)
-        XCTAssertEqual(store.mediaTypeEvidence(volumeID: "vol1")["fresh-upload"], "video/quicktime")
+        XCTAssertEqual(try XCTUnwrap(store.mediaTypeEvidence(volumeID: "vol1"))["fresh-upload"], "video/quicktime")
         XCTAssertEqual(store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: "vol1"), ["fresh-upload"])
 
         XCTAssertTrue(store.pruneUnmaterializedMediaTypeEvidence(volumeID: "vol1"))
         XCTAssertTrue(store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: "vol1").isEmpty)
-        XCTAssertNil(store.mediaTypeEvidence(volumeID: "vol1")["fresh-upload"])
-        XCTAssertEqual(store.mediaTypeEvidence(volumeID: "vol1")["missed-video"], "video/quicktime")
+        XCTAssertNil(try XCTUnwrap(store.mediaTypeEvidence(volumeID: "vol1"))["fresh-upload"])
+        XCTAssertEqual(try XCTUnwrap(store.mediaTypeEvidence(volumeID: "vol1"))["missed-video"], "video/quicktime")
 
         store.close()
         let reopened = try XCTUnwrap(TimelineMetadataStore(url: url))
         XCTAssertEqual(reopened.mediaTypeEvidenceRevision(), 1)
-        XCTAssertEqual(reopened.mediaTypeEvidence(volumeID: "vol1")["missed-video"], "video/quicktime")
-        XCTAssertTrue(reopened.load().first(where: { $0.uid == missedVideo.uid })?.isVideo == true)
+        XCTAssertEqual(try XCTUnwrap(reopened.mediaTypeEvidence(volumeID: "vol1"))["missed-video"], "video/quicktime")
+        XCTAssertTrue(try reopened.load().first(where: { $0.uid == missedVideo.uid })?.isVideo == true)
         reopened.close()
     }
 }

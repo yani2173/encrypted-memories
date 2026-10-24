@@ -12,7 +12,7 @@ import PhotosCore
 /// coordinates. Platform-agnostic (no AppKit) - reused as-is by a future iOS/iPad map UI.
 @MainActor
 @Observable
-public final class PhotoLocationIndex {
+public final class PhotoLocationIndex: PhotoPlaceSupportSource {
     public private(set) var coordinates: [PhotoCoordinate] = []
     /// Bumped whenever `coordinates` changes. The map view observes this to re-derive annotations.
     public private(set) var revision = 0
@@ -24,13 +24,177 @@ public final class PhotoLocationIndex {
     @ObservationIgnored private var buckets: [PhotoLocationQuerySnapshot.BucketID: [PhotoCoordinate]] = [:]
     /// Once the library has reconciled its live identities, late results from an older crawl may only merge
     /// coordinates that still belong to that library. `nil` preserves startup loading before identities arrive.
-    @ObservationIgnored private var allowedUIDs: Set<PhotoUID>?
+    @ObservationIgnored private var allowed: AllowList?
 
-    public init() {}
+    /// The photos that may store results after a clean-up: the library of that clean-up and, on top of it, the
+    /// library that the latest scan runs for.
+    private struct AllowList {
+        var retained: Set<PhotoUID>
+        /// The inventory revision at which the clean-up read its library. A list that was read at this revision or
+        /// earlier is older than the clean-up and never widens the index again.
+        let narrowedAfter: UInt64
+        /// The inventory of the latest scan. It is kept by reference, so a scan start makes no pass over the library.
+        var scanned: [PhotoUID: Date] = [:]
+        var scannedRevision: UInt64 = 0
+
+        func contains(_ uid: PhotoUID) -> Bool { retained.contains(uid) || scanned[uid] != nil }
+    }
+
+    @ObservationIgnored public private(set) var coordinateGeneration = 0
+    /// Changes when a classified snapshot becomes available, even without another crawl batch.
+    public private(set) var placeRevision = 0
+    @ObservationIgnored private var placeEvidenceTime: TimeInterval?
+    @ObservationIgnored private var placeEvidenceCount = 0
+    @ObservationIgnored private var cachedPlaceSnapshot: PlaceSnapshot?
+    @ObservationIgnored private var pendingPlaceSnapshot: PlaceSnapshot?
+    @ObservationIgnored private var placeEvidenceWarmTask: Task<Void, Never>?
+    @ObservationIgnored private var placeRefreshTask: Task<Void, Never>?
+
+    private final class PlaceSnapshot: Sendable {
+        let query: PhotoLocationQuerySnapshot
+        init(_ query: PhotoLocationQuerySnapshot) { self.query = query }
+    }
+
+    #if DEBUG
+        public var nowForTesting: (() -> TimeInterval)?
+        public var beforePlaceAnalysisForTesting: (@Sendable () -> Void)?
+        public var beforePlaceAnalysisAsyncForTesting: (@Sendable () async -> Void)?
+        public func waitForPlaceEvidenceForTesting() async { await placeEvidenceWarmTask?.value }
+        /// A test raises the priority of the warming task: a background task starves while many builds run.
+        public var warmingPriorityForTesting: TaskPriority = .background
+    #endif
+
+    private var warmingPriority: TaskPriority {
+        #if DEBUG
+            warmingPriorityForTesting
+        #else
+            .background
+        #endif
+    }
+
+    public init(supportSources: SupportDiagnosticsSources = .shared) {
+        supportSources.registerPlaces(self)
+    }
+
+    deinit {
+        placeEvidenceWarmTask?.cancel()
+        placeRefreshTask?.cancel()
+    }
+
+    private var now: TimeInterval {
+        #if DEBUG
+            if let nowForTesting { return nowForTesting() }
+        #endif
+        return ProcessInfo.processInfo.systemUptime
+    }
+
+    private func invalidatePlaceEvidence() {
+        placeEvidenceWarmTask?.cancel()
+        placeEvidenceWarmTask = nil
+        placeRefreshTask?.cancel()
+        placeRefreshTask = nil
+        pendingPlaceSnapshot = nil
+        cachedPlaceSnapshot = nil
+    }
+
+    private func resetPlaceEvidenceAdmission() {
+        coordinateGeneration &+= 1
+        placeEvidenceTime = nil
+        placeEvidenceCount = 0
+    }
+
+    /// All consumers use the same admission. A nil delay means that growth is insufficient.
+    private func placeEvidenceRefreshDelay(at time: TimeInterval) -> TimeInterval? {
+        guard scanProgress.phase == .scanning, let placeEvidenceTime else { return 0 }
+        guard coordinates.count >= placeEvidenceCount + max(1, (placeEvidenceCount + 9) / 10) else { return nil }
+        return max(0, 10 - (time - placeEvidenceTime))
+    }
+
+    private func placeSnapshot() -> PlaceSnapshot {
+        if let pendingPlaceSnapshot, pendingPlaceSnapshot.query.revision == revision {
+            return cachedPlaceSnapshot ?? pendingPlaceSnapshot
+        }
+        if let cachedPlaceSnapshot, cachedPlaceSnapshot.query.revision == revision { return cachedPlaceSnapshot }
+        let time = now
+        if let cachedPlaceSnapshot, placeEvidenceRefreshDelay(at: time) != 0 {
+            if placeRefreshTask == nil, let delay = placeEvidenceRefreshDelay(at: time), delay > 0 {
+                // The timer holds no coordinate, bucket, or evidence snapshot.
+                placeRefreshTask = Task { @MainActor [weak self] in
+                    do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+                    guard let self else { return }
+                    self.placeRefreshTask = nil
+                    _ = self.placeSnapshot()
+                }
+            }
+            return cachedPlaceSnapshot
+        }
+        placeRefreshTask?.cancel()
+        placeRefreshTask = nil
+        placeEvidenceWarmTask?.cancel()
+        let evidence = PhotoPlaceEvidence(coordinates: coordinates)
+        #if DEBUG
+            if let beforePlaceAnalysisForTesting { evidence.setBeforeAnalysisForTesting(beforePlaceAnalysisForTesting) }
+        #endif
+        let snapshot = PlaceSnapshot(
+            PhotoLocationQuerySnapshot(
+                buckets: buckets, evidence: evidence, revision: revision, generation: coordinateGeneration))
+        pendingPlaceSnapshot = snapshot
+        // The first opening can wait for its initial snapshot. Later consumers retain the classified snapshot.
+        if cachedPlaceSnapshot == nil { cachedPlaceSnapshot = snapshot }
+        placeEvidenceTime = time
+        placeEvidenceCount = coordinates.count
+        let priority = warmingPriority
+        #if DEBUG
+            let beforeAnalysis = beforePlaceAnalysisAsyncForTesting
+        #endif
+        let task = Task(priority: priority) { @MainActor [weak self, weak snapshot] in
+            guard let snapshot, !Task.isCancelled else { return }
+            let worker = Task.detached(priority: priority) {
+                #if DEBUG
+                    if let beforeAnalysis { await beforeAnalysis() }
+                #endif
+                snapshot.query.evidence.prewarm()
+            }
+            await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled else { return }
+            self?.publishPlaceSnapshot(snapshot)
+        }
+        evidence.registerWarmingTask(task)
+        placeEvidenceWarmTask = task
+        return cachedPlaceSnapshot ?? snapshot
+    }
+
+    private func publishPlaceSnapshot(_ snapshot: PlaceSnapshot) {
+        guard pendingPlaceSnapshot === snapshot, snapshot.query.generation == coordinateGeneration else { return }
+        cachedPlaceSnapshot = snapshot
+        pendingPlaceSnapshot = nil
+        placeRevision &+= 1
+    }
+
+    /// Creation is constant-time. The snapshot shares existing storage and one independent background analysis.
+    public func placeEvidence() -> PhotoPlaceEvidence { placeSnapshot().query.evidence }
+
+    private func warmPlaceEvidence() { _ = placeSnapshot() }
+
+    public func photoPlaceSupportSnapshot() async -> [PlaceCandidateSupportSnapshot] {
+        let evidence = placeEvidence()
+        guard await evidence.waitForWarming() else { return [] }
+        return await Task.detached(priority: .utility) { evidence.supportSnapshot() }.value
+    }
 
     /// Published by `LocationCrawl` (start / batch cadence / completion) - never per item.
     public func updateScanProgress(_ progress: PhotoLocationScanProgress) {
+        if progress.phase == .scanning, scanProgress.phase != .scanning, let cachedPlaceSnapshot {
+            placeEvidenceTime = now
+            placeEvidenceCount = cachedPlaceSnapshot.query.evidence.coordinates.count
+        }
         scanProgress = progress
+        // Completion bypasses crawl admission and publishes the final shared snapshot.
+        if progress.phase == .completed { warmPlaceEvidence() }
     }
 
     /// Replace the whole index - e.g. after decrypting the persisted snapshot at startup.
@@ -40,13 +204,16 @@ public final class PhotoLocationIndex {
 
     /// Replace the whole index, including the persisted negative-result cache.
     public func replaceAll(_ snapshot: PhotoLocationSnapshot) {
-        allowedUIDs = nil
+        invalidatePlaceEvidence()
+        resetPlaceEvidenceAdmission()
+        allowed = nil
         coordinates = snapshot.coordinates
         seen = Set(coordinates.map(\.uid))
         noLocationUIDs = snapshot.noLocationUIDs.subtracting(seen)
         seen.formUnion(noLocationUIDs)
         rebuildBuckets()
         revision += 1
+        warmPlaceEvidence()
     }
 
     /// Merge newly-crawled coordinates, deduped by uid. Bumps `revision` only if something was added,
@@ -55,10 +222,12 @@ public final class PhotoLocationIndex {
     public func merge(_ coords: [PhotoCoordinate]) -> [PhotoCoordinate] {
         var accepted: [PhotoCoordinate] = []
         for c in coords
-        where (allowedUIDs?.contains(c.uid) ?? true)
+        where (allowed?.contains(c.uid) ?? true)
             && (!seen.contains(c.uid) || noLocationUIDs.contains(c.uid))
         {
             guard Self.isValid(c) else { continue }
+            // Outside a crawl, release unobserved storage before append. A crawl retains its classified snapshot.
+            if accepted.isEmpty, scanProgress.phase != .scanning { invalidatePlaceEvidence() }
             coordinates.append(c)
             seen.insert(c.uid)
             noLocationUIDs.remove(c.uid)
@@ -75,7 +244,7 @@ public final class PhotoLocationIndex {
     public func markNoLocation(_ uids: some Sequence<PhotoUID>) -> Set<PhotoUID> {
         var accepted = Set<PhotoUID>()
         for uid in uids
-        where (allowedUIDs?.contains(uid) ?? true)
+        where (allowed?.contains(uid) ?? true)
             && !seen.contains(uid)
         {
             noLocationUIDs.insert(uid)
@@ -85,17 +254,30 @@ public final class PhotoLocationIndex {
         return accepted
     }
 
+    /// Lets a scan of a known library store results for every photo of that library, also for photos that a clean-up
+    /// excluded. Only `retainOnly` narrows what the index accepts; without a clean-up every photo is accepted already.
+    /// `revision` is the inventory revision at which the library was read. A library that is not newer than the last
+    /// clean-up, or older than the library of an earlier accept, is ignored: a late list never undoes a clean-up or a
+    /// newer list. The library of the latest scan replaces the one of an earlier scan, so a photo that a newer library
+    /// lacks is not accepted any more. The call keeps the inventory by reference and makes no pass over it.
+    public func accept(_ inventory: LocationCrawlInventory, revision: UInt64) {
+        guard let list = allowed, revision > list.narrowedAfter, revision >= list.scannedRevision else { return }
+        allowed?.scanned = inventory.captureDates
+        allowed?.scannedRevision = revision
+    }
+
     /// Reconciles the index with the authoritative whole-library identities and persists the filtered encrypted
     /// snapshot off-main. The allow-list also blocks a late in-flight crawl result from resurrecting a deleted pin.
     public func retainOnly(
         _ uids: Set<PhotoUID>,
         persistTo store: PhotoLocationStore? = nil,
-        sessionLease: PhotoLocationStore.SessionLease? = nil
+        sessionLease: PhotoLocationStore.SessionLease? = nil,
+        afterInventoryRevision inventoryRevision: UInt64 = 0
     ) async {
         if let store, let sessionLease, !store.isCurrentSessionLease(sessionLease) {
             return
         }
-        allowedUIDs = uids
+        allowed = AllowList(retained: uids, narrowedAfter: inventoryRevision)
         let retained = coordinates.filter { uids.contains($0.uid) }
         let retainedNegatives = noLocationUIDs.intersection(uids)
         if retained.count != coordinates.count || retainedNegatives != noLocationUIDs {
@@ -105,7 +287,10 @@ public final class PhotoLocationIndex {
             seen.formUnion(noLocationUIDs)
             rebuildBuckets()
             scanProgress.found = retained.count
+            invalidatePlaceEvidence()
+            resetPlaceEvidenceAdmission()
             revision += 1
+            warmPlaceEvidence()
         }
         guard let store else { return }
         _ = await persist(to: store, sessionLease: sessionLease)
@@ -208,9 +393,17 @@ public struct PhotoLocationQuerySnapshot: Sendable {
     }
 
     private let buckets: [BucketID: [PhotoCoordinate]]
+    public let evidence: PhotoPlaceEvidence
+    public let revision: Int
+    public let generation: Int
 
-    fileprivate init(buckets: [BucketID: [PhotoCoordinate]]) {
+    fileprivate init(
+        buckets: [BucketID: [PhotoCoordinate]], evidence: PhotoPlaceEvidence, revision: Int, generation: Int
+    ) {
         self.buckets = buckets
+        self.evidence = evidence
+        self.revision = revision
+        self.generation = generation
     }
 
     public func coordinates(in box: GeoBoundingBox) -> [PhotoCoordinate] {
@@ -241,13 +434,17 @@ public struct PhotoLocationQuerySnapshot: Sendable {
             ]
         }
 
+        let excluded = evidence.excludedPositions()
+        guard !Task.isCancelled, !evidence.warmingIsRetired else { return [] }
         var result: [PhotoCoordinate] = []
         for latitudeBucket in latitudeRange.0...latitudeRange.1 {
             for (lowerLongitude, upperLongitude) in longitudeRanges {
                 guard lowerLongitude <= upperLongitude else { continue }
                 for longitudeBucket in lowerLongitude...upperLongitude {
                     for coordinate in buckets[BucketID(latitude: latitudeBucket, longitude: longitudeBucket)] ?? []
-                    where box.contains(latitude: coordinate.latitude, longitude: coordinate.longitude) {
+                    where box.contains(latitude: coordinate.latitude, longitude: coordinate.longitude)
+                        && !excluded.contains(PhotoExactPosition(coordinate))
+                    {
                         result.append(coordinate)
                     }
                 }
@@ -292,7 +489,7 @@ public struct PhotoLocationQuerySnapshot: Sendable {
 public extension PhotoLocationIndex {
     /// Captures the bucket index for detached map aggregation.
     func querySnapshot() -> PhotoLocationQuerySnapshot {
-        PhotoLocationQuerySnapshot(buckets: buckets)
+        placeSnapshot().query
     }
 }
 

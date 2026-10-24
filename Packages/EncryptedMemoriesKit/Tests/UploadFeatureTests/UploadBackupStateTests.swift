@@ -259,6 +259,64 @@ final class UploadBackupStateTests: XCTestCase {
         }
     }
 
+    func testClosePreservesRecordsWhenTheStoreReopens() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
+        let record = UploadBackupAssetRecord(
+            source: source(), revision: revision(10), resourceCount: 2, pendingResourceCount: 1,
+            updatedAt: Date(timeIntervalSince1970: 100))
+        XCTAssertTrue(store.upsert(record))
+
+        store.close()
+        store.close()
+
+        XCTAssertNil(store.record(for: source(), revision: revision(10)))
+        XCTAssertFalse(store.hasAnyRecord(for: source()))
+        XCTAssertEqual(store.count(), 0)
+        XCTAssertEqual(store.lookupBatch([snapshot(revision: 10)]).first?.succeeded, false)
+        XCTAssertFalse(store.upsert(record))
+        XCTAssertFalse(store.upsertBatch([record]))
+        XCTAssertFalse(store.removeRecords(for: source(), keeping: []))
+
+        let reopened = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.record(for: source(), revision: revision(10)), record)
+        XCTAssertEqual(reopened.count(), 1)
+        XCTAssertEqual(reopened.lookupBatch([snapshot(revision: 10)]).first?.succeeded, true)
+        XCTAssertTrue(reopened.removeRecords(for: source(), keeping: []))
+        XCTAssertEqual(reopened.count(), 0)
+    }
+
+    func testEmptyBatchCallsPreserveOpenAndClosedStoreBehavior() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
+        let record = UploadBackupAssetRecord(
+            source: source(), revision: revision(10), resourceCount: 2, pendingResourceCount: 1,
+            updatedAt: Date(timeIntervalSince1970: 100))
+        XCTAssertTrue(store.upsert(record))
+
+        XCTAssertTrue(store.upsertBatch([]))
+        XCTAssertTrue(store.lookupBatch([]).isEmpty)
+        XCTAssertEqual(store.count(), 1)
+        XCTAssertEqual(store.record(for: source(), revision: revision(10)), record)
+        XCTAssertTrue(store.upsertBatch([record]))
+        XCTAssertEqual(store.lookupBatch([snapshot(revision: 10)]).first?.succeeded, true)
+
+        store.close()
+
+        XCTAssertTrue(store.upsertBatch([]))
+        XCTAssertTrue(store.lookupBatch([]).isEmpty)
+        XCTAssertFalse(store.upsertBatch([record]))
+        XCTAssertEqual(store.lookupBatch([snapshot(revision: 10)]).first?.succeeded, false)
+
+        let reopened = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.count(), 1)
+        XCTAssertEqual(reopened.record(for: source(), revision: revision(10)), record)
+        XCTAssertTrue(reopened.upsert(record))
+        XCTAssertEqual(reopened.lookupBatch([snapshot(revision: 10)]).first?.succeeded, true)
+    }
+
     func testSQLiteStoreFailsClosedForFutureSchemaWithoutChangingMarker() throws {
         let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
         do {

@@ -1,6 +1,9 @@
 import Foundation
+import ImageIO
+import PhotoViewerCore
 import PhotosCore
 import Testing
+import UniformTypeIdentifiers
 
 @testable import EncryptedMemoriesMobile
 
@@ -53,48 +56,101 @@ struct MobileShareExportTests {
     }
 
     @Test func concurrentShareJobsKeepTheirFilesAndSupportReport() async throws {
-        let backend = ShareExportTestBackend()
-        let runtime = LibraryRuntimeState()
-        let support = try #require(await MobileMediaExporter.exportSupportReport(Data("support".utf8)))
-        defer { MobileMediaExporter.cleanup([support]) }
-        let first = Task {
-            await MobileMediaExporter.exportOriginals([item("blocked")], backend: backend, runtimeState: runtime)
+        // Synthetic JPEG bytes are not decodable; this test keeps location to test the share files.
+        try await SharingLocationPreferenceLease.with(storedValue: false) {
+            let backend = ShareExportTestBackend()
+            let runtime = LibraryRuntimeState()
+            let support = try #require(await MobileMediaExporter.exportSupportReport(Data("support".utf8)))
+            defer { MobileMediaExporter.cleanup([support]) }
+            let first = Task {
+                await MobileMediaExporter.exportOriginals([item("blocked")], backend: backend, runtimeState: runtime)
+            }
+            await backend.waitUntilBlocked()
+            #expect(runtime.snapshot().activeUserTransferCount == 1)
+            let second = await MobileMediaExporter.exportOriginals([item("second")], backend: backend)
+            #expect(second.urls.count == 1)
+            #expect(second.urls.first?.deletingLastPathComponent() != support.deletingLastPathComponent())
+            MobileMediaExporter.cleanup(second.urls)
+            await backend.release()
+            let result = await first.value
+            #expect(runtime.snapshot().activeUserTransferCount == 0)
+            defer { MobileMediaExporter.cleanup(result.urls) }
+            #expect(result.urls.count == 1)
+            #expect(result.urls.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+            #expect(FileManager.default.fileExists(atPath: support.path))
         }
-        await backend.waitUntilBlocked()
-        #expect(runtime.snapshot().activeUserTransferCount == 1)
-        let second = await MobileMediaExporter.exportOriginals([item("second")], backend: backend)
-        #expect(second.urls.count == 1)
-        #expect(second.urls.first?.deletingLastPathComponent() != support.deletingLastPathComponent())
-        MobileMediaExporter.cleanup(second.urls)
-        await backend.release()
-        let result = await first.value
-        #expect(runtime.snapshot().activeUserTransferCount == 0)
-        defer { MobileMediaExporter.cleanup(result.urls) }
-        #expect(result.urls.count == 1)
-        #expect(result.urls.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
-        #expect(FileManager.default.fileExists(atPath: support.path))
     }
 
     @Test func shareStopsBeforeTheDeviceRunsFull() async throws {
-        let backend = ShareExportTestBackend()
-        let full = await MobileMediaExporter.exportOriginals(
-            [item("a"), item("b")], backend: backend, availableCapacity: { _ in 0 })
-        #expect(full.urls.isEmpty)
-        #expect(full.failed == 2)
-        #expect(full.ranOutOfSpace)
-        #expect(await backend.directory(for: "a") == nil, "no download starts without room")
+        // Synthetic JPEG bytes are not decodable; this test keeps location to test the share files.
+        try await SharingLocationPreferenceLease.with(storedValue: false) {
+            let backend = ShareExportTestBackend()
+            let full = await MobileMediaExporter.exportOriginals(
+                [item("a"), item("b")], backend: backend, availableCapacity: { _ in 0 })
+            #expect(full.urls.isEmpty)
+            #expect(full.failed == 2)
+            #expect(full.ranOutOfSpace)
+            #expect(await backend.directory(for: "a") == nil, "no download starts without room")
 
-        var remaining: Int64 = 1 << 40
-        let partial = await MobileMediaExporter.exportOriginals(
-            [item("c"), item("d"), item("e")], backend: backend,
-            availableCapacity: { _ in
-                defer { remaining = 0 }
-                return remaining
-            })
-        defer { MobileMediaExporter.cleanup(partial.urls) }
-        #expect(partial.urls.count == 1)
-        #expect(partial.failed == 2)
-        #expect(partial.ranOutOfSpace)
+            var remaining: Int64 = 1 << 40
+            let partial = await MobileMediaExporter.exportOriginals(
+                [item("c"), item("d"), item("e")], backend: backend,
+                availableCapacity: { _ in
+                    defer { remaining = 0 }
+                    return remaining
+                })
+            defer { MobileMediaExporter.cleanup(partial.urls) }
+            #expect(partial.urls.count == 1)
+            #expect(partial.failed == 2)
+            #expect(partial.ranOutOfSpace)
+        }
+    }
+
+    @Test(arguments: [nil, false] as [Bool?])
+    func shareOfARealPhotoFollowsTheLocationPreference(storedValue: Bool?) async throws {
+        try await SharingLocationPreferenceLease.with(storedValue: storedValue) {
+            let original = try LocatedShareTestImage.makeLocatedJPEG()
+            #expect(LocatedShareTestImage.locationProperties(of: original) != nil)
+            let result = await MobileMediaExporter.exportOriginals(
+                [item("located")], backend: ImageShareTestBackend(bytes: original))
+            defer { MobileMediaExporter.cleanup(result.urls) }
+            #expect(result.failed == 0)
+            let shared = try Data(contentsOf: try #require(result.urls.first))
+            if storedValue == false {
+                #expect(shared == original)
+            } else {
+                // An unset preference removes the location and keeps the other metadata.
+                #expect(LocatedShareTestImage.locationProperties(of: shared) == nil)
+                #expect(LocatedShareTestImage.lensModel(of: shared) == LocatedShareTestImage.lensModel)
+            }
+        }
+    }
+
+    /// The viewer shares the shown original of an edited photo through the same export as every photo, so the location
+    /// rule applies to the original too.
+    @Test(arguments: [nil, false] as [Bool?])
+    func shareOfAShownOriginalFollowsTheLocationPreference(storedValue: Bool?) async throws {
+        try await SharingLocationPreferenceLease.with(storedValue: storedValue) {
+            let edited = item("edited")
+            let original = item("original")
+            var state = EditedPhotoOriginalState()
+            state.record(original, of: edited.uid)
+            state.toggle(edited.uid)
+            let bytes = try LocatedShareTestImage.makeLocatedJPEG()
+
+            // Only the original has bytes, so a share of the edited version fails.
+            let result = await MobileMediaExporter.exportOriginals(
+                [state.displayed(edited)], backend: ImageShareTestBackend(bytes: bytes, onlyFor: original.uid))
+            defer { MobileMediaExporter.cleanup(result.urls) }
+            #expect(result.failed == 0)
+            let shared = try Data(contentsOf: try #require(result.urls.first))
+            if storedValue == false {
+                #expect(shared == bytes)
+            } else {
+                #expect(LocatedShareTestImage.locationProperties(of: shared) == nil)
+                #expect(LocatedShareTestImage.lensModel(of: shared) == LocatedShareTestImage.lensModel)
+            }
+        }
     }
 
     @Test func diskFullDuringADownloadStopsTheShare() async throws {
@@ -172,5 +228,23 @@ private actor ShareExportTestBackend: OriginalFileProvider, PhotoMetadataProvide
         isReleased = true
         releaseWaiters.forEach { $0.resume() }
         releaseWaiters.removeAll()
+    }
+}
+
+private struct ImageShareTestBackend: OriginalFileProvider, PhotoMetadataProvider {
+    let bytes: Data
+    /// When set, only this photo has bytes; every other photo fails to download.
+    var onlyFor: PhotoUID?
+
+    func writeOriginal(
+        for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        if let onlyFor, uid != onlyFor { throw CocoaError(.fileReadNoSuchFile) }
+        try bytes.write(to: destination)
+        onProgress(1)
+    }
+
+    func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
+        PhotoMetadata(filename: "located.jpg", mimeType: "image/jpeg")
     }
 }

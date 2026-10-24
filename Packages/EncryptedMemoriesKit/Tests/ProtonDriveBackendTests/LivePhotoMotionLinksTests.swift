@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import ProtonDriveSDK
+import SQLite3
 import Testing
 
 @testable import ProtonDriveBackend
@@ -171,6 +172,89 @@ struct LivePhotoMotionLinksTests {
         #expect(store.validationToken() == "token")
 
         #expect(try await launch(photos, store: store).reads == ["plist-2", "paired-2"])
+    }
+
+    @Test(arguments: [false, true])
+    @MainActor
+    func failedEvidenceRefreshKeepsPhotosUsableWithoutExtraMIMERequests(partial: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("library.sqlite")
+        let store = try #require(TimelineMetadataStore(url: url))
+        defer { store.close() }
+        let saved = [
+            PhotoItem(
+                uid: .init(volumeID: "v", nodeID: "known"), captureTime: .distantPast,
+                mediaType: "image/heic", isLivePhoto: true, relatedVideoID: "paired"),
+            PhotoItem(
+                uid: .init(volumeID: "v", nodeID: "video"), captureTime: .distantPast,
+                mediaType: "video/mp4"),
+            PhotoItem(
+                uid: .init(volumeID: "other", nodeID: "video"), captureTime: .distantPast,
+                mediaType: "image/jpeg"),
+        ]
+        #expect(store.save(saved, validationToken: "token").succeeded)
+        #expect(store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        #expect(store.recordMediaTypeEvidence([saved[0].uid: "image/heic", saved[1].uid: "video/mp4"]).succeeded)
+        var handle: OpaquePointer?
+        try #require(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        let fault =
+            partial
+            ? """
+            ALTER TABLE media_type_evidence RENAME TO fixture_evidence;
+            CREATE VIEW media_type_evidence AS SELECT vol, node,
+                CASE WHEN node='video' THEN abs(-9223372036854775808) ELSE mime END AS mime
+            FROM fixture_evidence;
+            """ : "ALTER TABLE media_type_evidence RENAME TO fixture_evidence;"
+        #expect(sqlite3_exec(handle, fault, nil, nil, nil) == SQLITE_OK)
+        // Refresh this connection's schema before testing preparation, not a deferred step error.
+        #expect(try store.load().map(\.uid) == saved.sorted(by: TimelineOrder.areInIncreasingOrder).map(\.uid))
+        #expect(store.mediaTypeEvidence(volumeID: "v") == nil)
+        let evidence = store.mediaTypeEvidenceForDisplay(volumeID: "v")
+        #expect(!evidence.canRefine)
+        let photos = ["known": ["plist", "paired"], "new": ["unread", "new-motion"]]
+        let stored = LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store)
+        var requests = 0
+        let answer = try await LivePhotoMotionLinks().motions(
+            of: photos, stored: stored, evidence: evidence.types, allowFetch: evidence.canRefine
+        ) { _ in
+            requests += 1
+            throw URLError(.timedOut)
+        }
+        #expect(requests == 0)
+        #expect(!answer.complete, "the skipped refinement remains incomplete")
+        #expect(answer.read.isEmpty)
+        #expect(answer.motions["known"] == .video("paired"))
+        let entries = [
+            PhotosListEntry(
+                linkID: "known", captureTime: 500, tags: [ProtonDriveSDK.PhotoTag.livePhotos.rawValue],
+                relatedPhotos: [.init(linkID: "plist"), .init(linkID: "paired")]),
+            PhotosListEntry(linkID: "video", captureTime: 501, tags: [], relatedPhotos: []),
+            PhotosListEntry(
+                linkID: "new", captureTime: 502, tags: [ProtonDriveSDK.PhotoTag.livePhotos.rawValue],
+                relatedPhotos: [.init(linkID: "unread"), .init(linkID: "new-motion")]),
+        ]
+        // Both authoritative/filtered listings and the SDK timeline finish with usable photos.
+        let filtered = DriveSDKBridge.group(
+            entries, volumeID: "v", mediaTypeOverrides: evidence.types, motions: answer.motions
+        ).flatMap(\.items)
+        let timeline = DriveSDKBridge.group(
+            entries.map {
+                PhotoTimelineItem(nodeUid: SDKNodeUid(volumeID: "v", nodeID: $0.linkID), captureTime: $0.captureTime)
+            },
+            mediaTypeOverrides: evidence.types, livePhotoMotions: answer.motions
+        ).flatMap(\.items)
+        for displayed in [filtered, timeline] {
+            #expect(displayed.map(\.uid.nodeID) == ["known", "video", "new"])
+            #expect(displayed[0].isLivePhoto)
+            #expect(displayed[0].relatedVideoID == "paired")
+            #expect(displayed[1].isVideo, "the stored video must remain playable as a video")
+            #expect(displayed[2].isLivePhoto, "unknown refinement must not hide the new photo or its Live control")
+        }
+        #expect(try store.load().map(\.uid) == saved.sorted(by: TimelineOrder.areInIncreasingOrder).map(\.uid))
+        #expect(store.validationToken() == "token")
     }
 
     /// One refresh of a new session: the stored motions, then one read of the files that still need a type.

@@ -35,7 +35,7 @@ enum PhotoLibraryUploadMetadataBuilder {
         )
     }
 
-    private static func location(from location: CLLocation?) -> PhotoUploadMetadataEncoder.Location? {
+    static func location(from location: CLLocation?) -> PhotoUploadMetadataEncoder.Location? {
         guard let location, CLLocationCoordinate2DIsValid(location.coordinate) else { return nil }
         return PhotoUploadMetadataEncoder.Location(
             latitude: location.coordinate.latitude,

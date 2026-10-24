@@ -489,6 +489,32 @@ struct TestMLVectorCipher: MLVectorCipher {
         #expect(store.generation(for: descriptorV1) == generation + 1)
     }
 
+    /// Another connection holds the file exclusively longer than the busy timeout. The derived index is never
+    /// deleted for that, and it opens again with its records once the lock is gone.
+    @Test func aFileThatAnotherConnectionHoldsIsKeptAndOpensAgainWithItsRecords() throws {
+        let url = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let first = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        first.upsert([record("a0", descriptorV1, [1, 2, 3, 4])])
+        first.close()
+        var blocker: OpaquePointer?
+        #expect(sqlite3_open(url.path, &blocker) == SQLITE_OK)
+        #expect(sqlite3_exec(blocker, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(blocker, "BEGIN EXCLUSIVE;", nil, nil, nil) == SQLITE_OK)
+
+        let noWait = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        let busy = SQLiteMLIndexStore(url: url, policy: noWait, cipher: TestMLVectorCipher())
+        busy?.close()
+        #expect(sqlite3_exec(blocker, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(blocker)
+
+        #expect(busy == nil, "the store is unavailable while the lock lasts")
+        #expect(FileManager.default.fileExists(atPath: url.path), "the index is not deleted")
+        let reopened = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        defer { reopened.close() }
+        #expect(reopened.count(for: descriptorV1) == 1)
+    }
+
     @Test func reopenedStoreSeesPersistedRecords() throws {
         let url = makeTempURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

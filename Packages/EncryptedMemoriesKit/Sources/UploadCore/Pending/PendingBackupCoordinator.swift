@@ -26,6 +26,9 @@ public actor PendingBackupCoordinator {
         /// "Zuletzt gelöscht" keeps deleted pending photos as long as the Proton trash keeps photos.
         public var trashRetention: TimeInterval
         public var acknowledgedHandoffRetention: TimeInterval
+        /// How long a change of the photo library waits before the excluded photos are checked again. A burst of
+        /// changes, such as a large import, shares one check.
+        public var libraryChangeDelay: Duration
 
         public init(
             membershipInterval: Duration = .seconds(1),
@@ -34,7 +37,8 @@ public actor PendingBackupCoordinator {
             checkmarkDuration: Duration = .seconds(1),
             uncheckedAdmissionLimit: Int = 64,
             trashRetention: TimeInterval = 30 * 24 * 60 * 60,
-            acknowledgedHandoffRetention: TimeInterval = 7 * 24 * 60 * 60
+            acknowledgedHandoffRetention: TimeInterval = 7 * 24 * 60 * 60,
+            libraryChangeDelay: Duration = .milliseconds(500)
         ) {
             self.membershipInterval = membershipInterval
             self.progressInterval = progressInterval
@@ -43,6 +47,7 @@ public actor PendingBackupCoordinator {
             self.uncheckedAdmissionLimit = uncheckedAdmissionLimit
             self.trashRetention = trashRetention
             self.acknowledgedHandoffRetention = acknowledgedHandoffRetention
+            self.libraryChangeDelay = libraryChangeDelay
         }
     }
 
@@ -88,6 +93,9 @@ public actor PendingBackupCoordinator {
     private var excludedAccessible = Set<PendingSourceKey>() {
         didSet { excludedListsCache = nil }
     }
+    /// Excluded sources that Apple Photos reported gone. The catalog still lists them until a backup pass runs, which
+    /// never happens while backup is paused, so a check of the excluded list must not show them again.
+    private var excludedMissing = Set<PendingSourceKey>()
     /// The trash and excluded lists as last built, when they were built, and the moment the oldest trash entry
     /// leaves the trash list. Progress ticks publish several times a second; the lists change only with the two
     /// properties above or with the clock.
@@ -127,6 +135,10 @@ public actor PendingBackupCoordinator {
     private var actionsRunning = false
     private var actionsAgain = false
     private var actionTimer: Task<Void, Never>?
+    /// The check of the excluded photos that a library change started, and whether a change arrived while it read.
+    private var excludedCheckTask: Task<Void, Never>?
+    private var excludedCheckReading = false
+    private var excludedCheckAgain = false
 
     public init(
         store: PendingBackupManifestStore,
@@ -226,6 +238,7 @@ public actor PendingBackupCoordinator {
         progressPublishTask?.cancel()
         reconcileTimer?.cancel()
         actionTimer?.cancel()
+        excludedCheckTask?.cancel()
         snapshotContinuation.finish()
     }
 
@@ -276,6 +289,7 @@ public actor PendingBackupCoordinator {
         recorder?.replacementLedger.dropSources(requests.map { ($0.key, $0.revision) })
         for state in states { sourceStates[state.key] = state }
         dirty.formUnion(excluded)
+        excludedMissing.subtract(excluded)
         excludedAccessible.formUnion(excluded.filter { metadata[$0] != nil })
         listsDirty = true
         publishMembership(force: true)
@@ -354,6 +368,7 @@ public actor PendingBackupCoordinator {
         guard let states = store.include(keys, at: now()) else { return false }
         // Only the person's return starts a new attempt; a queue reload cannot clear the block.
         for key in keys { recorder?.replacementLedger.readmit(key) }
+        excludedMissing.subtract(keys)
         for state in states { sourceStates[state.key] = state }
         dirty.formUnion(keys)
         listsDirty = true
@@ -451,9 +466,20 @@ public actor PendingBackupCoordinator {
 
     /// The platform found these local photos gone (deleted in Apple Photos before their upload). Their tiles
     /// leave the grid like any inaccessible source; an upload that still finishes shows as a Proton photo.
+    /// Excluded photos leave the excluded list, also while backup is paused and no pass updates the catalog.
     public func noteSourcesMissing(_ uids: [PhotoUID]) {
         guard !closed else { return }
-        let keys = uids.compactMap(PendingSourceKey.init(localUID:)).filter { tilesByKey[$0] != nil }
+        let reported = uids.compactMap(PendingSourceKey.init(localUID:))
+        let excluded = reported.filter { sourceStates[$0]?.desired == .excluded }
+        if !excluded.isEmpty {
+            excludedMissing.formUnion(excluded)
+            if !excludedAccessible.isDisjoint(with: excluded) {
+                excludedAccessible.subtract(excluded)
+                listsDirty = true
+                scheduleMembershipPublish()
+            }
+        }
+        let keys = reported.filter { tilesByKey[$0] != nil }
         guard !keys.isEmpty else { return }
         recorder?.replacementLedger.dropSources(keys.map { ($0, tilesByKey[$0]?.revision ?? rows[$0]?.revision) })
         for key in keys {
@@ -464,6 +490,34 @@ public actor PendingBackupCoordinator {
             dirty.insert(key)
         }
         scheduleMembershipPublish()
+    }
+
+    /// The photo library or a watched folder changed, or the app became active. Excluded photos that no longer
+    /// exist leave the excluded list. Changes during the delay share one check; changes during a check run one more.
+    public func noteLibraryChanged() {
+        guard started, !closed else { return }
+        if excludedCheckReading { excludedCheckAgain = true }
+        guard excludedCheckTask == nil else { return }
+        let delay = configuration.libraryChangeDelay
+        excludedCheckTask = Task { [weak self, sleep] in
+            if delay > .zero { try? await sleep(delay) }
+            await self?.checkExcludedAfterLibraryChange()
+        }
+    }
+
+    private func checkExcludedAfterLibraryChange() async {
+        guard !Task.isCancelled, !closed else { return }
+        excludedCheckReading = true
+        excludedCheckAgain = false
+        await refreshExcludedAccessibility()
+        excludedCheckReading = false
+        excludedCheckTask = nil
+        guard !closed else { return }
+        scheduleMembershipPublish()
+        if excludedCheckAgain {
+            excludedCheckAgain = false
+            noteLibraryChanged()
+        }
     }
 
     // MARK: - Queue and runner events
@@ -488,7 +542,7 @@ public actor PendingBackupCoordinator {
             for key in gone.subtracting(wasActive) where handoffs[key] == nil { dropSourceState(key) }
             reloadRows(for: Set(handoffs.keys.filter { $0.kind == kind }).subtracting(current).union(wasActive))
             dirty.formUnion(Set(previousRows.keys).union(current))
-        case .sources(let grouped):
+        case .sources(let grouped), .enqueued(let grouped):
             let identifiers = grouped[kind] ?? []
             let keys = Set(identifiers.map { PendingSourceKey(kind: kind, identifier: $0) })
             reloadRows(for: keys)
@@ -865,11 +919,18 @@ public actor PendingBackupCoordinator {
     private func refreshExcludedAccessibility() async {
         let excluded = sourceStates.values.filter { $0.desired == .excluded }.map(\.key)
         guard !excluded.isEmpty else {
-            excludedAccessible = []
+            if !excludedAccessible.isEmpty {
+                excludedAccessible = []
+                listsDirty = true
+            }
             return
         }
         let accessible = await metadataProvider.metadata(for: excluded)
-        excludedAccessible = Set(accessible.keys)
+        guard !closed else { return }
+        // A photo excluded during the read keeps the answer that its exclusion stored.
+        let checked = excludedAccessible.subtracting(excluded).union(accessible.keys).subtracting(excludedMissing)
+        guard checked != excludedAccessible else { return }
+        excludedAccessible = checked
         listsDirty = true
     }
 

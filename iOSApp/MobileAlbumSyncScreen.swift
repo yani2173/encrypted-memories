@@ -1,4 +1,5 @@
 import AlbumSyncCore
+import DesignSystemCore
 import PhotoLibraryBackupAdapter
 import PhotosCore
 import SwiftUI
@@ -25,7 +26,7 @@ struct MobileAlbumSyncScreen: View {
                     Section {
                         Text(message)
                             .font(.footnote)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(controller.lastMessageStyle == .information ? Color.secondary : Color.red)
                     }
                 }
             }
@@ -142,7 +143,7 @@ struct MobileAlbumSyncScreen: View {
             }
             Spacer()
             if isActive {
-                ProgressView()
+                ProgressSpinner()
             } else if album.state == .needsDecision {
                 Button(L10n.string("settings.albumsync_decide")) {
                     controller.presentConflict(albumID: album.id)
@@ -194,7 +195,7 @@ struct MobileAlbumSyncScreen: View {
                         .font(.footnote.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                ProgressView()
+                ProgressSpinner()
             }
         }
     }

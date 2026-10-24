@@ -272,8 +272,8 @@ private struct WindowConfigurator: NSViewRepresentable {
     }
 }
 
-/// Previous photo, Next photo and Close for the open viewer. The commands are disabled while no viewer has
-/// focus, and Close carries the Esc equivalent, which the responder chain alone does not guarantee.
+/// Previous photo, Next photo, Close and Show Original for the open viewer. The commands are disabled while no viewer
+/// has focus, and Close carries the Esc equivalent, which the responder chain alone does not guarantee.
 private struct PhotoViewerNavigationCommands: Commands {
     @FocusedValue(\.photoViewerNavigation) private var navigation
 
@@ -289,6 +289,12 @@ private struct PhotoViewerNavigationCommands: Commands {
             Button(L10n.string("viewer.close_photo")) { navigation?.close() }
                 .keyboardShortcut(.cancelAction)
                 .disabled(navigation == nil)
+            Divider()
+            let showsOriginal = navigation?.isShowingOriginal == true
+            Button(showsOriginal ? L10n.string("viewer.show_edited") : L10n.string("viewer.show_original")) {
+                navigation?.toggleOriginal()
+            }
+            .disabled(navigation?.canShowOriginal != true)
         }
     }
 }
@@ -537,9 +543,7 @@ private struct SignOutFailureView: View {
             } description: {
                 Text(L10n.string("sign_out.cleanup_failed_message"))
             } actions: {
-                Button(L10n.string("sign_out.try_again"), action: retry)
-                    .buttonStyle(.borderedProminent)
-                    .tint(ProtonColor.primary)
+                RetryButton(.prominent, action: retry)
             }
             .padding()
         }
@@ -567,7 +571,7 @@ private struct BackendErrorView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
             HStack(spacing: 10) {
-                Button(L10n.string("action.retry"), action: retry).buttonStyle(.glassProminent).frame(width: 120)
+                RetryButton(.prominent, action: retry).frame(minWidth: 120)
                 Button(L10n.string("action.sign_out")) { confirmSignOut = true }
                     .buttonStyle(.plain)
                     .foregroundStyle(ProtonColor.textHint)

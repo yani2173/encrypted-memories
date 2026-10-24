@@ -271,6 +271,16 @@ public actor UploadBackupPreflightIndex {
         }
     }
 
+    /// Whether each exact revision holds a complete state, in the order of `snapshots`.
+    public func completeStates(_ snapshots: [UploadBackupAssetSnapshot]) throws -> [Bool] {
+        guard !snapshots.isEmpty else { return [] }
+        let lookups = store.lookupBatch(snapshots)
+        guard lookups.count == snapshots.count, lookups.allSatisfy(\.succeeded) else {
+            throw UploadError.backend("Backup state batch could not be read")
+        }
+        return lookups.map { $0.directRecord?.isComplete == true }
+    }
+
     /// Marks a complete state of this exact revision pending again: its backup lacks a file. Returns whether the
     /// revision is pending work. A revision without a state keeps the usual classification.
     public func reopen(_ snapshot: UploadBackupAssetSnapshot) throws -> Bool {

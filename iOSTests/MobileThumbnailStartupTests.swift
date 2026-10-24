@@ -5,6 +5,7 @@ import LibrarySourceRuntime
 import MLSearchCore
 import MediaByteCache
 import MediaCacheUIKitAdapter
+import Observation
 import PhotosCore
 import Testing
 import UIKit
@@ -13,6 +14,36 @@ import UIKit
 @testable import ProtonDriveBackend
 
 @MainActor @Suite struct MobileThumbnailStartupTests {
+    @Test func authoritativeEmptyMetadataWakesTheLibraryPresentation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let remote = ThumbnailLoaderProbe(data: [:])
+        let coordinator = LibrarySourceCoordinator(remote: remote, thumbnailLoader: remote, inventoryStore: nil)
+        await coordinator.prepare()
+        let cache = ThumbnailCache(rootDirectory: root)
+        cache.configure(accountUID: "fixture-account", key: SymmetricKey(size: .bits256))
+        let feed = UIKitThumbnailFeed(cache: cache, loader: coordinator, concurrency: 1, batch: 1)
+        let runtime = LibrarySourceAnalysisRuntime(
+            coordinator: coordinator, feed: feed.feedCore, assets: MLAssetUniverse(),
+            initiallyActive: false, onAssetsChanged: {})
+        #expect(await runtime.start(primaryItems: [], authority: .authoritative, generation: 0) == .accepted)
+        let model = MobileLibraryModel()
+        model.applyIsolatedLibraryLoadEventsForTesting([
+            .authoritativeInventoryResolved(count: 0, requiresNewFrame: false)
+        ])
+        #expect(!model.isCompletelyEmpty)
+        let changes = EmptyLibraryObservationProbe()
+        withObservationTracking {
+            _ = model.isCompletelyEmpty
+        } onChange: {
+            changes.markChanged()
+        }
+        model.installIsolatedSourceAnalysisForTests(runtime)
+        #expect(model.isCompletelyEmpty)
+        #expect(changes.wasChanged, "The empty screen must update when authoritative metadata arrives")
+        await runtime.shutdown()
+    }
+
     @Test func metadataChangeDoesNotRestartCompletedStartupCrawl() async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
         defer { fixture.removeCache() }
@@ -223,8 +254,10 @@ import UIKit
         await feed.stopPrefetch()
     }
 
+    /// Waits until `predicate` holds. Every wait in this suite expects the state to arrive, so the limit only ends a
+    /// hung test: a loaded runner can take longer than any short limit to finish the thumbnail work.
     private func waitUntil(
-        timeout: Duration = .seconds(5),
+        timeout: Duration = .seconds(300),
         _ predicate: @MainActor @escaping () async -> Bool
     ) async -> Bool {
         let deadline = ContinuousClock.now + timeout
@@ -309,4 +342,11 @@ private actor UnansweredThumbnailLoader: ThumbnailBatchLoader {
     }
 
     func requests(for uid: PhotoUID) -> Int { requested[uid, default: 0] }
+}
+
+private final class EmptyLibraryObservationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var changed = false
+    var wasChanged: Bool { lock.withLock { changed } }
+    func markChanged() { lock.withLock { changed = true } }
 }

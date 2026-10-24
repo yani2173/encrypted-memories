@@ -54,9 +54,13 @@ struct SidebarView: View {
             }
             Section {
                 if isLoadingAlbums, albums.isEmpty {
-                    Label("sidebar.albums_loading", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
-                        .foregroundStyle(.secondary)
-                        .disabled(true)
+                    Label {
+                        Text("sidebar.albums_loading")
+                    } icon: {
+                        Image(systemName: "arrow.trianglehead.2.clockwise").spinsWhileActive(true)
+                    }
+                    .foregroundStyle(.secondary)
+                    .disabled(true)
                 } else if albumCatalogFailed, albums.isEmpty {
                     Button(action: onRetryAlbums) {
                         Label("sidebar.albums_failed", systemImage: "arrow.clockwise")
@@ -98,10 +102,11 @@ struct SidebarView: View {
             }
             Section(L10n.string("collections.section_shared_with_me")) {
                 if isLoadingSharedAlbums, sharedAlbums.isEmpty {
-                    Label(
-                        L10n.string("collections.loading_shared_albums"),
-                        systemImage: "arrow.trianglehead.2.clockwise.rotate.90"
-                    )
+                    Label {
+                        Text(L10n.string("collections.loading_shared_albums"))
+                    } icon: {
+                        Image(systemName: "arrow.trianglehead.2.clockwise").spinsWhileActive(true)
+                    }
                     .foregroundStyle(.secondary)
                     .disabled(true)
                 } else if sharedAlbumCatalogFailed, sharedAlbums.isEmpty {

@@ -1,3 +1,4 @@
+import AlbumSyncCore
 import Foundation
 import PhotosCore
 
@@ -9,6 +10,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 {
     enum State: String, Sendable {
         case active
+        case draft
         case trashed
         case deleted
     }
@@ -36,13 +38,16 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         var externalIdentifier: String?
         var mimeType = "image/jpeg"
         var tags: Set<Int> = []
+        /// The server time of the move to the trash, in seconds, where a person or a merge trashed the link.
+        var trashTime: Int64?
+        var clientUID: String?
 
         var uid: PhotoUID { PhotoUID(volumeID: "vol", nodeID: linkID) }
         var duplicate: RemotePhotoDuplicate {
             RemotePhotoDuplicate(
                 nameHash: nameHash, contentHash: contentHash,
-                linkState: state == .active ? .active : state == .trashed ? .trashed : nil,
-                linkID: linkID)
+                linkState: state == .active ? .active : state == .draft ? .draft : state == .trashed ? .trashed : nil,
+                linkID: linkID, clientUID: clientUID)
         }
     }
 
@@ -60,17 +65,29 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var deletedAssets: [String: Set<String>] = [:]
     private var history: [Step] = []
     private var nextID = 1
+    private var uploadRequests = 0
+    private var relatedFileTransferCalls = 0
+    private var contentLookupError: Error?
+    private var contentLookupRows: [RemotePhotoDuplicate]?
+    private var contentQueries = 0
+    private var visibilityErrors: [String: any Error] = [:]
+    private var visibilityOverrides: [String: RemoteLinkVisibility] = [:]
+    private var visibilityAfterContentLookup: [String: RemoteLinkVisibility] = [:]
+    private var cancelContentCaller = false
+    private var includeInactiveContent = false
     private var failTrash = false
     enum LineageRead: Sendable, Equatable { case identity, successors, ancestry, external }
     private var incompleteLineageRead: LineageRead?
     private var failLineageRead = false
     private var failVisibilityRead = false
+    private var omittedVisibilityLinks: Set<String> = []
     private var failCompoundRead = false
     private var cancelCompoundRead = false
     private var failRelatedLookupForTrashedMain = false
     private var healthOverride: UploadRemoteContentIndexHealth?
     private var sharedLinks: Set<String> = []
     private var nodeSizes: [String: Int64] = [:]
+    private var nodeFingerprints: [String: ExactDuplicateFingerprint] = [:]
     private var missingNodes: Set<String> = []
     private var covers: [String: String] = [:]
     private var failCoverWrite = false
@@ -84,6 +101,24 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private let ownAlbumIDs: Set<String> = ["own-album"]
 
     var links: [Link] { lock.withLock { orderedLinks() } }
+    var uploadRequestCount: Int { lock.withLock { uploadRequests } }
+    var relatedFileTransferCallCount: Int { lock.withLock { relatedFileTransferCalls } }
+
+    func setContentLookupError(_ error: Error?) { lock.withLock { contentLookupError = error } }
+    func setContentLookupRows(_ rows: [RemotePhotoDuplicate]) { lock.withLock { contentLookupRows = rows } }
+    func setVisibility(_ visibility: RemoteLinkVisibility, for linkID: String) {
+        lock.withLock { visibilityOverrides[linkID] = visibility }
+    }
+    func setVisibilityAfterContentLookup(_ visibility: RemoteLinkVisibility, for linkID: String) {
+        lock.withLock { visibilityAfterContentLookup[linkID] = visibility }
+    }
+    func cancelCallerAtContentLookup(_ enabled: Bool) { lock.withLock { cancelContentCaller = enabled } }
+    var contentLookupCount: Int { lock.withLock { contentQueries } }
+    func setVisibilityError(_ error: (any Error)?, whenAskingFor linkID: String) {
+        lock.withLock { visibilityErrors[linkID] = error }
+    }
+    func omitVisibility(of linkIDs: Set<String>) { lock.withLock { omittedVisibilityLinks = linkIDs } }
+    func returnInactiveContentFromStaleIndex() { lock.withLock { includeInactiveContent = true } }
     var personDeletedAssets: [String: Set<String>] { lock.withLock { deletedAssets } }
     var steps: [Step] { lock.withLock { history } }
     var remoteProofLookups: [[UploadBackupExternalIdentity]] { lock.withLock { proofLookups } }
@@ -113,15 +148,68 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func failNextTrash() { lock.withLock { failTrash = true } }
 
+    /// The next duplicate trash moves its photos and then fails, like a partial answer or a lost response.
+    func applyNextTrashThenFail() { lock.withLock { failTrashAfterApplying = true } }
+    private var failTrashAfterApplying = false
+
+    /// The next duplicate trash moves every photo except `linkID` and then fails, like a partial answer.
+    func failNextTrash(leaving linkID: String) { lock.withLock { trashLeavesActive = linkID } }
+    private var trashLeavesActive: String?
+
+    /// A duplicate trash refuses each link that is in the trash already, with an error for that link, and moves the
+    /// others. The real server's answer for such a link is unverified.
+    var rejectsTrashOfTrashedLinks: Bool {
+        get { lock.withLock { rejectTrashed } }
+        set { lock.withLock { rejectTrashed = newValue } }
+    }
+    private var rejectTrashed = false
+
+    /// The next duplicate restore moves its photos back and then fails, like a lost response.
+    func applyNextRestoreThenFail() { lock.withLock { failRestoreAfterApplying = true } }
+    private var failRestoreAfterApplying = false
+
+    /// A duplicate restore that names one of these links fails and moves nothing back.
+    var refusedRestores: Set<String> {
+        get { lock.withLock { refusedRestoreLinks } }
+        set { lock.withLock { refusedRestoreLinks = newValue } }
+    }
+    private var refusedRestoreLinks: Set<String> = []
+
+    /// A link that left the trash keeps the time of its last trash in its visibility, like a stale field.
+    var reportsTrashTimeOfRestoredLinks: Bool {
+        get { lock.withLock { staleTrashTime } }
+        set { lock.withLock { staleTrashTime = newValue } }
+    }
+    private var staleTrashTime = false
+
+    /// The server clock in seconds since 1970, from the device clock at the start. Every trash of a person or a merge
+    /// stamps it on the trashed link.
+    var serverTime: Int64 {
+        get { lock.withLock { clock } }
+        set { lock.withLock { clock = newValue } }
+    }
+    private var clock = Int64(Date().timeIntervalSince1970)
+
     /// The next favorites read fails.
     func failNextFavoritesRead() { lock.withLock { failFavoritesRead = true } }
     private var failFavoritesRead = false
 
-    func configureLineageIndex(incomplete: LineageRead? = nil, failing: Bool = false) {
+    /// `error` is what a failing lineage read throws.
+    func configureLineageIndex(
+        incomplete: LineageRead? = nil, failing: Bool = false,
+        error: any Error = UploadError.backend("The scenario lineage read failed")
+    ) {
         lock.withLock {
             incompleteLineageRead = incomplete
             failLineageRead = failing
+            lineageReadError = error
         }
+    }
+    private var lineageReadError: any Error = UploadError.backend("The scenario lineage read failed")
+
+    private var ancestryReadError: (any Error)?
+    func configureLineageFailureAtAncestry(_ error: (any Error)?) {
+        lock.withLock { ancestryReadError = error }
     }
 
     func configureOptionalReads(
@@ -227,7 +315,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                     nameHash: link.nameHash, mimeType: link.mimeType)
             }
             return UploadRemoteCompound(
-                main: file(main), related: resources.map(file), tags: main.tags,
+                // Proton lists a favorite with its favorite tag.
+                main: file(main), related: resources.map(file),
+                tags: main.favorite ? main.tags.union([PhotoTag.favorites.rawValue]) : main.tags,
                 externalIdentifier: main.externalIdentifier,
                 // The API returns CaptureTime in whole seconds.
                 captureDate: Date(timeIntervalSince1970: main.captureTime.timeIntervalSince1970.rounded(.down)),
@@ -243,7 +333,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {
         try lock.withLock {
-            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            if failLineageRead { throw lineageReadError }
             return (
                 Set(
                     table.values.filter {
@@ -255,7 +345,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         try lock.withLock {
-            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            if failLineageRead { throw lineageReadError }
             return (
                 Set(
                     table.values.filter {
@@ -267,7 +357,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
         try lock.withLock {
-            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            if failLineageRead { throw lineageReadError }
             let link = table[linkID]
             let identifier =
                 link?.state == .active && link?.mainLinkID == nil ? link?.externalIdentifier : nil
@@ -277,7 +367,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         try lock.withLock {
-            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            if let ancestryReadError { throw ancestryReadError }
+            if failLineageRead { throw lineageReadError }
             let link = table[linkID]
             return (
                 link?.state == .active && link?.mainLinkID == nil ? link?.replacedLinkIDs ?? [] : [],
@@ -313,6 +404,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         _ request: PhotoUploadRequest,
         onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
+        lock.withLock { uploadRequests += 1 }
         let digest = try UploadContentSHA1.digest(ofFileAt: request.fileURL)
         guard request.expectedSHA1 == digest else {
             throw UploadError.backend("The scenario upload bytes do not match the pipeline identity")
@@ -400,10 +492,25 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate] {
+        if lock.withLock({ cancelContentCaller }) { withUnsafeCurrentTask { $0?.cancel() } }
+        let rows = try lock.withLock { () throws -> [RemotePhotoDuplicate]? in
+            contentQueries += 1
+            if let contentLookupError { throw contentLookupError }
+            visibilityOverrides.merge(visibilityAfterContentLookup) { _, new in new }
+            return contentLookupRows.map { Array($0.prefix(limit)) }
+        }
+        if let rows { return rows }
+        return try await findDuplicate(contentHash: contentHash).map { [$0] } ?? []
+    }
+
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
-        lock.withLock {
-            // The content index proves only active content. Name lookup still includes trash.
-            orderedLinks().first { $0.state == .active && $0.contentHash == contentHash }?.duplicate
+        try lock.withLock {
+            if let contentLookupError { throw contentLookupError }
+            // Normal content lookup proves active content; fault tests can return stale rows.
+            return orderedLinks().first {
+                ($0.state == .active || includeInactiveContent) && $0.contentHash == contentHash
+            }?.duplicate
         }
     }
 
@@ -434,6 +541,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         guard !linkIDs.isEmpty else { return [:] }
         return try lock.withLock {
             counted.visibility += 1
+            for linkID in linkIDs {
+                if let error = visibilityErrors[linkID] { throw error }
+            }
             if failVisibilityRead { throw UploadError.backend("The scenario visibility read failed") }
             if armedVisibilityFailures > 0 {
                 armedVisibilityFailures -= 1
@@ -441,11 +551,39 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             }
             var result: [String: RemoteLinkVisibility] = [:]
             for linkID in linkIDs {
-                guard let link = table[linkID], link.state != .deleted else { continue }
+                if let override = visibilityOverrides[linkID] {
+                    result[linkID] = override
+                    continue
+                }
+                guard !omittedVisibilityLinks.contains(linkID), let link = table[linkID], link.state != .deleted else {
+                    continue
+                }
                 result[linkID] = RemoteLinkVisibility(
-                    isActive: link.state == .active, mainPhotoLinkID: link.mainLinkID)
+                    isActive: link.state == .active, mainPhotoLinkID: link.mainLinkID,
+                    trashTime: link.state == .trashed || staleTrashTime ? link.trashTime : nil)
             }
             return result
+        }
+    }
+
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        let visible = try await linkVisibility(of: linkIDs)
+        return lock.withLock {
+            var states: [String: Int] = [:]
+            var complete = omittedVisibilityLinks.isDisjoint(with: linkIDs)
+            for (id, evidence) in visible {
+                guard evidence.hasExplicitPhotoState, let link = table[id] else {
+                    complete = false
+                    continue
+                }
+                switch link.state {
+                case .draft: states[id] = 0
+                case .active: states[id] = 1
+                case .trashed: states[id] = 2
+                case .deleted: break
+                }
+            }
+            return .init(states: states, complete: complete)
         }
     }
 
@@ -495,6 +633,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             }
             return Set(uids.filter { table[$0.nodeID]?.favorite == true })
         }
+    }
+
+    /// Another device sets or removes the favorite tag.
+    func setFavorite(_ favorite: Bool, of uid: PhotoUID) {
+        lock.withLock { table[uid.nodeID]?.favorite = favorite }
     }
 
     func markFavorite(_ uids: [PhotoUID]) async throws {
@@ -591,6 +734,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             guard let target = table[uid.nodeID] else { return }
             table[uid.nodeID]?.state = .trashed
             table[uid.nodeID]?.personDeleted = true
+            table[uid.nodeID]?.trashTime = clock
             let remaining = table.values.filter {
                 $0.assetID == target.assetID && $0.mainLinkID == nil && $0.state == .active
             }
@@ -650,6 +794,18 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    func seedDraft(name: String, digest: Data, clientUID: String?) -> PhotoUID {
+        lock.withLock {
+            let uid = insertLink(digest: digest, main: nil, captureTime: .distantPast)
+            table[uid.nodeID] = Link(
+                linkID: uid.nodeID, nameHash: "nh(\(name))", contentHash: Self.contentHash(digest), state: .draft,
+                mainLinkID: nil, captureTime: .distantPast, assetID: "draft", generation: 0, isOriginal: false,
+                clientUID: clientUID)
+            record("foreign draft \(uid.nodeID)")
+            return uid
+        }
+    }
+
     /// Seeds one main photo for each digest with one recorded step, for a large library.
     @discardableResult
     func seedLinks(digests: [Data]) -> [PhotoUID] {
@@ -687,7 +843,36 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 }
 
+/// Forwards transfer attempts through the same server that owns the merge's other reads and writes.
+protocol EditScenarioDuplicateRemote: ExactDuplicateRemote {
+    var base: EditScenarioServer { get }
+}
+
+extension EditScenarioDuplicateRemote {
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        try await base.downloadRelatedFile(uid, to: destination, allowsExpensiveNetwork: allowsExpensiveNetwork)
+    }
+
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        try await base.uploadRelatedFile(request)
+    }
+}
+
 extension EditScenarioServer: ExactDuplicateRemote {
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        lock.withLock { relatedFileTransferCalls += 1 }
+        throw ExactDuplicateRelatedFileTransferError.unavailable
+    }
+
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        lock.withLock { relatedFileTransferCalls += 1 }
+        throw ExactDuplicateRelatedFileTransferError.unavailable
+    }
+
     /// The person's trash: only main photos, and a related file never leaves without an active copy elsewhere.
     func trashDuplicates(_ uids: [PhotoUID]) async throws {
         try lock.withLock {
@@ -697,9 +882,14 @@ extension EditScenarioServer: ExactDuplicateRemote {
                 throw UploadError.backend("The scenario trash write failed once")
             }
             var violations: [String] = []
+            var refused: [String] = []
+            let left = trashLeavesActive
+            trashLeavesActive = nil
             let targets = Set(uids.map(\.nodeID))
             for uid in uids {
-                guard let target = table[uid.nodeID], target.state == .active else { continue }
+                if rejectTrashed, table[uid.nodeID]?.state == .trashed { refused.append(uid.nodeID) }
+                if uid.nodeID == left { refused.append(uid.nodeID) }
+                guard uid.nodeID != left, let target = table[uid.nodeID], target.state == .active else { continue }
                 if target.mainLinkID != nil {
                     violations.append("The duplicate trash targeted related file \(target.linkID)")
                 }
@@ -716,21 +906,39 @@ extension EditScenarioServer: ExactDuplicateRemote {
                 }
                 table[uid.nodeID]?.state = .trashed
                 table[uid.nodeID]?.personDeleted = true
+                table[uid.nodeID]?.trashTime = clock
             }
             record("duplicate trash \(uids.map(\.nodeID))", violations: violations)
             if let other = pendingTrashAfterDuplicateTrash {
                 pendingTrashAfterDuplicateTrash = nil
                 table[other]?.state = .trashed
                 table[other]?.personDeleted = true
+                table[other]?.trashTime = clock
                 record("other device trash \(other)")
             }
             armedVisibilityFailures = visibilityFailuresAfterTrash
             visibilityFailuresAfterTrash = 0
+            if failTrashAfterApplying {
+                failTrashAfterApplying = false
+                throw UploadError.backend("The scenario trash moved the photos and its answer failed")
+            }
+            if !refused.isEmpty {
+                throw UploadError.backend("The scenario trash refused \(refused.count) links")
+            }
         }
     }
 
     func restoreDuplicates(_ uids: [PhotoUID]) async throws {
+        try lock.withLock {
+            guard uids.contains(where: { refusedRestoreLinks.contains($0.nodeID) }) else { return }
+            throw UploadError.backend("The scenario restore was refused")
+        }
         for uid in uids { personRestore(uid) }
+        try lock.withLock {
+            guard failRestoreAfterApplying else { return }
+            failRestoreAfterApplying = false
+            throw UploadError.backend("The scenario restore moved the photos back and its answer failed")
+        }
     }
 
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
@@ -755,7 +963,7 @@ extension EditScenarioServer: ExactDuplicateRemote {
                             isShared: sharedLinks.contains($0.nodeID), byteSize: nodeSizes[$0.nodeID],
                             albums: (table[$0.nodeID]?.albums ?? []).sorted {
                                 ($0.volumeID, $0.albumID) < ($1.volumeID, $1.albumID)
-                            })
+                            }, fingerprint: nodeFingerprints[$0.nodeID] ?? ExactDuplicateFingerprint())
                     )
                 })
         }
@@ -763,6 +971,11 @@ extension EditScenarioServer: ExactDuplicateRemote {
 
     /// The node of the photo states this file size.
     func setNodeSize(_ size: Int64, of uid: PhotoUID) { lock.withLock { nodeSizes[uid.nodeID] = size } }
+
+    /// The node of the photo carries this metadata. Without one, the node has no metadata.
+    func setFingerprint(_ fingerprint: ExactDuplicateFingerprint, of uid: PhotoUID) {
+        lock.withLock { nodeFingerprints[uid.nodeID] = fingerprint }
+    }
 
     /// The person shares the photo with other people or by a link.
     func share(_ uid: PhotoUID) { lock.withLock { _ = sharedLinks.insert(uid.nodeID) } }
@@ -847,6 +1060,7 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
     private var lineageSnapshotAt: Date
     private var lineageInvalidated = false
     private var ownUploads: [String: Date] = [:]
+    private var proofLookupsFail = false
 
     /// A device builds its index when it first opens the account.
     init(server: EditScenarioServer, staleLineage: Bool = false, now: @escaping @Sendable () -> Date = { Date() }) {
@@ -892,12 +1106,24 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
         server.noteProofLookup(identities)
+        if lock.withLock({ proofLookupsFail }) { throw UploadError.backend("The scenario device is offline") }
         let indexed = lock.withLock { proofs }
         let links = indexed.values.flatMap(\.remoteLinkIDs)
         let visibility = try await server.linkVisibility(of: links)
         let stale = indexed.filter { !$0.value.remoteLinkIDs.allSatisfy { visibility[$0]?.isActive == true } }.keys
         lock.withLock { for identity in stale { proofs[identity] = nil } }
         return lock.withLock { proofs.filter { identities.contains($0.key) } }
+    }
+
+    /// The device brings its stored index up to date with the server, as the remote events do.
+    func refreshProofs() {
+        let current = server.allRemoteAssetProofs()
+        lock.withLock { proofs = current }
+    }
+
+    /// The device cannot read its remote index, for example while it is offline.
+    func setProofLookupsFail(_ fail: Bool) {
+        lock.withLock { proofLookupsFail = fail }
     }
 
     func nameHash(forCorrectedName name: String) async throws -> String {
@@ -919,6 +1145,11 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         try await server.linkVisibility(of: linkIDs)
     }
+
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        try await server.linkStateSnapshot(of: linkIDs)
+    }
+
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {
@@ -1019,5 +1250,48 @@ final class EditScenarioDeviceRemote: PhotoUploading, EditReplacementRemote, @un
             }
         }
         try await server.trashReplaced(uids)
+    }
+}
+
+extension EditScenarioServer: AlbumSyncRemoteAlbumOps {
+    func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState] {
+        try await UploadRemoteDeletionLookup.states(for: links.map { $0.uid.nodeID }, checker: self)
+    }
+
+    func listAlbums() async throws -> [AlbumSyncRemoteAlbum] {
+        [.init(id: "own-album", title: "Scenario album")]
+    }
+
+    func createAlbum(name: String) async throws -> String {
+        throw UploadError.backend("The scenario uses an existing album")
+    }
+
+    func childMainLinkIDs(albumID: String) async throws -> Set<String> {
+        Set(
+            links.filter {
+                $0.mainLinkID == nil && $0.state == .active
+                    && $0.albums.contains(.init(volumeID: "vol", albumID: albumID))
+            }.map(\.linkID))
+    }
+
+    func activeMainLinkIDs(withSameContentAs sha1Hexes: Set<String>) async throws -> [String: Set<String>] {
+        var result: [String: Set<String>] = [:]
+        for link in links where link.state == .active && link.mainLinkID == nil {
+            for sha1Hex in sha1Hexes where link.contentHash == "ch(\(sha1Hex))" {
+                result[sha1Hex, default: []].insert(link.linkID)
+            }
+        }
+        return result
+    }
+
+    func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
+        let existing = try await childMainLinkIDs(albumID: albumID)
+        let active = Set(links.filter { $0.state == .active }.map(\.linkID))
+        let unavailable = photos.filter { !active.contains($0.uid.nodeID) }
+        let new = photos.filter { active.contains($0.uid.nodeID) && !existing.contains($0.uid.nodeID) }
+        try await addPhotos(new.map(\.uid), toOwnAlbum: albumID)
+        return AlbumSyncAttachResult(
+            attached: new.count, alreadyMember: photos.count - new.count - unavailable.count,
+            failed: unavailable.count, failedLinkIDs: unavailable.map { $0.uid.nodeID })
     }
 }

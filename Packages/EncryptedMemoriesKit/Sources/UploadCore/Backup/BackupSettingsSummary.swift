@@ -10,6 +10,7 @@ public enum BackupSettingsSummary: Sendable, Equatable {
     case backingUp
     case paused
     case waiting
+    case waitingForWiFi
     case incomplete
 
     public init(isAvailable: Bool, isEnabled: Bool, isUserPaused: Bool, display: BackupStatusPresentation) {
@@ -29,6 +30,7 @@ public enum BackupSettingsSummary: Sendable, Equatable {
         case .activity: self = .backingUp
         case .paused: self = .paused
         case .waiting: self = .waiting
+        case .waitingForWiFi: self = .waitingForWiFi
         case .attention: self = .incomplete
         case .idle, .success, .notice: self = .on
         }
@@ -45,6 +47,7 @@ public enum BackupSettingsSummary: Sendable, Equatable {
         case .backingUp: L10n.string("backup.summary_backing_up")
         case .paused: L10n.string("backup.summary_paused")
         case .waiting: L10n.string("backup.summary_waiting")
+        case .waitingForWiFi: L10n.string("backup.phase_waiting_wifi")
         case .incomplete: L10n.string("backup.summary_incomplete")
         }
     }

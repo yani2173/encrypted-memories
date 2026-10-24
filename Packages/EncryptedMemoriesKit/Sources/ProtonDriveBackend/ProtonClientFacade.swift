@@ -105,7 +105,7 @@ public final class ProtonClientFacade {
         identityComposition: UploadIdentityResolverComposition,
         settlementStore: UploadManualSettlementStore?
     ) -> ProtonClientFacade {
-        // Albums: SDK 0.29.1 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
+        // Albums: SDK 0.31.1 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
         // retained only for writes the SDK does not expose.
         // Recently Deleted lists photos that left every inventory. The coordinator authorizes their
         // thumbnails from that listing; a weak reference keeps the bridge from retaining the coordinator.
@@ -148,6 +148,8 @@ public final class ProtonClientFacade {
                 await librarySources.revokeAdditionalSource(for: album)
             }
         )
+        let albumCarryOver = AlbumRepositorySeriesCarryOver(
+            repository: albumsRepo, requestCause: bridge.requestCause(.carryOver))
 
         // Uploads: pure manager over the SDK uploader (the bridge) + the album-attaching shim +
         // the universal dedupe pipeline (hash, duplicate check, then skip or upload), so every upload
@@ -183,7 +185,7 @@ public final class ProtonClientFacade {
             photoTagAdder: bridge,
             seriesDissolution: bridge.makeSeriesDissolution(
                 duplicateChecker: identityComposition.duplicateChecker,
-                albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo)
+                albums: albumCarryOver
             ),
             editedPhotoReplacement: {
                 guard let checker = identityComposition.duplicateChecker,
@@ -192,7 +194,7 @@ public final class ProtonClientFacade {
                 else { return nil }
                 return EditedPhotoReplacement(
                     remote: bridge,
-                    albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
+                    albums: albumCarryOver,
                     relations: checker,
                     identities: identities,
                     journal: journal
@@ -206,12 +208,15 @@ public final class ProtonClientFacade {
                 else { return nil }
                 return ExactDuplicateFinder(
                     checker: checker,
-                    resolver: identityResolver,
+                    resolver: (identityResolver as? ShutdownGatedUploadIdentityResolver)?
+                        .naming(bridge.requestCause(.duplicatesRead)) ?? identityResolver,
                     index: index,
                     identities: identities,
                     journal: journal,
+                    mergeJournal: ExactDuplicateMergeJournalFileStore(
+                        accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent()),
                     remote: bridge,
-                    albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
+                    albums: albumCarryOver,
                     log: { DebugLog.log($0) }
                 )
             }(),
@@ -220,7 +225,8 @@ public final class ProtonClientFacade {
             accountDatabasePolicy: bridge.uploadManifestPolicy,
             albumSyncRemoteOps: ProtonAlbumSyncRemoteOps(
                 service: albumWrite,
-                listProvider: { try await albumsRepo.listAlbums() }
+                listProvider: { try await albumsRepo.listAlbums() },
+                duplicateChecker: identityComposition.duplicateChecker
             ),
             accountInfoRefresher: { try await bridge.refreshAccountInfo() },
             shutdownHandler: {
@@ -247,3 +253,49 @@ public final class ProtonClientFacade {
         await shutdownGate.run { await handler() }
     }
 }
+
+#if ENCRYPTED_MEMORIES_UPGRADE_TEST
+    extension ProtonClientFacade {
+        static func makeUpgradeTestFacade(
+            accountUID: String, keyPassword: String, policy: ProtonDriveBackendPolicy
+        ) async throws -> ProtonClientFacade {
+            let backend = UpgradeTestBackend()
+            let directory = LibraryDatabaseLocation.prepareAccountDirectory(uid: accountUID)
+            guard
+                let identities = UploadIdentityManifestStore(
+                    url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
+                    policy: policy.libraryDatabasePolicy)
+            else { throw UploadError.backend("The upgrade identity store did not open") }
+            let sources = LibrarySourceCoordinator(
+                remote: backend, thumbnailLoader: backend,
+                inventoryStore: LibrarySourceInventoryStore(
+                    directory: directory, accountUID: accountUID,
+                    encryptionKey: LibrarySourceInventoryKeyDerivation.key(
+                        accountUID: accountUID, keyPassword: keyPassword), policy: policy.libraryDatabasePolicy))
+            await sources.prepare()
+            let albums = AlbumsRepository(
+                catalogBackend: backend, writeBackend: backend,
+                capabilities: .init(canList: true, canCreate: false, canAddPhotos: false, canSetCover: false))
+            let pipeline = UploadDedupePipeline(store: identities, checker: backend)
+            let manager = UploadManager(
+                uploader: backend, albums: AlbumAttachingAdapter(albums: albums), identityResolver: pipeline)
+            let coordinator = UploadCoordinator(
+                manager: manager, uploadCapabilities: backend.capabilities,
+                canCreateAlbum: false, canAddToAlbum: false, canSetAlbumCover: false)
+            return ProtonClientFacade(
+                backend: backend, librarySources: sources, albums: albums, uploads: manager,
+                uploadCoordinator: coordinator, photoUploader: backend, photoTagAdder: backend,
+                seriesDissolution: nil,
+                editedPhotoReplacement: nil,
+                exactDuplicates: nil,
+                uploadIdentityResolver: pipeline, accountDataDirectory: directory,
+                accountDatabasePolicy: policy.libraryDatabasePolicy, albumSyncRemoteOps: UpgradeTestAlbumSync(),
+                accountInfoRefresher: {},
+                shutdownHandler: {
+                    await sources.shutdown()
+                    await manager.shutdown()
+                    identities.close()
+                })
+        }
+    }
+#endif

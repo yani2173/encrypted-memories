@@ -1,1 +1,1 @@
-Bitte teste Anmeldung, Foto-Timeline, Alben, Backup, Suche und die freiwilligen Trinkgelder auf allen verfügbaren Plattformen. Gib bei jedem Problem App-Version, Build-Nummer, Gerät, OS-Version und genaue Reproduktionsschritte an.
+Bitte teste Anmeldung, Foto-Timeline, Alben, Backup, Duplikate, Suche, die Datenschutz-Einstellungen und die freiwilligen Trinkgelder auf allen verfügbaren Plattformen. Gib bei jedem Problem App-Version, Build-Nummer, Gerät, OS-Version und genaue Reproduktionsschritte an.

@@ -1,0 +1,18 @@
+{
+  "threshold": 1000,
+  "commitsCompared": 1030,
+  "frameAndBackfillHistoryMatches": true,
+  "historySHA256": "294d85f884fd9ca1d4b0aea2f64d954aea795a25c7673c4ece79c31d8074e47b",
+  "checkpointEvents": [
+    {
+      "id": 2001,
+      "kind": "autocheckpoint",
+      "path": "/policy.sqlite",
+      "frames": 1000,
+      "threshold": 1000,
+      "result": 0,
+      "source": "",
+      "sourceLocation": ""
+    }
+  ]
+}

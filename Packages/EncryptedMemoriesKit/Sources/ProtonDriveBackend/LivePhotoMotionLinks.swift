@@ -61,7 +61,7 @@ struct LivePhotoMotionLinks: Sendable {
     /// next refresh reads them again.
     func motions(
         of livePhotos: [String: [String]], stored: [String: String], evidence: [String: String],
-        fetch: (_ linkIDs: [String]) async throws -> [String: String]
+        allowFetch: Bool = true, fetch: (_ linkIDs: [String]) async throws -> [String: String]
     ) async throws -> (motions: [String: LivePhotoMotion], read: [String: String], complete: Bool) {
         var seen = Set<String>()
         let unread = livePhotos.keys.sorted().flatMap { linkID -> [String] in
@@ -69,8 +69,8 @@ struct LivePhotoMotionLinks: Sendable {
             return related.filter { evidence[$0] == nil && mimeTypes[$0] == nil && seen.insert($0).inserted }
         }
         var read: [String: String] = [:]
-        var complete = true
-        if !unread.isEmpty {
+        var complete = unread.isEmpty || allowFetch
+        if !unread.isEmpty, allowFetch {
             do {
                 let answer = try await fetch(unread)
                 for linkID in unread { read[linkID] = answer[linkID] ?? "" }

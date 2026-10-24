@@ -24,7 +24,11 @@ public struct SessionKeychainStore: Sendable {
     private let keychain: any AppleKeychainStoring
 
     public init(service: String = Self.defaultService, account: String = "default") {
-        self.init(service: service, account: account, keychain: SystemAppleKeychainStore())
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)
+            self.init(service: service, account: account, keychain: UpgradeTestSessionFile())
+        #else
+            self.init(service: service, account: account, keychain: SystemAppleKeychainStore())
+        #endif
     }
 
     public init(service: String, account: String, keychain: any AppleKeychainStoring) {
@@ -36,12 +40,44 @@ public struct SessionKeychainStore: Sendable {
         self.keychain = keychain
     }
 
-    public static let defaultService = "at.oncloud.encryptedmemories.session"
+    private static let productionService = "at.oncloud.encryptedmemories.session"
+    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+        public static let defaultService = productionService + ".upgrade-test"
+    #else
+        public static let defaultService = productionService
+    #endif
 
     public func load() throws -> ProtonSession? {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            guard UpgradeTestProbe.isRequested else { throw SessionKeychainError.invalidPayload }
+            UpgradeTestProbe.rejectExternalNetwork()
+            let seedIdentity = [
+                "server": UpgradeTestProbe.endpoint.absoluteString,
+                "account": UpgradeTestProbe.accountUID,
+            ]
+            if UpgradeTestProbe.seedsAccount,
+                UserDefaults.standard.dictionary(forKey: "upgrade.fixture.seeded") as? [String: String] != seedIdentity
+            {
+                guard let domain = Bundle.main.bundleIdentifier, domain.hasSuffix(".upgrade-test") else {
+                    throw SessionKeychainError.invalidPayload
+                }
+                UserDefaults.standard.removePersistentDomain(forName: domain)
+                try clear()
+                try save(
+                    ProtonSession(
+                        uid: UpgradeTestProbe.accountUID, accessToken: "synthetic-access",
+                        refreshToken: "synthetic-refresh", keyPassword: "synthetic-key"))
+                UserDefaults.standard.set(seedIdentity, forKey: "upgrade.fixture.seeded")
+            }
+        #endif
         guard let data = try keychain.data(for: item) else { return nil }
         do {
-            return try JSONDecoder().decode(ProtonSession.self, from: data)
+            let session = try JSONDecoder().decode(ProtonSession.self, from: data)
+            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                guard session.uid == UpgradeTestProbe.accountUID else { throw SessionKeychainError.invalidPayload }
+                UpgradeTestProbe.checkpoint("session.loaded")
+            #endif
+            return session
         } catch {
             throw SessionKeychainError.invalidPayload
         }
@@ -84,7 +120,7 @@ public enum ProtonAuthLocalDataPurge {
         claim: BackupLocalDataPurge.Claim,
         defaults: UserDefaults = .standard
     ) -> Bool {
-        perform(claim: claim, defaults: defaults) {
+        perform(claim: claim, defaults: defaults, networkStores: .current) {
             try purgeKeychain()
         }
     }
@@ -96,7 +132,7 @@ public enum ProtonAuthLocalDataPurge {
         claim: BackupLocalDataPurge.Claim,
         defaults: UserDefaults = .standard
     ) async -> Bool {
-        await performOffMain(claim: claim, defaults: SendableUserDefaults(defaults)) {
+        await performOffMain(claim: claim, defaults: SendableUserDefaults(defaults), networkStores: .current) {
             try purgeKeychain()
         }
     }
@@ -109,6 +145,22 @@ public enum ProtonAuthLocalDataPurge {
         defaults: UserDefaults = .standard,
         plaintextPurgeSucceeded: Bool? = nil
     ) async -> Bool {
+        await performStartupOffMain(
+            claim: claim,
+            defaults: defaults,
+            plaintextPurgeSucceeded: plaintextPurgeSucceeded,
+            networkStores: UnusedNetworkStorePurge.Location.current,
+            purgeKeychain: { try purgeKeychain() }
+        )
+    }
+
+    static func performStartupOffMain(
+        claim: BackupLocalDataPurge.Claim?,
+        defaults: UserDefaults,
+        plaintextPurgeSucceeded: Bool?,
+        networkStores: UnusedNetworkStorePurge.Location?,
+        purgeKeychain: @escaping @Sendable () throws -> Void
+    ) async -> Bool {
         #if os(iOS)
             if claim != nil {
                 // Foundation's default network stores are app-sandbox local on iOS, but live
@@ -118,42 +170,58 @@ public enum ProtonAuthLocalDataPurge {
                 }
             }
         #endif
+        let sendableDefaults = SendableUserDefaults(defaults)
         return await performStartupOffMain(
             claim: claim,
-            defaults: SendableUserDefaults(defaults),
+            defaults: sendableDefaults,
+            unusedNetworkStorePurge: {
+                if claim != nil {
+                    return UnusedNetworkStorePurge.purgeForSignOut(
+                        defaults: sendableDefaults.value, location: networkStores)?
+                        .succeeded == true
+                }
+                UnusedNetworkStorePurge.purgeOnce(defaults: sendableDefaults.value, location: networkStores)
+                return true
+            },
             plaintextPurge: {
                 if let plaintextPurgeSucceeded {
                     return plaintextPurgeSucceeded
                 }
                 return TransientPlaintextPurge.purgeShareExports().succeeded
             },
-            purgeKeychain: {
-                try purgeKeychain()
-            }
+            purgeKeychain: purgeKeychain
         )
     }
 
     static func performOffMain(
         claim: BackupLocalDataPurge.Claim,
         defaults: SendableUserDefaults,
+        networkStores: UnusedNetworkStorePurge.Location?,
         purgeKeychain: @escaping @Sendable () throws -> Void
     ) async -> Bool {
         return await Task.detached(priority: .utility) {
-            perform(claim: claim, defaults: defaults.value, purgeKeychain: purgeKeychain)
+            perform(claim: claim, defaults: defaults.value, networkStores: networkStores, purgeKeychain: purgeKeychain)
         }.value
     }
 
+    /// Startup without a sign-out claim keeps network cleanup best effort and once per arming.
+    /// A pending sign-out claim requires verified network cleanup before the transaction can complete.
+    /// Each run is awaited before an account opens.
     static func performStartupOffMain(
         claim: BackupLocalDataPurge.Claim?,
         defaults: SendableUserDefaults,
+        unusedNetworkStorePurge: @escaping @Sendable () -> Bool,
         plaintextPurge: @escaping @Sendable () -> Bool,
         purgeKeychain: @escaping @Sendable () throws -> Void
     ) async -> Bool {
         await Task.detached(priority: .utility) {
+            let networkStoresPurged = unusedNetworkStorePurge()
             let plaintextPurgeSucceeded = plaintextPurge()
             let signOutPurgeSucceeded =
                 claim.map {
-                    perform(claim: $0, defaults: defaults.value, purgeKeychain: purgeKeychain)
+                    perform(
+                        claim: $0, defaults: defaults.value,
+                        unusedNetworkStorePurge: { networkStoresPurged }, purgeKeychain: purgeKeychain)
                 } ?? true
             return plaintextPurgeSucceeded && signOutPurgeSucceeded
         }.value
@@ -162,9 +230,25 @@ public enum ProtonAuthLocalDataPurge {
     static func perform(
         claim: BackupLocalDataPurge.Claim,
         defaults: UserDefaults,
+        networkStores: UnusedNetworkStorePurge.Location?,
+        purgeKeychain: () throws -> Void
+    ) -> Bool {
+        perform(
+            claim: claim, defaults: defaults,
+            unusedNetworkStorePurge: {
+                UnusedNetworkStorePurge.purgeForSignOut(defaults: defaults, location: networkStores)?.succeeded == true
+            },
+            purgeKeychain: purgeKeychain)
+    }
+
+    private static func perform(
+        claim: BackupLocalDataPurge.Claim,
+        defaults: UserDefaults,
+        unusedNetworkStorePurge: () -> Bool,
         purgeKeychain: () throws -> Void
     ) -> Bool {
         let fileResult = claim.perform(defaults: defaults, completesRequestOnSuccess: false)
+        let networkStoresPurged = unusedNetworkStorePurge()
         let keychainPurged: Bool
         do {
             try purgeKeychain()
@@ -172,7 +256,7 @@ public enum ProtonAuthLocalDataPurge {
         } catch {
             keychainPurged = false
         }
-        guard fileResult.succeeded, keychainPurged else { return false }
+        guard fileResult.succeeded, networkStoresPurged, keychainPurged else { return false }
         BackupLocalDataPurge.markPurgeCompleted(defaults: defaults)
         return true
     }
@@ -186,9 +270,15 @@ public enum ProtonAuthLocalDataPurge {
             SessionKeychainStore.defaultService,
             DeviceIdentityKeychainStore.defaultService,
         ]
+        var firstError: (any Error)?
         for service in services {
-            try keychain.removeAllData(service: service)
+            do {
+                try keychain.removeAllData(service: service)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
         }
+        if let firstError { throw firstError }
     }
 }
 

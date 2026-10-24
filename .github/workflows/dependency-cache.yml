@@ -15,13 +15,14 @@ on:
       - "scripts/build-paths.sh"
       - "scripts/install-xcodegen.sh"
       - "scripts/update-proton-sdk.sh"
+      - ".github/scripts/verify_xcode_toolchain.sh"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
 
 jobs:
   warm:

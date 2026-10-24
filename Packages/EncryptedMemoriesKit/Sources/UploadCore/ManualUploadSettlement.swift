@@ -215,7 +215,6 @@ public protocol UploadManualSettlementStoreProtocol: Sendable {
     func upsert(_ record: UploadManualSettlementRecord) -> Bool
     func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord?
     func allRecords() -> [UploadManualSettlementRecord]
-    func pendingRecords() -> [UploadManualSettlementRecord]
     @discardableResult
     func remove(queueItemID: UploadQueueItemID) -> Bool
     func close()
@@ -227,9 +226,8 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
     public static let databaseFileName = "upload-manual-settlement-v1.sqlite"
 
     private static let schemaVersion = 1
-    private var db: OpaquePointer?
-    private var operationFailed = false
-    private let lock = NSLock()
+    private let connection: SQLiteStoreConnection
+    private var db: OpaquePointer? { connection.database }
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let transient = SQLiteStoreSchemaGate.transientDestructor
@@ -240,31 +238,22 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
             withIntermediateDirectories: true
         )
         guard let handle = Self.open(url: url, policy: policy) else { return nil }
-        db = handle
+        connection = SQLiteStoreConnection(database: handle)
     }
 
     deinit { close() }
 
-    public func isOperational() -> Bool {
-        lock.withLock { db != nil && !operationFailed }
-    }
+    public func isOperational() -> Bool { connection.isOperational(probeDatabase: false) }
 
-    public func close() {
-        lock.withLock {
-            guard let db else { return }
-            sqlite3_exec(db, "PRAGMA optimize;", nil, nil, nil)
-            sqlite3_close(db)
-            self.db = nil
-        }
-    }
+    public func close() { connection.close() }
 
     @discardableResult
     public func upsert(_ record: UploadManualSettlementRecord) -> Bool {
-        lock.withLock {
-            guard let db, !operationFailed,
+        connection.withLock {
+            guard let db, !connection.operationFailed,
                 let payload = try? encoder.encode(record)
             else {
-                operationFailed = true
+                connection.markFailed()
                 return false
             }
             var statement: OpaquePointer?
@@ -282,7 +271,7 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     nil
                 ) == SQLITE_OK
             else {
-                operationFailed = true
+                connection.markFailed()
                 return false
             }
             defer { sqlite3_finalize(statement) }
@@ -291,7 +280,7 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
             bindText(statement, 3, String(decoding: payload, as: UTF8.self))
             sqlite3_bind_double(statement, 4, record.updatedAt.timeIntervalSince1970)
             guard sqlite3_step(statement) == SQLITE_DONE else {
-                operationFailed = true
+                connection.markFailed()
                 return false
             }
             return true
@@ -299,8 +288,8 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
     }
 
     public func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord? {
-        lock.withLock {
-            guard let db, !operationFailed else { return nil }
+        connection.withLock {
+            guard let db, !connection.operationFailed else { return nil }
             var statement: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -311,21 +300,21 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     nil
                 ) == SQLITE_OK
             else {
-                operationFailed = true
+                connection.markFailed()
                 return nil
             }
             defer { sqlite3_finalize(statement) }
             bindText(statement, 1, queueItemID.uuidString)
             let result = sqlite3_step(statement)
             guard result == SQLITE_ROW else {
-                if result != SQLITE_DONE { operationFailed = true }
+                if result != SQLITE_DONE { connection.markFailed() }
                 return nil
             }
             guard let payload = columnText(statement, 0),
                 let data = payload.data(using: .utf8),
                 let record = try? decoder.decode(UploadManualSettlementRecord.self, from: data)
             else {
-                operationFailed = true
+                connection.markFailed()
                 return nil
             }
             return record
@@ -336,14 +325,10 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
         readRecords(whereClause: nil)
     }
 
-    public func pendingRecords() -> [UploadManualSettlementRecord] {
-        readRecords(whereClause: "stage <> 'terminal'")
-    }
-
     @discardableResult
     public func remove(queueItemID: UploadQueueItemID) -> Bool {
-        lock.withLock {
-            guard let db, !operationFailed else { return false }
+        connection.withLock {
+            guard let db, !connection.operationFailed else { return false }
             var statement: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -354,13 +339,13 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     nil
                 ) == SQLITE_OK
             else {
-                operationFailed = true
+                connection.markFailed()
                 return false
             }
             defer { sqlite3_finalize(statement) }
             bindText(statement, 1, queueItemID.uuidString)
             guard sqlite3_step(statement) == SQLITE_DONE else {
-                operationFailed = true
+                connection.markFailed()
                 return false
             }
             return true
@@ -368,8 +353,8 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
     }
 
     private func readRecords(whereClause: String?) -> [UploadManualSettlementRecord] {
-        lock.withLock {
-            guard let db, !operationFailed else { return [] }
+        connection.withLock {
+            guard let db, !connection.operationFailed else { return [] }
             var statement: OpaquePointer?
             let suffix = whereClause.map { " WHERE \($0)" } ?? ""
             guard
@@ -381,7 +366,7 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     nil
                 ) == SQLITE_OK
             else {
-                operationFailed = true
+                connection.markFailed()
                 return []
             }
             defer { sqlite3_finalize(statement) }
@@ -392,14 +377,14 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     let data = payload.data(using: .utf8),
                     let record = try? decoder.decode(UploadManualSettlementRecord.self, from: data)
                 else {
-                    operationFailed = true
+                    connection.markFailed()
                     return []
                 }
                 records.append(record)
                 result = sqlite3_step(statement)
             }
             guard result == SQLITE_DONE else {
-                operationFailed = true
+                connection.markFailed()
                 return []
             }
             return records

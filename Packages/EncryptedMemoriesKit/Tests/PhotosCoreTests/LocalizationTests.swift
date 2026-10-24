@@ -76,9 +76,65 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(try loadCatalog(packageCatalog).sourceLanguage, "en")
     }
 
+    func testMergeAllProgressTextsAreEnglishAndGerman() throws {
+        let texts: [(String, String, String)] = [
+            ("duplicates.merging_title", "Merging Duplicates", "Duplikate werden zusammengeführt"),
+            ("duplicates.ranking_progress %@ %@", "%1$@ of %2$@ groups", "%1$@ von %2$@ Gruppen"),
+            ("duplicates.stop", "Stop", "Stop"),
+            (
+                "duplicates.merge_stopped %@ %@", "Merging stopped. %1$@ of %2$@ groups were merged.",
+                "Zusammenführen gestoppt. %1$@ von %2$@ Gruppen wurden zusammengeführt."
+            ),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
+    func testDuplicateThumbnailUnavailableLabelIsEnglishAndGerman() throws {
+        let key = "duplicates.thumbnail_unavailable"
+        XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), "Thumbnail unavailable")
+        XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), "Vorschaubild nicht verfügbar")
+    }
+
+    func testEveryRetryActionHasOneTryAgainTitle() throws {
+        XCTAssertEqual(try localizedValue("action.retry", language: "en", in: packageCatalog), "Try again")
+        XCTAssertEqual(try localizedValue("action.retry", language: "de", in: packageCatalog), "Erneut versuchen")
+        let retiredKeys = ["action.try_again", "sign_out.try_again", "albums.try_again", "backup.failed_sheet_retry"]
+        for catalog in [packageCatalog, appCatalog, mobileCatalog] {
+            let keys = try loadCatalog(catalog).coverage.keys
+            for key in retiredKeys {
+                XCTAssertFalse(keys.contains(key), "\(key) duplicates action.retry in \(catalog.lastPathComponent)")
+            }
+        }
+    }
+
+    func testWiFiWaitExplainsThatCellularBackupIsOffInEnglishAndGerman() throws {
+        let texts = [
+            ("backup.phase_waiting_wifi", "Waiting for Wi-Fi", "Wartet auf WLAN"),
+            (
+                "backup.detail_waiting_wifi", "Cellular data is off for backups.",
+                "Mobile Daten sind für Sicherungen aus."
+            ),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german)
+        }
+    }
+
     func testSharedLibraryTitleLivesInCore() throws {
         XCTAssertEqual(try localizedValue("library.title", language: "en", in: packageCatalog), "Library")
         XCTAssertEqual(try localizedValue("library.title", language: "de", in: packageCatalog), "Mediathek")
+    }
+
+    func testMadeInAustriaLineIsSharedEnglishOnly() throws {
+        let line = "Made with ❤️ in Austria 🇦🇹"
+        XCTAssertEqual(try localizedValue("brand.made_in_austria", language: "en", in: packageCatalog), line)
+        XCTAssertEqual(try localizedValue("brand.made_in_austria", language: "de", in: packageCatalog), line)
+        XCTAssertEqual(ProductBrand.madeInAustria, line)
+        XCTAssertNotEqual(ProductBrand.madeInAustria, "brand.made_in_austria")
     }
 
     func testProductAndProtonTerminology() throws {
@@ -175,7 +231,7 @@ final class LocalizationTests: XCTestCase {
         let cov = try loadCatalog(appCatalog).coverage
         let reps = [
             "login.tagline", "sidebar.all_photos", "settings.library_tab", "menu.upload_photos",
-            "action.refresh", "alert.trash_confirmation_title_other %lld",
+            "alert.trash_confirmation_title_other %lld",
             "a11y.download_count_selected_originals %lld",
         ]
         for key in reps {
@@ -189,7 +245,6 @@ final class LocalizationTests: XCTestCase {
         let cov = try loadCatalog(mobileCatalog).coverage
         let reps = [
             "tab.collections", "loading.library_title", "loading.preparing_count %lld",
-            "albums.photo_count %lld",
             "auth.sign_in_prompt",
             "viewer.share_action", "viewer.move_to_trash_action", "viewer.restore_action",
         ]
@@ -215,6 +270,7 @@ final class LocalizationTests: XCTestCase {
             "settings.bug_report_support_failed",
             "device.requires_metal3 %@",
             "device.unsupported_reassurance", "device.unsupported_title",
+            "albums.photo_count %lld",
         ]
         for key in reps {
             let langs = cov[key] ?? []

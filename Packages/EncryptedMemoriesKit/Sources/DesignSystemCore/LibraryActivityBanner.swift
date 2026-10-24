@@ -84,8 +84,7 @@ public struct LibraryActivityBanner: View {
         HStack(spacing: 8) {
             switch state {
             case .working:
-                ProgressView()
-                    .controlSize(.small)
+                ProgressSpinner()
             case .success:
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(.green)

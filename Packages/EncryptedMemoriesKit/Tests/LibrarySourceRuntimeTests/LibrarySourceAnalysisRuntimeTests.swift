@@ -12,6 +12,18 @@ import Testing
 @testable import LibrarySourceRuntime
 @testable import ProtonDriveBackend
 
+/// The limit only ends a hung test. Machine load never reaches it.
+private let hangLimit: Duration = .seconds(300)
+
+/// Yields to other work until `condition` holds, so the result never depends on how fast the machine is.
+private func yieldUntil(_ condition: () async -> Bool) async {
+    let deadline = ContinuousClock.now + hangLimit
+    while ContinuousClock.now < deadline {
+        if await condition() { return }
+        await Task.yield()
+    }
+}
+
 @Test func sourceAnalysisRuntimeKeepsPrimaryProjectionSeparateFromAuthoritativeAnalysis() async throws {
     let remoteUID = PhotoUID(volumeID: "additional-volume", nodeID: "remote-photo")
     let backend = FakeLibrarySourceBackend(
@@ -164,16 +176,15 @@ import Testing
     )
 
     #expect(await runtime.start())
-    while await !backend.isDiscoveryWaiting() { await Task.yield() }
+    await yieldUntil { await backend.isDiscoveryWaiting() }
+    try #require(await backend.isDiscoveryWaiting())
 
     let completion = CompletionProbe()
     let shutdown = Task {
         await runtime.shutdown()
         completion.markCompleted()
     }
-    for _ in 0..<1_000 where !backend.cancellationWasObserved {
-        await Task.yield()
-    }
+    await yieldUntil { backend.cancellationWasObserved }
 
     #expect(backend.cancellationWasObserved)
     #expect(!completion.isCompleted)
@@ -231,10 +242,7 @@ import Testing
     #expect(await backend.discoveryCalls == 0)
 
     await runtime.setActive(true)
-    for _ in 0..<10_000 {
-        if await backend.discoveryCalls >= 2, universe.snapshot().uids == [remoteUID] { break }
-        await Task.yield()
-    }
+    await yieldUntil { await backend.discoveryCalls >= 2 && universe.snapshot().uids == [remoteUID] }
 
     #expect(await backend.discoveryCalls == 2)
     #expect(universe.snapshot().isAuthoritative)
@@ -266,16 +274,15 @@ import Testing
     )
 
     #expect(await runtime.start())
-    while await !backend.isDiscoveryWaiting() { await Task.yield() }
+    await yieldUntil { await backend.isDiscoveryWaiting() }
+    try #require(await backend.isDiscoveryWaiting())
 
     let completion = CompletionProbe()
     let suspension = Task {
         await runtime.setActive(false)
         completion.markCompleted()
     }
-    for _ in 0..<1_000 where !backend.cancellationWasObserved {
-        await Task.yield()
-    }
+    await yieldUntil { backend.cancellationWasObserved }
 
     #expect(backend.cancellationWasObserved)
     #expect(!completion.isCompleted)
@@ -329,10 +336,7 @@ import Testing
             generation: 1
         ) == .accepted
     )
-    for _ in 0..<10_000 {
-        if await backend.discoveryCalls >= 2, universe.snapshot().uids == [remoteUID] { break }
-        await Task.yield()
-    }
+    await yieldUntil { await backend.discoveryCalls >= 2 && universe.snapshot().uids == [remoteUID] }
 
     #expect(await backend.discoveryCalls == 2)
     #expect(universe.snapshot().isAuthoritative)
@@ -392,8 +396,9 @@ import Testing
     )
 
     await runtime.setActive(true)
-    for _ in 0..<300 {
-        if !FileManager.default.fileExists(atPath: cache.diskURL(for: orphan).path) { break }
+    let cleanupDeadline = ContinuousClock.now + hangLimit
+    let orphanPath = cache.diskURL(for: orphan).path
+    while FileManager.default.fileExists(atPath: orphanPath), ContinuousClock.now < cleanupDeadline {
         try await Task.sleep(for: .milliseconds(10))
     }
 

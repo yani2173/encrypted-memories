@@ -199,23 +199,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Für %lld Objekt(e) ist nicht genug freier Speicher da; sie werden ausgelassen." } }
       }
     },
-    "action.try_again": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Erneut versuchen"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Try again"
-          }
-        }
-      }
-    },
     "albums.detail_empty": {
       "extractionState": "manual",
       "localizations": {
@@ -302,71 +285,13 @@
         }
       }
     },
-    "albums.photo_count %lld": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "variations": {
-            "plural": {
-              "one": {
-                "stringUnit": {
-                  "state": "translated",
-                  "value": "%lld Foto"
-                }
-              },
-              "other": {
-                "stringUnit": {
-                  "state": "translated",
-                  "value": "%lld Fotos"
-                }
-              }
-            }
-          }
-        },
-        "en": {
-          "variations": {
-            "plural": {
-              "one": {
-                "stringUnit": {
-                  "state": "translated",
-                  "value": "%lld photo"
-                }
-              },
-              "other": {
-                "stringUnit": {
-                  "state": "translated",
-                  "value": "%lld photos"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "auth.checking_session": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Ihre Sitzung wird überprüft …"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Checking your session…"
-          }
-        }
-      }
-    },
     "auth.sign_in_prompt": {
       "extractionState": "manual",
       "localizations": {
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Melden Sie sich mit Ihrem Proton-Konto an, um Ihre Fotos in Proton Drive zu sehen."
+            "value": "Melde dich mit deinem Proton-Konto an, um deine Fotos in Proton Drive zu sehen."
           }
         },
         "en": {
@@ -502,7 +427,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ihre Mediathek wird geladen …"
+            "value": "Deine Mediathek wird geladen …"
           }
         },
         "en": {

@@ -29,25 +29,18 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         case duplicateTrashed
     }
 
-    private var db: OpaquePointer?
-    private let lock = NSLock()
+    private let connection: SQLiteStoreConnection
+    private var db: OpaquePointer? { connection.database }
     private static let schemaVersion = 8
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
-        db = handle
+        connection = SQLiteStoreConnection(database: handle)
     }
 
     deinit { close() }
 
-    public func close() {
-        lock.withLock {
-            guard db != nil else { return }
-            sqlite3_exec(db, "PRAGMA optimize;", nil, nil, nil)
-            sqlite3_close(db)
-            db = nil
-        }
-    }
+    public func close() { connection.close() }
 
     // MARK: Open / schema
 
@@ -189,7 +182,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     // MARK: UploadIdentityStore
 
     public func record(for source: UploadSourceIdentity) -> UploadIdentityRecord? {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -226,7 +219,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     }
 
     public func trustedRecords(contentHash: String, hashKeyEpoch: String, limit: Int) -> [UploadIdentityRecord] {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -285,7 +278,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     /// One scan for all links: without an index on `remote_link`, each single lookup would scan the table again.
     public func sources(withRemoteLinkIDs linkIDs: Set<String>) -> [String: [UploadSourceIdentity]]? {
         guard !linkIDs.isEmpty else { return [:] }
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -323,7 +316,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     public func forgetRemoteLinks(_ linkIDs: Set<String>, of source: UploadSourceIdentity) -> Bool {
         let unique = linkIDs.filter { !$0.isEmpty }
         guard !unique.isEmpty else { return true }
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -362,7 +355,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     private func write(
         _ record: UploadIdentityRecord, keepingRemoteLinkChangedFrom readLinkID: String?, onlyIfUnchanged: Bool
     ) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -415,7 +408,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         let valid = moves.filter { !$0.from.isEmpty && !$0.to.isEmpty && $0.from != $0.to }
         guard !valid.isEmpty else { return true }
         let now = Date().timeIntervalSince1970
-        return lock.withLock {
+        return connection.withLock {
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
             var stmt: OpaquePointer?
             var didWrite =
@@ -454,7 +447,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         hashKeyEpoch: String,
         limit: Int
     ) -> [UploadRemoteContentIndexRecord] {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -484,11 +477,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     public func remoteContentIndexCheckpoint(
         hashKeyEpoch: String
     ) -> UploadRemoteContentIndexCheckpoint? {
-        lock.withLock { readRemoteContentCheckpointLocked(hashKeyEpoch: hashKeyEpoch) }
+        connection.withLock { readRemoteContentCheckpointLocked(hashKeyEpoch: hashKeyEpoch) }
     }
 
     public func hasRemoteAssetIndexCheckpoint(hashKeyEpoch: String) -> Bool {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -508,7 +501,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         hashKeyEpoch: String
     ) -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
         guard !identities.isEmpty else { return [:] }
-        return lock.withLock {
+        return connection.withLock {
             var recordStmt: OpaquePointer?
             var linksStmt: OpaquePointer?
             guard
@@ -574,7 +567,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     }
 
     public func remoteContentIndexHealth(hashKeyEpoch: String) -> UploadRemoteContentIndexHealth {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -602,7 +595,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     public func remoteContentIndexBuildCheckpoint(
         hashKeyEpoch: String
     ) -> UploadRemoteContentIndexBuildCheckpoint? {
-        lock.withLock { readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch) }
+        connection.withLock { readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch) }
     }
 
     public func beginRemoteContentIndexBuild(
@@ -615,7 +608,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         guard !hashKeyEpoch.isEmpty, !eventID.isEmpty, !sourceFingerprint.isEmpty, total >= 0 else {
             return nil
         }
-        return lock.withLock {
+        return connection.withLock {
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return nil }
             if let existing = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
                 existing.eventID == eventID,
@@ -681,7 +674,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         guard !buildID.isEmpty,
             records.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch })
         else { return false }
-        return lock.withLock {
+        return connection.withLock {
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
             guard let checkpoint = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
                 checkpoint.buildID == buildID,
@@ -712,7 +705,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         hashKeyEpoch: String,
         buildID: String
     ) -> [String: UploadBackupExternalIdentity] {
-        lock.withLock {
+        connection.withLock {
             guard sqlite3_exec(db, "BEGIN;", nil, nil, nil) == SQLITE_OK else { return [:] }
             guard readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch)?.buildID == buildID else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
@@ -757,7 +750,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         guard !buildID.isEmpty,
             remoteAssetRecords.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch })
         else { return false }
-        return lock.withLock {
+        return connection.withLock {
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
             guard let build = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
                 build.buildID == buildID,
@@ -810,7 +803,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     @discardableResult
     public func invalidateRemoteContentIndexBuild(hashKeyEpoch: String) -> Bool {
         guard !hashKeyEpoch.isEmpty else { return false }
-        return lock.withLock {
+        return connection.withLock {
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
             guard clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch),
                 sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
@@ -833,7 +826,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         guard records.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch }),
             remoteAssetRecords.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch })
         else { return false }
-        return lock.withLock {
+        return connection.withLock {
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
             var deleteStmt: OpaquePointer?
             guard
@@ -899,7 +892,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             upsertingRemoteAssetRecords.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch }),
             !expectedEventID.isEmpty
         else { return false }
-        return lock.withLock {
+        return connection.withLock {
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
             guard readRemoteContentCheckpointLocked(hashKeyEpoch: hashKeyEpoch)?.eventID == expectedEventID else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
@@ -935,7 +928,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
     @discardableResult
     public func upsertRemoteContentRecord(_ record: UploadRemoteContentIndexRecord) -> Bool {
-        lock.withLock {
+        connection.withLock {
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
             let didDelete =
                 clearRemoteContentBuildLocked(hashKeyEpoch: record.hashKeyEpoch)
@@ -953,7 +946,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     }
 
     public func remoteContentDuplicateGroups(hashKeyEpoch: String) -> [String: [String]]? {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             // A related file of a proven compound, such as a Live Photo video or the original of an edit, holds the
             // bytes of another photo but never is a main photo. Proton cannot detach it, so it is left out here,
@@ -1000,7 +993,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     }
 
     public func remoteContentDuplicateSizes(hashKeyEpoch: String) -> [String: Int64]? {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -1042,7 +1035,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
     /// Row count - surfaced for tests and a future cache-status UI.
     public func count() -> Int {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM upload_identity;", -1, &stmt, nil) == SQLITE_OK else {
                 return 0

@@ -201,6 +201,19 @@ import Testing
         #expect(placeSeason?.title.contains("Klosterneuburg") == true)
     }
 
+    @Test func repeatedDefaultWithDistantGPSOnManyDaysDoesNotBecomeAPlace() {
+        let coordinates = (0..<60).flatMap { offset in
+            let captured = date(2024, 1, 1).addingTimeInterval(Double(offset / 2 * 7) * 86_400)
+            return [
+                coordinate("fixed-\(offset)", 20.123456789, 30.123456789, captured),
+                coordinate("gps-\(offset)", -20 + Double(offset) * 0.0001, -30, captured),
+            ]
+        }
+        let candidates = TimelineSearchDiscovery.placeCandidates(coordinates: coordinates)
+        #expect(candidates.count == 1)
+        #expect(candidates.allSatisfy { $0.uids.allSatisfy { $0.nodeID.hasPrefix("gps-") } })
+    }
+
     // MARK: Ranking and previews
 
     @Test func representativesPreferAFavoriteSkipExcludedItemsAndSpreadInTime() {

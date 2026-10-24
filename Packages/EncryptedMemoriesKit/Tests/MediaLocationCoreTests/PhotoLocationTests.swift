@@ -219,6 +219,49 @@ private final class LocationWriteBarrier: @unchecked Sendable {
         #expect(Set(index.coordinates.map(\.uid)) == [uid("keep"), uid("delete")])
     }
 
+    @Test func theScannedLibraryIsAcceptedOnTopOfTheCleanUpLibraryAndReplacedByTheNextScan() async {
+        func inventory(_ names: [String]) -> LocationCrawlInventory {
+            LocationCrawlInventory(
+                uids: names.map(uid), captureDates: Dictionary(uniqueKeysWithValues: names.map { (uid($0), Date()) }))
+        }
+        let index = PhotoLocationIndex()
+        // Before a clean-up the index accepts every photo, and accepting a library changes nothing.
+        index.accept(inventory(["early"]), revision: 1)
+        #expect(index.merge([coord("anything", 1, 1)]).map(\.uid) == [uid("anything")])
+
+        await index.retainOnly([uid("kept")], afterInventoryRevision: 1)
+        index.accept(inventory(["added", "restored", "later", "pending"]), revision: 2)
+        #expect(
+            index.merge([coord("added", 1, 1), coord("restored", 2, 2), coord("unknown", 3, 3)]).map(\.uid)
+                == [uid("added"), uid("restored")],
+            "The scan stores results for its library, not for a photo that no library has")
+        #expect(
+            index.markNoLocation([uid("later"), uid("unknown")]) == [uid("later")],
+            "A result without a location is admitted exactly like a coordinate")
+
+        // A newer scan replaces the library of the older one. The clean-up library stays accepted.
+        index.accept(inventory(["added"]), revision: 3)
+        #expect(index.merge([coord("pending", 4, 4)]).isEmpty, "A photo that the newer library lacks is not accepted")
+        #expect(index.markNoLocation([uid("pending")]).isEmpty)
+        #expect(index.merge([coord("kept", 5, 5)]).map(\.uid) == [uid("kept")])
+
+        // A list that was read before the accepted one is ignored.
+        index.accept(inventory(["pending"]), revision: 2)
+        #expect(index.merge([coord("pending", 4, 4)]).isEmpty, "A late older list must not replace a newer one")
+
+        // A list that is not newer than the last clean-up never undoes it; a newer list does.
+        await index.retainOnly([uid("kept")], afterInventoryRevision: 3)
+        index.accept(inventory(["stale"]), revision: 3)
+        #expect(index.merge([coord("stale", 6, 6)]).isEmpty, "A list read before the clean-up must not undo it")
+        index.accept(inventory(["fresh"]), revision: 4)
+        #expect(index.merge([coord("fresh", 7, 7)]).map(\.uid) == [uid("fresh")])
+
+        // A later clean-up starts from its own library: the library of the earlier scan does not survive it.
+        await index.retainOnly([uid("kept")], afterInventoryRevision: 4)
+        #expect(index.markNoLocation([uid("fresh")]).isEmpty)
+        #expect(index.merge([coord("added", 1, 1)]).isEmpty)
+    }
+
     @Test func staleReconcileCannotPersistIntoReplacementAccount() async {
         let dir = tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -234,53 +277,55 @@ private final class LocationWriteBarrier: @unchecked Sendable {
         #expect(store.load().isEmpty)
     }
 
-    @Test func accountReplacementDuringBlockedReconcileRejectsLateWrite() async {
-        let dir = tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = PhotoLocationStore(directory: dir)
-        let staleLease = store.configure(accountUID: "old", key: SymmetricKey(size: .bits256))
-        let index = PhotoLocationIndex()
-        index.merge([coord("old", 1, 1)])
-        let barrier = LocationWriteBarrier()
-        store.setBeforeWriteHook { barrier.block() }
+    #if DEBUG
+        @Test func accountReplacementDuringBlockedReconcileRejectsLateWrite() async {
+            let dir = tempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = PhotoLocationStore(directory: dir)
+            let staleLease = store.configure(accountUID: "old", key: SymmetricKey(size: .bits256))
+            let index = PhotoLocationIndex()
+            index.merge([coord("old", 1, 1)])
+            let barrier = LocationWriteBarrier()
+            store.setBeforeWriteHook { barrier.block() }
 
-        let reconcile = Task {
-            await index.retainOnly([uid("old")], persistTo: store, sessionLease: staleLease)
+            let reconcile = Task {
+                await index.retainOnly([uid("old")], persistTo: store, sessionLease: staleLease)
+            }
+            await Task.detached { barrier.waitUntilEntered() }.value
+            store.configure(accountUID: "new", key: SymmetricKey(size: .bits256))
+            barrier.release()
+            await reconcile.value
+            store.setBeforeWriteHook(nil)
+
+            #expect(store.load().isEmpty)
         }
-        await Task.detached { barrier.waitUntilEntered() }.value
-        store.configure(accountUID: "new", key: SymmetricKey(size: .bits256))
-        barrier.release()
-        await reconcile.value
-        store.setBeforeWriteHook(nil)
 
-        #expect(store.load().isEmpty)
-    }
+        @Test func olderSameAccountSnapshotCannotOverwriteNewerReconcile() async {
+            let dir = tempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = PhotoLocationStore(directory: dir)
+            let lease = store.configure(accountUID: "acct", key: SymmetricKey(size: .bits256))
+            let index = PhotoLocationIndex()
+            index.merge([coord("keep", 1, 1), coord("delete", 2, 2)])
+            let barrier = LocationWriteBarrier()
+            store.setBeforeWriteHook { barrier.blockFirst() }
 
-    @Test func olderSameAccountSnapshotCannotOverwriteNewerReconcile() async {
-        let dir = tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = PhotoLocationStore(directory: dir)
-        let lease = store.configure(accountUID: "acct", key: SymmetricKey(size: .bits256))
-        let index = PhotoLocationIndex()
-        index.merge([coord("keep", 1, 1), coord("delete", 2, 2)])
-        let barrier = LocationWriteBarrier()
-        store.setBeforeWriteHook { barrier.blockFirst() }
+            let older = Task {
+                await index.retainOnly(
+                    [uid("keep"), uid("delete")],
+                    persistTo: store,
+                    sessionLease: lease
+                )
+            }
+            await Task.detached { barrier.waitUntilEntered() }.value
+            await index.retainOnly([uid("keep")], persistTo: store, sessionLease: lease)
+            barrier.release()
+            await older.value
+            store.setBeforeWriteHook(nil)
 
-        let older = Task {
-            await index.retainOnly(
-                [uid("keep"), uid("delete")],
-                persistTo: store,
-                sessionLease: lease
-            )
+            #expect(store.load().map(\.uid) == [uid("keep")])
         }
-        await Task.detached { barrier.waitUntilEntered() }.value
-        await index.retainOnly([uid("keep")], persistTo: store, sessionLease: lease)
-        barrier.release()
-        await older.value
-        store.setBeforeWriteHook(nil)
-
-        #expect(store.load().map(\.uid) == [uid("keep")])
-    }
+    #endif
 
     @Test func boundingBoxFiltersToVisibleRegion() {
         let index = PhotoLocationIndex()

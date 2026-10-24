@@ -10,7 +10,7 @@ The Viewer opens photos, videos, Live Photos, and burst media without leaving th
 - Press and hold a Live Photo to play motion where supported.
 - Browse burst frames.
 - Favorite or unfavorite an item.
-- Share or export the original format.
+- Share or export the original format. With **Remove location when sharing** on (the default), shared and exported copies have no standard GPS metadata.
 - Move an item to Recently Deleted, or restore it when opened from trash.
 - Open [[Media Information|Media-Information]].
 

@@ -41,7 +41,7 @@ public enum TransientPlaintextPurge {
         }
     }
 
-    private static func removeWithoutFollowingLinks(at url: URL, boundary: URL) throws {
+    static func removeWithoutFollowingLinks(at url: URL, boundary: URL) throws {
         let standardized = url.standardizedFileURL
         let boundaryPath = boundary.standardizedFileURL.path
         let path = standardized.path

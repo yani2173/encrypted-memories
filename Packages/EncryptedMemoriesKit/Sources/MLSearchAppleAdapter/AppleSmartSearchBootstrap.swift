@@ -42,6 +42,9 @@ public enum AppleSmartSearchBootstrap {
         tier: AppProductTier = .free,
         policy: AppFeaturePolicy = .production
     ) -> AppFeatureAvailability {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested { return .available }
+        #endif
         let hasNeuralEngine = MLComputeDevice.allComputeDevices.contains { device in
             if case .neuralEngine = device { return true }
             return false
@@ -66,6 +69,13 @@ public enum AppleSmartSearchBootstrap {
         runnerConfiguration: MLIndexRunner.Configuration = .init(),
         catalogEndpoint: AppleSmartSearchCatalogEndpoint = .production
     ) -> MLSmartSearchLifecycle {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                return UpgradeTestSmartSearch.makeLifecycle(
+                    accountDirectory: accountDirectory, accountUID: accountUID, keyPassword: keyPassword,
+                    assetsProvider: assetsProvider, databasePolicy: databasePolicy)
+            }
+        #endif
         #if DEBUG
             let selectedCatalogEndpoint = catalogEndpoint
         #else

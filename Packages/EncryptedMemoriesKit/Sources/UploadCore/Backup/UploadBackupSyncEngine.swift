@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 public struct UploadBackupAssetCandidate: Sendable, Equatable {
     public let snapshot: UploadBackupAssetSnapshot
@@ -37,15 +38,48 @@ public protocol UploadBackupCandidateEnqueueing: Sendable {
     @discardableResult
     func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult
     /// Re-opens the backed-up revision of each candidate, unless its backup already holds the file that the asset now
-    /// lists. Returns the candidates whose revision is pending work.
+    /// lists. Returns the candidates whose revision is pending work. With `deferringWithoutRemoteProof`, a remote proof
+    /// that cannot be read throws `UploadBackupRemoteProofUnavailable` and changes nothing; without it, the revisions
+    /// that only the proof could settle re-open.
     @discardableResult
-    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate]
+    func reopenBackedUpRevisions(
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+    ) async throws -> [UploadBackupAssetCandidate]
+    /// Requeues terminal missing rows for explicit Photos changes, even when their revision is unchanged.
+    /// Dismissed missing rows retain their reason until the runner proves their bytes returned.
+    func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws
+    /// Local-only recovery. Complete states and sources with any queue row stay untouched.
+    func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws
+    func missingSourceDiscardGeneration() async throws -> Int64
+    /// Makes every queue row written so far survive a power loss. Returns false when that is not certain.
+    func synchronizeQueueToDisk() async -> Bool
+}
+
+/// The remote proof could not be read, so revisions that only the proof can settle stay as they are for now.
+public struct UploadBackupRemoteProofUnavailable: Error, Sendable {
+    public init() {}
 }
 
 public extension UploadBackupCandidateEnqueueing {
+    func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {}
+
+    func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
+        throw UploadError.backend("Backup source recovery is unavailable")
+    }
+    func missingSourceDiscardGeneration() async throws -> Int64 {
+        throw UploadError.backend("Backup source recovery is unavailable")
+    }
+
+    @discardableResult
+    func reopenBackedUpRevisions(
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+    ) async throws -> [UploadBackupAssetCandidate] {
+        []
+    }
+
     @discardableResult
     func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate] {
-        []
+        try await reopenBackedUpRevisions(reopenings, deferringWithoutRemoteProof: false)
     }
 
     func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
@@ -143,10 +177,43 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         try await enqueueBatch([candidate])
     }
 
+    public func synchronizeQueueToDisk() -> Bool {
+        queue.synchronizeToDisk()
+    }
+
     public func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
         // A photo the person deleted before upload stays out of the backup, also when a rescan offers it again.
-        let candidates = try withoutExcludedSources(candidates)
-        guard !candidates.isEmpty else { return UploadBackupSyncScanResult() }
+        let included = try withoutExcludedSources(candidates)
+        guard !included.isEmpty else { return UploadBackupSyncScanResult() }
+        var candidates: [UploadBackupAssetCandidate] = []
+        var result = UploadBackupSyncScanResult()
+        let mayHaveDismissals = queue.containsAny(in: [.dismissedFailure, .discovered, .checking])
+        guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
+        for candidate in included {
+            try Task.checkCancellation()
+            if mayHaveDismissals {
+                let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+                guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
+                if let row, row.isDismissedSourceRecheck || row.state == .dismissedFailure {
+                    result.scanned += 1
+                    if row.state == .dismissedFailure, row.source.kind == .photoLibraryAsset,
+                        let reason = row.lastError, BackupIssueRecord.decode(reason)?.kind == .sourceMissing,
+                        row.remoteCommitReconciliation == nil
+                    {
+                        var pending = row
+                        pending.state = .discovered
+                        pending.updatedAt = now()
+                        guard
+                            queue.updateDismissedSourceRecheck(
+                                pending, matchingState: .dismissedFailure, matchingLastError: reason) != nil
+                        else { throw Self.localStateError("Backup queue could not persist a source check") }
+                    }
+                    continue
+                }
+            }
+            candidates.append(candidate)
+        }
+        guard !candidates.isEmpty else { return result }
         var decisions = try await preflight.classifyBatch(candidates.map(\.snapshot))
         try Task.checkCancellation()
         guard decisions.count == candidates.count else {
@@ -169,6 +236,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    if UploadError.isCancellation(error) { throw error }
                     proofs = [:]
                 }
                 try Task.checkCancellation()
@@ -191,7 +259,6 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
                 }
             }
         }
-        var result = UploadBackupSyncScanResult()
         var entries: [UploadBackupSyncQueueEntry] = []
         entries.reserveCapacity(candidates.count)
         for (candidate, decision) in zip(candidates, decisions) {
@@ -201,32 +268,76 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         }
         try Task.checkCancellation()
         guard queue.upsertBatch(entries) else {
-            throw UploadError.backend("Backup queue could not persist an asset batch")
+            throw Self.localStateError("Backup queue could not persist an asset batch")
         }
+        try removeUnsavedEarlierRevisions(of: entries.filter { $0.state == .alreadyBackedUp })
         return result
+    }
+
+    public func missingSourceDiscardGeneration() async throws -> Int64 {
+        guard let generation = queue.missingSourceDiscardGeneration(), queue.isOperational() else {
+            throw Self.localStateError("Backup queue could not be read")
+        }
+        return generation
+    }
+
+    public func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
+        var missing: [UploadBackupAssetCandidate] = []
+        for candidate in candidates {
+            try Task.checkCancellation()
+            let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+            guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
+            if row?.state == .sourceMissing || row?.state == .dismissedFailure { missing.append(candidate) }
+        }
+        if !missing.isEmpty { _ = try await enqueueBatch(missing) }
+    }
+
+    public func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
+        let included = try withoutExcludedSources(candidates)
+        guard !included.isEmpty else { return }
+        guard let existing = queue.sourcesWithEntries(included.map(\.snapshot.source)), queue.isOperational() else {
+            throw Self.localStateError("Backup queue could not be read")
+        }
+        let missing = included.filter { !existing.contains($0.snapshot.source) }
+        let decisions = try await preflight.classifyBatch(missing.map(\.snapshot))
+        try Task.checkCancellation()
+        guard decisions.count == missing.count else {
+            throw UploadError.backend("Backup preflight classification was incomplete")
+        }
+        let entries = zip(missing, decisions).compactMap { candidate, decision in
+            decision == .alreadyBackedUp ? nil : prepare(candidate, decision: decision).entry
+        }
+        // The conditional insert also protects a row added while the preflight actor was awaited.
+        guard queue.insertMissingSources(entries) else {
+            throw Self.localStateError("Backup queue could not persist missing sources")
+        }
     }
 
     /// A complete revision becomes pending work again; its settled queue row goes away, so the next `enqueueBatch`
     /// queues the upload. A revision whose backup already holds the late file as main file, or that has no state,
-    /// keeps the usual classification.
+    /// keeps the usual classification. So does a revision that the remote proof settled on this device and still
+    /// settles.
     @discardableResult
     public func reopenBackedUpRevisions(
-        _ reopenings: [UploadBackupReopening]
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
     ) async throws -> [UploadBackupAssetCandidate] {
         var pending: [UploadBackupAssetCandidate] = []
         let kept = Set(try withoutExcludedSources(reopenings.map(\.candidate)).map(\.snapshot.source))
-        for reopening in reopenings where kept.contains(reopening.candidate.snapshot.source) {
+        let offered = reopenings.filter { kept.contains($0.candidate.snapshot.source) }
+        let proven = try await settledByRemoteProof(offered, deferringWithoutProof: deferringWithoutRemoteProof)
+        for reopening in offered {
             let snapshot = reopening.candidate.snapshot
+            if proven.contains(snapshot.source) { continue }
             if await backupHoldsLateMain(snapshot.source, formerMain: reopening.formerMain) { continue }
             try Task.checkCancellation()
             guard try await preflight.reopen(snapshot) else { continue }
             pending.append(reopening.candidate)
             try Task.checkCancellation()
             let row = queue.entry(for: snapshot.source, revision: snapshot.revision)
-            guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+            guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             guard let row, row.state == .completed || row.state == .alreadyBackedUp else { continue }
             guard queue.remove(source: snapshot.source, revision: snapshot.revision) else {
-                throw UploadError.backend("Backup queue could not re-open an asset")
+                throw Self.localStateError("Backup queue could not re-open an asset")
             }
         }
         return pending
@@ -244,6 +355,51 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             return false
         }
         return former.sha1Hex != main.sha1Hex
+    }
+
+    /// The sources whose complete revision the remote proof settles. A revision qualifies when this device holds no
+    /// manifest record for its former main file: such a record marks a backup with the late file as main file that
+    /// this device made, which `backupHoldsLateMain` checks. A record for the main file alone, such as the unedited
+    /// original hashed before another device uploaded the edit, does not tell what the backup holds. The proof counts
+    /// the files of the backup, so a backup without the late file settles nothing. An identity that two photos share
+    /// proves neither. When the proof cannot be read, `deferringWithoutProof` throws
+    /// `UploadBackupRemoteProofUnavailable` before anything changes; otherwise those revisions re-open as usual.
+    private func settledByRemoteProof(
+        _ reopenings: [UploadBackupReopening], deferringWithoutProof: Bool
+    ) async throws -> Set<UploadSourceIdentity> {
+        guard let remoteProofResolver, !reopenings.isEmpty else { return [] }
+        let complete = try await preflight.completeStates(reopenings.map(\.candidate.snapshot))
+        var unhashed: [UploadBackupExternalIdentity: [UploadBackupAssetSnapshot]] = [:]
+        for (reopening, isComplete) in zip(reopenings, complete) where isComplete {
+            try Task.checkCancellation()
+            let snapshot = reopening.candidate.snapshot
+            guard let identity = snapshot.externalIdentity else { continue }
+            if let formerMain = reopening.formerMain, await remoteProofResolver.identityRecord(for: formerMain) != nil {
+                continue
+            }
+            unhashed[identity, default: []].append(snapshot)
+        }
+        guard !unhashed.isEmpty else { return [] }
+        let proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]
+        do {
+            proofs = try await remoteProofResolver.remoteAssetProofs(for: Array(unhashed.keys))
+        } catch {
+            // A cancelled index build ends the lookup with a cancellation error even when this pass goes on.
+            if Task.isCancelled { throw CancellationError() }
+            if !(error is CancellationError), UploadError.isCancellation(error) { throw error }
+            if deferringWithoutProof { throw UploadBackupRemoteProofUnavailable() }
+            return []
+        }
+        try Task.checkCancellation()
+        var proven: Set<UploadSourceIdentity> = []
+        for (identity, snapshots) in unhashed {
+            guard snapshots.count == 1, let snapshot = snapshots.first,
+                let proof = proofs[identity], proof.externalIdentity == identity,
+                proof.resourceCount == snapshot.resourceCount
+            else { continue }
+            proven.insert(snapshot.source)
+        }
+        return proven
     }
 
     private func prepare(
@@ -305,9 +461,26 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     public func markCompleted(_ candidate: UploadBackupAssetCandidate) async throws {
         try await preflight.markBackedUp(candidate.snapshot)
         try Task.checkCancellation()
-        guard queue.upsert(entry(for: candidate, state: .completed)) else {
-            throw UploadError.backend("Backup queue could not persist completion")
+        let completed = entry(for: candidate, state: .completed)
+        guard queue.upsert(completed) else {
+            throw Self.localStateError("Backup queue could not persist completion")
         }
+        try removeUnsavedEarlierRevisions(of: [completed])
+    }
+
+    private func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) throws {
+        for start in stride(from: 0, to: entries.count, by: Self.scanBatchSize) {
+            let batch = Array(entries[start..<min(start + Self.scanBatchSize, entries.count)])
+            guard queue.removeUnsavedEarlierRevisions(of: batch) else {
+                throw Self.localStateError("Backup queue could not remove obsolete failures")
+            }
+        }
+    }
+
+    private static func localStateError(_ diagnostic: StaticString) -> UploadError {
+        PhotoDiagnostics.shared.increment("backup.queue.localStateUnavailable")
+        PhotoDiagnostics.shared.emitDebug("BackupSync", ["error": String(describing: diagnostic)])
+        return .backend(L10n.string("backup.error_local_state_unavailable"))
     }
 
     public func summary() -> UploadBackupSyncQueueSummary {

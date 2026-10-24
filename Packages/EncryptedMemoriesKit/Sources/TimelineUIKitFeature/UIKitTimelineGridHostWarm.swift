@@ -24,6 +24,23 @@
             }
         }
 
+        /// The tiles of `uids` that are not resident and may still be fetched, newest first, and how many of them
+        /// already have a decoded image in RAM.
+        func missingRetryableTiles(
+            in uids: [PhotoUID],
+            isResident: (PhotoUID) -> Bool
+        ) -> (uids: [PhotoUID], ramReady: Int) {
+            let feed = thumbnailFeed
+            let missing = newestFirst(
+                uids.filter { uid in
+                    !isResident(uid) && !(feed?.isKnownUnfetchable(uid) ?? false)
+                })
+            let ramReady = missing.reduce(into: 0) { count, uid in
+                if feed?.memoryCGImage(for: uid) != nil { count += 1 }
+            }
+            return (missing, ramReady)
+        }
+
         /// The still-missing visible tiles (newest-first, reliability-critical order) followed by any additional warm
         /// UIDs the composer requested (upgrade re-decode sources), de-duplicated. A no-op-ish superset when settled
         /// is off (the composer's warm list is then just the missing tiles).

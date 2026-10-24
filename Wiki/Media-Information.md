@@ -12,7 +12,11 @@ Available fields can include:
 - Album memberships
 - Video or Live Photo details
 
-Missing fields stay absent instead of being guessed. Location is shown only when the app has positive location metadata for the item.
+Missing fields stay absent instead of being guessed. Location appears only when the app has location data for the item.
+
+- The information panel (Mac) and the information sheet (iPhone and iPad) show the same location block: the place name, a small map, and the coordinates.
+- The place name appears when the app can resolve it.
+- If **Map and Places** is off, the place name and the map disappear. The coordinates stay as text. See [[Settings, Cache, and Privacy|Settings-Cache-and-Privacy]].
 
 - **iPhone and iPad:** Open the information sheet from the Viewer.
 - **Mac:** Open the Viewer information panel.

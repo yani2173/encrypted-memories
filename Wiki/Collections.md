@@ -8,10 +8,10 @@ Every device offers Favorites, Screenshots, Videos, Live Photos, Motion Photos, 
 
 ## iPhone and iPad
 
-Open the **Collections** tab. Each row opens the same shared timeline filtered to that collection. Use the add menu to create an album when the account supports album creation.
+Open the **Collections** tab. Each row opens the same shared timeline filtered to that collection. Use the add menu to create an album when the account supports album creation. The **Utilities** section contains [[Duplicates|Duplicates]].
 
 ## Mac
 
-The smart filters, albums, shared-album listings, and Recently Deleted appear directly in the sidebar.
+The smart filters, albums, shared-album listings, Duplicates, and Recently Deleted appear directly in the sidebar.
 
 Continue with [[Albums|Albums]] or [[Recently Deleted|Recently-Deleted]].

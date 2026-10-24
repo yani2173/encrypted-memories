@@ -7,6 +7,7 @@ import DesignSystemCore
 import MapUIKitAdapter
 import MediaByteCache
 import MediaCacheUIKitAdapter
+import MediaFeedCore
 import MediaLocationCore
 import PhotoViewerCore
 import PhotoViewerUIKitAdapter
@@ -14,6 +15,7 @@ import PhotosCore
 import SwiftUI
 import TimelineCore
 import UIKit
+import UploadCore
 import VisionKit
 
 /// Native full-screen photo/video viewer. Paging + chrome live here (pure presentation); the media decoding,
@@ -31,6 +33,8 @@ struct MobilePhotoViewer: View {
     let viewerRouter: MobileViewerRouter
     /// True for a library viewer: it follows a photo that the backup replaced, such as an edit in Apple Photos.
     let followsLibraryReplacements: Bool
+    /// A group of duplicates: the bottom bar keeps a copy and merges the group instead of the library actions.
+    let duplicateGroup: MobileDuplicateViewerGroup?
     @State private var pageIndex: ViewerPageIndex
 
     @Environment(\.dismiss) private var dismiss
@@ -39,6 +43,8 @@ struct MobilePhotoViewer: View {
     @State private var index: Int
     @State private var chromeVisible = true
     @State private var burstSelection = BurstSelectionModel()
+    @State private var editedOriginal = EditedPhotoOriginalState()
+    @State private var editedOriginalLookup = EditedPhotoOriginalLookup()
     @State private var selection = MobileGridSelectionController()
     @State private var isRestoring = false
     @State private var showRestoreError = false
@@ -73,6 +79,8 @@ struct MobilePhotoViewer: View {
     /// the shared `PhotoViewerUIKitAdapter` store, wired to the feed's RAM tier via a closure so the
     /// adapter never depends on a concrete feed type.
     @State private var imageStore: UIKitViewerImageStore
+    /// Read access to the cached thumbnail of the shown Duplicates copy, which can lie outside the library.
+    @State private var visibleThumbnail: VisibleThumbnailSession?
 
     init(
         items: [PhotoItem],
@@ -81,7 +89,8 @@ struct MobilePhotoViewer: View {
         libraryModel: MobileLibraryModel,
         viewerRouter: MobileViewerRouter,
         showsInfoInitially: Bool = false,
-        followsLibraryReplacements: Bool = false
+        followsLibraryReplacements: Bool = false,
+        duplicateGroup: MobileDuplicateViewerGroup? = nil
     ) {
         _showInfo = State(initialValue: showsInfoInitially)
         _items = State(initialValue: items)
@@ -90,6 +99,7 @@ struct MobilePhotoViewer: View {
         self.libraryModel = libraryModel
         self.viewerRouter = viewerRouter
         self.followsLibraryReplacements = followsLibraryReplacements
+        self.duplicateGroup = duplicateGroup
         _pageIndex = State(initialValue: ViewerPageIndex(orderedUIDs: items.map(\.uid)))
         _index = State(initialValue: min(max(startIndex, 0), max(items.count - 1, 0)))
         _titleMetadataCoordinator = State(
@@ -98,6 +108,9 @@ struct MobilePhotoViewer: View {
                 placeNameResolver: NativePlaceNameResolver.shared
             ))
         let feed = libraryModel.thumbnailFeed
+        let visibleThumbnail = duplicateGroup == nil ? nil : feed.map { VisibleThumbnailSession(feed: $0.feedCore) }
+        if items.indices.contains(startIndex) { visibleThumbnail?.select(items[startIndex].uid) }
+        _visibleThumbnail = State(initialValue: visibleThumbnail)
         // Seed/reuse the E2EE originals cache via the shared helper, injected as a closure so the viewer
         // adapter stays decoupled from the cache layer. When the viewer decrypts an original (a no-preview
         // item), it lands in the encrypted cache and later opens / shares reuse it before the network.
@@ -119,7 +132,10 @@ struct MobilePhotoViewer: View {
         _imageStore = State(
             initialValue: UIKitViewerImageStore(
                 thumbnailProvider: { feed?.memoryImage(for: $0) },
-                cachedThumbnailProvider: { await feed?.cachedImage(for: $0) },
+                cachedThumbnailProvider: { uid in
+                    if let visibleThumbnail { return await visibleThumbnail.cachedImage(for: uid) }
+                    return await feed?.cachedImage(for: uid)
+                },
                 media: media,
                 originalDataOverride: originalFetch))
     }
@@ -140,7 +156,8 @@ struct MobilePhotoViewer: View {
                 MobileViewerPager(
                     count: items.count, revision: itemsRevision, id: { items[$0].uid }, index: $index
                 ) { i, isCurrent in
-                    let item = items[i]
+                    // The page of an edited photo shows its original while the person asks for it.
+                    let item = editedOriginal.displayed(items[i])
                     MobileViewerPage(
                         item: item,
                         isCurrent: isCurrent,
@@ -174,7 +191,13 @@ struct MobilePhotoViewer: View {
             // The Live Photo status sits on the media inside the safe area, below the navigation bar.
             .overlay(alignment: .topLeading) {
                 if currentBaseItem?.isLivePhoto == true {
-                    viewerLiveIndicator
+                    viewerBadge(.live)
+                }
+            }
+            // The original of an edited photo is marked in the same place; such a photo is never a Live Photo.
+            .overlay(alignment: .topLeading) {
+                if let base = currentBaseItem, editedOriginal.isShowingOriginal(of: base.uid) {
+                    viewerBadge(.original)
                 }
             }
             // A series shows its photo count in the same place; a burst is never a Live Photo.
@@ -210,7 +233,7 @@ struct MobilePhotoViewer: View {
             // Register the viewer's transient display cache with the shared memory governor (identity-keyed:
             // a newly opened viewer replaces the previous registration; the weak capture makes a dismissed
             // viewer's handler a no-op). Under `.minimal` the store purges every page except the visible one.
-            UIKitMemoryPressureCoordinator.shared.attach(imageStore, key: "viewerImageStore") {
+            UIKitMemoryPressureCoordinator.shared.attach(imageStore) {
                 [weak imageStore] tier in
                 imageStore?.applyMemoryPressure(scale: tier.budgetScale, purge: tier.requiresImmediatePurge)
             }
@@ -275,13 +298,25 @@ struct MobilePhotoViewer: View {
             Button(L10n.string("action.ok"), role: .cancel) { saveToLibraryMessage = nil }
         }
         .albumActionFailureAlert(libraryModel.albumActions)
-        .onChange(of: currentBaseItem?.uid) { _, _ in
+        .onChange(of: currentBaseItem?.uid) { _, uid in
             cancelViewerMutationPresentation()
             liveTextHighlighted = false
+            visibleThumbnail?.select(uid)
+            editedOriginal.pageChanged(to: uid)
+            lookUpEditedOriginal()
         }
+        // The library may still load when the viewer opens; the photo on screen then asks as soon as it is ready.
+        .onChange(of: editedOriginalProvider != nil) { _, available in
+            if available, let provider = editedOriginalProvider { editedOriginalLookup.providerAvailable(provider) }
+        }
+        // A full-screen cover over the viewer, such as the series selection, ends the access of the shown copy.
+        .onAppear { visibleThumbnail?.reopen(currentBaseItem?.uid) }
+        .onAppear { lookUpEditedOriginal() }
         .onDisappear {
             cancelViewerMutationPresentation()
             titleMetadataCoordinator.cancelAll()
+            visibleThumbnail?.end()
+            editedOriginalLookup.cancel()
         }
         .animation(
             MobileViewerMotionPolicy.animation(.smooth(duration: 0.24), reduceMotion: reduceMotion),
@@ -300,6 +335,7 @@ struct MobilePhotoViewer: View {
                 selectedUID: currentBaseItem?.uid,
                 feed: libraryModel.thumbnailFeed,
                 itemSide: min(46, profile.filmstripHeight),
+                allowsVisibleDuplicateThumbnails: duplicateGroup != nil,
                 onSelect: selectPage
             )
             .frame(height: profile.filmstripHeight)
@@ -324,8 +360,12 @@ struct MobilePhotoViewer: View {
         ToolbarItem(placement: .principal) { viewerTitleView }
         viewerCloseItem
         viewerMoreActions
-        ToolbarItem(placement: .bottomBar) { viewerShareButton }
-            .mobileVisibilityPriority(.high)
+        // A group of duplicates keeps this toolbar: Keep This Copy takes the place of Share, which stays in the
+        // more-actions menu, and Merge takes the place of the mutation.
+        ToolbarItem(placement: .bottomBar) {
+            if let duplicateGroup { duplicateKeepButton(duplicateGroup) } else { viewerShareButton }
+        }
+        .mobileVisibilityPriority(.high)
         ToolbarSpacer(.flexible, placement: .bottomBar)
         ToolbarItemGroup(placement: .bottomBar) {
             // Shared photos cannot carry the account's favorite tag; the context is fixed for the presentation.
@@ -336,8 +376,43 @@ struct MobilePhotoViewer: View {
         // Favorite, Album, and Info are the first to leave a compressed bar; the overflow menu keeps their titles.
         .mobileVisibilityPriority(.low)
         ToolbarSpacer(.flexible, placement: .bottomBar)
-        ToolbarItem(placement: .bottomBar) { viewerMutationButton }
-            .mobileVisibilityPriority(.high)
+        ToolbarItem(placement: .bottomBar) {
+            if let duplicateGroup { duplicateMergeButton(duplicateGroup) } else { viewerMutationButton }
+        }
+        .mobileVisibilityPriority(.high)
+    }
+
+    /// Keeps the photo shown when its group is merged. "Kept" with a filled checkmark once a merge keeps it.
+    private func duplicateKeepButton(_ group: MobileDuplicateViewerGroup) -> some View {
+        let uid = currentBaseItem?.uid
+        let title = uid.map { group.model.keepTitle(for: $0) } ?? ""
+        let symbol = uid.map { group.model.keepSymbol(for: $0) } ?? "checkmark.circle"
+        return Button {
+            guard let uid else { return }
+            group.model.keep(uid)
+        } label: {
+            Label(title, systemImage: symbol)
+        }
+        .disabled(!(uid.map { group.model.canKeep($0) } ?? false))
+        .accessibilityLabel(title)
+        .accessibilityIdentifier("duplicates.viewer.keep")
+    }
+
+    /// Merges the group of the photo on screen with the photo shown as kept, like Merge in Apple Photos, and closes
+    /// the viewer. The group is found at the tap: it can have split since the viewer opened.
+    private func duplicateMergeButton(_ group: MobileDuplicateViewerGroup) -> some View {
+        let title = group.model.mergeTitle
+        let uid = currentBaseItem?.uid
+        return Button {
+            guard let uid else { return }
+            dismiss()
+            Task { await group.model.merge(containing: uid) }
+        } label: {
+            Label(title, systemImage: group.model.mergeSymbol)
+        }
+        .disabled(!(uid.map { group.model.canMerge(containing: $0) } ?? false))
+        .accessibilityLabel(title)
+        .accessibilityIdentifier("duplicates.viewer.merge")
     }
 
     /// Close is the primary navigation control: it stays at the top of a vertical bar and never overflows.
@@ -366,7 +441,7 @@ struct MobilePhotoViewer: View {
                     viewerActionMenu
                 } label: {
                     if selection.isBusy || isRestoring {
-                        ProgressView()
+                        ProgressSpinner()
                     } else {
                         Label(String(localized: "viewer.more_actions_a11y"), systemImage: "ellipsis")
                     }
@@ -410,9 +485,9 @@ struct MobilePhotoViewer: View {
         )
     }
 
-    /// The Live Photo status leaves with the chrome and never steals paging, press or dismiss gestures.
-    private var viewerLiveIndicator: some View {
-        MobileLiveBadge()
+    /// A media status badge leaves with the chrome and never steals paging, press or dismiss gestures.
+    private func viewerBadge(_ badge: MobileViewerBadge) -> some View {
+        badge
             .padding(16)
             .opacity(chromeVisible ? 1 : 0)
             .allowsHitTesting(false)
@@ -553,6 +628,18 @@ struct MobilePhotoViewer: View {
         }
         .disabled(currentBaseItem == nil || selection.isBusy)
 
+        if let base = currentBaseItem, editedOriginal.canShowOriginal(of: base.uid) {
+            let showing = editedOriginal.isShowingOriginal(of: base.uid)
+            Button {
+                editedOriginal.toggle(base.uid)
+            } label: {
+                Label(
+                    showing ? L10n.string("viewer.show_edited") : L10n.string("viewer.show_original"),
+                    systemImage: showing ? "wand.and.rays" : "wand.and.rays.inverse"
+                )
+            }
+        }
+
         if currentBaseItem?.uid != nil, liveTextUID == currentBaseItem?.uid {
             Button {
                 liveTextHighlighted.toggle()
@@ -608,20 +695,26 @@ struct MobilePhotoViewer: View {
         let uid = item.uid
         titleMetadataState = titleMetadataCoordinator.state(for: uid)
         metadataLoadState = .loading
-        isLoadingAlbumMemberships = libraryModel.facade?.albums != nil
-        async let memberships = resolvedAlbumTitles(for: uid)
-        async let titleResolution = titleMetadataCoordinator.resolve(item)
-        let membershipResult = await memberships
-        let resolution = await titleResolution
-        guard !Task.isCancelled, currentBaseItem?.uid == uid else { return }
-        applyAlbumMembershipResult(membershipResult)
-        titleMetadataState = .resolved(resolution)
-        metadataLoadState = resolution.metadataLoadState
-        guard let metadata = resolution.metadata else { return }
-        let resolvedKind = VideoContentSniffer.kind(mimeType: metadata.mimeType)
-        if resolvedKind != .unknown {
-            resolvedMediaKinds[uid] = resolvedKind
-        }
+        let albums = libraryModel.facade?.albums
+        isLoadingAlbumMemberships = albums != nil
+        let coordinator = titleMetadataCoordinator
+        // A retry, a privacy change or an album change keeps the photo but starts a new run.
+        let run = metadataTaskID
+        await ViewerInfoPublication.run(
+            metadata: { await coordinator.resolve(item) },
+            memberships: { await Self.albumTitles(of: uid, in: albums) },
+            isCurrent: { metadataTaskID == run },
+            publishMetadata: { resolution in
+                titleMetadataState = .resolved(resolution)
+                metadataLoadState = resolution.metadataLoadState
+                guard let metadata = resolution.metadata else { return }
+                let resolvedKind = VideoContentSniffer.kind(mimeType: metadata.mimeType)
+                if resolvedKind != .unknown {
+                    resolvedMediaKinds[uid] = resolvedKind
+                }
+            },
+            publishMemberships: { applyAlbumMembershipResult($0) }
+        )
     }
 
     private func retryCurrentMetadata() {
@@ -630,8 +723,10 @@ struct MobilePhotoViewer: View {
         metadataRequestGeneration &+= 1
     }
 
-    private func resolvedAlbumTitles(for uid: PhotoUID) async -> Result<[String], Error>? {
-        guard let repository = libraryModel.facade?.albums else { return nil }
+    private static func albumTitles(
+        of uid: PhotoUID, in repository: AlbumsRepository?
+    ) async -> Result<[String], Error>? {
+        guard let repository else { return nil }
         do {
             return .success(try await repository.albumMembershipTitles(for: uid))
         } catch {
@@ -655,8 +750,10 @@ struct MobilePhotoViewer: View {
         }
     }
 
+    /// Shares what the page shows: the original of an edited photo while it is shown.
     private func shareCurrentItem() {
-        guard let item = currentBaseItem, libraryModel.backend != nil else { return }
+        guard let base = currentBaseItem, libraryModel.backend != nil else { return }
+        let item = editedOriginal.displayed(base)
         let items = burstBelongsToCurrentPage ? burstSelection.exportItems(current: item) : [item]
         selection.startShare(
             items: items, backend: libraryModel.viewerMedia,
@@ -845,6 +942,17 @@ struct MobilePhotoViewer: View {
                 }
             )
         }
+    }
+
+    /// Asks for the original of the settled page, once it stayed for the dwell; see `EditedPhotoOriginalLookup`.
+    private func lookUpEditedOriginal() {
+        editedOriginalLookup.settled(on: currentBaseItem, provider: editedOriginalProvider) { base, original in
+            editedOriginal.record(original, of: base.uid)
+        }
+    }
+
+    private var editedOriginalProvider: (any EditedPhotoOriginalProviding)? {
+        libraryModel.backend as? any EditedPhotoOriginalProviding
     }
 
     @MainActor private func loadBurst(for item: PhotoItem) async {
@@ -2715,12 +2823,28 @@ private struct MobileMotionPlayerLayer: UIViewRepresentable {
     }
 }
 
-/// The small "LIVE" affordance shown on a Live Photo page - signals the press-and-hold-to-play interaction.
-private struct MobileLiveBadge: View {
+/// A small status badge on the media: "LIVE" signals the press-and-hold-to-play interaction of a Live Photo,
+/// "ORIGINAL" marks the shown original of an edited photo.
+private struct MobileViewerBadge: View {
+    let title: String
+    let systemImage: String
+    let accessibilityLabel: String
+
+    static var live: MobileViewerBadge {
+        MobileViewerBadge(
+            title: L10n.string("viewer.live_badge"), systemImage: "livephoto",
+            accessibilityLabel: L10n.string("viewer.live_photo_a11y"))
+    }
+    static var original: MobileViewerBadge {
+        MobileViewerBadge(
+            title: L10n.string("viewer.original_badge"), systemImage: "wand.and.rays.inverse",
+            accessibilityLabel: L10n.string("viewer.original_badge_a11y"))
+    }
+
     var body: some View {
         HStack(spacing: 4) {
-            Image(systemName: "livephoto")
-            Text(L10n.string("viewer.live_badge"))
+            Image(systemName: systemImage)
+            Text(title)
                 .font(.caption2.weight(.semibold))
         }
         .foregroundStyle(.white)
@@ -2728,6 +2852,6 @@ private struct MobileLiveBadge: View {
         .padding(.vertical, 4)
         .glassEffect(in: Capsule())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(L10n.string("viewer.live_photo_a11y"))
+        .accessibilityLabel(accessibilityLabel)
     }
 }

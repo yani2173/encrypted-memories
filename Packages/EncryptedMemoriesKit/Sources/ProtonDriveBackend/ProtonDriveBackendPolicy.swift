@@ -72,6 +72,12 @@ public enum ProtonDriveBackendFactory {
         store: SessionKeychainStore,
         policy: ProtonDriveBackendPolicy
     ) async throws -> ProtonClientFacade {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                return try await ProtonClientFacade.makeUpgradeTestFacade(
+                    accountUID: session.uid, keyPassword: session.keyPassword, policy: policy)
+            }
+        #endif
         let bridge = try await DriveSDKBridge(session: session, store: store, policy: policy)
         let accountDataDirectory = bridge.uploadManifestURL.deletingLastPathComponent()
         let sourceInventoryStore = LibrarySourceInventoryStore(

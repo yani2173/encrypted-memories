@@ -238,7 +238,7 @@ import Testing
         }
         #expect(fullInventoryPasses == 1)
         #expect(postInventoryProbes == 1)
-        #expect(store.load() == oldItems)
+        #expect(try store.load() == oldItems)
         #expect(store.validationToken() == oldToken)
 
         await #expect(throws: TimelineContinuityRecoveryPendingError.self) {
@@ -277,7 +277,7 @@ import Testing
         }
         #expect(fullInventoryPasses == 2)
         #expect(postInventoryProbes == 2)
-        #expect(store.load() == oldItems)
+        #expect(try store.load() == oldItems)
         #expect(store.validationToken() == oldToken)
 
         await #expect(throws: TimelineContinuityRecoveryPendingError.self) {
@@ -330,7 +330,7 @@ import Testing
         #expect(recovery.state?.qualifiedPassCount == 2)
 
         let reopened = try #require(TimelineMetadataStore(url: databaseURL))
-        #expect(reopened.load() == oldItems)
+        #expect(try reopened.load() == oldItems)
         #expect(reopened.validationToken() == oldToken)
 
         let retryInventory = try await recovery.fetchInventory(
@@ -361,7 +361,7 @@ import Testing
         #expect(postInventoryProbes == 4, "the failed final save must require a fresh post-list probe")
         #expect(recovery.state == nil)
         #expect(monitorCursor == recoveredToken)
-        #expect(reopened.load() == recoveredItems)
+        #expect(try reopened.load() == recoveredItems)
         #expect(reopened.validationToken() == recoveredToken)
         reopened.close()
     }

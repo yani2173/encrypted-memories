@@ -143,6 +143,44 @@ final class EditScenarioTests: XCTestCase {
         await harness.drain()
     }
 
+    func testTurningTheLiveEffectOffAndOnReplacesTheLivePhotoWithAStillAndBack() async throws {
+        let live = try await firstBackup(live: true)
+        let video = try XCTUnwrap(harness.library.snapshot.first?.pairedVideo)
+        let videoHash = EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: video)))
+        let liveTag: Set<Int> = [PhotoTag.livePhotos.rawValue]
+        func compound(of main: PhotoUID) throws -> (main: EditScenarioServer.Link, video: EditScenarioServer.Link) {
+            let links = harness.server.links
+            return (
+                try XCTUnwrap(links.first { $0.uid == main }),
+                try XCTUnwrap(links.first { $0.mainLinkID == main.nodeID && $0.contentHash == videoHash })
+            )
+        }
+        XCTAssertEqual(try compound(of: live).main.tags, liveTag)
+
+        harness.library.setLivePlaybackOff(true)
+        let off = try await edit("live-off-render")
+        await harness.drain()
+
+        XCTAssertEqual(harness.state(of: off), .completed)
+        XCTAssertEqual(harness.server.links.first { $0.uid == live }?.state, .trashed)
+        let still = try compound(of: try harness.liveMain())
+        XCTAssertEqual(still.main.tags, [], "a still photo carries no Live Photo tag")
+        XCTAssertEqual(still.video.tags, [], "the paired video stays a plain related file")
+        XCTAssertEqual(still.video.state, .active)
+        harness.assertCurrentManifest()
+
+        harness.library.setLivePlaybackOff(false)
+        let on = try await undo()
+        await harness.drain()
+
+        XCTAssertEqual(harness.state(of: on), .completed)
+        XCTAssertEqual(harness.server.links.first { $0.uid == still.main.uid }?.state, .trashed)
+        let liveAgain = try compound(of: try harness.liveMain())
+        XCTAssertEqual(liveAgain.main.tags, liveTag)
+        XCTAssertEqual(liveAgain.video.tags, liveTag)
+        harness.assertCurrentManifest()
+    }
+
     func testPersonTrashesLiveMainThenEditsNothingUploads() async throws {
         let main = try await firstBackup()
         harness.server.personTrash(main)

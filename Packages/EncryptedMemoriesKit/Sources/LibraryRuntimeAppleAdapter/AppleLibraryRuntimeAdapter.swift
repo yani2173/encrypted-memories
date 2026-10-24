@@ -102,17 +102,46 @@ public final class AppleLibraryRuntimeAdapter {
     }
 
     private func installNetworkMonitor() {
-        networkMonitor.pathUpdateHandler = { [weak self] path in
-            let state = LibraryNetworkState(
-                isReachable: path.status == .satisfied,
-                isConstrained: path.isConstrained,
-                isExpensive: path.isExpensive
-            )
-            Task { @MainActor [weak self] in
-                self?.runtimeState.update { $0.network = state }
-            }
+        // The state is lock-protected. Updating it here, in path order, keeps a busy main thread (for example while
+        // the app returns to the foreground) from letting the backup read the previous network.
+        let runtimeState = runtimeState
+        networkMonitor.pathUpdateHandler = { path in
+            let state = LibraryNetworkState(path: Self.networkPath(path))
+            runtimeState.update { $0.network = state }
         }
         networkMonitor.start(queue: networkQueue)
+    }
+
+    private nonisolated static func networkPath(_ path: NWPath) -> LibraryNetworkPath {
+        LibraryNetworkPath(
+            isSatisfied: path.status == .satisfied,
+            isConstrained: path.isConstrained,
+            isExpensive: path.isExpensive,
+            usedInterfaces: Set(
+                LibraryNetworkInterfaceKind.allCases.filter { path.usesInterfaceType(interfaceType(for: $0)) }),
+            availableInterfaces: Set(path.availableInterfaces.map { interfaceKind(for: $0.type) })
+        )
+    }
+
+    private nonisolated static func interfaceKind(for type: NWInterface.InterfaceType) -> LibraryNetworkInterfaceKind {
+        switch type {
+        case .wifi: .wifi
+        case .cellular: .cellular
+        case .wiredEthernet: .wiredEthernet
+        case .loopback: .loopback
+        case .other: .other
+        @unknown default: .other
+        }
+    }
+
+    private nonisolated static func interfaceType(for kind: LibraryNetworkInterfaceKind) -> NWInterface.InterfaceType {
+        switch kind {
+        case .wifi: .wifi
+        case .cellular: .cellular
+        case .wiredEthernet: .wiredEthernet
+        case .loopback: .loopback
+        case .other: .other
+        }
     }
 
     private func installMemoryPressureSource() {
@@ -216,11 +245,10 @@ public final class AppleLibraryRuntimeAdapter {
 /// Merges observed pressure independently from proactive background cache reduction.
 /// A UIKit warning retains purge-now semantics in every execution opportunity.
 public enum AppleRuntimeMemoryPolicy {
-    /// Background activity affects cache budgets, not observed pressure. Keep the argument for source compatibility.
+    /// Background activity affects cache budgets, not observed pressure.
     public static func pressure(
         dispatchPressure: MemoryConditions.Pressure,
-        memoryWarningLatched: Bool,
-        isBackgrounded _: Bool
+        memoryWarningLatched: Bool
     ) -> MemoryConditions.Pressure {
         memoryWarningLatched ? .critical : dispatchPressure
     }
@@ -236,8 +264,7 @@ public enum AppleRuntimeMemoryPolicy {
         return MemoryConditions(
             pressure: pressure(
                 dispatchPressure: dispatchPressure,
-                memoryWarningLatched: memoryWarningLatched,
-                isBackgrounded: isBackgrounded
+                memoryWarningLatched: memoryWarningLatched
             ),
             thermal: thermal,
             lowPowerMode: lowPowerMode,

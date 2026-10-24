@@ -4,7 +4,7 @@ import PhotosCore
 
 /// `AlbumWriteBackend` over the app's direct-HTTP album operations.
 ///
-/// SDK 0.29.1 owns listing, sharing and membership reads. This adapter intentionally contains
+/// SDK 0.31.1 owns listing, sharing and membership reads. This adapter intentionally contains
 /// only the write contracts still absent from the SDK.
 struct HTTPAlbumWriteBackend: AlbumWriteBackend {
     /// Supplied by the bridge: PUT the album's cover to an already-uploaded photo (cleartext LinkID, no crypto).

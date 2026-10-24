@@ -88,7 +88,7 @@
       "comment": "Shown when a registered backup folder cannot be read. %@ is the affected name.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Backup stopped because %@ could not be read. Check its permissions and try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung wurde beendet, weil %@ nicht gelesen werden konnte. Prüfen Sie die Berechtigungen und versuchen Sie es erneut." } }
+        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung wurde beendet, weil %@ nicht gelesen werden konnte. Prüfe die Berechtigungen und versuche es erneut." } }
       }
     },
     "settings.backup_folder_error_missing %@": {
@@ -96,7 +96,7 @@
       "comment": "Shown when a registered backup folder or child disappears. %@ is the affected name.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Backup stopped because %@ is no longer available. Select the folder again and retry." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung wurde beendet, weil %@ nicht mehr verfügbar ist. Wählen Sie den Ordner erneut aus und versuchen Sie es noch einmal." } }
+        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung wurde beendet, weil %@ nicht mehr verfügbar ist. Wähle den Ordner erneut aus und versuche es noch einmal." } }
       }
     },
     "settings.backup_folder_error_transient %@": {
@@ -104,7 +104,7 @@
       "comment": "Shown for another file-system error during folder backup. %@ is the affected name.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Backup could not finish reading %@. Try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung konnte %@ nicht vollständig lesen. Versuchen Sie es erneut." } }
+        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung konnte %@ nicht vollständig lesen. Versuche es erneut." } }
       }
     },
     "settings.backup_status_section": {
@@ -265,23 +265,6 @@
         }
       }
     },
-    "action.refresh": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Refresh"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Aktualisieren"
-          }
-        }
-      }
-    },
     "login.tagline": {
       "extractionState": "manual",
       "comment": "Product tagline under the app name on the login screen.",
@@ -295,7 +278,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ihre Fotos, Ende-zu-Ende-verschlüsselt."
+            "value": "Deine Fotos, Ende-zu-Ende-verschlüsselt."
           }
         }
       }
@@ -313,7 +296,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Öffnet Ihren Browser zur sicheren Anmeldung. In dieser App wird niemals ein Passwort eingegeben."
+            "value": "Öffnet deinen Browser zur sicheren Anmeldung. In dieser App wird niemals ein Passwort eingegeben."
           }
         }
       }
@@ -331,7 +314,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ihre Mediathek wird aufgebaut …"
+            "value": "Deine Mediathek wird aufgebaut …"
           }
         }
       }
@@ -349,7 +332,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ihre Mediathek konnte nicht geöffnet werden"
+            "value": "Deine Mediathek konnte nicht geöffnet werden"
           }
         }
       }
@@ -748,7 +731,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Upload abgeschlossen, aber die Mediathek hat ihn noch nicht indexiert. Verwenden Sie „Mediathek aktualisieren“."
+            "value": "Upload abgeschlossen, aber die Mediathek hat ihn noch nicht indexiert. Verwende „Mediathek aktualisieren“."
           }
         }
       }
@@ -1293,24 +1276,6 @@
         }
       }
     },
-    "settings.diagnostics_tab": {
-      "extractionState": "manual",
-      "comment": "Settings tab label for cache and library diagnostics.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Diagnostics"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Diagnose"
-          }
-        }
-      }
-    },
     "settings.offline_library_toggle": {
       "extractionState": "manual",
       "comment": "Toggle label.",
@@ -1491,42 +1456,6 @@
         }
       }
     },
-    "settings.coverage_section": {
-      "extractionState": "manual",
-      "comment": "Developer-tab section header.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Coverage"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Abdeckung"
-          }
-        }
-      }
-    },
-    "settings.prefetch_section": {
-      "extractionState": "manual",
-      "comment": "Developer-tab section header.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Prefetch"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Prefetch"
-          }
-        }
-      }
-    },
     "settings.storage_section": {
       "extractionState": "manual",
       "comment": "Settings section header for Proton storage quota.",
@@ -1541,240 +1470,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Speicher"
-          }
-        }
-      }
-    },
-    "settings.dev_total_assets": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Total assets"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Assets gesamt"
-          }
-        }
-      }
-    },
-    "settings.dev_metadata_rows": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Metadata rows"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Metadaten-Zeilen"
-          }
-        }
-      }
-    },
-    "settings.dev_thumbnails_on_disk": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Thumbnails on disk"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Thumbnails auf Disk"
-          }
-        }
-      }
-    },
-    "settings.dev_thumbnails_missing": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Thumbnails missing"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Thumbnails fehlend"
-          }
-        }
-      }
-    },
-    "settings.dev_disk_coverage": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Disk coverage"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Disk-Abdeckung"
-          }
-        }
-      }
-    },
-    "settings.dev_ram_decoded": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "RAM decoded (≤)"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "RAM dekodiert (≤)"
-          }
-        }
-      }
-    },
-    "settings.dev_prefetch_queue": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Prefetch queue"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Prefetch-Warteschlange"
-          }
-        }
-      }
-    },
-    "settings.dev_active_prefetch": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Active prefetch jobs"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Aktive Prefetch-Jobs"
-          }
-        }
-      }
-    },
-    "settings.dev_prefetch_pause_reason": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Prefetch pause reason"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Prefetch-Pause-Grund"
-          }
-        }
-      }
-    },
-    "settings.dev_failed_thumbnails": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed thumbnails"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Fehlgeschlagene Thumbnails"
-          }
-        }
-      }
-    },
-    "settings.dev_cache_size_disk": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Cache size (disk)"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Cache-Größe (Disk)"
-          }
-        }
-      }
-    },
-    "settings.dev_preview_cache_disk": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Preview cache (disk)"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Vorschau-Cache (Disk)"
-          }
-        }
-      }
-    },
-    "settings.dev_last_error": {
-      "extractionState": "manual",
-      "comment": "Developer-tab metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Last error"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Letzter Fehler"
           }
         }
       }
@@ -1901,24 +1596,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ausschalten & löschen"
-          }
-        }
-      }
-    },
-    "settings.dev_originals_cache_disk": {
-      "extractionState": "manual",
-      "comment": "Library-info metric label.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Originals cache (disk)"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Originale-Cache (Disk)"
           }
         }
       }

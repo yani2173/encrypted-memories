@@ -3,7 +3,9 @@
 
 require "minitest/autorun"
 require "tmpdir"
+require "open3"
 require_relative "release_contract"
+require_relative "test_release_upgrade_workflow"
 
 class GitHubReleaseContractTest < Minitest::Test
   def payload(tag: "v1.2.0", prerelease: false, body: valid_body)
@@ -46,6 +48,51 @@ class GitHubReleaseContractTest < Minitest::Test
 
       assert_equal "1.2.0", release.version
       assert_equal "testflight", release.channel
+    end
+  end
+
+  def test_published_shipping_metadata_matches_the_prechange_golden_values
+    # Derived from 059b1001: capture the tag's numeric version; IDs above 383102208
+    # become the Apple build unchanged. These IDs were checked against published releases.
+    golden = [
+      ["v1.1.0-beta.3", 408_645_166, "1.1.0", "408645166"],
+      ["v1.1.0-beta.2", 406_396_439, "1.1.0", "406396439"],
+      ["v1.0.5", 397_223_379, "1.0.5", "397223379"],
+      ["v1.0.5-beta.3", 397_183_579, "1.0.5", "397183579"]
+    ]
+    baseline = "059b1001591cac5a31d858bace98d23482950510"
+    Dir.mktmpdir do |directory|
+      %w[release_contract.rb release_build_number.rb].each do |name|
+        content, status = Open3.capture2("git", "show", "#{baseline}:.github/scripts/#{name}")
+        assert status.success?, "The immutable prechange release code must be available"
+        File.binwrite(File.join(directory, name), content)
+      end
+      script = <<~CODE
+        require "json"
+        payload = JSON.parse($stdin.read)
+        version = GitHubReleaseContract.parse(payload).version
+        build = AppleReleaseBuildNumber.for_release(ARGV.fetch(0), payload)
+        print JSON.generate({ "version" => version, "build_number" => build })
+      CODE
+      golden.each do |tag, id, version, build|
+        sha, status = Open3.capture2("git", "rev-parse", "#{tag}^{commit}")
+        assert status.success?, "Published release tag #{tag} must be available"
+        data = payload(tag: tag, prerelease: tag.include?("-")).merge("id" => id)
+        expected = JSON.generate({ "version" => version, "build_number" => build }).b
+        before, status = Open3.capture2("ruby", "-r", File.join(directory, "release_contract.rb"),
+          "-r", File.join(directory, "release_build_number.rb"), "-e", script, sha.strip,
+          stdin_data: JSON.generate(data))
+        assert status.success?, "The original shipping derivation must succeed for #{tag}"
+        assert_equal expected, before.b, "Prechange shipping metadata must match the golden values for #{tag}"
+
+        release = GitHubReleaseContract.parse(data)
+        shipping_build = AppleReleaseBuildNumber.for_release(sha.strip, data)
+        after = JSON.generate({ "version" => release.version, "build_number" => shipping_build }).b
+        assert_equal expected, after, "Shipping metadata must remain byte-identical for #{tag}"
+        metadata = GitHubReleaseIdentity.metadata(sha.strip, data)
+        assert_equal version, metadata.fetch("version"), "Probe version must match shipping for #{tag}"
+        assert_equal build, metadata.fetch("build_number"), "Probe build must match shipping for #{tag}"
+      end
     end
   end
 
