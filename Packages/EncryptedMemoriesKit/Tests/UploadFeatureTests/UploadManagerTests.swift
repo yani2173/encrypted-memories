@@ -124,6 +124,36 @@ private final class CancellationAwareAlbumResolver: AlbumAttaching, @unchecked S
     func setCover(albumID: String, photo: PhotoUID) async throws {}
 }
 
+/// Holds each album request until every participant made one, so every upload records its UID before an album
+/// request returns.
+private final class BarrierAlbumAttaching: AlbumAttaching, @unchecked Sendable {
+    private let barrier: UploadTestBarrier
+    private let lock = NSLock()
+    private var _added: [PhotoUID] = []
+    private var _covers: [PhotoUID] = []
+
+    init(participantCount: Int) {
+        barrier = UploadTestBarrier(participantCount: participantCount)
+    }
+
+    var added: [PhotoUID] { lock.withLock { _added } }
+    var covers: [PhotoUID] { lock.withLock { _covers } }
+
+    func resolveAlbum(for target: UploadDestination.Target) async throws -> String? {
+        guard case .existingAlbum(let id, _) = target else { return nil }
+        return id
+    }
+
+    func addPhoto(_ uid: PhotoUID, to albumID: String) async throws {
+        await barrier.arriveAndWait()
+        lock.withLock { _added.append(uid) }
+    }
+
+    func setCover(albumID: String, photo: PhotoUID) async throws {
+        lock.withLock { _covers.append(photo) }
+    }
+}
+
 /// Waits for a latch and reports whether it fired before `timeout`. The timeout only bounds a failing run.
 private func waitForSignal(_ latch: UploadManagerTestLatch, timeout: Duration = .seconds(5)) async -> Bool {
     let timeouts = UploadChangeCounter()
@@ -746,6 +776,24 @@ final class UploadManagerTests: XCTestCase {
         _ = await waitForAllTerminal(manager)
         XCTAssertEqual(albums.coversSnapshot.count, 1)
         XCTAssertEqual(albums.coversSnapshot.first?.1, testUID("a.jpg"))
+    }
+
+    /// Both uploads record their UIDs before either album request returns, as with parallel uploads of
+    /// similar size. A cover decided after the album request saw the other upload in both items, so none set it.
+    func testFirstUploadedCoverIsSetOnceWhenConcurrentUploadsFinishTogether() async throws {
+        let (_, urls) = try jpegs(["a", "b"])
+        let uploader = MockUploader(deliverProgress: false)
+        let albums = BarrierAlbumAttaching(participantCount: 2)
+        let manager = UploadManager(uploader: uploader, albums: albums, maxConcurrent: 2)
+        let dest = UploadDestination(target: .existingAlbum(id: "alb", title: "T"), cover: .firstUploaded)
+
+        await manager.enqueueFiles(urls, destination: dest)
+        let items = await waitForAllTerminal(manager)
+
+        XCTAssertEqual(items.map(\.state), [.completed, .completed])
+        XCTAssertEqual(albums.added.count, 2)
+        XCTAssertEqual(albums.covers.count, 1, "exactly one of the concurrent uploads sets the cover")
+        XCTAssertTrue(albums.covers.allSatisfy { [testUID("a.jpg"), testUID("b.jpg")].contains($0) })
     }
 
     func testSpecificCoverPhoto() async throws {

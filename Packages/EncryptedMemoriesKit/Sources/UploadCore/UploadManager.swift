@@ -68,6 +68,8 @@ public actor UploadManager: UploadManaging {
         var settlementRecord: UploadManualSettlementRecord?
         var remoteCommitReceipt: UploadRemoteCommitReceipt?
         var resolvedAlbumID: String?
+        /// Whether this item sets the album cover for `.firstUploaded`. Nil until the item decided it.
+        var claimsFirstUploadedCover: Bool? = nil
         var task: Task<Void, Never>?
         var controlTask: Task<Void, Never>? = nil
         var controlID: UUID? = nil
@@ -557,6 +559,7 @@ public actor UploadManager: UploadManaging {
         do {
             try await attachToAlbum(
                 record.uploadedUID,
+                of: record.queueItemID,
                 albumID: albumID,
                 cover: record.destination.cover.destinationCover
             )
@@ -871,7 +874,8 @@ public actor UploadManager: UploadManaging {
             if let albumID = jobs[id]?.resolvedAlbumID {
                 transition(id, to: .finalizing)
                 do {
-                    try await attachToAlbum(uploadedUID, albumID: albumID, cover: jobs[id]?.destination.cover)
+                    try await attachToAlbum(
+                        uploadedUID, of: id, albumID: albumID, cover: jobs[id]?.destination.cover)
                 } catch {
                     // The photo upload succeeded, but the album step failed. Keep the partial-success state.
                     markPartialFailure(id, message: message(error))
@@ -953,20 +957,34 @@ public actor UploadManager: UploadManaging {
         }
     }
 
-    private func attachToAlbum(_ uid: PhotoUID, albumID: String, cover: UploadDestination.Cover?) async throws {
+    private func attachToAlbum(
+        _ uid: PhotoUID,
+        of id: UploadQueueItemID,
+        albumID: String,
+        cover: UploadDestination.Cover?
+    ) async throws {
         guard let albums else { throw UploadError.albumStep("no album backend") }
+        // Decided before the album request: while it runs, other uploads of this album can record their UIDs.
+        let setsFirstUploadedCover =
+            cover == .firstUploaded && claimsFirstUploadedCover(id, uid: uid, albumID: albumID)
         try await albums.addPhoto(uid, to: albumID)
         switch cover {
-        case .firstUploaded:
-            // Set cover to the first item (lowest ordinal) that has uploaded in this album.
-            if isFirstUploadedInAlbum(uid, albumID: albumID) {
-                try? await albums.setCover(albumID: albumID, photo: uid)
-            }
+        case .firstUploaded where setsFirstUploadedCover:
+            try? await albums.setCover(albumID: albumID, photo: uid)
         case .specific(let coverUID) where coverUID == uid:
             try? await albums.setCover(albumID: albumID, photo: uid)
         default:
             break
         }
+    }
+
+    /// Whether `id` is the first item of `albumID` that uploaded. Each item decides once: `setUploadedUID` decides
+    /// when the upload returns, and an item restored from a durable settlement decides before its album request.
+    private func claimsFirstUploadedCover(_ id: UploadQueueItemID, uid: PhotoUID, albumID: String) -> Bool {
+        if let decided = jobs[id]?.claimsFirstUploadedCover { return decided }
+        let decided = isFirstUploadedInAlbum(uid, albumID: albumID)
+        jobs[id]?.claimsFirstUploadedCover = decided
+        return decided
     }
 
     private func isFirstUploadedInAlbum(_ uid: PhotoUID, albumID: String) -> Bool {
@@ -1058,6 +1076,11 @@ public actor UploadManager: UploadManaging {
 
     private func setUploadedUID(_ id: UploadQueueItemID, _ uid: PhotoUID) {
         jobs[id]?.item.uploadedUID = uid
+        // Decide the first-uploaded cover in the same actor step that records the UID. Decided after the album
+        // request, concurrent uploads of one album would each see the others' UIDs, and none would set the cover.
+        if jobs[id]?.destination.cover == .firstUploaded, let albumID = jobs[id]?.resolvedAlbumID {
+            _ = claimsFirstUploadedCover(id, uid: uid, albumID: albumID)
+        }
     }
 
     private func emitCompletedUpload(_ id: UploadQueueItemID) {
@@ -1315,6 +1338,7 @@ public actor UploadManager: UploadManaging {
         jobs[id]?.cancellationRequested = false
         jobs[id]?.item.state = .queued
         jobs[id]?.item.uploadedUID = nil
+        jobs[id]?.claimsFirstUploadedCover = nil
         notify()
         let controlID = UUID()
         let resolver = identityResolver
@@ -1343,7 +1367,7 @@ public actor UploadManager: UploadManaging {
         controlID: UUID
     ) async {
         do {
-            try await attachToAlbum(uid, albumID: albumID, cover: cover)
+            try await attachToAlbum(uid, of: id, albumID: albumID, cover: cover)
             guard jobs[id]?.generation == generation,
                 jobs[id]?.retryRequested == true
             else {

@@ -79,6 +79,7 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
             "ResourcePermit",
             [
                 "action": "acquire",
+                "active": "2",
                 "workload": "mlInference",
                 "uid": "secret-asset",
                 "filename": "secret.jpg",
@@ -95,6 +96,7 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
             snapshot.events.first?.fields,
             [
                 "action": "acquire",
+                "active": "2",
                 "workload": "mlInference",
             ])
         XCTAssertEqual(snapshot.counters, ["timeline.refresh.applied": 1])

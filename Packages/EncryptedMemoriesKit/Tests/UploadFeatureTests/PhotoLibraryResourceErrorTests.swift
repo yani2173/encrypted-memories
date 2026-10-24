@@ -124,7 +124,10 @@ final class PhotoLibraryResourceErrorTests: XCTestCase {
             now: { clock.value },
             cancelRequest: { cancellations.record($0) }
         )
-        let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())
+        // In the background backup preparation runs alone, so the following permit waits for the stalled one.
+        let coordinator = LibraryResourceCoordinator(
+            runtimeState: LibraryRuntimeState(
+                initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted)))
         let work = LibraryWorkRequest(
             workload: .backupMaterialization,
             intent: .automatic,

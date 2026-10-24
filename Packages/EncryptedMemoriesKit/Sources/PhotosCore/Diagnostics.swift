@@ -619,7 +619,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
             ]
         case "ResourcePermit":
             allowedFields = [
-                "action", "durationMs", "intent", "mode", "policyAdmitted", "reason",
+                "action", "active", "durationMs", "intent", "mode", "policyAdmitted", "reason",
                 "waitMs", "workload", "yieldReason",
             ]
         case "MLIndexQuantum":

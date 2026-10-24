@@ -17,6 +17,15 @@ public enum LibraryHeavyWorkload: String, Sendable, Equatable {
         case .mlModelLoading, .mlInference, .backupHashing, .backupMaterialization, .cryptoPreparation: false
         }
     }
+
+    /// Backup preparation mostly waits for PhotoKit reads and iCloud downloads, so a few photos may prepare at once.
+    /// Every other workload holds admission alone.
+    var sharesAdmission: Bool {
+        switch self {
+        case .backupMaterialization, .backupHashing: true
+        case .mlModelLoading, .mlInference, .mlIndexing, .cryptoPreparation, .videoDerivative: false
+        }
+    }
 }
 
 public enum LibraryWorkIntent: Int, Sendable, Comparable, Equatable {
@@ -92,6 +101,8 @@ public struct LibraryWorkBudget: Sendable, Equatable {
     public var internalParallelism: Int
     public var maxItemsPerQuantum: Int
     public var maximumWallTime: Duration?
+    /// The most permits that may hold admission together with this one, this one included. One means it runs alone.
+    public var concurrentPermits: Int
     public var memoryTier: MemoryBudgetTier
     public var reason: LibraryWorkPolicyReason
     public var snapshotGeneration: UInt64
@@ -101,6 +112,7 @@ public struct LibraryWorkBudget: Sendable, Equatable {
         internalParallelism: Int,
         maxItemsPerQuantum: Int,
         maximumWallTime: Duration? = nil,
+        concurrentPermits: Int = 1,
         memoryTier: MemoryBudgetTier,
         reason: LibraryWorkPolicyReason,
         snapshotGeneration: UInt64
@@ -109,6 +121,7 @@ public struct LibraryWorkBudget: Sendable, Equatable {
         self.internalParallelism = max(0, internalParallelism)
         self.maxItemsPerQuantum = max(0, maxItemsPerQuantum)
         self.maximumWallTime = maximumWallTime.flatMap { $0 > .zero ? $0 : nil }
+        self.concurrentPermits = max(0, concurrentPermits)
         self.memoryTier = memoryTier
         self.reason = reason
         self.snapshotGeneration = snapshotGeneration
@@ -203,7 +216,8 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
             _ reason: LibraryWorkPolicyReason,
             honorsDemand: Bool = false,
             maximumParallelism: Int = 1,
-            maximumWallTime: Duration? = nil
+            maximumWallTime: Duration? = nil,
+            concurrentPermits: Int = 1
         ) -> LibraryWorkBudget {
             let demand = honorsDemand ? request.demand : nil
             return LibraryWorkBudget(
@@ -215,10 +229,21 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
                 maximumWallTime: admitted
                     ? Self.shorter(demand?.maximumWallTime, maximumWallTime)
                     : nil,
+                concurrentPermits: admitted ? concurrentPermits : 0,
                 memoryTier: snapshot.memoryBudgetTier,
                 reason: reason,
                 snapshotGeneration: snapshot.generation
             )
+        }
+
+        // Backup preparation shares admission only in the foreground with full memory budgets: three photos at
+        // nominal and two at fair thermal pressure. Serious pressure, Low Power Mode and the background keep one.
+        func sharedPermits(_ limit: Int) -> Int {
+            guard request.workload.sharesAdmission, snapshot.memoryBudgetTier == .normal else { return 1 }
+            switch snapshot.executionOpportunity {
+            case .foregroundActive, .foregroundInactive: return limit
+            case .backgroundPermitted, .suspended: return 1
+            }
         }
 
         if snapshot.executionOpportunity == .suspended {
@@ -284,7 +309,8 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
                 request.intent >= .userInitiated ? 2 : 1,
                 .fairPressure,
                 honorsDemand: request.workload == .mlIndexing,
-                maximumWallTime: request.workload == .mlIndexing ? .milliseconds(500) : nil
+                maximumWallTime: request.workload == .mlIndexing ? .milliseconds(500) : nil,
+                concurrentPermits: sharedPermits(2)
             )
         }
         if request.workload == .mlIndexing, request.intent == .automatic, request.demand != nil {
@@ -303,7 +329,7 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
             case .automatic: 2
             case .maintenance: 1
             }
-        return result(true, items, .nominal)
+        return result(true, items, .nominal, concurrentPermits: sharedPermits(3))
     }
 
     private static func shorter(_ lhs: Duration?, _ rhs: Duration?) -> Duration? {
@@ -453,7 +479,8 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
 }
 
 /// Admission owner for CPU/RAM-heavy local work. It never owns feature jobs or network transfers.
-/// A scoped permit plus a single active slot prevents cancellation/error paths from leaking admission.
+/// A scoped permit that releases its own slot prevents cancellation/error paths from leaking admission.
+/// Each permit runs alone unless its budget lets backup preparation share admission.
 public actor LibraryResourceCoordinator {
     public static let shared = LibraryResourceCoordinator(runtimeState: .shared)
 
@@ -482,7 +509,7 @@ public actor LibraryResourceCoordinator {
     private let monotonicNow: @Sendable () -> UInt64
     private let preemptionSignal = LibraryWorkPreemptionSignal()
     private var waiters: [Waiter] = []
-    private var activePermit: ActivePermit?
+    private var activePermits: [UUID: ActivePermit] = [:]
     private var sequence: UInt64 = 0
     private var observedSnapshot: LibraryRuntimeSnapshot
     private var effectiveSnapshot: LibraryRuntimeSnapshot
@@ -581,7 +608,7 @@ public actor LibraryResourceCoordinator {
                         request: request, enqueuedAt: monotonicNow(),
                         hasRecordedPolicyPause: false, continuation: continuation
                     ))
-                if let activePermit, request.intent > activePermit.request.intent {
+                if activePermits.values.contains(where: { request.intent > $0.request.intent }) {
                     preemptionSignal.signal()
                 }
                 admitNextIfPossible()
@@ -599,14 +626,14 @@ public actor LibraryResourceCoordinator {
     }
 
     private func release(id: UUID) {
-        guard let permit = activePermit, permit.id == id else { return }
-        activePermit = nil
+        guard let permit = activePermits.removeValue(forKey: id) else { return }
         collectedMetrics.permitsReleased += 1
         let duration = Self.milliseconds(from: permit.acquiredAt, to: monotonicNow())
         PhotoDiagnostics.shared.emit(
             "ResourcePermit",
             [
                 "action": "release",
+                "active": "\(activePermits.count)",
                 "durationMs": "\(duration)",
                 "intent": String(describing: permit.request.intent),
                 "reason": permit.budget.reason.rawValue,
@@ -616,8 +643,17 @@ public actor LibraryResourceCoordinator {
         admitNextIfPossible()
     }
 
+    /// The smallest limit of the running permits. A permit that runs alone stops admission, as the single slot did.
+    private var runningPermitLimit: Int { activePermits.values.map(\.budget.concurrentPermits).min() ?? .max }
+
     private func admitNextIfPossible() {
-        guard activePermit == nil, !waiters.isEmpty else { return }
+        while activePermits.count < runningPermitLimit, admitNextWaiter() {}
+    }
+
+    /// Admits the first waiter in priority order that the policy admits, and returns whether the queue changed.
+    /// That waiter holds back every waiter behind it until it fits beside the running permits, so shared backup
+    /// permits cannot starve exclusive or higher-priority work.
+    private func admitNextWaiter() -> Bool {
         let ordered = waiters.indices.sorted {
             let lhs = waiters[$0]
             let rhs = waiters[$1]
@@ -629,8 +665,7 @@ public actor LibraryResourceCoordinator {
             if candidate.generation != effectiveSnapshot.generation {
                 waiters.remove(at: index)
                 candidate.continuation.resume(throwing: CancellationError())
-                admitNextIfPossible()
-                return
+                return true
             }
             let budget = budget(for: candidate.request)
             guard budget.isAdmitted else {
@@ -640,6 +675,7 @@ public actor LibraryResourceCoordinator {
                 }
                 continue
             }
+            guard activePermits.count < budget.concurrentPermits else { return false }
             waiters.remove(at: index)
             let now = monotonicNow()
             let leaseState = LibraryWorkLeaseState(
@@ -651,7 +687,7 @@ public actor LibraryResourceCoordinator {
                 acquiredAt: now,
                 monotonicNow: monotonicNow
             )
-            activePermit = ActivePermit(
+            activePermits[candidate.id] = ActivePermit(
                 id: candidate.id,
                 request: candidate.request,
                 budget: budget,
@@ -659,13 +695,15 @@ public actor LibraryResourceCoordinator {
                 acquiredAt: now
             )
             collectedMetrics.permitsAcquired += 1
-            collectedMetrics.maximumConcurrentPermits = max(collectedMetrics.maximumConcurrentPermits, 1)
+            collectedMetrics.maximumConcurrentPermits = max(
+                collectedMetrics.maximumConcurrentPermits, activePermits.count)
             let wait = Self.milliseconds(from: candidate.enqueuedAt, to: now)
             collectedMetrics.maximumWaitMilliseconds = max(collectedMetrics.maximumWaitMilliseconds, wait)
             PhotoDiagnostics.shared.emit(
                 "ResourcePermit",
                 [
                     "action": candidate.hasRecordedPolicyPause ? "resume" : "acquire",
+                    "active": "\(activePermits.count)",
                     "intent": String(describing: candidate.request.intent),
                     "reason": budget.reason.rawValue,
                     "waitMs": "\(wait)",
@@ -678,8 +716,9 @@ public actor LibraryResourceCoordinator {
                     decision: { leaseState.decision() },
                     runtimeSnapshot: { runtimeState.snapshot() }
                 ))
-            return
+            return true
         }
+        return false
     }
 
     private func observe(_ snapshot: LibraryRuntimeSnapshot) {
