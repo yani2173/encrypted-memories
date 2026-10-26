@@ -414,11 +414,16 @@ public actor PendingBackupCoordinator {
     /// photo that a delete moved to the Proton trash comes back as well.
     @discardableResult
     public func restore(_ uids: [PhotoUID]) async -> Bool {
+        await restore(uids.compactMap(PendingSourceKey.init(localUID:)), restoredRemoteLinkIDs: [])
+    }
+
+    private func restore(_ keys: [PendingSourceKey], restoredRemoteLinkIDs: Set<String>) async -> Bool {
         guard !closed else { return false }
-        let keys = uids.compactMap(PendingSourceKey.init(localUID:))
         guard !keys.isEmpty else { return true }
         for key in keys { _ = nextActionToken(for: key) }
-        guard let states = store.include(keys, at: now()) else { return false }
+        guard let states = store.include(keys, restoredRemoteLinkIDs: restoredRemoteLinkIDs, at: now()) else {
+            return false
+        }
         // Only the person's return starts a new attempt; a queue reload cannot clear the block.
         for key in keys { recorder?.replacementLedger.readmit(key) }
         excludedMissing.subtract(keys)
@@ -431,7 +436,7 @@ public actor PendingBackupCoordinator {
     }
 
     /// Restores the sources behind Proton photos that the person restored from the Proton trash, when a
-    /// pending delete had moved them there.
+    /// pending delete had moved them there. Those photos are out of the trash already and are not restored again.
     public func restoreSources(ofRemote uids: [PhotoUID]) async {
         let linkIDs = Set(uids.map(\.nodeID))
         // The earlier upload of a deleted edit can have no handoff left; the delete recorded it as its photo.
@@ -441,7 +446,7 @@ public actor PendingBackupCoordinator {
         let keys = Set(store.handoffs(forRemoteLinkIDs: Array(linkIDs)).map(\.key) + deleted)
             .filter { sourceStates[$0]?.desired == .excluded }
         guard !keys.isEmpty else { return }
-        await restore(keys.map(\.localUID))
+        _ = await restore(Array(keys), restoredRemoteLinkIDs: linkIDs)
     }
 
     /// "Endgültig löschen" / "Papierkorb leeren": the entries leave "Zuletzt gelöscht", the photos stay

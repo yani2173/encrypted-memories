@@ -291,11 +291,12 @@ public final class PendingGridSession {
     public func restore(_ uids: [PhotoUID]) async -> Bool { await coordinator.restore(uids) }
 
     /// The person restored these Proton photos from the trash. They show at once, also when an edit's
-    /// replacement hid them while the listing still returned them.
-    public func photosRestored(_ uids: [PhotoUID]) { presenter.showRestored(uids) }
-
-    /// A Proton photo came back from the trash; a pending delete that trashed it is undone as well.
-    public func restoreSources(ofRemote uids: [PhotoUID]) async { await coordinator.restoreSources(ofRemote: uids) }
+    /// replacement hid them while the listing still returned them. A local photo whose delete moved one of them there
+    /// returns to the backup.
+    public func photosRestored(_ uids: [PhotoUID]) async {
+        presenter.showRestored(uids)
+        await coordinator.restoreSources(ofRemote: uids)
+    }
 
     @discardableResult
     public func removeFromTrashList(_ uids: [PhotoUID]) async -> Bool { await coordinator.removeFromTrashList(uids) }

@@ -76,7 +76,7 @@ import UploadCore
         model.installIsolatedDuplicatesForTesting(MobileFixtureDuplicates(groups: []))
         let controller = PhotoLibraryBackupController(
             configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: PendingBackend(), uploader: PendingBackend(), pendingStore: store,
+            identityResolver: MobilePendingTestBackend(), uploader: MobilePendingTestBackend(), pendingStore: store,
             requiresPendingStore: true)
         do {
             #expect(controller.installPausedBackupFixtureForTesting())
@@ -146,25 +146,6 @@ import UploadCore
         func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
             await base.merge(requests)
         }
-    }
-
-    private struct PendingBackend: PhotoUploading, UploadIdentityResolving {
-        let capabilities = UploadBackendCapabilities(
-            canUpload: true, supportsCancel: true, supportsPauseResume: false, supportsResumeAcrossRelaunch: false)
-        func upload(
-            _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
-        ) async throws -> PhotoUID { throw CancellationError() }
-        func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
-            throw CancellationError()
-        }
-        func cancel(token: UUID) async {}
-        func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
-            throw CancellationError()
-        }
-        func recordUploaded(
-            _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String,
-            remoteLinkID: String
-        ) async throws { throw CancellationError() }
     }
 
     private struct PendingRemote: PendingRemoteEffects {

@@ -1187,6 +1187,47 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(effects.order.suffix(2), ["restore", "return"])
     }
 
+    /// The person restored the Proton photo of a deleted photo from the Proton trash. The local photo returns to the
+    /// backup without a second Proton restore, and restoring the same photo again changes nothing (#829).
+    func testARestoreFromTheProtonTrashReturnsTheLocalPhotoToTheBackupOnce() async throws {
+        let remote = try await deleteAnUploadedPhoto("back")
+
+        await coordinator.restoreSources(ofRemote: [remote])
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertTrue(effects.restored.isEmpty, "the photo is out of the Proton trash already")
+        XCTAssertEqual(effects.returned, [[key("back")]], "the local photo returns to the backup once")
+        XCTAssertNotEqual(store.sourceState(for: key("back"))?.desired, .excluded)
+    }
+
+    /// A restore from the Proton trash that cannot read the stored state leaves the local photo excluded (#829).
+    func testARestoreFromTheProtonTrashThatCannotReadTheStateKeepsThePhotoExcluded() async throws {
+        let remote = try await deleteAnUploadedPhoto("back")
+        let failure = KeyedReadFailure()
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        failure.remove(from: store)
+        XCTAssertGreaterThan(failure.count, 0)
+        XCTAssertTrue(effects.restored.isEmpty)
+        XCTAssertTrue(effects.returned.isEmpty, "nothing returns to the backup on an unreadable state")
+        XCTAssertEqual(store.sourceState(for: key("back"))?.desired, .excluded)
+    }
+
+    /// Deletes an uploaded pending photo, which moves its Proton photo to the Proton trash, and returns that photo.
+    private func deleteAnUploadedPhoto(_ id: String) async throws -> PhotoUID {
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-\(id)")
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("handoff known") { $0.tiles.first?.handoff != nil }
+        await coordinator.exclude([PhotoUID(localPending: .photoLibrary, identifier: id)])
+        XCTAssertEqual(effects.trashed, [[remote]])
+        return remote
+    }
+
     /// An edit uploads while its tile hides the earlier upload of this device. The tile of that upload retired,
     /// so only the store still knows its handoff.
     private func startPendingEdit(
@@ -1939,7 +1980,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         failure.remove(from: store)
         await coordinator.restoreSources(ofRemote: [PhotoUID(volumeID: "vol", nodeID: "link-kept")])
         XCTAssertEqual(
-            effects.restored.joined().map(\.nodeID), ["link-kept"], "the last known state finds the deleted source")
+            effects.returned.joined().map(\.identifier), ["kept"], "the last known state finds the deleted source")
+        XCTAssertTrue(effects.restored.isEmpty, "the photo is out of the Proton trash already")
     }
 
     func testAZeroRetryDelayStillWaitsASecond() {
