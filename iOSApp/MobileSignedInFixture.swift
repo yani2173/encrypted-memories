@@ -280,6 +280,8 @@ import UploadCore
                         kinds = [.network]
                     } else if arguments.contains("-EncryptedMemoriesAccountStorageOnlyBackupFixture") {
                         kinds = [.accountStorage]
+                    } else if arguments.contains("-EncryptedMemoriesRemoteServiceOnlyBackupFixture") {
+                        kinds = [.remoteService]
                     } else if arguments.contains("-EncryptedMemoriesNoUserResolvableBackupFixture") {
                         kinds = [.network, .deletedElsewhere, .unsupported]
                     } else {

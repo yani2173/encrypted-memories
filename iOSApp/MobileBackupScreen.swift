@@ -690,7 +690,7 @@ struct MobileFailedBackupSheet: View {
                 case .list:
                     List {
                         BackupProblemSections(items: items) { item in
-                            BackupProblemRow(item: item)
+                            BackupProblemRow(item: item, showsFailureDetail: true)
                                 .contentShape(Rectangle())
                                 .onTapGesture {
                                     if offersDecision(item) { deletionItem = item }
@@ -706,8 +706,12 @@ struct MobileFailedBackupSheet: View {
                                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                                     if offersDecision(item) {
                                         deletionActions(for: item, place: "swipe")
-                                    } else if item.isPermanent, let controller {
-                                        Button(L10n.string("backup.failed_item_dismiss")) {
+                                    } else if item.isDismissible, let controller {
+                                        Button(
+                                            item.isPermanent
+                                                ? L10n.string("backup.failed_item_dismiss")
+                                                : L10n.string("backup.failed_item_ignore")
+                                        ) {
                                             controller.dismissFailedItem(item)
                                             problemList.dismissItem(id: item.id)
                                         }

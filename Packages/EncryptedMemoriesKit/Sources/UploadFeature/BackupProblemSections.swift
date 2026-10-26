@@ -27,10 +27,13 @@ public struct BackupProblemSections<Row: View>: View {
 /// The same file, reason, and retry caption with the existing native typography on each platform.
 public struct BackupProblemRow<Actions: View>: View {
     private let item: BackupFailedItem
+    private let showsFailureDetail: Bool
     private let actions: Actions
 
-    public init(item: BackupFailedItem, @ViewBuilder actions: () -> Actions) {
+    /// `showsFailureDetail` adds the error that a failed item stopped on below its reason.
+    public init(item: BackupFailedItem, showsFailureDetail: Bool = false, @ViewBuilder actions: () -> Actions) {
         self.item = item
+        self.showsFailureDetail = showsFailureDetail
         self.actions = actions()
     }
 
@@ -52,6 +55,12 @@ public struct BackupProblemRow<Actions: View>: View {
                     .font(.caption)
                     .foregroundStyle(detailColor)
                     .fixedSize(horizontal: false, vertical: true)
+                if showsFailureDetail, let failureDetail = item.failureDetail {
+                    Text(failureDetail)
+                        .font(.caption2)
+                        .foregroundStyle(detailColor)
+                        .lineLimit(3)
+                }
                 if let retryDescription = item.retryDescription {
                     Text(retryDescription)
                         .font(.caption2)
@@ -84,7 +93,7 @@ public struct BackupProblemRow<Actions: View>: View {
 }
 
 extension BackupProblemRow where Actions == EmptyView {
-    public init(item: BackupFailedItem) {
-        self.init(item: item) { EmptyView() }
+    public init(item: BackupFailedItem, showsFailureDetail: Bool = false) {
+        self.init(item: item, showsFailureDetail: showsFailureDetail) { EmptyView() }
     }
 }

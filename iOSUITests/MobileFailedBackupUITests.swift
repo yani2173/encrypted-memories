@@ -108,6 +108,31 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertFalse(app.buttons["backup.retryUserResolvable.sheet"].exists)
     }
 
+    func testFailedRowShowsItsErrorAndCanStopBackingUp() {
+        openSheet(mode: "-EncryptedMemoriesRemoteServiceOnlyBackupFixture")
+        let failed = row("remoteService fixture.heic")
+        XCTAssertTrue(failed.waitForExistence(timeout: 5))
+        XCTAssertTrue(failed.label.contains("Proton cannot take this photo right now."))
+        XCTAssertTrue(failed.label.contains("Fixture technical detail"))
+        let ignore = app.buttons["backup.dismissFailedItem.swipe.remoteService fixture.heic"]
+        func rowLeaves(within timeout: TimeInterval) -> Bool {
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: failed)
+            return XCTWaiter.wait(for: [gone], timeout: timeout) == .completed
+        }
+        // Swipe again only while the row is still there, as in the permanent dismissal above.
+        for _ in 0..<2 where failed.exists {
+            failed.swipeLeft()
+            guard ignore.waitForExistence(timeout: 5) else { continue }
+            XCTAssertEqual(ignore.label, "Don’t back up")
+            ignore.tap()
+            if rowLeaves(within: 20) { break }
+        }
+        XCTAssertTrue(rowLeaves(within: 10), "the ignored row must leave the list")
+        let retry = app.buttons["backup.retryUserResolvable.sheet"]
+        let noRetry = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: retry)
+        XCTAssertEqual(XCTWaiter.wait(for: [noRetry], timeout: 10), .completed, "nothing is left to try again")
+    }
+
     func testAccountStorageExposesTryAgainAndRunsTheSheetAction() {
         openSheet(mode: "-EncryptedMemoriesAccountStorageOnlyBackupFixture")
         let retry = app.buttons["backup.retryUserResolvable.sheet"]
