@@ -137,6 +137,52 @@ public enum PendingDesiredState: String, Sendable, Equatable {
     case included
 }
 
+/// One source's desired state as read from the store. A readable nil is confirmed absence; `unreadable` means the query
+/// failed or the row did not decode.
+public enum PendingSourceStateRead: Sendable, Equatable {
+    case unreadable
+    case readable(PendingSourceState?)
+
+    public var state: PendingSourceState? {
+        guard case .readable(let state) = self else { return nil }
+        return state
+    }
+}
+
+/// The source states that decoded, and whether the read was complete. An incomplete read can leave out owed work.
+public struct PendingSourceStatesRead: Sendable, Equatable {
+    public let states: [PendingSourceState]
+    public let complete: Bool
+
+    public init(states: [PendingSourceState], complete: Bool) {
+        self.states = states
+        self.complete = complete
+    }
+}
+
+/// One source's latest handoff as read from the store. A readable nil is confirmed absence; `unreadable` means the
+/// query failed or the row did not decode.
+public enum PendingHandoffRead: Sendable, Equatable {
+    case unreadable
+    case readable(PendingHandoff?)
+
+    public var handoff: PendingHandoff? {
+        guard case .readable(let handoff) = self else { return nil }
+        return handoff
+    }
+}
+
+/// The actions that decoded, and whether the read was complete. An incomplete read can leave out owed actions.
+public struct PendingActionsRead: Sendable, Equatable {
+    public let actions: [PendingAction]
+    public let complete: Bool
+
+    public init(actions: [PendingAction], complete: Bool) {
+        self.actions = actions
+        self.complete = complete
+    }
+}
+
 /// The desired backup state of one source and the effects that are still due. A row is never deleted
 /// before its effects finish, so a crash or a failed request cannot lose a delete or a restore.
 public struct PendingSourceState: Sendable, Equatable {
@@ -209,17 +255,22 @@ public struct PendingExclusionRequest: Sendable, Equatable {
     /// The revision the person deleted. The store also looks up a durable handoff of this revision, so a
     /// commit whose event has not reached the coordinator yet still goes to the trash.
     public let revision: UploadBackupRevision?
+    /// The coordinator could not tell which Proton photo the delete covers. The store then keeps no photo that the
+    /// stored state still names; only a durable commit of the deleted revision goes to the trash.
+    public let remoteUnknown: Bool
 
     public init(
         key: PendingSourceKey,
         presentation: PendingPresentationMetadata?,
         remote: PhotoUID?,
-        revision: UploadBackupRevision? = nil
+        revision: UploadBackupRevision? = nil,
+        remoteUnknown: Bool = false
     ) {
         self.key = key
         self.presentation = presentation
         self.remote = remote
         self.revision = revision
+        self.remoteUnknown = remoteUnknown
     }
 }
 

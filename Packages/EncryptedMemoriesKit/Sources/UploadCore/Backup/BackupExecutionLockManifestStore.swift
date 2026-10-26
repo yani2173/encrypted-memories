@@ -107,9 +107,17 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
     }
 
     @discardableResult
-    public func heartbeat(runID: String, phase: String?) -> Bool {
+    public func heartbeat(runID: String, phase: String?) -> BackupLockHeartbeat {
         connection.withLock {
-            guard let existing = readLock(), existing.runID == runID else { return false }
+            let existing: BackupExecutionLock
+            // A failed bind or an unreadable owner is a storage failure, never a sign that another run owns the lock.
+            switch readLockResult(strict: true) {
+            case .failed: return .unavailable
+            case .confirmedAbsent: return .lost
+            case .row(let row):
+                guard row.runID == runID else { return .lost }
+                existing = row
+            }
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -117,13 +125,16 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
                     "UPDATE backup_execution_lock SET heartbeat_at=?, phase=? WHERE lock_name=? AND run_id=?;",
                     -1, &stmt, nil
                 ) == SQLITE_OK
-            else { return false }
+            else { return .unavailable }
             defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_double(stmt, 1, now().timeIntervalSince1970)
-            bindNullableText(stmt, 2, phase ?? existing.phase)
-            bindText(stmt, 3, lockName)
-            bindText(stmt, 4, runID)
-            return sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) > 0
+            guard sqlite3_bind_double(stmt, 1, now().timeIntervalSince1970) == SQLITE_OK,
+                bindNullableText(stmt, 2, phase ?? existing.phase) == SQLITE_OK,
+                bindText(stmt, 3, lockName) == SQLITE_OK,
+                bindText(stmt, 4, runID) == SQLITE_OK
+            else { return .unavailable }
+            guard sqlite3_step(stmt) == SQLITE_DONE else { return .unavailable }
+            // Another connection removed or replaced the row after the read.
+            return sqlite3_changes(db) > 0 ? .renewed : .lost
         }
     }
 
@@ -214,7 +225,8 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
         return row
     }
 
-    private func readLockResult() -> LockReadResult {
+    /// `strict` also treats a failed bind and an unreadable run identifier as a failed read; the heartbeat uses it.
+    private func readLockResult(strict: Bool = false) -> LockReadResult {
         var stmt: OpaquePointer?
         guard
             sqlite3_prepare_v2(
@@ -227,10 +239,11 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
             ) == SQLITE_OK
         else { return .failed }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, lockName)
+        guard bindText(stmt, 1, lockName) == SQLITE_OK || !strict else { return .failed }
         let result = sqlite3_step(stmt)
         if result == SQLITE_DONE { return .confirmedAbsent }
         guard result == SQLITE_ROW else { return .failed }
+        if strict, columnText(stmt, 1) == nil { return .failed }
         return .row(
             BackupExecutionLock(
                 owner: BackupExecutionOwner(rawValue: columnText(stmt, 0) ?? BackupExecutionOwner.foreground.rawValue),
@@ -344,11 +357,13 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
 
     private let transient = SQLiteStoreSchemaGate.transientDestructor
 
-    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
+    @discardableResult
+    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) -> Int32 {
         sqlite3_bind_text(stmt, index, value, -1, transient)
     }
 
-    private func bindNullableText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) {
+    @discardableResult
+    private func bindNullableText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) -> Int32 {
         if let value {
             bindText(stmt, index, value)
         } else {

@@ -33,6 +33,10 @@ public enum ExactDuplicateRelatedFileTransferError: Error, Sendable, Equatable {
         case destination
         case size
         case capacity
+        /// The device did not answer how much space is free.
+        case capacityUnknown
+        /// The person's Proton storage cannot hold the file.
+        case accountStorage
         case integrity
         case transfer
         case cleanup
@@ -176,6 +180,14 @@ public enum ExactDuplicateKeepReason: String, Sendable, Equatable {
     case unreadable
     /// A related file, such as a Live Photo video or an original, has no copy under the kept photo.
     case relatedFileWithoutTwin
+    /// The extra file could not be copied safely; its source remains active.
+    case copyFailed
+    /// The copy follows the saved mobile-data setting and waits for Wi-Fi.
+    case waitingForWiFi
+    /// The device has too little free space to stage the extra file; its source remains active.
+    case deviceStorageFull
+    /// The person's Proton storage cannot hold the extra file; its source remains active.
+    case protonStorageFull
     /// The replacement of an edited photo still tracks the photo.
     case pendingEditReplacement
     /// A local source counts the photo as its backup, and the manifest cannot move that row to the kept photo.
@@ -270,6 +282,14 @@ public struct ExactDuplicateFinder: Sendable {
     let albums: any SeriesAlbumCarryOver
     /// Receives the duration and the request count of each phase, never an identifier.
     let log: @Sendable (String) -> Void
+    /// Re-read before each transfer phase; production shares the backup's existing saved preference.
+    var copyNetwork: @Sendable () -> BackupThrottleInputs = {
+        BackupThrottleInputs(
+            runtime: LibraryRuntimeState.shared.snapshot(),
+            usesMobileData: BackupMobileDataPolicy.isEnabled(defaults: .standard))
+    }
+    /// The parent of the related-file staging folder; tests give each case its own.
+    var relatedFileStagingParent = FileManager.default.temporaryDirectory
     /// The volume and the favorites that the ranking reads once and shares across its pages.
     let rankingContext = ExactDuplicateRankingContext()
     /// The merges of this finder between their record and the check of their kept photo.
@@ -615,6 +635,11 @@ public struct ExactDuplicateFinder: Sendable {
     private func mergeInTurn(
         _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun
     ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        // Staging left by an ended process goes before this batch's first copy. A run with a registered copy, or a
+        // folder that stays unclean, makes no copy in this batch.
+        let stagingClear =
+            !run.hasRegisteredCopies
+            && BackupLocalDataPurge.emptyRelatedFileStaging(temporaryDirectory: relatedFileStagingParent)
         await resolvePendingMerges()
         var results = [Result<ExactDuplicateMergeOutcome, any Error>?](repeating: nil, count: requests.count)
         var favorites: Set<PhotoUID> = []
@@ -645,9 +670,46 @@ public struct ExactDuplicateFinder: Sendable {
         if !Task.isCancelled, !plans.isEmpty {
             // One manifest scan serves every member. A store that cannot tell keeps every duplicate.
             let owners = identities.sources(
-                withRemoteLinkIDs: Set(plans.flatMap { $0.plan.candidates.flatMap(\.links) }))
+                withRemoteLinkIDs: Set(
+                    plans.flatMap {
+                        $0.plan.candidates.flatMap(\.links) + $0.plan.relatedCopies.flatMap(\.links)
+                    }))
+            var copied = [[CopiedRelatedFiles]](repeating: [], count: plans.count)
+            var settled: Set<Int> = []
+            let settle = { (position: Int, error: any Error) in
+                let plan = plans[position].plan
+                settled.insert(position)
+                if error as? ExactDuplicateRelatedFileTransferError == .copyFailed(.cleanup) {
+                    results[plans[position].index] = .success(
+                        .merged(kept: plan.kept, trashed: [], keptDuplicates: plan.keptDuplicates))
+                } else {
+                    results[plans[position].index] = .failure(error)
+                }
+            }
             for position in plans.indices {
-                decide(&plans[position].plan, owners: owners)
+                do {
+                    copied[position] = try await preserveRelatedFiles(
+                        in: &plans[position].plan, owners: owners, run: run, stagingClear: stagingClear)
+                } catch {
+                    settle(position, error)
+                }
+            }
+            // Every upload of the batch has ended. A source can have changed while a later copy ran, so each copied
+            // member proves its twins once more; only a member that passes can reach the trash.
+            for position in plans.indices where !settled.contains(position) {
+                do {
+                    try await proveCopies(copied[position], in: &plans[position].plan, run: run)
+                } catch {
+                    settle(position, error)
+                    continue
+                }
+                // Copy work awaited remote changes; re-read local owners for those groups before deciding moves.
+                let currentOwners =
+                    plans[position].plan.relatedCopies.isEmpty
+                    ? owners
+                    : identities.sources(
+                        withRemoteLinkIDs: Set(plans[position].plan.candidates.flatMap(\.links)))
+                decide(&plans[position].plan, owners: currentOwners)
                 let plan = plans[position].plan
                 if plan.trashable.isEmpty {
                     results[plans[position].index] = .success(
@@ -686,6 +748,7 @@ public struct ExactDuplicateFinder: Sendable {
         let epoch: String
         let volumeID: String
         var candidates: [(member: PhotoUID, links: Set<String>, moves: [UploadRemoteLinkMove])] = []
+        var relatedCopies: [RelatedCopy] = []
         var keptDuplicates: [PhotoUID: ExactDuplicateKeepReason] = [:]
         /// The members that the trash takes, and the rows that move with them. `decide` fills both.
         var trashable: [PhotoUID] = []
@@ -694,6 +757,18 @@ public struct ExactDuplicateFinder: Sendable {
         var members: [ExactDuplicateMergeIntent.Member] = []
         /// The kept photo and the candidates whose compound read shows Proton's favorite tag.
         var taggedFavorites: [PhotoUID] = []
+
+        /// Stop revokes only members that needed copy work, through their trash dispatch.
+        func excludingStoppedCopies(in run: ExactDuplicateMergeRun) -> PlannedMerge {
+            guard run.copiesStopped else { return self }
+            let stopped = Set(relatedCopies.map(\.member))
+            var filtered = self
+            for member in trashable where stopped.contains(member) { filtered.keptDuplicates[member] = .copyFailed }
+            filtered.trashable.removeAll { stopped.contains($0) }
+            filtered.members.removeAll { member in stopped.contains { $0.nodeID == member.link } }
+            filtered.moves = filtered.members.flatMap(\.moves)
+            return filtered
+        }
 
         func intent(trashedAt: Int64, successors: [String]?) -> ExactDuplicateMergeIntent {
             ExactDuplicateMergeIntent(
@@ -806,6 +881,9 @@ public struct ExactDuplicateFinder: Sendable {
         if keptCompound.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(kept) }
         // A trash ends the sharing of a photo, so a shared duplicate stays.
         let shared = Set(facts.filter(\.value.isShared).keys)
+        // The group's link states are read at the first unreadable member. A complete answer stands for the later
+        // unreadable members; an answer that omits a member does not, so the next one reads again.
+        var checkedLinkStates = false
         for member in active where member != kept {
             try Task.checkCancellation()
             // A copy with other metadata, such as another date or place, is no duplicate: its trash would lose them.
@@ -823,8 +901,9 @@ public struct ExactDuplicateFinder: Sendable {
             } else {
                 read = try await checker.compound(ofMainLink: member.nodeID)
             }
-            if read == nil {
+            if read == nil, !checkedLinkStates {
                 let current = try await checker.linkVisibility(batching: group.members.map(\.nodeID))
+                checkedLinkStates = group.members.allSatisfy { current[$0.nodeID] != nil }
                 if let currentKept = current[kept.nodeID], currentKept.hasExplicitPhotoState,
                     currentKept.isActiveMain,
                     group.members.filter({ $0 != kept }).allSatisfy({ other in
@@ -841,7 +920,14 @@ public struct ExactDuplicateFinder: Sendable {
             }
             // The trash takes the related files along. Each needs a copy under the kept photo.
             guard let twins = UploadRemoteReplacementSafety.relatedTwins(of: compound, under: keptCompound) else {
-                plan.keptDuplicates[member] = .relatedFileWithoutTwin
+                if facts[kept]?.isShared == false {
+                    plan.relatedCopies.append(
+                        RelatedCopy(
+                            member: member, source: compound,
+                            missing: Self.missingRelated(compound, under: keptCompound)))
+                } else {
+                    plan.keptDuplicates[member] = .relatedFileWithoutTwin
+                }
                 continue
             }
             let memberMoves =
@@ -857,22 +943,246 @@ public struct ExactDuplicateFinder: Sendable {
         return .planned(plan)
     }
 
-    /// The local checks, right before the writes: a member that the edit replacement tracks, or that a local source
-    /// needs and whose row cannot move, stays.
-    private func decide(_ plan: inout PlannedMerge, owners: [String: [UploadSourceIdentity]]?) {
-        for candidate in plan.candidates {
-            guard !journal.namesAnyLink(candidate.links) else {
-                plan.keptDuplicates[candidate.member] = .pendingEditReplacement
+    private struct RelatedCopy {
+        let member: PhotoUID
+        let source: UploadRemoteCompound
+        let missing: [UploadRemoteCompound.File]
+        var links: Set<String> { Set([member.nodeID] + source.related.map(\.linkID)) }
+        var hashes: [String: String] {
+            Dictionary(
+                ([source.main] + source.related).map { ($0.linkID, $0.contentHash) },
+                uniquingKeysWith: { first, _ in first })
+        }
+    }
+
+    /// One twin satisfies one occurrence only; the kept main never stands for a related file.
+    private static func missingRelated(
+        _ source: UploadRemoteCompound, under kept: UploadRemoteCompound
+    ) -> [UploadRemoteCompound.File] {
+        var used: Set<String> = []
+        return source.related.filter {
+            UploadRemoteReplacementSafety.contentTwin(of: $0, among: kept.related, used: &used) == nil
+        }
+    }
+
+    /// A member whose copies ended verified, with the twins that its own check found.
+    private struct CopiedRelatedFiles {
+        let copy: RelatedCopy
+        var twins: [String: UploadRemoteCompound.File]
+    }
+
+    /// Returns the verified copies; `proveCopies` adds them as candidates. A failed member remains active while
+    /// already-added twins may remain.
+    private func preserveRelatedFiles(
+        in plan: inout PlannedMerge, owners: [String: [UploadSourceIdentity]]?, run: ExactDuplicateMergeRun,
+        stagingClear: Bool
+    ) async throws -> [CopiedRelatedFiles] {
+        var copied: [CopiedRelatedFiles] = []
+        for copy in plan.relatedCopies {
+            try Task.checkCancellation()
+            if let reason = localKeepReason(links: copy.links, hashes: copy.hashes, epoch: plan.epoch, owners: owners) {
+                plan.keptDuplicates[copy.member] = reason
                 continue
             }
-            let isCovered = { [epoch = plan.epoch] (row: UploadSourceIdentity, linkID: String) -> Bool in
-                guard let record = identities.record(for: row), record.provesUpload, record.remoteLinkID == linkID,
-                    record.hashKeyEpoch == epoch
-                else { return false }
-                return candidate.moves.contains { $0.from == linkID && $0.contentHash == record.contentHash }
+            guard stagingClear else {
+                plan.keptDuplicates[copy.member] = .copyFailed
+                continue
             }
-            guard !identities.isNeededElsewhere(candidate.links, except: isCovered, sources: { owners?[$0] }) else {
-                plan.keptDuplicates[candidate.member] = .neededByLocalSource
+            do {
+                let snapshot = plan
+                let twins = try await run.copying { try await self.copyRelatedFiles(copy, under: snapshot) }
+                copied.append(CopiedRelatedFiles(copy: copy, twins: twins))
+            } catch {
+                try keepSource(copy.member, after: error, in: &plan, run: run)
+            }
+        }
+        return copied
+    }
+
+    /// Reads every copied member again after all copies of the batch, and adds only the members whose twins still
+    /// cover their source.
+    private func proveCopies(
+        _ copied: [CopiedRelatedFiles], in plan: inout PlannedMerge, run: ExactDuplicateMergeRun
+    ) async throws {
+        var proven = copied
+        var failed: Set<PhotoUID> = []
+        for index in proven.indices {
+            let copy = proven[index].copy
+            do {
+                let snapshot = plan
+                proven[index].twins = try await run.copying { try await self.verifiedTwins(copy, under: snapshot) }
+            } catch {
+                failed.insert(copy.member)
+                try keepSource(copy.member, after: error, in: &plan, run: run)
+            }
+        }
+        for (copy, twins) in proven.map({ ($0.copy, $0.twins) }) where !failed.contains(copy.member) {
+            let moves =
+                [UploadRemoteLinkMove(from: copy.member.nodeID, to: plan.kept.nodeID, contentHash: plan.contentHash)]
+                + copy.source.related.compactMap { file in
+                    twins[file.linkID].map {
+                        UploadRemoteLinkMove(from: file.linkID, to: $0.linkID, contentHash: file.contentHash)
+                    }
+                }
+            plan.candidates.append((copy.member, copy.links, moves))
+            if copy.source.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(copy.member) }
+        }
+    }
+
+    /// A failed or stopped copy keeps its source active; a cancelled task ends the merge.
+    private func keepSource(
+        _ member: PhotoUID, after error: any Error, in plan: inout PlannedMerge, run: ExactDuplicateMergeRun
+    ) throws {
+        let transferError = error as? ExactDuplicateRelatedFileTransferError
+        if transferError == .copyFailed(.cleanup) {
+            plan.keptDuplicates[member] = .copyFailed
+            if Task.isCancelled { throw error }
+        } else {
+            if Task.isCancelled || (error is CancellationError && !run.copiesStopped) {
+                throw CancellationError()
+            }
+            plan.keptDuplicates[member] = Self.keepReason(for: transferError)
+        }
+    }
+
+    /// Only a typed transfer failure names its cause; every other failure is a plain copy failure.
+    private static func keepReason(for error: ExactDuplicateRelatedFileTransferError?) -> ExactDuplicateKeepReason {
+        switch error {
+        case .waitingForWiFi: .waitingForWiFi
+        case .copyFailed(.capacity): .deviceStorageFull
+        case .copyFailed(.accountStorage): .protonStorageFull
+        default: .copyFailed
+        }
+    }
+
+    private func copyRelatedFiles(
+        _ copy: RelatedCopy, under plan: PlannedMerge
+    ) async throws -> [String: UploadRemoteCompound.File] {
+        for file in copy.missing {
+            try Task.checkCancellation()
+            let current = try await copyContext(copy, under: plan)
+            guard Self.missingRelated(copy.source, under: current).contains(where: { $0.linkID == file.linkID }) else {
+                continue
+            }
+            let allowsDownload = try copyNetworkPolicy()
+            let folder = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: relatedFileStagingParent)
+            do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) } catch {
+                throw ExactDuplicateRelatedFileTransferError.copyFailed(.staging)
+            }
+            let destination = folder.appendingPathComponent(UUID().uuidString)
+            var ownsCompletedDownload = false
+            do {
+                let metadata = try await remote.downloadRelatedFile(
+                    PhotoUID(volumeID: copy.member.volumeID, nodeID: file.linkID), to: destination,
+                    allowsExpensiveNetwork: allowsDownload)
+                ownsCompletedDownload = true
+                try Task.checkCancellation()
+                let staged = try ExactDuplicateStagedFile.read(at: destination)
+                let contentHash = try await checker.contentHash(
+                    forSHA1Hex: UploadContentSHA1.hexString(digest: staged.sha1))
+                guard contentHash == file.contentHash else {
+                    throw ExactDuplicateRelatedFileTransferError.copyFailed(.integrity)
+                }
+                // The final read follows staging and hashing, so another device's new twin suppresses this upload.
+                let fresh = try await copyContext(copy, under: plan)
+                if Self.missingRelated(copy.source, under: fresh).contains(where: { $0.linkID == file.linkID }) {
+                    var request = PhotoUploadRequest(
+                        queueItemID: UUID(), cancellationToken: UUID(), fileURL: destination,
+                        name: metadata.filename, mediaType: metadata.mediaType, fileSize: staged.fileSize,
+                        captureTime: metadata.captureTime, modificationDate: metadata.modificationDate,
+                        tags: [], additionalMetadata: metadata.additionalMetadata, expectedSHA1: staged.sha1,
+                        mainPhotoUID: plan.kept)
+                    request.allowsExpensiveNetwork = try copyNetworkPolicy()
+                    try Task.checkCancellation()
+                    _ = try await remote.uploadRelatedFile(request)
+                    try Task.checkCancellation()
+                }
+            } catch {
+                // Only a returned, completed download receipt grants caller ownership. Rejections touch nothing.
+                if ownsCompletedDownload { try discardOwnedRelatedFile(destination) }
+                throw error
+            }
+            try discardOwnedRelatedFile(destination)
+        }
+        return try await verifiedTwins(copy, under: plan)
+    }
+
+    /// A fresh read of both compounds; every related file of the source needs its own twin under the kept photo.
+    private func verifiedTwins(
+        _ copy: RelatedCopy, under plan: PlannedMerge
+    ) async throws -> [String: UploadRemoteCompound.File] {
+        let verified = try await copyContext(copy, under: plan)
+        guard let twins = UploadRemoteReplacementSafety.relatedTwins(of: copy.source, under: verified) else {
+            throw ExactDuplicateRelatedFileTransferError.copyFailed(.integrity)
+        }
+        try Task.checkCancellation()
+        return twins
+    }
+
+    /// Both mains, sharing, source membership and key epoch must still support this additive copy.
+    /// Read the kept compound last, immediately before the caller's upload decision or final verification.
+    private func copyContext(_ copy: RelatedCopy, under plan: PlannedMerge) async throws -> UploadRemoteCompound {
+        try Task.checkCancellation()
+        guard try await checker.hashKeyEpoch() == plan.epoch else {
+            throw ExactDuplicateRelatedFileTransferError.copyFailed(.integrity)
+        }
+        let visibility = try await checker.linkVisibility(batching: [copy.member.nodeID, plan.kept.nodeID])
+        let facts = try await remote.nodeFacts(of: [copy.member, plan.kept])
+        guard visibility[copy.member.nodeID]?.isActiveMain == true,
+            visibility[plan.kept.nodeID]?.isActiveMain == true,
+            facts[copy.member]?.isShared == false, facts[plan.kept]?.isShared == false,
+            let fingerprint = facts[copy.member]?.fingerprint, fingerprint == facts[plan.kept]?.fingerprint,
+            let source = try await checker.compound(ofMainLink: copy.member.nodeID),
+            source.main.contentHash == plan.contentHash, source.related.count == copy.source.related.count,
+            copy.source.related.allSatisfy({ expected in
+                source.related.contains { $0.linkID == expected.linkID && $0.contentHash == expected.contentHash }
+            }),
+            let kept = try await checker.compound(ofMainLink: plan.kept.nodeID),
+            kept.main.contentHash == plan.contentHash
+        else { throw ExactDuplicateRelatedFileTransferError.copyFailed(.transfer) }
+        try Task.checkCancellation()
+        return kept
+    }
+
+    private func copyNetworkPolicy() throws -> Bool {
+        let network = copyNetwork()
+        if network.waitsForWiFi || network.waitsForFirstNetworkPath {
+            throw ExactDuplicateRelatedFileTransferError.waitingForWiFi
+        }
+        guard network.isNetworkAvailable else { throw ExactDuplicateRelatedFileTransferError.copyFailed(.transfer) }
+        return network.usesMobileData
+    }
+
+    private func discardOwnedRelatedFile(_ file: URL) throws {
+        do { try ExactDuplicateRelatedFileTransfer().discard(file) } catch {
+            throw ExactDuplicateRelatedFileTransferError.copyFailed(.cleanup)
+        }
+    }
+
+    /// The same local guard admits copy work and decides the final verified row moves.
+    private func localKeepReason(
+        links: Set<String>, hashes: [String: String], epoch: String, owners: [String: [UploadSourceIdentity]]?
+    ) -> ExactDuplicateKeepReason? {
+        guard !journal.namesAnyLink(links) else { return .pendingEditReplacement }
+        let isCovered = { (row: UploadSourceIdentity, linkID: String) -> Bool in
+            guard let record = identities.record(for: row), record.provesUpload, record.remoteLinkID == linkID,
+                record.hashKeyEpoch == epoch
+            else { return false }
+            return hashes[linkID] == record.contentHash
+        }
+        guard !identities.isNeededElsewhere(links, except: isCovered, sources: { owners?[$0] }) else {
+            return .neededByLocalSource
+        }
+        return nil
+    }
+
+    /// Local identity/edit guards run again after copy work before admitting any verified candidate to trash.
+    private func decide(_ plan: inout PlannedMerge, owners: [String: [UploadSourceIdentity]]?) {
+        for candidate in plan.candidates {
+            let hashes = Dictionary(
+                candidate.moves.map { ($0.from, $0.contentHash) }, uniquingKeysWith: { first, _ in first })
+            if let reason = localKeepReason(links: candidate.links, hashes: hashes, epoch: plan.epoch, owners: owners) {
+                plan.keptDuplicates[candidate.member] = reason
                 continue
             }
             plan.trashable.append(candidate.member)
@@ -893,6 +1203,7 @@ public struct ExactDuplicateFinder: Sendable {
         _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>, covers: [String: String],
         run: ExactDuplicateMergeRun, into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
     ) async {
+        let writes = writes.map { (index: $0.index, plan: $0.plan.excludingStoppedCopies(in: run)) }
         // The trash needs its record, so the merge writes nothing while the journal cannot take one.
         switch mergeJournal.prepareForWrites() {
         case .ready: break
@@ -903,7 +1214,12 @@ public struct ExactDuplicateFinder: Sendable {
             return
         }
         var trashing: [(index: Int, plan: PlannedMerge)] = []
-        for (index, plan) in writes where !Task.isCancelled {
+        for (index, original) in writes where !Task.isCancelled {
+            var plan = original.excludingStoppedCopies(in: run)
+            guard !plan.trashable.isEmpty else {
+                results[index] = .success(.merged(kept: plan.kept, trashed: [], keptDuplicates: plan.keptDuplicates))
+                continue
+            }
             // The carry-over tags the kept photo as favorite when a trashed duplicate is one.
             let marksFavorite = !favorites.contains(plan.kept) && plan.trashable.contains(where: favorites.contains)
             do {
@@ -911,6 +1227,7 @@ public struct ExactDuplicateFinder: Sendable {
                 try await remote.carryOver(
                     from: plan.trashable, to: plan.kept, ownVolumeID: plan.volumeID,
                     albums: CurrentAlbumCarryOver(base: albums), favorites: favorites)
+                plan = plan.excludingStoppedCopies(in: run)
                 if marksFavorite {
                     run.noteFavorites([plan.kept])
                     rankingContext.noteFavorites([plan.kept])
@@ -920,10 +1237,17 @@ public struct ExactDuplicateFinder: Sendable {
                 for (albumID, cover) in covers.sorted(by: { $0.key < $1.key }) where trashedLinks.contains(cover) {
                     try Task.checkCancellation()
                     try await albums.setCover(plan.kept, ofOwnAlbum: albumID)
+                    plan = plan.excludingStoppedCopies(in: run)
                     run.noteCover(plan.kept.nodeID, ofOwnAlbum: albumID)
                 }
                 // The rows move before the trash: the kept photo holds the same bytes, and after the trash only the
                 // trashed links would name the related files that a retry has to move.
+                plan = plan.excludingStoppedCopies(in: run)
+                guard !plan.trashable.isEmpty else {
+                    results[index] = .success(
+                        .merged(kept: plan.kept, trashed: [], keptDuplicates: plan.keptDuplicates))
+                    continue
+                }
                 guard identities.rebindRemoteLinks(plan.moves, hashKeyEpoch: plan.epoch) else {
                     throw UploadError.backend("Upload identity manifest could not be updated")
                 }
@@ -940,12 +1264,22 @@ public struct ExactDuplicateFinder: Sendable {
         guard !trashing.isEmpty, !Task.isCancelled else { return }
         // The edits that replaced a kept photo before the trash, so the check counts only a later edit.
         var known: [[String]?] = []
-        for (_, plan) in trashing { known.append(await successors(of: plan.kept.nodeID)) }
+        for position in trashing.indices {
+            known.append(await successors(of: trashing[position].plan.kept.nodeID))
+            trashing[position].plan = trashing[position].plan.excludingStoppedCopies(in: run)
+        }
         guard !Task.isCancelled else { return }
+        trashing = trashing.map { (index: $0.index, plan: $0.plan.excludingStoppedCopies(in: run)) }
         // The record survives a failed answer and the end of the process, so a later scan or merge restores a copy of
         // a group whose kept photo left the library during the trash.
         let trashedAt = Int64(Date().timeIntervalSince1970)
-        let intents = zip(trashing, known).map { $0.plan.intent(trashedAt: trashedAt, successors: $1) }
+        let prepared = zip(trashing, known).filter { !$0.0.plan.trashable.isEmpty }
+        for (index, plan) in trashing where plan.trashable.isEmpty {
+            results[index] = .success(.merged(kept: plan.kept, trashed: [], keptDuplicates: plan.keptDuplicates))
+        }
+        trashing = prepared.map(\.0)
+        guard !trashing.isEmpty else { return }
+        let intents = prepared.map { $0.0.plan.intent(trashedAt: trashedAt, successors: $0.1) }
         mergesInFlight.insert(intents)
         defer { mergesInFlight.remove(intents) }
         guard mergeJournal.record(intents) else {
@@ -953,9 +1287,22 @@ public struct ExactDuplicateFinder: Sendable {
             for (index, _) in trashing { results[index] = .failure(error) }
             return
         }
+        guard !Task.isCancelled else {
+            for (index, _) in trashing { results[index] = .failure(CancellationError()) }
+            return
+        }
+        // Keep the recorded intents for normal reconciliation if Stop arrived during journal preparation.
+        trashing = trashing.map { (index: $0.index, plan: $0.plan.excludingStoppedCopies(in: run)) }
+        let dispatched = trashing.flatMap(\.plan.trashable)
+        guard !dispatched.isEmpty else {
+            for (index, plan) in trashing {
+                results[index] = .success(.merged(kept: plan.kept, trashed: [], keptDuplicates: plan.keptDuplicates))
+            }
+            return
+        }
         var trashError: (any Error)?
         do {
-            try await remote.trashDuplicates(trashing.flatMap(\.plan.trashable))
+            try await remote.trashDuplicates(dispatched)
         } catch {
             // A failed trash can still have moved some photos.
             trashError = error
@@ -1388,6 +1735,44 @@ public final class ExactDuplicateMergeRun: @unchecked Sendable {
     private let members: Set<PhotoUID>
     private var favorites: (covered: Set<PhotoUID>, uids: Set<PhotoUID>)?
     private var covers: [String: String]?
+
+    private var copyAdmissionRevoked = false
+    private var copyCancellations: [UUID: @Sendable () -> Void] = [:]
+
+    var copiesStopped: Bool { lock.withLock { copyAdmissionRevoked } }
+    /// A copy of this run is still registered, so its staging must stay.
+    var hasRegisteredCopies: Bool { lock.withLock { !copyCancellations.isEmpty } }
+
+    /// Revoke admission atomically with registration. Cancel outside the lock; the caller joins each copy.
+    func stopCopies() {
+        let cancellations = lock.withLock {
+            copyAdmissionRevoked = true
+            return Array(copyCancellations.values)
+        }
+        cancellations.forEach { $0() }
+    }
+
+    /// Only this run owns this task. Completion removes only its exact registration, never another run's work.
+    func copying<Value: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let id = UUID()
+        let task: Task<Value, any Error> = try lock.withLock {
+            guard !copyAdmissionRevoked else { throw CancellationError() }
+            let task = Task {
+                try Task.checkCancellation()
+                return try await operation()
+            }
+            copyCancellations[id] = { task.cancel() }
+            return task
+        }
+        defer { lock.withLock { _ = copyCancellations.removeValue(forKey: id) } }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
 
     /// `members` holds the members of every group that the run can merge. One favorites listing covers them all.
     public init(members: [PhotoUID]) {

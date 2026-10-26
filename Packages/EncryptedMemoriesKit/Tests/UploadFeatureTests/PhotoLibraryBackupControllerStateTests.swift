@@ -2683,6 +2683,84 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
     }
 
+    func testBackupThatIsOffAtLaunchOrTurnedOffReportsThatNoIndexBuildIsNeeded() async throws {
+        let resolver = FakeIdentityResolver()
+        let fixture = try makeControllerFixture(prefix: "backup-off-index", enabled: false, identityResolver: resolver)
+        defer { fixture.cleanup() }
+        try await waitForReports(1, from: resolver, "a launch with backup off")
+
+        fixture.controller.disableBackup()
+        try await waitForReports(2, from: resolver, "turning backup off")
+    }
+
+    #if DEBUG
+        func testTurningBackupOffThatWasOnReportsThatNoIndexBuildIsNeeded() async throws {
+            let resolver = FakeIdentityResolver()
+            let fixture = try makeControllerFixture(prefix: "backup-on-off-index", identityResolver: resolver)
+            defer { fixture.cleanup() }
+            try await waitForReports(1, from: resolver, "a launch with backup off")
+            fixture.controller.setEnabledForTesting()
+
+            fixture.controller.disableBackup()
+            try await waitForReports(2, from: resolver, "turning backup off after it was on")
+        }
+
+        func testAPassWhoseScanFinishedWithNothingToUploadReportsThatNoIndexBuildIsNeeded() async throws {
+            let resolver = FakeIdentityResolver()
+            let reports = try await reportsAfterAPass(prefix: "backup-scan-done-index", resolver: resolver) {}
+            XCTAssertEqual(reports, 1, "the finished scan found nothing, so no index build follows")
+        }
+
+        func testAPassWhoseScanFailedReportsNothing() async throws {
+            let resolver = FakeIdentityResolver()
+            let reports = try await reportsAfterAPass(prefix: "backup-scan-failed-index", resolver: resolver) {
+                throw UploadError.backend("Photo library scan state could not be saved")
+            }
+            XCTAssertEqual(reports, 0, "a scan that did not finish may have missed photos that start an index build")
+        }
+
+        /// Runs one pass over an empty queue with `scan` in place of the photo library scan, and returns the reports of
+        /// no index build that the pass sent. The launch with backup off reports once before the pass; it is not
+        /// counted.
+        private func reportsAfterAPass(
+            prefix: String, resolver: FakeIdentityResolver, scan: @escaping @Sendable () async throws -> Void
+        ) async throws -> Int {
+            let fixture = try makeControllerFixture(
+                prefix: prefix, identityResolver: resolver, runtimeSignals: .wiFiWithMobileDataOff)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try await waitForReports(1, from: resolver, "a launch with backup off")
+            controller.setEnabledForTesting()
+            controller.setAccessStateForTesting(.full)
+            let scans = PassCounter()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                try await scan()
+            }
+
+            controller.syncNow()
+            let finished = await waitUntil(timeout: .seconds(10)) { scans.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(finished, "the pass must run its scan and end")
+            let reports = resolver.remoteIndexPreparationNotNeededCount - 1
+            await controller.shutdown()
+            return reports
+        }
+    #endif
+
+    private func waitForReports(
+        _ count: Int, from resolver: FakeIdentityResolver, _ description: String, file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(10))
+        while resolver.remoteIndexPreparationNotNeededCount < count, clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            resolver.remoteIndexPreparationNotNeededCount, count, "\(description) reports no index build", file: file,
+            line: line)
+    }
+
     private func makeControllerFixture(
         prefix: String, enabled: Bool = false, identityResolver: (any UploadIdentityResolving)? = nil,
         runtimeSignals: BackupRuntimeSignalSource = .apple, firstNetworkPathWait: Duration = .seconds(10)

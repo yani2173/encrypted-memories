@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import re
+import socketserver
 import struct
 import threading
 import zlib
@@ -27,6 +28,15 @@ class BurstHTTPServer(ThreadingHTTPServer):
     # The app requests its synthetic thumbnails in parallel. On a loaded runner the accept loop falls behind, and
     # macOS resets connections beyond the listen backlog; the default of 5 lost requests the server never saw.
     request_queue_size = 128
+
+    def server_bind(self):
+        # `HTTPServer.server_bind` resolves the bound address with `socket.getfqdn`, a reverse name lookup that can
+        # reach mDNS and may show the macOS prompt "Allow Python to find devices on local networks?". This server
+        # listens on 127.0.0.1 only and needs no name.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
 
 class FixtureServer:

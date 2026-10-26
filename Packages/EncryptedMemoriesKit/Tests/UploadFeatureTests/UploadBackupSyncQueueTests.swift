@@ -249,6 +249,83 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         )
     }
 
+    /// A catalog scan can upsert the revision that the runner has claimed. The claim keeps the receipt of an upload that
+    /// already reached Proton, and the scan must not replace it.
+    func testScanUpsertOfAClaimedRowKeepsItsReceipt() throws {
+        let store = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
+        let entry = UploadBackupSyncQueueEntry(
+            source: source("claimed"), revision: revision(10), originalFilename: "claimed.heic", state: .uploading,
+            attempts: 2, updatedAt: Date(timeIntervalSince1970: 10))
+        let reconciliation = UploadRemoteCommitReconciliation(
+            source: entry.source,
+            identity: UploadIdentity(
+                correctedName: entry.originalFilename, nameHash: "name-hash",
+                sha1Hex: String(repeating: "ab", count: 20), sha1Digest: Data(repeating: 0xAB, count: 20),
+                contentHash: "content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
+        let scanned = UploadBackupSyncQueueEntry(
+            source: entry.source, revision: entry.revision, originalFilename: "claimed.heic", state: .discovered,
+            updatedAt: Date(timeIntervalSince1970: 13))
+        XCTAssertTrue(store.upsert(entry))
+        XCTAssertTrue(
+            store.markNeedsRemoteReconciliation(
+                source: entry.source, revision: entry.revision, reconciliation: reconciliation,
+                lastError: "manifest unavailable", updatedAt: Date(timeIntervalSince1970: 11)))
+        let stored = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertGreaterThan(stored.attempts, 0)
+        XCTAssertEqual(stored.lastError, "manifest unavailable")
+
+        XCTAssertTrue(store.upsert(scanned))
+        let reconciling = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(reconciling.remoteCommitReconciliation, reconciliation, "a reconciliation row keeps its receipt")
+        XCTAssertEqual(reconciling.attempts, stored.attempts)
+        XCTAssertEqual(reconciling.lastError, stored.lastError)
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 12)).count, 1)
+
+        XCTAssertTrue(store.upsert(scanned))
+        let claimed = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(claimed.state, .checking)
+        XCTAssertEqual(claimed.remoteCommitReconciliation, reconciliation, "the scan keeps the claimed row's receipt")
+        XCTAssertEqual(claimed.attempts, stored.attempts, "the scan keeps the claimed row's attempts")
+        XCTAssertEqual(claimed.lastError, stored.lastError, "the scan keeps the claimed row's error")
+
+        XCTAssertTrue(store.upsertBatch([scanned]))
+        XCTAssertEqual(
+            store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation, reconciliation)
+        XCTAssertEqual(store.requeueStaleActive(before: Date(timeIntervalSince1970: 100), updatedAt: Date()), 1)
+        let recovered = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(recovered.state, .needsRemoteReconciliation, "an interrupted claim resumes from its receipt")
+        XCTAssertEqual(recovered.remoteCommitReconciliation, reconciliation)
+    }
+
+    func testScanUpsertOfAnUnclaimedRowStillTakesTheIncomingReceipt() throws {
+        let store = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
+        var entry = UploadBackupSyncQueueEntry(
+            source: source("unclaimed"), revision: revision(10), originalFilename: "unclaimed.heic",
+            state: .discovered, updatedAt: Date(timeIntervalSince1970: 10))
+        let reconciliation = UploadRemoteCommitReconciliation(
+            source: entry.source,
+            identity: UploadIdentity(
+                correctedName: entry.originalFilename, nameHash: "name-hash",
+                sha1Hex: String(repeating: "cd", count: 20), sha1Digest: Data(repeating: 0xCD, count: 20),
+                contentHash: "content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
+        XCTAssertTrue(store.upsert(entry))
+
+        entry.remoteCommitReconciliation = reconciliation
+        XCTAssertTrue(store.upsert(entry))
+        XCTAssertEqual(
+            store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation, reconciliation)
+
+        entry.remoteCommitReconciliation = nil
+        XCTAssertTrue(store.upsert(entry))
+        XCTAssertNil(store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+    }
+
     func testQueueWideRuntimeIssueSurvivesReopenAndClearsExplicitly() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let expected = BackupIssueRecord(

@@ -282,6 +282,45 @@ struct SessionHardeningTests {
         }
     }
 
+    #if os(macOS)
+        /// An unsandboxed run finishes sign-out without touching the shared Library (#792).
+        @Test func signOutOutsideAMacSandboxContainerCompletesTheClaim() async throws {
+            let suite = "auth-network-unsandboxed-\(UUID().uuidString)"
+            let defaults = try #require(UserDefaults(suiteName: suite))
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer {
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: root)
+            }
+            let accountRoot = root.appendingPathComponent("account", isDirectory: true)
+            try FileManager.default.createDirectory(at: accountRoot, withIntermediateDirectories: true)
+            let library = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            let caches = library.appendingPathComponent("Caches", isDirectory: true)
+            let sharedCache = caches.appendingPathComponent("at.oncloud.encryptedmemories/Cache.db")
+            let sharedCookies = library.appendingPathComponent("Cookies/Cookies.binarycookies")
+            for file in [sharedCache, sharedCookies] {
+                try FileManager.default.createDirectory(
+                    at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data([1]).write(to: file)
+            }
+            BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+            let claim = try #require(BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [accountRoot]))
+            let probe = StartupPurgeProbe()
+            let succeeded = await ProtonAuthLocalDataPurge.performOffMain(
+                claim: claim, defaults: SendableUserDefaults(defaults),
+                networkStores: UnusedNetworkStorePurge.Location(
+                    libraryDirectory: library, cachesDirectory: caches,
+                    bundleIdentifier: "at.oncloud.encryptedmemories"),
+                purgeKeychain: { probe.record("keychain") })
+            #expect(succeeded)
+            #expect(!BackupLocalDataPurge.isPurgePending(defaults: defaults))
+            #expect(probe.events == ["keychain"])
+            #expect(!FileManager.default.fileExists(atPath: accountRoot.path))
+            #expect(try Data(contentsOf: sharedCache) == Data([1]))
+            #expect(try Data(contentsOf: sharedCookies) == Data([1]))
+        }
+    #endif
+
     @Test(arguments: [false, true])
     func keychainPurgeAttemptsBothServicesAndRetainsTheFirstError(secondFails: Bool) throws {
         let keychain = RecordingPurgeKeychainStore(secondFails: secondFails)

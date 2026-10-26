@@ -2,7 +2,7 @@ import Foundation
 import PhotosCore
 
 /// App-facing album operations. Reads and writes are deliberately split below at the transport
-/// boundary: SDK 0.31.1 owns catalog/sharing/membership reads, while direct Photos HTTP remains only
+/// boundary: SDK 0.32.1 owns catalog/sharing/membership reads, while direct Photos HTTP remains only
 /// for the write contracts the SDK does not expose.
 public protocol PhotoAlbumMembershipProviding: Sendable {
     func albumMembershipTitles(for photoUID: PhotoUID) async throws -> [String]
@@ -30,7 +30,7 @@ public protocol AlbumCatalogBackend: Sendable {
     func albumMemberships(for photoUIDs: [PhotoUID]) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>]
 }
 
-/// Direct-HTTP write seam retained only for operations absent from SDK 0.31.1.
+/// Direct-HTTP write seam retained only for operations absent from the Swift API of SDK 0.32.1.
 public protocol AlbumWriteBackend: Sendable {
     func createAlbum(name: String) async throws -> AlbumID
     func deleteAlbum(albumID: AlbumID) async throws

@@ -1056,6 +1056,154 @@ else:
                         request.close()
             self.assertEqual(results, [200] * 40)
 
+    def test_runner_sampler_line_reports_swap_every_minute_and_the_trees_every_fifth(self):
+        timeouts = {}
+
+        def size(tree, timeout=300):
+            timeouts[tree.name] = timeout
+            return 1.5
+        with patch.object(run_journey, 'free_gib', return_value=20.0), \
+                patch.object(run_journey, 'swap_used_mib', return_value=12.0), \
+                patch.object(run_journey, 'tree_gib', side_effect=size):
+            trees = run_journey.runner_trees(Path('/evidence/runner-load.log'), Path('/root'))
+            first = run_journey.runner_sample_line(0, trees)
+            second = run_journey.runner_sample_line(1, trees)
+            fifth = run_journey.runner_sample_line(5, trees)
+        self.assertIn('free 20.0 GiB swap used 12 MiB', first)
+        for name in ('evidence', 'scratch', 'products', 'simulators', 'derived-data',
+                     'tmp', 'caches', 'logs', 'diagnostics'):
+            self.assertIn(f' {name} 1.5', first)
+        self.assertNotIn('|', second)
+        self.assertIn('swap used 12 MiB', second)
+        self.assertIn(' tmp 1.5', fifth)
+        self.assertEqual(trees['tmp'], Path(tempfile.gettempdir()))
+        # The four trees that #498 added have the smaller bound; the six old ones keep theirs.
+        self.assertEqual(timeouts[Path(tempfile.gettempdir()).name], 60)
+        self.assertEqual({timeouts[name] for name in ('Caches', 'Logs', 'diagnostics')}, {60})
+        self.assertEqual({timeouts[name] for name in ('evidence', 'scratch', 'products', 'Devices', 'CoreSimulator',
+                                                      'DerivedData')} - {300}, set())
+
+    def test_a_failing_temporary_directory_lookup_does_not_stop_the_sampler_line(self):
+        with patch.object(run_journey.tempfile, 'gettempdir', side_effect=FileNotFoundError('no temporary directory')), \
+                patch.object(run_journey, 'free_gib', return_value=20.0), \
+                patch.object(run_journey, 'swap_used_mib', return_value=12.0), \
+                patch.object(run_journey, 'tree_gib', return_value=1.5):
+            trees = run_journey.runner_trees(Path('/evidence/runner-load.log'), Path('/root'))
+            line = run_journey.runner_sample_line(0, trees)
+        self.assertIsNone(trees['tmp'])
+        self.assertIn(' tmp nan', line)
+        self.assertIn(' caches 1.5', line)
+
+    def test_swap_usage_reads_megabytes_and_gigabytes_and_fails_open(self):
+        def result(text, code=0):
+            return subprocess.CompletedProcess(['sysctl'], code, stdout=text)
+        with patch.object(run_journey.subprocess, 'run',
+                          return_value=result('vm.swapusage: total = 2048.00M  used = 1.25M  free = 2046.75M  (encrypted)')):
+            self.assertEqual(run_journey.swap_used_mib(), 1.25)
+        with patch.object(run_journey.subprocess, 'run',
+                          return_value=result('vm.swapusage: total = 8.00G  used = 2.00G  free = 6.00G  (encrypted)')):
+            self.assertEqual(run_journey.swap_used_mib(), 2048.0)
+        with patch.object(run_journey.subprocess, 'run', return_value=result('')):
+            self.assertTrue(run_journey.swap_used_mib() != run_journey.swap_used_mib())  # NaN
+        with patch.object(run_journey.subprocess, 'run',
+                          return_value=result('vm.swapusage: total = 2048.00M  used = 1.25M  free = 2046.75M', 1)):
+            self.assertTrue(run_journey.swap_used_mib() != run_journey.swap_used_mib())  # NaN: nonzero exit
+        with patch.object(run_journey.subprocess, 'run', side_effect=FileNotFoundError()):
+            self.assertTrue(run_journey.swap_used_mib() != run_journey.swap_used_mib())
+
+    def test_swap_usage_is_read_in_the_c_locale(self):
+        with patch.object(run_journey.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                ['sysctl'], 0, stdout='vm.swapusage: total = 1.00M  used = 1.00M  free = 0.00M')) as run:
+            run_journey.swap_used_mib()
+        self.assertEqual(run.call_args.kwargs['env']['LC_ALL'], 'C')
+
+    def stub_du(self, root, code, stdout):
+        directory = Path(root) / 'bin'
+        directory.mkdir()
+        script = directory / 'du'
+        script.write_text(f'#!/bin/sh\nprintf "{stdout}"\nexit {code}\n')
+        script.chmod(0o755)
+        return patch.dict(os.environ, {'PATH': f'{directory}{os.pathsep}{os.environ["PATH"]}'})
+
+    def test_a_tree_total_is_clean_only_when_du_exits_zero(self):
+        with tempfile.TemporaryDirectory() as root:
+            tree = Path(root) / 'tree'
+            tree.mkdir()
+            with self.stub_du(root, 0, '2097152\\t/tree\\n'):
+                clean = run_journey.tree_gib(tree)
+            self.assertEqual(clean, 2.0)
+            self.assertNotIsInstance(clean, run_journey.PartialSize)
+            self.assertEqual(run_journey.tree_label(clean), '2.0')
+
+    def test_a_tree_with_an_unreadable_part_is_a_partial_total_and_a_failed_du_is_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            tree = Path(root) / 'tree'
+            tree.mkdir()
+            partial_root = Path(root) / 'partial'
+            partial_root.mkdir()
+            with self.stub_du(partial_root, 1, '1048576\\t/tree\\n'):
+                partial = run_journey.tree_gib(tree)
+            self.assertIsInstance(partial, run_journey.PartialSize)
+            self.assertEqual(float(partial), 1.0)
+            self.assertEqual(run_journey.tree_label(partial), '1.0 partial')
+            failed_root = Path(root) / 'failed'
+            failed_root.mkdir()
+            with self.stub_du(failed_root, 1, ''):
+                unknown = run_journey.tree_gib(tree)
+            self.assertTrue(unknown != unknown)  # NaN
+            self.assertEqual(run_journey.tree_label(unknown), 'nan')
+
+    def test_tree_size_passes_its_time_limit_to_du(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(run_journey.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    ['du'], 0, stdout='1024\t/x\n')) as run:
+                run_journey.tree_gib(Path(root), 60)
+                run_journey.tree_gib(Path(root))
+        self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [60, 300])
+
+    def test_a_tree_that_cannot_be_examined_reads_as_unknown(self):
+        class Unexaminable:
+            def exists(self):
+                raise PermissionError(13, 'Permission denied')
+        self.assertTrue(run_journey.tree_gib(Unexaminable()) != run_journey.tree_gib(Unexaminable()))  # NaN
+        with tempfile.TemporaryDirectory() as root, patch.object(run_journey.subprocess, 'run', side_effect=FileNotFoundError()):
+            size = run_journey.tree_gib(Path(root))
+        self.assertTrue(size != size)  # NaN: no du
+
+    @unittest.skipIf(os.geteuid() == 0, 'root can read every directory')
+    def test_an_unreadable_tree_never_reads_as_a_clean_number(self):
+        # BSD du prints nothing for an unreadable root; GNU du prints a total and exits 1. Both are not a clean number.
+        with tempfile.TemporaryDirectory() as root:
+            tree = Path(root) / 'diagnostics'
+            tree.mkdir()
+            (tree / 'file').write_bytes(b'x' * 4096)
+            tree.chmod(0)
+            try:
+                size = run_journey.tree_gib(tree)
+            finally:
+                tree.chmod(0o700)
+            self.assertTrue(size != size or isinstance(size, run_journey.PartialSize), size)
+
+    def test_fixture_server_binds_without_a_name_lookup(self):
+        # The loopback server needs no host name. A reverse lookup of its address can reach mDNS on macOS and show the
+        # local network prompt over the journey.
+        def refuse(*arguments, **keywords):
+            raise AssertionError('the fixture server looked up a host name')
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch('socket.getfqdn', side_effect=refuse), patch('socket.gethostbyaddr', side_effect=refuse):
+                server = FixtureServer(Path(root), 'backup.claimed')
+            with server:
+                self.assertEqual(server.http.server_name, '127.0.0.1')
+                with urlopen(server.url + '/links', timeout=10) as response:
+                    self.assertEqual(json.load(response), [])
+
+    def test_the_journey_lists_its_points_without_any_other_argument(self):
+        result = subprocess.run([sys.executable, str(Path(run_journey.__file__)), '--list-points'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), run_journey.POINTS)
+
     def test_upload_ledger_survives_app_replacement_and_exposes_duplicates(self):
         with tempfile.TemporaryDirectory() as root, FixtureServer(Path(root), 'backup.claimed') as server:
             def upload():

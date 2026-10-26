@@ -179,6 +179,10 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
     public var message: String {
         switch self {
         case .keptDuplicates(_, .relatedFileWithoutTwin): L10n.string("duplicates.kept_reason_related_file")
+        case .keptDuplicates(_, .copyFailed): L10n.string("duplicates.kept_reason_copy_failed")
+        case .keptDuplicates(_, .waitingForWiFi): L10n.string("duplicates.kept_reason_waiting_for_wifi")
+        case .keptDuplicates(_, .deviceStorageFull): L10n.string("duplicates.kept_reason_device_storage")
+        case .keptDuplicates(_, .protonStorageFull): L10n.string("duplicates.kept_reason_proton_storage")
         case .keptDuplicates(_, .pendingEditReplacement): L10n.string("duplicates.kept_reason_pending_edit")
         case .keptDuplicates(_, .neededByLocalSource): L10n.string("duplicates.kept_reason_needed_here")
         case .keptDuplicates(_, .shared): L10n.string("duplicates.kept_reason_shared")
@@ -431,7 +435,7 @@ public final class ExactDuplicatesModel {
     public private(set) var mergeAllProgress: ExactDuplicateScanProgress?
     /// Merge All runs, from its ranking to its last batch.
     public private(set) var isMergingAll = false
-    /// The person stopped Merge All. The running batch finishes first.
+    /// The person stopped Merge All. Owned copies stop; the rest of the running batch finishes first.
     public private(set) var isStoppingMergeAll = false
     /// Account retirement permanently prevents a queued action from starting another merge.
     private var isRetired = false
@@ -442,6 +446,8 @@ public final class ExactDuplicatesModel {
     @ObservationIgnored private var isMergePaused = false
     /// Merge All waits here while it is paused.
     @ObservationIgnored private var mergeResumers: [UUID: CheckedContinuation<Void, Never>] = [:]
+    /// The exact run owns only its related-file copy tasks, including during single-group retirement.
+    @ObservationIgnored private var mergeRun: ExactDuplicateMergeRun?
     /// A batch of a merge is with the finder.
     @ObservationIgnored private var isMergeBatchRunning = false
     /// They wait until the running batch finished.
@@ -1179,7 +1185,10 @@ public final class ExactDuplicatesModel {
 
     /// Runs the build of the content index, or waits for the build that already runs.
     private func buildIndex() async throws -> Bool {
-        if let indexBuild { return try await indexBuild.value }
+        if let indexBuild {
+            PhotoDiagnostics.shared.increment("duplicates.indexBuildJoined")
+            return try await indexBuild.value
+        }
         let finder = finder
         let report: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { [weak self] progress in
             await self?.show(progress)
@@ -1230,16 +1239,17 @@ public final class ExactDuplicatesModel {
     }
 
     /// Merges every group shown, batch by batch, with progress. The screen shows the outcome of each batch before the
-    /// next one starts. The run stops after the running batch when the person stops it, and after a batch in which no
+    /// next one starts. Stop cancels owned copies and lets the rest of the batch finish. The run also ends after a batch in which no
     /// group merged, for example without a connection. A run does not survive the app: it never resumes after a quit.
     public func mergeAll() async {
         guard canMerge else { return }
         await merge(groups, all: true)
     }
 
-    /// Ends this account's ownership. A running batch finishes; no queued action can start another merge.
+    /// Ends this account's ownership. Owned copies stop; other batch work joins before ownership ends.
     func retire() {
         isRetired = true
+        mergeRun?.stopCopies()
         // Invalidate suspended reads without cancelling the joined index build.
         loadGeneration += 1
         rescanAfterMerge = false
@@ -1248,10 +1258,10 @@ public final class ExactDuplicatesModel {
         stopMergeAll()
     }
 
-    /// Stops Merge All. The running batch finishes; a running ranking stops, and then nothing merges. The groups that
-    /// did not merge stay.
+    /// Stops owned copies and ranking. Other work in the active batch finishes; no further batch starts.
     public func stopMergeAll() {
         guard canStopMergeAll else { return }
+        mergeRun?.stopCopies()
         isStoppingMergeAll = true
         rankingPublication.cancel(mergeRanking, token: mergeRankingToken)
         // A paused run wakes up to stop.
@@ -1357,6 +1367,8 @@ public final class ExactDuplicatesModel {
         if all { mergeAllProgress = ExactDuplicateScanProgress(completed: 0, total: selected.count) }
         // One favorites listing and one album listing serve every batch.
         let run = ExactDuplicateMergeRun(members: selected.flatMap(\.scanGroup.members))
+        mergeRun = run
+        defer { if mergeRun === run { mergeRun = nil } }
         while handled < selected.count {
             if all {
                 await waitWhileMergePaused()
@@ -1389,7 +1401,12 @@ public final class ExactDuplicatesModel {
                 do {
                     switch try result.get() {
                     case .merged(let keptPhoto, let moved, let keptDuplicates):
-                        mergedGroups += 1
+                        // A stopped copy that retained every source did not merge a group.
+                        if !run.copiesStopped || !moved.isEmpty
+                            || !keptDuplicates.values.contains(where: Self.stoppedCopyReasons.contains)
+                        {
+                            mergedGroups += 1
+                        }
                         trashed += moved
                         kept.merge(keptDuplicates) { first, _ in first }
                         if keptDuplicates.values.contains(.differentDetails) {
@@ -1509,12 +1526,18 @@ public final class ExactDuplicatesModel {
         return .keptDuplicates(count: kept.count, reason: reason)
     }
 
+    /// The reasons of a copy that ended without its trash. After Stop they mean that the group did not merge.
+    private static let stoppedCopyReasons: Set<ExactDuplicateKeepReason> = [
+        .copyFailed, .deviceStorageFull, .protonStorageFull,
+    ]
+
     /// The first of `reasons` in a fixed order. Nil when `reasons` is empty.
     private static func firstReason(
         in reasons: some Collection<ExactDuplicateKeepReason>
     ) -> ExactDuplicateKeepReason? {
         let order: [ExactDuplicateKeepReason] = [
-            .differentDetails, .relatedFileWithoutTwin, .pendingEditReplacement, .neededByLocalSource, .shared,
+            .differentDetails, .relatedFileWithoutTwin, .deviceStorageFull, .protonStorageFull, .copyFailed,
+            .waitingForWiFi, .pendingEditReplacement, .neededByLocalSource, .shared,
             .unreadable,
         ]
         return order.first(where: reasons.contains)

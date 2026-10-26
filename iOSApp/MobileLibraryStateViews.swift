@@ -54,18 +54,7 @@ struct MobileSignOutFailureView: View {
                 .contentShape(Rectangle())
                 .ignoresSafeArea()
 
-            ContentUnavailableView {
-                Label {
-                    Text(L10n.string("sign_out.cleanup_failed_title"))
-                } icon: {
-                    Image(systemName: "exclamationmark.shield")
-                }
-            } description: {
-                Text(L10n.string("sign_out.cleanup_failed_message"))
-            } actions: {
-                RetryButton(.prominent, action: onRetry)
-            }
-            .padding()
+            SignOutCleanupFailedView(retry: onRetry)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea()

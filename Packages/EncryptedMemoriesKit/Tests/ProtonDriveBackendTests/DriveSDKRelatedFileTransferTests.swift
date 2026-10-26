@@ -131,6 +131,46 @@ struct DriveSDKRelatedFileTransferTests {
         }
     }
 
+    @Test(arguments: [true, false])
+    func bridgeChecksProtonStorageBeforeTheTransport(full: Bool) async throws {
+        RelatedFileDenyHTTP.reset()
+        defer { RelatedFileDenyHTTP.reset() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let probe = RelatedFileBridgeProbe()
+        let bridge = try await makeBridge(
+            directory: directory,
+            operations: .init(
+                transfer: transfer(directory: directory),
+                uploadTransport: { _, request, _ in await probe.upload(request) }))
+        let file = directory.appendingPathComponent("related.jpg")
+        try Data("abc".utf8).write(to: file)
+        let request = try request(file: file, allowsExpensiveNetwork: false)
+        let remote: any ExactDuplicateRemote = bridge
+        // Nothing throws between this shared quota and its removal.
+        let account = "related-quota-fixture"
+        await MainActor.run {
+            AccountInfo.shared.beginSession(accountUID: account)
+            AccountInfo.shared.updateDriveStorage(usedBytes: full ? 1_000 : 0, maxBytes: 1_000, accountUID: account)
+        }
+        let result: Result<PhotoUID, any Error>
+        do { result = .success(try await remote.uploadRelatedFile(request)) } catch { result = .failure(error) }
+        await bridge.shutdown()
+        await MainActor.run { AccountInfo.shared.clear() }
+
+        if full {
+            #expect(throws: ExactDuplicateRelatedFileTransferError.copyFailed(.accountStorage)) { try result.get() }
+            // The full answer is refreshed once, as for a backup upload; the offline fixture refuses it.
+            #expect(RelatedFileDenyHTTP.requestCount >= 1)
+        } else {
+            #expect(try result.get() == PhotoUID(volumeID: "vol", nodeID: "copied"))
+            #expect(RelatedFileDenyHTTP.requestCount == 0)
+        }
+        #expect(await probe.uploadCount == (full ? 0 : 1))
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+    }
+
     @Test func aClosedBridgeRemovesUploadStagingWithoutInvokingTheTransport() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

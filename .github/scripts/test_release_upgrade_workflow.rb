@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "json"
 require "yaml"
 require "tmpdir"
 require_relative "test_release_identity"
@@ -24,7 +25,9 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     assert_includes Array(@jobs.fetch("upload").fetch("needs")), "build"
     refute @jobs.fetch("upgrade").key?("if"), "Stable releases and betas both require the gate"
     refute @jobs.fetch("upload").key?("if"), "Upload must use the default successful-needs barrier"
-    assert_equal %w[iOS macOS], @jobs.fetch("upgrade").dig("strategy", "matrix", "include").map { |shard| shard.fetch("platform") }.uniq.sort
+    platforms = IO.popen(["python3", "-c", "import sys; sys.path.insert(0, sys.argv[1]); " \
+      "import release_upgrade as r; print(' '.join(r.PLATFORMS))", File.expand_path(__dir__)], &:read).split
+    assert_equal %w[iOS macOS], platforms.sort
     build = @jobs.fetch("build").fetch("steps").map { |step| step["run"].to_s }.join("\n")
     assert_includes build, "xcodebuild archive"
     refute_includes build, "altool --upload-package"
@@ -33,11 +36,22 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     refute_includes upload, "xcodebuild archive"
   end
 
-  def test_the_shards_of_each_platform_cover_every_interruption_point_exactly_once
-    script = "import sys; sys.path.insert(0, sys.argv[1]); import run_journey; print(' '.join(run_journey.POINTS))"
-    points = IO.popen(["python3", "-c", script, File.expand_path("../../scripts/upgrade-test", __dir__)], &:read).split
+  # The jobs of the upgrade gate come from the one point list of the journey and the selected sources; a new point
+  # or source needs no workflow edit. The generator is tested in test_release_upgrade.py; this checks the wiring.
+  def test_the_jobs_of_the_upgrade_gate_are_generated_from_the_point_list_and_the_sources
+    journey = File.expand_path("../../scripts/upgrade-test/run_journey.py", __dir__)
+    points = IO.popen(["python3", journey, "--list-points"], &:read).split
     assert_equal 12, points.length
-    shards = @jobs.fetch("upgrade").dig("strategy", "matrix", "include")
+    assert_equal points.uniq, points
+    matrix = @jobs.fetch("upgrade").dig("strategy", "matrix")
+    assert_equal "${{ fromJSON(needs.prepare.outputs.upgrade_matrix) }}", matrix
+    assert_equal "${{ steps.upgrade-plan.outputs.upgrade_matrix }}", @jobs.fetch("prepare").fetch("outputs").fetch("upgrade_matrix")
+    plan = @jobs.fetch("prepare").fetch("steps").find { |step| step["id"] == "upgrade-plan" }
+    refute_nil plan
+    generated = IO.popen(["python3", "-c", "import json, sys; sys.path.insert(0, sys.argv[1]); " \
+      "import release_upgrade as r; print(json.dumps(r.upgrade_matrix(['a', 'b', 'c'], sys.argv[2].split())))",
+                          File.expand_path(__dir__), points.join(" ")], &:read)
+    shards = JSON.parse(generated).fetch("include")
     shards.group_by { |shard| shard.fetch("platform") }.each do |platform, group|
       covered = group.flat_map { |shard| shard.fetch("points").split }
       assert_equal points.sort, covered.sort, "#{platform} shards must cover every point exactly once"

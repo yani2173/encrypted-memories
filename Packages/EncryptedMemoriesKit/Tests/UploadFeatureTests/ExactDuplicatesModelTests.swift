@@ -1114,8 +1114,13 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let (model, _) = makeModel(finder)
         let first = Task { await model.load() }
         await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
+        // The gate opens only when the second load has joined the running build; its scan says nothing about that, and
+        // a build that ends before the join leaves nothing to wait for.
+        let joinedBefore = PhotoDiagnostics.shared.counter("duplicates.indexBuildJoined")
         let second = Task { await model.load() }
-        await waitUntil({ finder.scanCalls == 2 }, "the second load scans")
+        await waitUntil(
+            { PhotoDiagnostics.shared.counter("duplicates.indexBuildJoined") > joinedBefore },
+            "the second load waits for the running build")
         finder.buildGate.open()
         await first.value
         await second.value
@@ -2754,12 +2759,100 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertFalse(group.isKeptChosen)
     }
 
+    func testCopyReasonPrecedencePreservesEveryExistingPair() async {
+        let order: [ExactDuplicateKeepReason] = [
+            .differentDetails, .relatedFileWithoutTwin, .deviceStorageFull, .protonStorageFull, .copyFailed,
+            .waitingForWiFi, .pendingEditReplacement, .neededByLocalSource, .shared, .unreadable,
+        ]
+        for first in order.indices {
+            for second in order.indices where second > first {
+                for reversed in [false, true] {
+                    let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+                    finder.outcomes["A"] = .merged(
+                        kept: a1, trashed: [],
+                        keptDuplicates: [
+                            a2: order[reversed ? second : first], a3: order[reversed ? first : second],
+                        ])
+                    let (model, _) = makeModel(finder)
+                    await model.load()
+                    await model.merge(groupID: "A")
+                    XCTAssertEqual(model.notice, .keptDuplicates(count: 2, reason: order[first]))
+                    // differentDetails deliberately invalidates the displayed fingerprint/reason for a fresh check.
+                    if order[first] != .differentDetails {
+                        XCTAssertEqual(model.groups.first?.keptReason, order[first])
+                    }
+                }
+            }
+        }
+    }
+
+    func testCopyReasonPrecedencePreservesMixedMultiReasonCountsInBothOrders() async {
+        let order: [ExactDuplicateKeepReason] = [
+            .differentDetails, .relatedFileWithoutTwin, .deviceStorageFull, .protonStorageFull, .copyFailed,
+            .waitingForWiFi, .pendingEditReplacement, .neededByLocalSource, .shared, .unreadable,
+        ]
+        for start in order.indices {
+            let reasons = Array(order[start...])
+            let members = (0...reasons.count).map { PhotoUID(volumeID: "v", nodeID: "mixed-\($0)") }
+            let group = ExactDuplicateGroup(contentHash: "mixed", hashKeyEpoch: "e", members: members)
+            for reversed in [false, true] {
+                let finder = FakeDuplicateFinder(scans: [.init(groups: [group], coverage: .complete)])
+                let ordered = reversed ? Array(reasons.reversed()) : reasons
+                finder.outcomes[group.id] = .merged(
+                    kept: members[0], trashed: [],
+                    keptDuplicates: Dictionary(uniqueKeysWithValues: zip(members.dropFirst(), ordered)))
+                let (model, _) = makeModel(finder)
+                await model.load()
+                await model.merge(groupID: group.id)
+                XCTAssertEqual(model.notice, .keptDuplicates(count: reasons.count, reason: order[start]))
+                if order[start] != .differentDetails { XCTAssertEqual(model.groups.first?.keptReason, order[start]) }
+            }
+        }
+    }
+
     func testEveryKeptReasonHasItsOwnMessage() {
         let reasons: [ExactDuplicateKeepReason] = [
-            .relatedFileWithoutTwin, .pendingEditReplacement, .neededByLocalSource, .unreadable,
+            .relatedFileWithoutTwin, .copyFailed, .waitingForWiFi, .deviceStorageFull, .protonStorageFull,
+            .pendingEditReplacement, .neededByLocalSource, .unreadable,
         ]
         let messages = Set(reasons.map { ExactDuplicateMergeNotice.keptDuplicates(count: 1, reason: $0).message })
         XCTAssertEqual(messages.count, reasons.count)
+    }
+
+    func testStorageReasonsSayWhatTheBackupStatusSaysForTheSameStorage() {
+        let pairs: [(ExactDuplicateKeepReason, String, String)] = [
+            (.deviceStorageFull, "duplicates.kept_reason_device_storage", "backup.issue_device_storage"),
+            (.protonStorageFull, "duplicates.kept_reason_proton_storage", "backup.issue_account_storage"),
+        ]
+        for (reason, key, backupKey) in pairs {
+            let message = ExactDuplicateMergeNotice.keptDuplicates(count: 1, reason: reason).message
+            XCTAssertEqual(message, L10n.string(dynamicKey: key))
+            XCTAssertNotEqual(message, key, "the key must resolve in the catalog")
+            XCTAssertEqual(message, L10n.string(dynamicKey: backupKey))
+        }
+    }
+
+    func testAStoppedMergeAllDoesNotCountAGroupWhoseCopyKeptItsSource() async {
+        let reasons: [(ExactDuplicateKeepReason, countsAsMerged: Bool)] = [
+            (.copyFailed, false), (.deviceStorageFull, false), (.protonStorageFull, false),
+            (.pendingEditReplacement, true),
+        ]
+        for (reason, countsAsMerged) in reasons {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+            finder.outcomes["A"] = .merged(kept: a1, trashed: [], keptDuplicates: [a2: reason, a3: reason])
+            let (model, _) = makeModel(finder)
+            await model.load()
+            finder.mergeGate.close()
+            let merge = Task { await model.mergeAll() }
+            await waitUntil({ finder.mergeGate.hasWaiters }, "the batch is with the finder")
+            model.stopMergeAll()
+            finder.mergeGate.open()
+            await merge.value
+            XCTAssertEqual(
+                model.notice,
+                countsAsMerged ? .keptDuplicates(count: 2, reason: reason) : .stopped(merged: 0, total: 1),
+                "\(reason)")
+        }
     }
 
     func testAFailedMergeKeepsTheGroupAndSaysSo() async {

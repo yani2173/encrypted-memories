@@ -779,20 +779,216 @@ import Testing
             observedTimes == [.seconds(5), .seconds(35), .seconds(45), .seconds(75)],
             "A stable published baseline closes the old burst before later changes")
     }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aChangeAtExactlyTheQuietDeadlineRefreshesInsteadOfRestartingTheWait() async {
+        let clock = TimelineRefreshTestClock()
+        let origin = clock.now
+        let provider = TokenProvider("a")
+        let timeline = MonitorRefreshTimeline()
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(provider: provider, initialToken: "a") {
+            let token = await provider.currentToken()
+            await timeline.record(clock.now - origin, token: token)
+            return .refreshed(token: token)
+        }
+        #expect(await clock.waitForSleepCount(1))
+        for tick in 1...7 {
+            switch tick {
+            case 1: await provider.set("b")  // refreshes at 5 seconds
+            case 2: await provider.set("c")  // the first deferred change at 10 seconds: quiet deadline at 35 seconds
+            case 7: await provider.set("d")  // arrives at exactly 35 seconds
+            default: break
+            }
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(tick + 1))
+        }
+        #expect(
+            await timeline.times == [.seconds(5), .seconds(35)],
+            "A change at exactly 25 seconds of quiet ends the burst; it does not start the wait again")
+        #expect(await timeline.tokens == ["b", "d"])
+        await monitor.stop()
+        #expect(clock.pendingSleeps == 0)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aFailedProbeDuringAPendingBurstDoesNotWaitPastItsDeadline() async {
+        let clock = TimelineRefreshTestClock()
+        let origin = clock.now
+        let provider = TokenProvider("a")
+        let timeline = MonitorRefreshTimeline()
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(provider: provider, initialToken: "a") {
+            let token = await provider.currentToken()
+            await timeline.record(clock.now - origin, token: token)
+            return .refreshed(token: token)
+        }
+        #expect(await clock.waitForSleepCount(1))
+        for tick in 1...7 {
+            switch tick {
+            case 1: await provider.set("b")
+            case 2: await provider.set("c")  // the quiet deadline of this burst is 35 seconds
+            case 6: await provider.failNextProbes(1)  // the probe at 30 seconds fails
+            default: break
+            }
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(tick + 1))
+            if tick == 6 {
+                #expect(
+                    clock.requestedSleeps.last == .seconds(5),
+                    "The failure wait of 30 seconds is cut to the 5 seconds left until the deadline")
+            }
+        }
+        #expect(await timeline.times == [.seconds(5), .seconds(35)])
+        #expect(await timeline.tokens == ["b", "c"])
+        await monitor.stop()
+        #expect(clock.pendingSleeps == 0)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aFailedProbeAtOrAfterTheDeadlineKeepsTheFullFailureWait() async {
+        let clock = TimelineRefreshTestClock()
+        let provider = TokenProvider("a")
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(provider: provider, initialToken: "a") { .refreshed(token: await provider.currentToken()) }
+        #expect(await clock.waitForSleepCount(1))
+        for tick in 1...7 {
+            switch tick {
+            case 1: await provider.set("b")
+            case 2: await provider.set("c")
+            case 7: await provider.failNextProbes(2)  // the probes at the deadline and after it fail
+            default: break
+            }
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(tick + 1))
+        }
+        #expect(
+            clock.requestedSleeps.last == .seconds(30),
+            "A probe that fails exactly at the deadline adds no shorter wait: it is not polled every few seconds")
+        clock.advance(by: .seconds(30))
+        #expect(await clock.waitForSleepCount(9))
+        #expect(
+            clock.requestedSleeps.last == .seconds(30),
+            "A probe that fails after the deadline waits the full failure interval as well")
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aShortenedFailureWaitKeepsTheAbsoluteDeadlineWhenTheClockRegistersLate() async {
+        let clock = TimelineRefreshTestClock()
+        let origin = clock.now
+        let provider = TokenProvider("a")
+        let timeline = MonitorRefreshTimeline()
+        let arm = HeldSleepArm()
+        let entered = TestSignal()
+        let release = TestSignal()
+        let dependency = TimelineRefreshClock(
+            now: { clock.now },
+            sleep: { duration in
+                if await arm.takeIfArmed() {
+                    await entered.signal()
+                    await release.wait()
+                }
+                try await clock.dependency.sleep(duration)
+            },
+            sleepUntil: { deadline in
+                if await arm.takeIfArmed() {
+                    await entered.signal()
+                    await release.wait()
+                }
+                try await clock.dependency.sleepUntil(deadline)
+            }
+        )
+        let monitor = LibraryChangeMonitor(clock: dependency)
+        await monitor.start(provider: provider, initialToken: "a") {
+            let token = await provider.currentToken()
+            await timeline.record(clock.now - origin, token: token)
+            return .refreshed(token: token)
+        }
+        #expect(await clock.waitForSleepCount(1))
+        await provider.set("b")
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(2))
+        await provider.set("c")  // the first deferred change at 10 seconds: quiet deadline at 35 seconds
+        for tick in 2...5 {
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(tick + 1))
+        }
+        // The probe at 30 seconds fails. The clock registers the shortened wait only after 40 seconds.
+        await arm.arm()
+        await provider.failNextProbes(1)
+        clock.advance(by: .seconds(5))
+        await entered.wait()
+        clock.advance(by: .seconds(10))
+        await release.signal()
+        #expect(await timeline.waitForLoadOrSleep(after: 1, clock: clock))
+        if await timeline.times.count < 2, clock.pendingSleeps > 0 { clock.advanceToNextSleep() }
+        #expect(await clock.waitForSleepCount(8))
+        #expect(
+            await timeline.times == [.seconds(5), .seconds(40)],
+            "The wait ends at the deadline of 35 seconds, not five seconds after the late registration")
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aSecondContinuousBurstIsBoundedByItsOwnCap() async {
+        let clock = TimelineRefreshTestClock()
+        let origin = clock.now
+        let provider = TokenProvider("0")
+        let timeline = MonitorRefreshTimeline()
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(provider: provider, initialToken: "0") {
+            let token = await provider.currentToken()
+            await timeline.record(clock.now - origin, token: token)
+            return .refreshed(token: token)
+        }
+        #expect(await clock.waitForSleepCount(1))
+        for tick in 1...27 {
+            await provider.set(String(tick))
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(tick + 1))
+        }
+        #expect(
+            await timeline.times == [.seconds(5), .seconds(70), .seconds(135)],
+            "Each burst is bounded by sixty seconds from its own first deferred change")
+        #expect(await timeline.tokens == ["1", "14", "27"])
+        await monitor.stop()
+        #expect(clock.pendingSleeps == 0)
+    }
+}
+
+private struct TokenProbeFailure: Error {}
+
+private actor HeldSleepArm {
+    private var armed = false
+
+    func arm() { armed = true }
+
+    func takeIfArmed() -> Bool {
+        defer { armed = false }
+        return armed
+    }
 }
 
 private actor TokenProvider: LibraryChangeTokenProvider {
     private var token: String
     private(set) var probeCount = 0
+    private var failingProbes = 0
     private var probeWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
     init(_ token: String) { self.token = token }
 
     func set(_ token: String) { self.token = token }
     func currentToken() -> String { token }
+    /// The next probes fail, as when the server is unreachable.
+    func failNextProbes(_ count: Int) { failingProbes = count }
 
     func libraryChangeToken() async throws -> String {
         probeCount += 1
+        if failingProbes > 0 {
+            failingProbes -= 1
+            throw TokenProbeFailure()
+        }
         let completed = probeWaiters.filter { probeCount >= $0.count }
         probeWaiters.removeAll { probeCount >= $0.count }
         for waiter in completed {

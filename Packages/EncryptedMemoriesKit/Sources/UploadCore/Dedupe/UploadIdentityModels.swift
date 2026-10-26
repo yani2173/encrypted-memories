@@ -888,6 +888,9 @@ public protocol UploadDuplicateChecking: Sendable {
     func prepareRemoteIndex(
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
     ) async throws
+    /// The backup ended a pass without preparing the remote index for a reason that lasts until the person acts:
+    /// backup is off, or nothing waits for an upload. A wait for the first full index build may end early.
+    func remoteIndexPreparationNotNeeded() async
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth
     /// Exact active-remote proofs for source identities stored in Proton's encrypted metadata.
     /// Missing entries are unknown, never negative proof.
@@ -963,6 +966,8 @@ public extension UploadDuplicateChecking {
     ) async throws {
         await progress(.init(phase: .ready))
     }
+    /// A backend without a wait for its first index build has nothing to end.
+    func remoteIndexPreparationNotNeeded() async {}
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
         .complete(indexedCount: 0)
     }
@@ -1013,6 +1018,9 @@ public protocol UploadIdentityResolving: Sendable {
     func prepareRemoteIndex(
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
     ) async throws
+    /// The backup ended a pass without preparing the remote index for a reason that lasts until the person acts:
+    /// backup is off, or nothing waits for an upload. A wait for the first full index build may end early.
+    func remoteIndexPreparationNotNeeded() async
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth
     /// Batch-prefetch duplicate states for a fresh enqueue batch (Proton queries name hashes in
     /// chunks of 150). Best-effort: failures surface later through per-item `resolve`.
@@ -1053,6 +1061,8 @@ public extension UploadIdentityResolving {
     ) async throws {
         await progress(.init(phase: .ready))
     }
+    /// A backend without a wait for its first index build has nothing to end.
+    func remoteIndexPreparationNotNeeded() async {}
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
         .complete(indexedCount: 0)
     }

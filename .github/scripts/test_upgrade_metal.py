@@ -94,7 +94,9 @@ print(Metal3RuntimeCapability.supports(device: ControlledDevice(true)))
         self.assertEqual(self.results['candidate', False], ['false', 'false', 'true', 'false', 'true'])
 
     def test_every_historical_overlay_is_covered(self):
-        self.assertEqual(self.tags, ['v1.0.5', 'v1.1.0-beta.3'])
+        # One list: a patch file in the overlay directory needs its entry in versions.json, and the reverse.
+        patches = sorted(path.stem for path in (self.repo / 'scripts/upgrade-test/overlays').glob('*.patch'))
+        self.assertEqual(self.tags, patches)
 
     def test_historical_without_flag_requires_a_metal3_device(self):
         for tag in self.tags:

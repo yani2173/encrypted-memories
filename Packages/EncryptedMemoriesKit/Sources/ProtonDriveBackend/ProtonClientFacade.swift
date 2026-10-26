@@ -105,7 +105,7 @@ public final class ProtonClientFacade {
         identityComposition: UploadIdentityResolverComposition,
         settlementStore: UploadManualSettlementStore?
     ) -> ProtonClientFacade {
-        // Albums: SDK 0.31.1 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
+        // Albums: SDK 0.32.1 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
         // retained only for writes the SDK does not expose.
         // Recently Deleted lists photos that left every inventory. The coordinator authorizes their
         // thumbnails from that listing; a weak reference keeps the bridge from retaining the coordinator.

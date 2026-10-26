@@ -130,6 +130,13 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     /// Makes the next index preparations fail, for example with a cancellation.
     var prepareRemoteIndexError: Error?
     private(set) var findBatches: [[String]] = []
+    private var notNeededSignals = 0
+    /// How often the backup reported that it ended a pass without preparing the index.
+    var remoteIndexPreparationNotNeededCount: Int { lock.withLock { notNeededSignals } }
+
+    func remoteIndexPreparationNotNeeded() async {
+        lock.withLock { notNeededSignals += 1 }
+    }
     private(set) var nameHashCalls = 0
     private var invalidationCount = 0
     private var nameLookupAttempts = 0
@@ -339,6 +346,11 @@ final class UploadDedupePipelineTests: XCTestCase {
         hasher = FakeHasher()
         checker = FakeChecker()
         pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+    }
+
+    func testThePipelineHandsTheEndOfAPassWithoutAnIndexBuildToItsChecker() async {
+        await pipeline.remoteIndexPreparationNotNeeded()
+        XCTAssertEqual(checker.remoteIndexPreparationNotNeededCount, 1)
     }
 
     private func descriptor(

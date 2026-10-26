@@ -5,7 +5,7 @@ import Testing
 
 @testable import ProtonDriveBackend
 
-/// SDK 0.31.1 sends small files as one buffered multipart request through `requestSmallUpload`.
+/// SDK 0.32.1 sends small files as one buffered multipart request through `requestSmallUpload`.
 /// The transport must keep the opaque body byte-identical, authenticate with the session, never
 /// resend after an ambiguous failure, and keep the existing one-shot refresh after an explicit 401.
 @Suite("SDK small upload transport", .serialized)

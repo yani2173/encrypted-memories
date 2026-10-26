@@ -159,6 +159,7 @@ jobs:
           python3 .github/scripts/test_review_replay.py
           bash .github/scripts/test_run_ui_tests_with_retry.sh
           python3 .github/scripts/test_swift_style_scripts.py
+          python3 scripts/tests/test_verify_tests_script.py
 
       - name: Lint GitHub Actions workflows
         env:

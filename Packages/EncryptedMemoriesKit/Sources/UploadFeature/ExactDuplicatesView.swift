@@ -531,8 +531,9 @@ private struct ExactDuplicateMembers<Cover: View>: View {
 
     var body: some View {
         // A row that fits never takes a scroll gesture: a vertical one over it scrolls the list, not the row.
+        // A lazy stack builds only the copies near the screen, so a group of 1,000 copies loads a few thumbnails.
         ScrollView(.horizontal) {
-            HStack(spacing: 10) {
+            LazyHStack(spacing: 10) {
                 ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
                     let isKept = uid == group.kept
                     let keepTitle = group.keepTitle(for: uid)

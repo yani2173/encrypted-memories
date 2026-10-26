@@ -548,24 +548,8 @@ public struct PhotoViewerView: View {
     }
 
     /// A native determinate indicator with a percentage while bytes arrive, otherwise the indeterminate spinner.
-    @ViewBuilder private func progressIndicator(_ progress: Double, isDownloading: Bool) -> some View {
-        if isDownloading, progress > 0.001, progress < 0.995 {
-            ProgressView(value: progress) {
-                EmptyView()
-            } currentValueLabel: {
-                Text(progress, format: .percent.precision(.fractionLength(0)))
-                    .monospacedDigit()
-            }
-            .progressViewStyle(.circular)
-            .controlSize(.large)
-            .padding(20)
-            .glassEffect(in: Circle())
-        } else {
-            ProgressView()
-                .controlSize(.large)
-                .padding(20)
-                .glassEffect(in: Circle())
-        }
+    private func progressIndicator(_ progress: Double, isDownloading: Bool) -> some View {
+        MediaLoadingSpinner(fraction: MediaLoadingSpinner.visibleFraction(progress, isDownloading: isDownloading))
     }
 
     private var livePhotoLoadFailureOverlay: some View {

@@ -85,8 +85,12 @@ Run focused tests while you work. Run these gates before requesting review:
 ./scripts/verify-universal-core.sh fast
 ```
 
+`ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=1 ./scripts/verify-tests.sh` skips the vendored SDK tests for a quick local run.
+CI refuses this switch, and the gate before review runs without it.
+
 `./scripts/verify-ios-app-tests.sh ui` runs the UI tests. They launch the app in the simulator on an offline test
 account and tap through it. They need no Proton account and no network. Add a UI test when you add a user action.
+The iOS app tests and UI tests need a Mac with Apple silicon: the Proton Drive SDK has no x86_64 iOS Simulator build.
 
 Run the platform shell build when your change affects that app:
 
@@ -265,14 +269,28 @@ A typical cold run needs two app builds per platform; cached historical products
 Release metadata also keys the cache,
 so distinct releases on one commit cannot reuse the wrong version or build number.
 
-On the hosted runner one iOS case takes about seven minutes, so the iOS gate runs in two jobs.
-Each job tests every source with half of the interruption points; together they cover the same cases as one job.
+On the hosted runner one iOS case takes seven to eight minutes, so the iOS gate runs in as many jobs as the time model needs.
+The prepare job builds the jobs from the one list of interruption points in `scripts/upgrade-test/run_journey.py`
+(`--list-points`) and the selected sources (`.github/scripts/release_upgrade.py`). Each job tests every source with its
+share of the points; together the jobs of a platform cover every point once, and no job plans more than 165 of its 180 minutes.
+A job plans `12 x sources + case x sources x points` minutes, with 8.0 minutes per iOS case and 1.5 minutes per macOS case.
+These coefficients are estimates from the job means of the releases v1.1.0-rc.1 and v1.1.0; the measured maxima are higher
+(code comment in `release_upgrade.py`: up to 12.8 minutes of builds per source, 9.2 minutes for the slowest iOS point mean,
+10.9 minutes for the slowest single case). The check at 165 minutes keeps a margin against the estimate only; a job that
+concentrates slow points, or a slower runner, can use more of its 180-minute timeout.
+A plan of more than 256 jobs, or a point that no job can hold, fails in the prepare job with its cost. A valid deliberate
+override keeps the normal plan when it fits; when it does not fit, or has more than 256 jobs, the override uses one job per
+platform with every point. The override skips the journey steps; the jobs only acknowledge it. A new interruption point or a
+new source needs no workflow edit.
 Each UI run gets up to 600 seconds to start its first test case. The 180-second preparation budget starts
 when the first test case starts, when the old app reaches its checkpoint on its own, or when the UI run ends, whichever comes first.
 The 240-second verification budget starts with the first test case or the end of the run.
 A slow UI runner start on a loaded runner therefore cannot use up either budget.
-Each iOS job holds six points per source. With three sources, a job needs about 145 minutes of its 180;
-a fourth source needs a third iOS job.
+The iOS gate runs in at least two jobs (`MIN_IOS_JOBS` in `release_upgrade.py`), but never in more jobs than points. With one
+source the generator plans two iOS jobs of six points (about 60 planned minutes each) and one macOS job: about one more
+build (12 minutes) of runner time than one job of twelve points (about 108 planned minutes), and about half the wall-clock
+time. With three sources it plans three iOS jobs of four points (about 132 minutes each) and one macOS job; a fourth source
+makes it plan four iOS jobs. The macOS gate keeps one job as long as it fits.
 A failing case keeps the app's system log. The evidence also holds the runner load, the free disk and the size of
 the large build and Simulator directories, and each case's timing and free disk.
 The job summary shows the free disk at the start and the end. The journey step prints only result, timing and disk

@@ -75,6 +75,9 @@ public struct BackupSyncProgress: Sendable, Equatable {
     /// refresh is visible and resumable instead of looking like a frozen backup counter.
     public var remoteIndexPreparation: UploadRemoteIndexPreparationProgress?
     public var remoteIndexPreparationFailed = false
+    /// True when an automatic pass found no row that waits for an upload or can come back without the person: nothing
+    /// runnable, no parked draft re-check, and every queue read succeeded. No index build follows from such a pass.
+    public var leavesNoUploadWork = false
     /// Durable queue-wide reason for a failed remote index refresh. This is not attached to each photo.
     public var remoteIndexPreparationIssue: BackupIssueRecord?
     /// Readable-but-incomplete remote metadata degrades duplicate coverage without blocking backup.

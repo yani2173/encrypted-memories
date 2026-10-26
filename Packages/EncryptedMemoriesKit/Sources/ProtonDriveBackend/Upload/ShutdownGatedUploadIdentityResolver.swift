@@ -41,6 +41,12 @@ struct ShutdownGatedUploadIdentityResolver: UploadIdentityResolving {
         }
     }
 
+    func remoteIndexPreparationNotNeeded() async {
+        _ = try? await admitted {
+            await self.base.remoteIndexPreparationNotNeeded()
+        }
+    }
+
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
         try await admitted {
             try await self.base.remoteContentIndexHealth()

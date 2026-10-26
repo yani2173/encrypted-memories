@@ -1,5 +1,5 @@
 diff --git a/Package.swift b/Package.swift
-index 01cccf5..38a293e 100644
+index 9d2cadb..f5f052c 100644
 --- a/Package.swift
 +++ b/Package.swift
 @@ -3,0 +4 @@
@@ -193,12 +193,12 @@ index a5cb60e..9371fb1 100644
 @@ -518,0 +554 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
 diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-index bfbdda4..a744d57 100644
+index 8fd4ed7..a767448 100644
 --- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
 +++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-@@ -351,0 +352 @@ extension ProtonDriveClient {
+@@ -362,0 +363 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
-@@ -383,0 +385 @@ extension ProtonDriveClient {
+@@ -394,0 +396 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
 diff --git a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
 index 367242f..f6b161f 100644
@@ -1114,7 +1114,7 @@ index c1f6f71..a7743d1 100644
 +    }
 +
 diff --git a/Sources/Plumbing/SDKRequestHandler.swift b/Sources/Plumbing/SDKRequestHandler.swift
-index f6f8a9d..89771c5 100644
+index 6f33a01..96d39e7 100644
 --- a/Sources/Plumbing/SDKRequestHandler.swift
 +++ b/Sources/Plumbing/SDKRequestHandler.swift
 @@ -7,0 +8,31 @@ enum SDKRequestHandler {

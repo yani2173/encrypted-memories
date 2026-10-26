@@ -31,10 +31,21 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
     private var task: Task<Void, Never>?
     private var retired = false
     private let startGate: TimelineMetadataStartGate?
+    private let runtimeState: LibraryRuntimeState
+    private let coordinator: LibraryResourceCoordinator
+    /// The runtime snapshots that held a pass back, so a test can tell that the task waits.
+    private var heldSnapshots = 0
 
-    public init(startGate: TimelineMetadataStartGate? = nil) {
+    public init(
+        startGate: TimelineMetadataStartGate? = nil, runtimeState: LibraryRuntimeState = .shared,
+        coordinator: LibraryResourceCoordinator = .shared
+    ) {
         self.startGate = startGate
+        self.runtimeState = runtimeState
+        self.coordinator = coordinator
     }
+
+    var heldSnapshotCount: Int { lock.withLock { heldSnapshots } }
 
     /// Repeated offers for the active inventory do not repeat its metadata requests.
     public func schedule(
@@ -58,9 +69,15 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
             let runGeneration = generation
             task = Task(priority: .background) { [self] in
                 await startGate?.wait()
-                while let pass = takeInput(generation: runGeneration) {
-                    await operation(pass)
-                    finish(pass)
+                // Only an owed pass waits: after the last pass, the task ends instead of waiting untracked.
+                while hasOwedInput(generation: runGeneration), let opportunity = await waitUntilAPassMayRun() {
+                    if opportunity == .backgroundPermitted {
+                        await runInBackgroundWindow(generation: runGeneration, operation: operation)
+                    } else {
+                        guard let pass = takeInput(generation: runGeneration) else { break }
+                        await operation(pass)
+                        finish(pass)
+                    }
                 }
             }
             return replacedTask
@@ -90,6 +107,51 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
         await current?.value
     }
 
+    /// A pass waits while the app is suspended. A foreground app runs it, also when inactive; a background window of
+    /// iOS runs it under the coordinator's permit. The runtime state yields its current snapshot first, so a change
+    /// between the check and the subscription cannot be missed. Returns the opportunity, or nil after cancellation.
+    private func waitUntilAPassMayRun() async -> LibraryExecutionOpportunity? {
+        for await snapshot in runtimeState.updates() {
+            if Self.passMayRun(snapshot) { return snapshot.executionOpportunity }
+            lock.withLock { heldSnapshots += 1 }
+        }
+        return nil
+    }
+
+    private static func passMayRun(_ snapshot: LibraryRuntimeSnapshot) -> Bool {
+        snapshot.executionOpportunity != .suspended
+    }
+
+    /// In a background window a pass runs only under the coordinator's single heavy permit, so a waiting backup item
+    /// goes first. When the permit yields or the window ends, the pass is cancelled; the operation stops at its next
+    /// page and keeps the pages it saved. The pass stays owed and runs again in the next window or in the foreground.
+    private func runInBackgroundWindow(
+        generation: UInt64, operation: @escaping @Sendable (Pass) async -> Void
+    ) async {
+        guard
+            let permit = await LibraryBackgroundWindowPermit.acquire(
+                LibraryBackgroundWorkTuning.orderPass, coordinator: coordinator, runtimeState: runtimeState)
+        else { return }
+        defer { permit.release() }
+        guard let pass = takeInput(generation: generation) else { return }
+        let stopped = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await operation(pass)
+                return false
+            }
+            group.addTask { await permit.nextStop() != nil }
+            // The first child that ends decides: the pass, or a stop that cancels it.
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        if stopped { keepOwed(pass) } else { finish(pass) }
+    }
+
+    private func hasOwedInput(generation: UInt64) -> Bool {
+        lock.withLock { !retired && self.generation == generation && !Task.isCancelled && input != nil }
+    }
+
     private func takeInput(generation: UInt64) -> Pass? {
         lock.withLock {
             guard !retired, self.generation == generation, !Task.isCancelled, let inventory = input else {
@@ -100,15 +162,28 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
         }
     }
 
+    /// A stopped pass stays owed, unless a newer inventory already waits; that one runs instead.
+    private func keepOwed(_ pass: Pass) {
+        lock.withLock {
+            guard generation == pass.generation, !retired, !Task.isCancelled else { return }
+            if !takePendingInventory() { input = pass.inventory }
+        }
+    }
+
+    /// Moves the newest pending inventory to the input. Call with the lock held.
+    private func takePendingInventory() -> Bool {
+        guard let next = pending else { return false }
+        pending = nil
+        input = next.inventory
+        activeSignature = next.signature
+        activeLibraryID = next.inventory.libraryID ?? activeLibraryID
+        return true
+    }
+
     private func finish(_ pass: Pass) {
         lock.withLock {
             guard generation == pass.generation else { return }
-            if !retired, !Task.isCancelled, let next = pending {
-                pending = nil
-                input = next.inventory
-                activeSignature = next.signature
-                activeLibraryID = next.inventory.libraryID ?? activeLibraryID
-            } else {
+            if retired || Task.isCancelled || !takePendingInventory() {
                 pending = nil
                 input = nil
                 task = nil

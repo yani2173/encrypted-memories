@@ -518,20 +518,253 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
     }
 
     #if os(macOS)
-        func testDoesNothingOutsideAMacSandboxContainer() throws {
+        /// An unsandboxed run shares `Library/Cookies` with other apps. It removes nothing and still completes (#792).
+        func testOutsideAMacSandboxContainerRemovesNothingAndCompletes() throws {
             let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
             let sharedCookies = sharedLibrary.appendingPathComponent("Cookies/Cookies.binarycookies")
             let sharedCache = sharedLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
             try write(sharedCookies)
             try write(sharedCache)
 
+            let result = try XCTUnwrap(purge(library: sharedLibrary))
+
+            XCTAssertEqual(result.removed, [])
+            XCTAssertEqual(result.failed, [])
+            XCTAssertTrue(exists(sharedCookies))
+            XCTAssertTrue(exists(sharedCache))
+            XCTAssertTrue(isDone)
+        }
+
+        private func linkedLibrary(to destination: URL) throws -> URL {
+            let link = root.appendingPathComponent("Users/\(UUID().uuidString)/Library", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+            return link
+        }
+
+        /// A Library that leads into a container through a link is not an unsandboxed Library.
+        func testALibraryLinkIntoTheOwnContainerIsRefused() throws {
+            try seedUnusedStores()
+
+            XCTAssertNil(purge(library: try linkedLibrary(to: library)))
+
+            XCTAssertTrue(exists(urlCache.appendingPathComponent("Cache.db")))
+            XCTAssertTrue(exists(cookies.appendingPathComponent("Cookies.binarycookies")))
+            XCTAssertFalse(isDone)
+        }
+
+        func testALibraryLinkIntoAnotherAppsContainerIsRefused() throws {
+            let otherLibrary = root.appendingPathComponent("Containers/other.id/Data/Library", isDirectory: true)
+            let otherCache = otherLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
+            try write(otherCache)
+
+            XCTAssertNil(purge(library: try linkedLibrary(to: otherLibrary)))
+
+            XCTAssertTrue(exists(otherCache))
+            XCTAssertFalse(isDone)
+        }
+
+        /// A case-insensitive volume stores `containers` and `data` in any case.
+        func testALowercaseContainerLayoutIsRefused() throws {
+            let otherLibrary = root.appendingPathComponent("lower/containers/other.id/data/Library", isDirectory: true)
+            let otherCache = otherLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
+            try write(otherCache)
+
+            XCTAssertNil(purge(library: otherLibrary))
+            defaults.removeObject(forKey: UnusedNetworkStorePurge.completedKey)
+            XCTAssertNil(purge(library: try linkedLibrary(to: otherLibrary)))
+
+            XCTAssertTrue(exists(otherCache))
+            XCTAssertFalse(isDone)
+        }
+
+        func testAGroupContainerLibraryIsRefused() throws {
+            let groupLibrary = root.appendingPathComponent("Group Containers/group.other/Library", isDirectory: true)
+            let groupCache = groupLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
+            try write(groupCache)
+
+            XCTAssertNil(purge(library: groupLibrary))
+            defaults.removeObject(forKey: UnusedNetworkStorePurge.completedKey)
+            XCTAssertNil(purge(library: try linkedLibrary(to: groupLibrary)))
+
+            XCTAssertTrue(exists(groupCache))
+            XCTAssertFalse(isDone)
+        }
+
+        /// A link to another plain Library is still outside every container. It completes and removes nothing.
+        func testALibraryLinkToAnotherPlainLibraryCompletesWithoutRemovingAnything() throws {
+            let plainLibrary = root.appendingPathComponent("Users/other/Library", isDirectory: true)
+            let plainCache = plainLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
+            let plainCookies = plainLibrary.appendingPathComponent("Cookies/Cookies.binarycookies")
+            try write(plainCache)
+            try write(plainCookies)
+
+            let result = try XCTUnwrap(purge(library: try linkedLibrary(to: plainLibrary)))
+
+            XCTAssertEqual(result.removed, [])
+            XCTAssertEqual(result.failed, [])
+            XCTAssertTrue(exists(plainCache))
+            XCTAssertTrue(exists(plainCookies))
+            XCTAssertTrue(isDone)
+        }
+
+        func testALibraryThatIsAFileIsRefused() throws {
+            let fileLibrary = root.appendingPathComponent("Users/someone/Library")
+            try write(fileLibrary)
+
+            XCTAssertNil(purge(library: fileLibrary))
+
+            XCTAssertFalse(isDone)
+        }
+
+        func testUnsandboxedCachesThatLinkToAForeignFolderAreRefused() throws {
+            let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            try FileManager.default.createDirectory(at: sharedLibrary, withIntermediateDirectories: true)
+            let foreignCaches = root.appendingPathComponent("foreign/Caches", isDirectory: true)
+            let foreignCache = foreignCaches.appendingPathComponent("\(bundleIdentifier)/Cache.db")
+            try write(foreignCache)
+            try FileManager.default.createSymbolicLink(
+                at: sharedLibrary.appendingPathComponent("Caches"), withDestinationURL: foreignCaches)
+
             XCTAssertNil(purge(library: sharedLibrary))
 
-            XCTAssertTrue(exists(sharedCookies))
+            XCTAssertTrue(exists(foreignCache))
+            XCTAssertFalse(isDone)
+        }
+
+        /// A Caches path that ends in `.` or `child/..` still names the literal Caches entry; a link there is refused.
+        func testUnsandboxedCachesWithDotComponentsCannotHideALink() throws {
+            let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            let realCaches = sharedLibrary.appendingPathComponent("RealCaches", isDirectory: true)
+            try write(realCaches.appendingPathComponent("child/entry"))
+            let foreignCaches = root.appendingPathComponent("foreign/Caches", isDirectory: true)
+            try write(foreignCaches.appendingPathComponent("child/entry"))
+            let caches = sharedLibrary.appendingPathComponent("Caches")
+            for destination in [realCaches, foreignCaches] {
+                try? FileManager.default.removeItem(at: caches)
+                try FileManager.default.createSymbolicLink(at: caches, withDestinationURL: destination)
+                for suffix in ["/.", "/child/.."] {
+                    defaults.removeObject(forKey: UnusedNetworkStorePurge.completedKey)
+                    let dotted = URL(fileURLWithPath: caches.path + suffix)
+
+                    XCTAssertNil(purge(library: sharedLibrary, caches: dotted), destination.lastPathComponent + suffix)
+                    XCTAssertFalse(isDone, destination.lastPathComponent + suffix)
+                }
+            }
+        }
+
+        func testUnsandboxedCachesWithDotComponentsOnARealFolderComplete() throws {
+            let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            let caches = sharedLibrary.appendingPathComponent("Caches", isDirectory: true)
+            try write(caches.appendingPathComponent("child/entry"))
+            for suffix in ["/.", "/child/.."] {
+                defaults.removeObject(forKey: UnusedNetworkStorePurge.completedKey)
+
+                let result = purge(library: sharedLibrary, caches: URL(fileURLWithPath: caches.path + suffix))
+
+                XCTAssertEqual(result, UnusedNetworkStorePurge.Result(removed: [], failed: []), suffix)
+                XCTAssertTrue(isDone, suffix)
+            }
+        }
+
+        /// The written path is the lexically standardized path: components that `..` cancels do not count.
+        func testCancelledContainerComponentsInTheWrittenPathDoNotRefuse() throws {
+            let plainLibrary = root.appendingPathComponent("Plain/Library", isDirectory: true)
+            try write(plainLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db"))
+            for folder in ["Containers/x/Data", "Group Containers"] {
+                try FileManager.default.createDirectory(
+                    at: root.appendingPathComponent(folder, isDirectory: true), withIntermediateDirectories: true)
+            }
+            for written in ["Containers/x/Data/../../../Plain/Library", "Group Containers/../Plain/Library"] {
+                defaults.removeObject(forKey: UnusedNetworkStorePurge.completedKey)
+                let library = URL(fileURLWithPath: root.path + "/" + written)
+
+                let result = purge(library: library, caches: URL(fileURLWithPath: library.path + "/Caches"))
+
+                XCTAssertEqual(result, UnusedNetworkStorePurge.Result(removed: [], failed: []), written)
+            }
+            XCTAssertTrue(exists(plainLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")))
+        }
+
+        func testUnsandboxedCachesThatLinkInsideTheLibraryAreRefused() throws {
+            let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            let realCaches = sharedLibrary.appendingPathComponent("RealCaches", isDirectory: true)
+            try write(realCaches.appendingPathComponent("\(bundleIdentifier)/Cache.db"))
+            try FileManager.default.createSymbolicLink(
+                at: sharedLibrary.appendingPathComponent("Caches"), withDestinationURL: realCaches)
+
+            XCTAssertNil(purge(library: sharedLibrary))
+
+            XCTAssertFalse(isDone)
+        }
+
+        func testAnAncestorLinkIntoAContainerIsRefused() throws {
+            try seedUnusedStores()
+            let data = library.deletingLastPathComponent()
+            let link = root.appendingPathComponent("Users/someone", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: data)
+
+            XCTAssertNil(purge(library: link.appendingPathComponent("Library", isDirectory: true)))
+
+            XCTAssertTrue(exists(urlCache.appendingPathComponent("Cache.db")))
+            XCTAssertFalse(isDone)
+        }
+
+        /// The written path counts as well: a container path that links to a plain Library is still refused.
+        func testAContainerPathLinkedToAPlainLibraryIsRefused() throws {
+            let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            let sharedCache = sharedLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
+            try write(sharedCache)
+            let otherLibrary = root.appendingPathComponent("Containers/other.id/Data/Library", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: otherLibrary.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: otherLibrary, withDestinationURL: sharedLibrary)
+
+            XCTAssertNil(purge(library: otherLibrary))
+
             XCTAssertTrue(exists(sharedCache))
             XCTAssertFalse(isDone)
         }
+
+        func testAMissingLibraryOutsideAContainerIsRefused() throws {
+            XCTAssertNil(purge(library: root.appendingPathComponent("Users/nobody/Library", isDirectory: true)))
+            XCTAssertFalse(isDone)
+        }
+
+        func testCachesOutsideAnUnsandboxedLibraryAreRefused() throws {
+            let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            try FileManager.default.createDirectory(at: sharedLibrary, withIntermediateDirectories: true)
+            let foreignCaches = root.appendingPathComponent("elsewhere/Caches", isDirectory: true)
+            let foreignCache = foreignCaches.appendingPathComponent("\(bundleIdentifier)/Cache.db")
+            try write(foreignCache)
+
+            XCTAssertNil(purge(library: sharedLibrary, caches: foreignCaches))
+
+            XCTAssertTrue(exists(foreignCache))
+            XCTAssertFalse(isDone)
+        }
     #endif
+
+    /// iOS has no container layout rule. Its Library keeps the full removal of the five names.
+    func testIOSRuleRemovesTheNamedEntriesOutsideAContainerLayout() throws {
+        let iOSLibrary = root.appendingPathComponent("\(UUID().uuidString)/Library", isDirectory: true)
+        let iOSCache = iOSLibrary.appendingPathComponent("Caches/\(bundleIdentifier)", isDirectory: true)
+        for name in ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData/0B1C2D3E"] {
+            try write(iOSCache.appendingPathComponent(name))
+        }
+        try write(iOSLibrary.appendingPathComponent("Cookies/Cookies.binarycookies"))
+
+        let result = try XCTUnwrap(purge(library: iOSLibrary, requiresSandboxContainer: false))
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(
+            Set(result.removed.map(\.lastPathComponent)),
+            ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData", "Cookies.binarycookies"])
+        XCTAssertTrue(isDone)
+    }
 
     /// Sign-out clears the app's preferences, so the next cold launch removes any URL cache or
     /// cookie file that appeared since the last purge.

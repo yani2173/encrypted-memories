@@ -27,9 +27,8 @@ struct SDKCapabilities {
     /// Upload capabilities, as the UI sees them (the wired SDK uploader). Single source of truth.
     var upload = UploadBackendCapabilities.sdkUploader
 
-    /// SDK 0.31.1 exposes read-only album enumeration and album-node metadata. The app's complete
-    /// read/write album seam remains on the narrow HTTP adapter until a separate behavior-equivalence
-    /// pass adopts those reads and the SDK exposes the missing writes.
+    /// The app reads the album catalog, sharing and membership through SDK 0.32.1. Direct Photos HTTP remains only
+    /// for the album writes that the Swift API of SDK 0.32.1 does not expose.
     var albumReadAPIsAvailable = true
     var photoTagUpdatesAvailable = true
     var albumsViaSDK = false

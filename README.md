@@ -82,7 +82,7 @@ The reviewed Wiki source lives in [`Wiki`](Wiki). GitHub stores the visible Wiki
 - Metal-based timeline rendering with shared layout, transition, composition, and residency policies.
 - Swift Package Manager modules under `Packages/EncryptedMemoriesKit`.
 - Xcode project generation from `project.yml` with XcodeGen.
-- The official open-source Proton Drive SDK 0.31.1, distributed under the MIT License and restored at `Vendor/sdk-swift`.
+- The official open-source Proton Drive SDK 0.32.1, distributed under the MIT License and restored at `Vendor/sdk-swift`.
 
 `EncryptedMemoriesKit` is application-internal source. Its public declarations support package target
 boundaries and are not a stable third-party library API.
@@ -141,18 +141,20 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 ```bash
 git clone https://github.com/OnCloud-at/encrypted-memories.git
 cd encrypted-memories
-./scripts/update-proton-sdk.sh 0.31.1
+./scripts/update-proton-sdk.sh 0.32.1
 ./scripts/proton-sdk-current-version.sh
 xcodegen generate
 ```
 
 The SDK checkout is reproducible: the bootstrap script applies the versioned fixes tracked under
-`VendorPatches/sdk-swift/0.31.1` after checking out the upstream tag. The updater fails before
+`VendorPatches/sdk-swift/0.32.1` after checking out the upstream tag. The updater fails before
 changing the checkout when the requested tag has no reviewed patch set.
 The repository retains a complete patch set only for the currently supported SDK tag. An SDK upgrade
 must add its reviewed patch and `UPSTREAM_COMMIT` pin together.
 
 ## Build
+
+The iOS Simulator build needs a Mac with Apple silicon: the Proton Drive SDK has no x86_64 iOS Simulator build.
 
 Build macOS without installing the app:
 

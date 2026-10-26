@@ -85,9 +85,10 @@ public struct ExactDuplicateRelatedFileTransfer: Sendable {
                 parentIsDirectory.boolValue
             else { throw failure(.staging) }
             // Query every time, including empty files. An unknown answer never permits the download.
-            guard let free = availableCapacity(destination.deletingLastPathComponent()), free >= size else {
-                throw failure(.capacity)
+            guard let free = availableCapacity(destination.deletingLastPathComponent()) else {
+                throw failure(.capacityUnknown)
             }
+            guard free >= size else { throw failure(.capacity) }
             try Task.checkCancellation()
             let opened = try RelatedFileWriter(destination: destination, expectedSize: size, io: stagingIO)
             created = true
@@ -161,7 +162,7 @@ public struct ExactDuplicateRelatedFileTransfer: Sendable {
         guard network.isReachable else { throw failure(.transfer) }
     }
 
-    private func discard(_ url: URL) throws {
+    func discard(_ url: URL) throws {
         do { try FileManager.default.removeItem(at: url) } catch let error as CocoaError
             where error.code == .fileNoSuchFile
         { return }
@@ -170,6 +171,7 @@ public struct ExactDuplicateRelatedFileTransfer: Sendable {
     private func mapped(_ error: any Error, allowsExpensiveNetwork: Bool, depth: Int = 0) -> any Error {
         if Task.isCancelled || containsCancellation(error, depth: depth) { return CancellationError() }
         if let error = error as? ExactDuplicateRelatedFileTransferError { return error }
+        if case UploadError.accountStorageFull = error { return failure(.accountStorage) }
         let transportCode = transportCode(of: error)
         if !allowsExpensiveNetwork,
             transportCode == NSURLErrorDataNotAllowed || (error as? URLError)?.networkUnavailableReason == .expensive

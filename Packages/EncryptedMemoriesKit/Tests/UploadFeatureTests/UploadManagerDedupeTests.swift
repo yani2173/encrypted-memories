@@ -9,6 +9,13 @@ import XCTest
 final class FakeIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
     private let lock = NSLock()
     var decisionsByFilename: [String: UploadDuplicateDecision] = [:]
+    private var notNeededSignals = 0
+    /// How often the backup reported that it ended a pass without preparing the index.
+    var remoteIndexPreparationNotNeededCount: Int { lock.withLock { notNeededSignals } }
+
+    func remoteIndexPreparationNotNeeded() async {
+        lock.withLock { notNeededSignals += 1 }
+    }
     var errorsByFilename: [String: Error] = [:]
     var recordErrorsByFilename: [String: Error] = [:]
     var resolveDelay: Duration?

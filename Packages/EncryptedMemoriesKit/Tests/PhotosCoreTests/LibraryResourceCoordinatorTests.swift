@@ -558,6 +558,83 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
             XCTFail("expected stale work cancellation")
         } catch is CancellationError {}
     }
+
+    // MARK: - Work in an iOS background window
+
+    func testTheBackgroundWorkloadsYieldToLowPowerModeAndTheCrawlToCriticalStorage() {
+        let policy = LibraryResourcePolicy()
+        let orderPass = LibraryBackgroundWorkTuning.orderPass
+        let crawl = LibraryBackgroundWorkTuning.crawlBatch
+        let window = LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted)
+        XCTAssertTrue(policy.budget(for: orderPass, snapshot: window).isAdmitted)
+        XCTAssertTrue(policy.budget(for: crawl, snapshot: window).isAdmitted)
+
+        let lowPower = LibraryRuntimeSnapshot(isLowPowerMode: true, executionOpportunity: .backgroundPermitted)
+        for request in [orderPass, crawl] {
+            let budget = policy.budget(for: request, snapshot: lowPower)
+            XCTAssertFalse(budget.isAdmitted, "\(request.workload)")
+            XCTAssertEqual(budget.reason, .lowPowerMode, "\(request.workload)")
+        }
+
+        let fullStorage = LibraryRuntimeSnapshot(storagePressure: .critical, executionOpportunity: .backgroundPermitted)
+        XCTAssertFalse(policy.budget(for: crawl, snapshot: fullStorage).isAdmitted, "the crawl fills the cache")
+        XCTAssertTrue(policy.budget(for: orderPass, snapshot: fullStorage).isAdmitted, "the order pass writes little")
+    }
+
+    func testNextYieldWakesOnARuntimeChange() async throws {
+        let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let coordinator = LibraryResourceCoordinator(runtimeState: state)
+        let reason = try await coordinator.withHeavyPermit(LibraryBackgroundWorkTuning.orderPass) { lease in
+            let waiting = Task { await lease.nextYield() }
+            state.update { $0.executionOpportunity = .suspended }
+            return await boundedValue(of: waiting)
+        }
+        XCTAssertEqual(reason, .some(.executionSuspended))
+    }
+
+    func testNextYieldWakesWhenABackupItemWaitsForThePermit() async throws {
+        let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let coordinator = LibraryResourceCoordinator(runtimeState: state)
+        let backupRan = AsyncTestSignal()
+        let (reason, backup) = try await coordinator.withHeavyPermit(LibraryBackgroundWorkTuning.orderPass) {
+            lease in
+            let waiting = Task { await lease.nextYield() }
+            // The backup item arrives only after the wait checked the lease once, so only the preemption can wake it.
+            let checked = await waitFor { lease.yieldWaitEvaluations >= 1 }
+            XCTAssertTrue(checked, "the wait checked the lease")
+            let backup = Task {
+                _ = try? await coordinator.withHeavyPermit(
+                    LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+                ) { _ in backupRan.fire() }
+            }
+            return (await boundedValue(of: waiting), backup)
+        }
+        XCTAssertEqual(reason, .some(.higherPriorityWork), "backup outranks background work")
+        await awaitWindowEvent(backupRan, "the backup item after the release")
+        await backup.value
+    }
+
+    func testNextYieldWakesAtTheEndOfTheTimeSlice() async throws {
+        let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())
+        let request = LibraryWorkRequest(
+            workload: .mlIndexing, intent: .automatic,
+            demand: LibraryWorkDemand(
+                maximumInternalParallelism: 1, maximumItemsPerQuantum: 1, maximumWallTime: .milliseconds(50)))
+        let reason = try await coordinator.withHeavyPermit(request) { lease in
+            await boundedValue(of: Task { await lease.nextYield() })
+        }
+        XCTAssertEqual(reason, .some(.timeSliceCompleted))
+    }
+
+    func testNextYieldEndsWhenItsTaskIsCancelled() async throws {
+        let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())
+        let reason = try await coordinator.withHeavyPermit(LibraryBackgroundWorkTuning.orderPass) { lease in
+            let waiting = Task { await lease.nextYield() }
+            waiting.cancel()
+            return await boundedValue(of: waiting)
+        }
+        XCTAssertEqual(reason, .some(nil), "a cancelled wait returns without a reason")
+    }
 }
 
 private func waitUntilYielding(

@@ -35,7 +35,7 @@ packages:
     path: Packages/EncryptedMemoriesKit
   ProtonCore:
     url: https://github.com/ProtonMail/protoncore_ios.git
-    # Proton Drive SDK 0.31.1 does not pin ProtonCore; the app pins this version for ProtonAuth and crypto.
+    # Proton Drive SDK 0.32.1 does not pin ProtonCore; the app pins this version for ProtonAuth and crypto.
     exactVersion: 37.3.0
 
 fileGroups:
@@ -226,9 +226,6 @@ targets:
         OTHER_LDFLAGS[sdk=iphonesimulator*][arch=arm64]:
           - $(inherited)
           - -llibbootstrapperdll.iossimulator-arm64.o
-        OTHER_LDFLAGS[sdk=iphonesimulator*][arch=x86_64]:
-          - $(inherited)
-          - -llibbootstrapperdll.iossimulator-x64.o
         OTHER_LDFLAGS[sdk=iphoneos*]:
           - $(inherited)
           - -llibbootstrapperdll.ios-arm64.o

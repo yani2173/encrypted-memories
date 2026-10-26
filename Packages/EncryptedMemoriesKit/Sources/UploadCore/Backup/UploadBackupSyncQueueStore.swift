@@ -1317,6 +1317,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private static let upsertReplaceableStateList =
         "'discovered','queuedForUpload','failed','paused','sourceMissing','blockedByDraft','skippedRemoteDeletion'"
 
+    /// A claimed row (`checking`) keeps its receipt like a reconciliation row: the claim carries the receipt of an
+    /// upload that already reached Proton, and stale recovery resumes from it.
     private static let upsertSQL = """
         INSERT INTO backup_sync_queue(
           source_kind, source_id, resource, revision_us, original_filename,
@@ -1338,7 +1340,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             ELSE backup_sync_queue.last_error
           END,
           remote_commit_reconciliation=CASE
-            WHEN backup_sync_queue.state='needsRemoteReconciliation'
+            WHEN backup_sync_queue.state IN ('needsRemoteReconciliation','checking')
               THEN backup_sync_queue.remote_commit_reconciliation
             ELSE excluded.remote_commit_reconciliation
           END,

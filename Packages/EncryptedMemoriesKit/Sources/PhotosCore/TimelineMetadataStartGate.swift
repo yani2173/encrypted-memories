@@ -78,4 +78,9 @@ public final class TimelineMetadataStartGate: @unchecked Sendable {
     private var isBuilding: Bool {
         lock.withLock { state == .building }
     }
+
+    /// The passes that wait, so a test can tell that a pass is held before it checks that nothing released it.
+    var waiterCount: Int { lock.withLock { waiters.count } }
+
+    var isOpen: Bool { lock.withLock { state == .open } }
 }

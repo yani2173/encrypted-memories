@@ -41,13 +41,14 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         }
         var req = URLRequest(url: url)
         req.httpMethod = method
-        applyAuthAndHeaders(&req, headers: headers)
+        let credentialGeneration = applyAuthAndHeaders(&req, headers: headers)
         if !content.isEmpty { req.httpBody = content }
         Self.applyDriveJSONHeaders(&req, hasContent: !content.isEmpty)
 
         let result = await perform(
             req,
             scope: .api,
+            credentialGeneration: credentialGeneration,
             retryOn401: true,
             retryOn429: Self.canRetryAfterRateLimit(method: method)
         )
@@ -130,7 +131,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
     // MARK: Small upload (absolute url, buffered)
 
-    /// Sends one complete multipart upload to the Drive API. SDK 0.31.1 buffers a small file from byte
+    /// Sends one complete multipart upload to the Drive API. SDK 0.32.1 buffers a small file from byte
     /// zero and hands us the opaque multipart body plus its metadata JSON as a side channel. The body
     /// goes out unchanged with session auth; `metadata` may contain plaintext, so it is neither logged
     /// nor reconstructed from `content`. The SDK forbids resending after a timeout, lost connection or
@@ -148,7 +149,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         }
         var req = URLRequest(url: requestURL)
         req.httpMethod = method
-        applyAuthAndHeaders(&req, headers: headers)
+        let credentialGeneration = applyAuthAndHeaders(&req, headers: headers)
         req.httpBody = content
         Self.applyDriveAcceptHeader(&req)
         applyExpensiveNetworkAccess(&req)
@@ -156,7 +157,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         // Redirects are refused: following one would replay the authenticated body against a
         // Location the trusted-host check above never saw. The 3xx status reaches the SDK unchanged.
         let result = await perform(
-            req, scope: .api, retryOn401: true, retryOn429: false, taskDelegate: RedirectRefusingTaskDelegate.shared)
+            req, scope: .api, credentialGeneration: credentialGeneration, retryOn401: true, retryOn429: false,
+            taskDelegate: RedirectRefusingTaskDelegate.shared)
         switch result {
         case .success(let resp) where resp.statusCode >= 400:
             DebugLog.log("smallUpload \(method) -> \(resp.statusCode)")
@@ -224,6 +226,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     private func perform(
         _ request: URLRequest,
         scope: ProtonRequestScope,
+        credentialGeneration: UInt64,
         retryOn401: Bool,
         retryOn429: Bool,
         taskDelegate: URLSessionTaskDelegate? = nil
@@ -250,18 +253,21 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     return await perform(
                         request,
                         scope: scope,
+                        credentialGeneration: credentialGeneration,
                         retryOn401: retryOn401,
                         retryOn429: false,
                         taskDelegate: taskDelegate
                     )
                 }
             }
-            if http.statusCode == 401, retryOn401, await driveSession.refreshToken() {
+            if http.statusCode == 401, retryOn401, await driveSession.refreshToken(after: credentialGeneration) {
                 var retry = request
-                for (k, v) in driveSession.authHeaders() { retry.setValue(v, forHTTPHeaderField: k) }
+                let auth = driveSession.authorization()
+                for (k, v) in auth.headers { retry.setValue(v, forHTTPHeaderField: k) }
                 return await perform(
                     retry,
                     scope: scope,
+                    credentialGeneration: auth.generation,
                     retryOn401: false,
                     retryOn429: retryOn429,
                     taskDelegate: taskDelegate
@@ -311,9 +317,13 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         req.allowsExpensiveNetworkAccess = expensiveUploadAccess?.allowsExpensiveNetworkAccess ?? true
     }
 
-    private func applyAuthAndHeaders(_ req: inout URLRequest, headers: [(String, [String])]) {
-        for (k, v) in driveSession.authHeaders() { req.setValue(v, forHTTPHeaderField: k) }
-        applyHeaders(&req, headers: headers)
+    /// Returns the credential generation of the applied headers for the 401 retry.
+    private func applyAuthAndHeaders(_ req: inout URLRequest, headers: [(String, [String])]) -> UInt64 {
+        let auth = driveSession.authorization()
+        for (k, v) in auth.headers { req.setValue(v, forHTTPHeaderField: k) }
+        // Supplied headers cannot replace the session credentials that the returned generation describes.
+        applyHeaders(&req, headers: headers.filter { !["authorization", "x-pm-uid"].contains($0.0.lowercased()) })
+        return auth.generation
     }
 
     private func applyHeaders(_ req: inout URLRequest, headers: [(String, [String])]) {

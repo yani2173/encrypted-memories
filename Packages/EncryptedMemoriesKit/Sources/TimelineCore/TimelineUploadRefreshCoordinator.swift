@@ -17,7 +17,14 @@ public struct TimelineUploadRefreshAttempt: Sendable, Equatable {
 }
 
 /// Owns explicit refreshes and automatic upload convergence for one owner.
-/// Explicit requests stay immediate. New automatic cycles run at most once per minute or at an explicit end.
+///
+/// - Explicit requests stay immediate: an explicit request wakes a pending wait of an automatic cycle and runs next.
+///   It never cancels a refresh or an observer that is running, so it waits for that one load at most. It runs before
+///   the next retry of the automatic cycle. A newer explicit request replaces an older one that has not started.
+/// - The 60-second interval gates new automatic cycles only. A newer automatic request inside a running cycle adds no
+///   load of its own: the next retry of that cycle uses its closure. Retries follow the convergence schedule.
+/// - A flush ends the wait for the interval. It keeps a pending convergence delay: a retry before the library has
+///   caught up cannot find the upload sooner. A cancelled flush stops waiting; the automatic work goes on.
 public actor TimelineUploadRefreshCoordinator {
     public typealias Refresh = @Sendable (Int) async -> TimelineRefreshFailureReason?
     public typealias Observer = @Sendable (TimelineUploadRefreshAttempt) async -> Void
@@ -39,6 +46,7 @@ public actor TimelineUploadRefreshCoordinator {
     }
 
     private struct FlushWaiter {
+        let id: UInt64
         let generation: UInt64
         let continuation: CheckedContinuation<Void, Never>
     }
@@ -56,7 +64,14 @@ public actor TimelineUploadRefreshCoordinator {
     private var nextAutomaticCycleAt: ContinuousClock.Instant?
     private var forcedAutomaticGeneration: UInt64?
     private var automaticWait: Task<Void, any Error>?
+    /// The wait that `automaticWait` holds is the one for the interval; a convergence delay is not.
+    private var automaticWaitIsAdmission = false
+    private var nextFlushWaiterID: UInt64 = 0
     private var flushWaiters: [FlushWaiter] = []
+    /// Waiters that `cancel()` took from `flushWaiters` and releases after it joined the worker. A waiter is in one
+    /// of the two lists until it is removed to be resumed, so it resumes exactly once: when its generation completes,
+    /// when its task is cancelled, or when `cancel()` releases it.
+    private var retiredFlushWaiters: [FlushWaiter] = []
 
     public init(policy: TimelineRefreshConvergencePolicy = .init()) {
         self.policy = policy
@@ -102,22 +117,45 @@ public actor TimelineUploadRefreshCoordinator {
             completedAutomaticGeneration != request.generation
         else { return }
         forcedAutomaticGeneration = max(forcedAutomaticGeneration ?? request.generation, request.generation)
-        automaticWait?.cancel()
+        if automaticWaitIsAdmission { automaticWait?.cancel() }
         startWorkerIfNeeded()
-        await withCheckedContinuation { continuation in
-            flushWaiters.append(.init(generation: request.generation, continuation: continuation))
+        nextFlushWaiterID &+= 1
+        let id = nextFlushWaiterID
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                flushWaiters.append(.init(id: id, generation: request.generation, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.stopWaitingForFlush(id: id) }
         }
+    }
+
+    /// The flushing task was cancelled: it stops waiting, also while `cancel()` joins the worker. A waiter that
+    /// already completed is gone.
+    private func stopWaitingForFlush(id: UInt64) {
+        if let index = flushWaiters.firstIndex(where: { $0.id == id }) {
+            flushWaiters.remove(at: index).continuation.resume()
+        } else {
+            releaseRetiredFlushWaiter(id: id)
+        }
+    }
+
+    private func releaseRetiredFlushWaiter(id: UInt64) {
+        guard let index = retiredFlushWaiters.firstIndex(where: { $0.id == id }) else { return }
+        retiredFlushWaiters.remove(at: index).continuation.resume()
     }
 
     public func cancel() async {
         generation &+= 1
         let active = worker
-        let retiredWaiters = flushWaiters
+        let retiredIDs = Set(flushWaiters.map(\.id))
+        retiredFlushWaiters += flushWaiters
         active?.cancel()
         automaticWait?.cancel()
         activeWorkerID = nil
         worker = nil
         automaticWait = nil
+        automaticWaitIsAdmission = false
         latestRequest = nil
         completedExplicitGeneration = nil
         latestAutomaticRequest = nil
@@ -126,7 +164,8 @@ public actor TimelineUploadRefreshCoordinator {
         forcedAutomaticGeneration = nil
         flushWaiters = []
         await active?.value
-        for waiter in retiredWaiters { waiter.continuation.resume() }
+        // A waiter whose task was cancelled meanwhile is gone already.
+        for id in retiredIDs { releaseRetiredFlushWaiter(id: id) }
     }
 
     private func startWorkerIfNeeded() {
@@ -147,30 +186,33 @@ public actor TimelineUploadRefreshCoordinator {
 
         var automaticCycle: AutomaticCycle?
         while !Task.isCancelled, activeWorkerID == workerID {
+            // The observer of an admitted automatic load comes before any explicit work: the load and its observer are
+            // one step that an explicit request waits for.
+            if var cycle = automaticCycle, let observation = cycle.observation {
+                await cycle.request.observer(observation)
+                guard !Task.isCancelled, activeWorkerID == workerID else { return }
+                cycle.observation = nil
+                if case .retry(let delay) = observation.decision {
+                    cycle.retryAt = clock.now() + delay
+                    automaticCycle = cycle
+                } else {
+                    complete(cycle.request)
+                    automaticCycle = nil
+                }
+                continue
+            }
+
             if let explicit = latestRequest, completedExplicitGeneration != explicit.generation {
                 if await runCycle(explicit, workerID: workerID) { complete(explicit) }
                 continue
             }
 
             if var cycle = automaticCycle {
-                if let observation = cycle.observation {
-                    await cycle.request.observer(observation)
-                    guard !Task.isCancelled, activeWorkerID == workerID else { return }
-                    cycle.observation = nil
-                    if case .retry(let delay) = observation.decision {
-                        cycle.retryAt = clock.now() + delay
-                        automaticCycle = cycle
-                    } else {
-                        complete(cycle.request)
-                        automaticCycle = nil
-                    }
-                    continue
-                }
-
                 if let retryAt = cycle.retryAt {
                     if clock.now() < retryAt {
                         let wait = Task { try await clock.sleepUntil(retryAt) }
                         automaticWait = wait
+                        automaticWaitIsAdmission = false
                         do {
                             try await wait.value
                         } catch {
@@ -208,6 +250,7 @@ public actor TimelineUploadRefreshCoordinator {
                 {
                     let wait = Task { try await clock.sleepUntil(nextAutomaticCycleAt) }
                     automaticWait = wait
+                    automaticWaitIsAdmission = true
                     do {
                         try await wait.value
                     } catch is CancellationError {
