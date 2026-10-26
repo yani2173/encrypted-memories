@@ -99,6 +99,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         try await checker.prepareRemoteIndex(progress: progress)
     }
 
+    public func remoteIndexPreparationNotNeeded() async {
+        await checker.remoteIndexPreparationNotNeeded()
+    }
+
     public func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
         try await checker.remoteContentIndexHealth()
     }

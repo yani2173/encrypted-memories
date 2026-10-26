@@ -47,6 +47,10 @@ public actor BackupSyncRunner {
         /// How often a one-shot drain (`waitForScheduledRetries`, such as an album backup the user waits for) checks
         /// a photo the camera still processes again. Library passes check it once, at the end of the camera window.
         public var oneShotSourceRecheckInterval: TimeInterval
+        /// The photo library backup turns this on: on the last check of a Live Photo whose video Photos still reports
+        /// missing, it backs up the photo without its video. Off, every such photo keeps the end of a missing photo,
+        /// as for an album backup.
+        public var leavesOutMissingLivePhotoVideos: Bool
 
         public init(
             batchSize: Int = 32,
@@ -56,7 +60,8 @@ public actor BackupSyncRunner {
             uploadStallPollInterval: TimeInterval = 5,
             retry: BackupRetryPolicy = BackupRetryPolicy(),
             throttle: BackupThrottlePolicy = BackupThrottlePolicy(),
-            oneShotSourceRecheckInterval: TimeInterval = 30
+            oneShotSourceRecheckInterval: TimeInterval = 30,
+            leavesOutMissingLivePhotoVideos: Bool = false
         ) {
             self.batchSize = max(1, batchSize)
             self.staleActiveGrace = max(0, staleActiveGrace)
@@ -66,6 +71,7 @@ public actor BackupSyncRunner {
             self.retry = retry
             self.throttle = throttle
             self.oneShotSourceRecheckInterval = max(0, oneShotSourceRecheckInterval)
+            self.leavesOutMissingLivePhotoVideos = leavesOutMissingLivePhotoVideos
         }
     }
 
@@ -361,7 +367,14 @@ public actor BackupSyncRunner {
         emitProgress()
 
         if mode == .eligibleOnly {
-            guard let nextRunnableDate = queue.nextRunnableDate(), nextRunnableDate <= now() else {
+            guard let nextRunnableDate = queue.nextRunnableDate() else {
+                // Nothing is due now or later. A parked draft whose re-check is due later can still start an index
+                // build, and a failed read proves nothing. The controller reports the rest once its scan has finished.
+                progress.isRunning = false
+                progress.leavesNoUploadWork = !queue.containsAny(in: [.blockedByDraft]) && queue.isOperational()
+                return progress
+            }
+            guard nextRunnableDate <= now() else {
                 progress.isRunning = false
                 return progress
             }
@@ -871,6 +884,11 @@ public actor BackupSyncRunner {
             let resolver = self.resolver
             let policy = configuration.throttle
             let inputs = throttleInputs
+            // Only the photo library backup, on the last check of a row whose file Photos reports missing, may leave
+            // out the Live Photo video. A dismissed row keeps its check without an upload.
+            let omitsMissingPairedVideo =
+                configuration.leavesOutMissingLivePhotoVideos && !isSourceRecheck
+                && Self.usedReportedMissingChecks(resolvingEntry, now: now())
             let readAdmission: BackupResourceReadAdmission = {
                 try Task.checkCancellation()
                 if isSourceRecheck {
@@ -886,7 +904,8 @@ public actor BackupSyncRunner {
             ) { _ in
                 try readAdmission()
                 return try await resolver.resolve(
-                    resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission)
+                    resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission,
+                    omittingMissingPairedVideo: omitsMissingPairedVideo)
             }
         } catch is BackupWorkDeferredError {
             if isSourceRecheck {
@@ -983,6 +1002,19 @@ public actor BackupSyncRunner {
         }
 
         let entry = checkingEntry
+        // An edit, or the undo of one, moves its earlier uploads to the trash once it is backed up, and they can hold
+        // the Live Photo video. Without the edit journal the backup cannot tell, so it assumes an edit. Such a photo
+        // keeps today's end before the duplicate check: it uploads nothing, replaces nothing, and moves nothing to the
+        // trash.
+        if resolved.omitsMissingPairedVideo,
+            editReplacement.map({
+                $0.isReplacing(entry.source)
+                    || $0.replacesEarlierUploads(of: entry.source, edited: Self.isEdited(resolved))
+            }) ?? true
+        {
+            retryOrPark(entry, from: persistedState, error: UploadError.sourceReportedMissing(entry.originalFilename))
+            return
+        }
         if let reconciliation = entry.remoteCommitReconciliation {
             await reconcileRemoteCommit(
                 reconciliation,
@@ -1020,7 +1052,8 @@ public actor BackupSyncRunner {
                         descriptor: UploadResourceDescriptorSnapshot(resolved.descriptor),
                         queueBinding: UploadRemoteCommitQueueBinding(
                             source: entry.source,
-                            revision: entry.revision
+                            revision: entry.revision,
+                            uploadedRevision: resolved.candidate.snapshot.revision
                         )
                     )
                     guard
@@ -1097,6 +1130,13 @@ public actor BackupSyncRunner {
             )
 
         case .decision(let preflightResult):
+            // Proton already holds this still, maybe with its Live Photo tag, or the photo waits for a decision.
+            // Without its video it keeps today's end.
+            if resolved.omitsMissingPairedVideo {
+                retryOrPark(
+                    entry, from: persistedState, error: UploadError.sourceReportedMissing(entry.originalFilename))
+                return
+            }
             switch preflightResult.decision {
             case .awaitDeletionCheck:
                 await awaitDeletionCheck(entry, from: persistedState)
@@ -1361,6 +1401,13 @@ public actor BackupSyncRunner {
         resolved: BackupResolvedResource,
         workIntent: LibraryWorkIntent
     ) async {
+        guard Self.receiptBelongs(reconciliation, to: entry, resolvedRevision: resolved.candidate.snapshot.revision)
+        else {
+            // The receipt proves only the revision it was saved for. Recording it now could overwrite a newer backup of
+            // this source, so nothing is recorded and the ordinary path hashes and deduplicates the current revision.
+            requeueWithoutReceipt(entry, from: state)
+            return
+        }
         if reconciliation.source == entry.source,
             events?.recordHandoff(
                 source: entry.source,
@@ -1433,22 +1480,34 @@ public actor BackupSyncRunner {
         } else {
             // The secondary manifest is repaired. Re-run the primary's cheap duplicate decision
             // to recover its UID, then the compound pass will skip this secondary from manifest.
-            guard
-                queue.updateState(
-                    source: entry.source,
-                    revision: entry.revision,
-                    state: .discovered,
-                    attempts: nil,
-                    lastError: nil,
-                    updatedAt: now()
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: state, to: .discovered)
-            emitProgress()
+            requeueWithoutReceipt(entry, from: state)
         }
+    }
+
+    /// A receipt settles only the revision whose bytes it uploaded, from the queue row it is bound to. A receipt without
+    /// a binding, as written by older builds, and one without the uploaded revision use the row revision instead.
+    static func receiptBelongs(
+        _ reconciliation: UploadRemoteCommitReconciliation,
+        to entry: UploadBackupSyncQueueEntry,
+        resolvedRevision: UploadBackupRevision
+    ) -> Bool {
+        guard let binding = reconciliation.queueBinding else { return resolvedRevision == entry.revision }
+        guard binding.source == entry.source, binding.revision == entry.revision else { return false }
+        return resolvedRevision == (binding.uploadedRevision ?? entry.revision)
+    }
+
+    /// Clears the receipt and returns the row to the ordinary path.
+    private func requeueWithoutReceipt(_ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState) {
+        guard
+            queue.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: nil, lastError: nil,
+                updatedAt: now())
+        else {
+            stopRequested = true
+            return
+        }
+        adjustProgress(from: state, to: .discovered)
+        emitProgress()
     }
 
     private func parkRemoteReconciliation(
@@ -1537,6 +1596,7 @@ public actor BackupSyncRunner {
                 requiresRelatedMatch: replacesEarlierUpload,
                 entry: entry,
                 entryKey: Self.key(entry),
+                uploadedRevision: resolved.candidate.snapshot.revision,
                 workIntent: workIntent
             ) {
             case .allSettled:
@@ -1730,7 +1790,10 @@ public actor BackupSyncRunner {
             retryOrPark(entry, from: persistedState, error: error)
             return
         }
-        finish(entry, from: persistedState, as: terminal, message: nil, resolved: resolved)
+        // For diagnostics, the note keeps why the photo backed up without its Live Photo video.
+        finish(
+            entry, from: persistedState, as: terminal,
+            message: resolved.omitsMissingPairedVideo ? Self.missingPairedVideoNote : nil, resolved: resolved)
     }
 
     private func awaitDeletionCheck(
@@ -1801,6 +1864,7 @@ public actor BackupSyncRunner {
         requiresRelatedMatch: Bool,
         entry: UploadBackupSyncQueueEntry,
         entryKey: String,
+        uploadedRevision: UploadBackupRevision,
         workIntent: LibraryWorkIntent
     ) async -> SecondaryOutcome {
         var remaining = secondaries.count
@@ -1821,7 +1885,8 @@ public actor BackupSyncRunner {
                             descriptor: UploadResourceDescriptorSnapshot(secondary.descriptor),
                             queueBinding: UploadRemoteCommitQueueBinding(
                                 source: entry.source,
-                                revision: entry.revision
+                                revision: entry.revision,
+                                uploadedRevision: uploadedRevision
                             )
                         )
                         guard
@@ -2605,6 +2670,22 @@ public actor BackupSyncRunner {
     /// The waits double: one, two, and four hours.
     static let reportedMissingRechecks = 3
     static let reportedMissingRecheckDelay: TimeInterval = 3600
+
+    /// True when the row used its checks of a file that Photos reports missing and its planned last check is due. A
+    /// check that Back Up Now starts earlier does not count.
+    static func usedReportedMissingChecks(_ entry: UploadBackupSyncQueueEntry, now: Date) -> Bool {
+        guard sourceWaits(of: entry, detail: BackupFailedItem.sourceReportedMissingDetail) >= reportedMissingRechecks
+        else { return false }
+        guard let planned = BackupIssueRecord.decode(entry.lastError)?.nextAttemptAt else { return true }
+        return now >= planned
+    }
+
+    /// The note of a photo that backed up without the Live Photo video that Photos still reports missing. It is the
+    /// record of a photo that Photos reports missing after its checks, so diagnostics read it as that reason.
+    static let missingPairedVideoNote = BackupIssueRecord(
+        kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail,
+        automaticRetryAttempt: reportedMissingRechecks
+    ).persistedValue
 
     /// The waits that a row already spent for the reason `detail`; another reason starts again at zero.
     private static func sourceWaits(of entry: UploadBackupSyncQueueEntry, detail: String) -> Int {

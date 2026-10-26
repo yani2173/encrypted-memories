@@ -5,7 +5,7 @@ inputs:
   sdk-version:
     description: Reviewed Proton Drive SDK tag.
     required: false
-    default: "0.31.1"
+    default: "0.32.1"
   xcode-version:
     description: Xcode version that the build expects. A runner with another version fails.
     required: false

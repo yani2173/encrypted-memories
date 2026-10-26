@@ -448,6 +448,37 @@ final class MobileDuplicatesUITests: XCTestCase {
         keepScreenshot("duplicates-ios-slow-refresh-complete")
     }
 
+    /// A group with more copies than fit scrolls sideways to its last copy; a group whose copies fit does not move.
+    func testAWideGroupScrollsSidewaysAndAGroupThatFitsStays() {
+        openDuplicates(fixture: "-EncryptedMemoriesDuplicatesWideFixture")
+        let window = app.windows.firstMatch
+        func isOnScreen(_ element: XCUIElement) -> Bool { element.exists && window.frame.contains(element.frame) }
+        /// Drags across a row from its right edge to its left edge, as a finger does.
+        func dragLeft(_ row: XCUIElement) {
+            row.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+                .press(forDuration: 0.05, thenDragTo: row.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5)))
+        }
+        let wide = group(0)
+        XCTAssertTrue(wide.waitForExistence(timeout: 10))
+        let first = member(0, 0)
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        let last = member(0, 11)
+        XCTAssertFalse(isOnScreen(last), "the last copy starts beside the screen")
+        let firstX = first.frame.minX
+
+        for _ in 0..<8 where !isOnScreen(last) { dragLeft(wide) }
+        XCTAssertTrue(last.waitForExistence(timeout: 5), "the row builds its last copy when it scrolls there")
+        XCTAssertTrue(isOnScreen(last), "the row scrolls to its last copy: \(last.frame) in \(window.frame)")
+        XCTAssertTrue(!first.exists || first.frame.minX < firstX, "the row moved sideways")
+
+        let copy = member(1, 0)
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        XCTAssertTrue(isOnScreen(member(1, 1)), "both copies fit")
+        let copyX = copy.frame.minX
+        dragLeft(group(1))
+        XCTAssertEqual(copy.frame.minX, copyX, accuracy: 0.5, "a row that fits does not move sideways")
+    }
+
     func testTheContextMenuKeepsAnotherPhoto() {
         openDuplicates()
         let other = member(0, 1)

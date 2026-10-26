@@ -244,6 +244,28 @@ final class ExactDuplicateRelatedFileTransferTests: XCTestCase {
         }
     }
 
+    func testAStagingParentThatIsNoDirectoryIsRejectedBeforeTheCapacityQuery() async throws {
+        let fileParent = directory.appendingPathComponent("parent-file")
+        try Data("not a folder".utf8).write(to: fileParent)
+        for parent in [directory.appendingPathComponent("missing-parent"), fileParent] {
+            let queries = CapacityQueries()
+            let transfer = ExactDuplicateRelatedFileTransfer(
+                temporaryDirectory: directory, availableCapacity: { _ in queries.record() },
+                networkState: { LibraryNetworkState() })
+            let staged = parent.appendingPathComponent("related.partial")
+            let source = source()
+            do {
+                _ = try await transfer.download(
+                    to: staged, allowsExpensiveNetwork: false, source: { source }, stream: { _ in })
+                XCTFail("A download into a parent that is no folder must fail")
+            } catch {
+                XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .copyFailed(.staging))
+            }
+            XCTAssertEqual(queries.count, 0, "The rejection comes before the capacity query")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: staged.path))
+        }
+    }
+
     func testUnknownOrInsufficientCapacityNeverStartsTheDownload() async throws {
         for free in [nil, -1, 2] as [Int64?] {
             let probe = RelatedTransferProbe()
@@ -253,7 +275,11 @@ final class ExactDuplicateRelatedFileTransferTests: XCTestCase {
                     to: destination, allowsExpensiveNetwork: false, source: { source },
                     stream: { _ in await probe.hit() })
                 XCTFail("A download without enough known capacity must fail")
-            } catch { XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .copyFailed(.capacity)) }
+            } catch {
+                XCTAssertEqual(
+                    error as? ExactDuplicateRelatedFileTransferError,
+                    .copyFailed(free == nil ? .capacityUnknown : .capacity))
+            }
             let calls = await probe.count
             XCTAssertEqual(calls, 0)
             XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
@@ -1010,6 +1036,17 @@ final class ExactDuplicateRelatedFileTransferTests: XCTestCase {
         } catch { XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .copyFailed(.integrity)) }
         XCTAssertTrue(reservation.isActive)
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+}
+
+/// Counts the capacity queries of a transfer; each query answers 100 free bytes.
+private final class CapacityQueries: @unchecked Sendable {
+    private let lock = NSLock()
+    private var queries = 0
+    var count: Int { lock.withLock { queries } }
+    func record() -> Int64? {
+        lock.withLock { queries += 1 }
+        return 100
     }
 }
 

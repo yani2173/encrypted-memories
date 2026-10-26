@@ -534,18 +534,7 @@ private struct SignOutFailureView: View {
     var body: some View {
         ZStack {
             ProtonColor.backgroundNorm.ignoresSafeArea()
-            ContentUnavailableView {
-                Label {
-                    Text(L10n.string("sign_out.cleanup_failed_title"))
-                } icon: {
-                    Image(systemName: "exclamationmark.shield")
-                }
-            } description: {
-                Text(L10n.string("sign_out.cleanup_failed_message"))
-            } actions: {
-                RetryButton(.prominent, action: retry)
-            }
-            .padding()
+            SignOutCleanupFailedView(retry: retry)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

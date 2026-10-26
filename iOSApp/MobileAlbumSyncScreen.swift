@@ -222,30 +222,25 @@ private struct MobileAlbumPickerSheet: View {
     @State private var searchText = ""
     @State private var didLoad = false
 
-    private var filteredAlbums: [LocalAlbumSummary] {
-        let query = searchText.trimmingCharacters(in: .whitespaces)
-        guard !query.isEmpty else { return controller.availableAlbums }
-        return controller.availableAlbums.filter { $0.title.localizedCaseInsensitiveContains(query) }
-    }
-
     var body: some View {
         NavigationStack {
             Group {
-                if controller.isLoadingAlbums && !didLoad {
+                switch controller.pickerContent(matching: searchText, didLoad: didLoad) {
+                case .loading:
                     ProgressView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if controller.accessState == .denied || controller.accessState == .restricted {
+                case .accessDenied:
                     ContentUnavailableView(
                         String(localized: "settings.photos_backup_denied_ios"),
                         systemImage: "lock.rectangle.stack"
                     )
-                } else if filteredAlbums.isEmpty {
+                case .empty:
                     ContentUnavailableView(
                         L10n.string("settings.albumsync_picker_empty"),
                         systemImage: "rectangle.stack"
                     )
-                } else {
-                    List(filteredAlbums) { album in
+                case .list(let albums):
+                    List(albums) { album in
                         let isSelected = draft.contains(album.id)
                         Button {
                             toggle(album.id)

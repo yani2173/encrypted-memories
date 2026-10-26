@@ -149,6 +149,9 @@ public struct BackupResolvedResource: BackupResourceMaterializing {
     /// so exports are freed per item instead of piling up until the whole pass ends. `nil` when the
     /// resource points at a durable location the pipeline must not delete (e.g. a user's real file).
     public let cleanup: (@Sendable () -> Void)?
+    /// The compound leaves out the Live Photo video that Photos still reports missing after the runner's checks, so
+    /// the photo backs up without the Live Photo tag. Held in memory for this pass only; the queue never stores it.
+    public let omitsMissingPairedVideo: Bool
 
     public init(
         candidate: UploadBackupAssetCandidate,
@@ -165,8 +168,10 @@ public struct BackupResolvedResource: BackupResourceMaterializing {
         materializeWithProgress: (
             @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor
         )? = nil,
-        cleanup: (@Sendable () -> Void)? = nil
+        cleanup: (@Sendable () -> Void)? = nil,
+        omitsMissingPairedVideo: Bool = false
     ) {
+        self.omitsMissingPairedVideo = omitsMissingPairedVideo
         self.candidate = candidate
         let photos = additionalMetadata.first { $0.name == "iOS.photos" }.flatMap {
             try? JSONDecoder().decode(PhotoUploadMetadataEncoder.IOSPhotos.self, from: $0.utf8JsonValue)
@@ -212,9 +217,28 @@ public protocol BackupResourceResolving: Sendable {
         onPreparationProgress: @escaping BackupResourcePreparationHandler,
         readAdmission: @escaping BackupResourceReadAdmission
     ) async throws -> BackupResolvedResource?
+    /// `omittingMissingPairedVideo` is true on the last check of a row whose file Photos reports missing. A resolver
+    /// may then leave out a Live Photo video that Photos still reports missing and set `omitsMissingPairedVideo`.
+    /// Every other failure throws as usual.
+    func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission,
+        omittingMissingPairedVideo: Bool
+    ) async throws -> BackupResolvedResource?
 }
 
 public extension BackupResourceResolving {
+    /// A resolver without Live Photo videos resolves the whole entry and never leaves anything out.
+    func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission,
+        omittingMissingPairedVideo: Bool
+    ) async throws -> BackupResolvedResource? {
+        try await resolve(entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission)
+    }
+
     func resolve(
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler,
@@ -259,6 +283,17 @@ public struct CompositeBackupResourceResolver: BackupResourceResolving {
     ) async throws -> BackupResolvedResource? {
         try await resolver(for: entry).resolve(
             entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission)
+    }
+
+    public func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission,
+        omittingMissingPairedVideo: Bool
+    ) async throws -> BackupResolvedResource? {
+        try await resolver(for: entry).resolve(
+            entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission,
+            omittingMissingPairedVideo: omittingMissingPairedVideo)
     }
 
     private func resolver(for entry: UploadBackupSyncQueueEntry) throws -> any BackupResourceResolving {

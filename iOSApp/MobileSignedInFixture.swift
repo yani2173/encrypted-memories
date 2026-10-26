@@ -135,6 +135,16 @@ import UploadCore
                             "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil,
                         invalidatingMergeReloadFails: ProcessInfo.processInfo.arguments.contains(
                             "-EncryptedMemoriesDuplicatesReloadFailure")))
+            } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesWideFixture") {
+                // One group with more copies than fit on the screen, and one whose two copies fit.
+                let wide = Array(sections[0].items.prefix(12))
+                let fitting = Array(sections[1].items.prefix(2))
+                runtime.libraryModel.installIsolatedDuplicatesForTesting(
+                    MobileFixtureDuplicates(
+                        groups: [wide.map(\.uid), fitting.map(\.uid)],
+                        captureDates: Dictionary(
+                            (wide + fitting).map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }))
+                )
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesLargeFixture") {
                 // 1,500 groups of two or three library photos, for the scrolling and memory measurement.
                 let items = sections.flatMap(\.items)

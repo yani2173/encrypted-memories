@@ -2,7 +2,7 @@ import DeviceRootCore
 import Foundation
 import ProtonDriveSDK
 
-/// SDK 0.31.1 operations for the app-owned Computer or My files fallback.
+/// SDK 0.32.1 operations for the app-owned Computer or My files fallback.
 /// Construct this only after the account Labs gate opens.
 struct ProtonDriveDeviceRootTransport: DeviceRootSDKTransport {
     private let client: ProtonDriveClient

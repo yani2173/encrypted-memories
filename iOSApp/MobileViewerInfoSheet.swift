@@ -103,17 +103,8 @@ struct MobileViewerInfoSheet: View {
             EmptyView()
 
         case .failed:
-            ContentUnavailableView {
-                Label(
-                    L10n.string("infopanel.load_failed_title"),
-                    systemImage: "exclamationmark.triangle"
-                )
-            } description: {
-                Text(L10n.string("infopanel.load_failed_message"))
-            } actions: {
-                RetryButton(.prominent, action: onRetry)
-            }
-            .frame(maxWidth: .infinity)
+            ViewerInfoLoadFailedView(onRetry: onRetry)
+                .frame(maxWidth: .infinity)
         }
     }
 

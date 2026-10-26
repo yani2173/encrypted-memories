@@ -4019,26 +4019,43 @@ import Testing
         #expect(await harness.lifecycle.currentSnapshot().selectedModelID == entryA.id)
     }
 
-    @Test func downloadProgressIsMonotonicAndCoalesced() async throws {
+    @Test(.timeLimit(.minutes(1)))
+    func downloadProgressIsMonotonicAndCoalesced() async throws {
         let payload = Data(repeating: 0xAB, count: 1 << 16)
         let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payload)
         let harness = try makeHarness(
             catalog: MLModelCatalog(entries: [entryA]), payloads: [urlA: payload], assets: [uid("a")])
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
 
+        // The stream is taken before the lifecycle starts, so the observer sees every snapshot whenever its task runs.
+        // The observer ends when it has read the complete ready snapshot, which follows every download snapshot, and
+        // the test joins it before it reads the fractions.
         let fractions = Fractions()
+        let stream = await harness.lifecycle.snapshots()
         let observation = Task {
-            for await snapshot in await harness.lifecycle.snapshots() {
+            for await snapshot in stream {
                 if case .downloading(let progress) = snapshot.phase, let fraction = progress.fraction {
                     fractions.append(fraction)
                 }
+                if case .ready(let coverage) = snapshot.phase, coverage.isComplete, coverage.total == 1 { return }
             }
         }
 
         await harness.lifecycle.start()
         await harness.lifecycle.enable(with: entryA.id)
-        #expect(await waitForCompleteIndex(harness, total: 1))
-        observation.cancel()
+        let indexed = await waitForCompleteIndex(harness, total: 1)
+        #expect(indexed)
+        if indexed {
+            // The time limit cancels this test, not the observer task, so the join forwards the cancellation.
+            await withTaskCancellationHandler {
+                await observation.value
+            } onCancel: {
+                observation.cancel()
+            }
+        } else {
+            observation.cancel()
+            await observation.value
+        }
 
         let seen = fractions.values
         #expect(seen == seen.sorted(), "download progress must be monotonic")

@@ -2886,6 +2886,9 @@ extension DriveSDKBridge: ExactDuplicateRemote {
         // Own staging before session admission, so a closed session also removes its plaintext.
         try await relatedFileOperations.transfer.upload(request) { checked in
             try await self.withOpenSession(cause: .duplicatesMerge) { bridge in
+                // The account check of every backup upload: a full account keeps the source before any transfer.
+                // A fixed label replaces the name, because related-file copies never log private details.
+                try await bridge.ensureRemoteCapacity(forBytes: checked.fileSize, filename: "related file")
                 let reservation = try await bridge.reserveNetwork(
                     allowsExpensiveNetwork: checked.allowsExpensiveNetwork)
                 defer { reservation.release() }

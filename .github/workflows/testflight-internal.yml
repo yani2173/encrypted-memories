@@ -42,6 +42,7 @@ jobs:
       commit_sha: ${{ steps.revision.outputs.commit_sha }}
       automation_sha: ${{ steps.automation.outputs.commit_sha }}
       upgrade_sources: ${{ steps.upgrade-plan.outputs.upgrade_sources }}
+      upgrade_matrix: ${{ steps.upgrade-plan.outputs.upgrade_matrix }}
       upgrade_overridden: ${{ steps.upgrade-plan.outputs.upgrade_overridden }}
       notes_ios_de_base64: ${{ steps.release.outputs.notes_ios_de_base64 }}
       notes_ios_en_base64: ${{ steps.release.outputs.notes_ios_en_base64 }}
@@ -856,23 +857,10 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      matrix:
-        # One iOS case takes about 7 minutes on the hosted runner (run 38171860265: 13 cases in 95 minutes after
-        # 19 minutes of builds), so all 24 iOS cases would exceed one 180-minute job. Each shard tests every
-        # source; together the shards of a platform cover every interruption point exactly once. A shard holds
-        # 6 points per source: 3 sources need about 145 minutes, so a fourth source needs a third iOS shard.
-        include:
-          - platform: iOS
-            shard: backup-model
-            points: backup.claimed backup.remoteReceipt backup.localRecord model.partial model.installRecord model.promoted
-          - platform: iOS
-            shard: index-thumbnail
-            points: index.embed index.beforeCommit index.afterCommit thumbnail.beforeLoad thumbnail.afterLoad thumbnail.stored
-          - platform: macOS
-            shard: all
-            points: >-
-              backup.claimed backup.remoteReceipt backup.localRecord model.partial model.installRecord model.promoted
-              index.embed index.beforeCommit index.afterCommit thumbnail.beforeLoad thumbnail.afterLoad thumbnail.stored
+      # The prepare job builds the jobs from the one list of interruption points and the selected sources
+      # (.github/scripts/release_upgrade.py): each platform tests every source, together its jobs cover every
+      # point once, and each job fits its time budget. A new point or source needs no edit here.
+      matrix: ${{ fromJSON(needs.prepare.outputs.upgrade_matrix) }}
     env:
       # The lines that tell each case's result, timing and free disk. GitHub cuts a step log at about 10 MB, so the
       # journey step prints only these lines; the full output stays in the retained release-upgrade.log.

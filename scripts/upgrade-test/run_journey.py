@@ -129,30 +129,82 @@ def free_gib(path=Path.home()):
     return shutil.disk_usage(path).free / 2**30
 
 
-def tree_gib(path):
-    if not path.exists():
-        return 0.0
+class PartialSize(float):
+    """The total of a tree that `du` could not read completely: a lower bound, not the size."""
+
+
+# The six trees of the first rehearsals keep their 300 s; the four trees that #498 added have a smaller bound, so that
+# one slow tree adds at most 60 s to a sample round.
+TREE_TIMEOUT_SECONDS = 300
+NEW_TREE_TIMEOUT_SECONDS = 60
+TREE_TIMEOUTS = {'tmp': NEW_TREE_TIMEOUT_SECONDS, 'caches': NEW_TREE_TIMEOUT_SECONDS,
+                 'logs': NEW_TREE_TIMEOUT_SECONDS, 'diagnostics': NEW_TREE_TIMEOUT_SECONDS}
+
+
+def tree_gib(path, timeout=TREE_TIMEOUT_SECONDS):
     try:
-        result = subprocess.run(['du', '-sk', str(path)], capture_output=True, text=True, timeout=300)
-        return int(result.stdout.split()[0]) / 2**20
-    except (subprocess.TimeoutExpired, ValueError, IndexError):
+        if not path.exists():
+            return 0.0
+        result = subprocess.run(['du', '-sk', str(path)], capture_output=True, text=True, timeout=timeout)
+        size = int(result.stdout.split()[0]) / 2**20
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        return float('nan')  # Unknown: no total, for example a root that the user cannot read.
+    # A nonzero exit with a total (a readable tree with an unreadable part, or GNU du with an unreadable root) is
+    # only a lower bound.
+    return PartialSize(size) if result.returncode else size
+
+
+def tree_label(size):
+    return f'{size:.1f}' + (' partial' if isinstance(size, PartialSize) else '')
+
+
+def swap_used_mib():
+    # `sysctl vm.swapusage` prints "vm.swapusage: total = 2048.00M  used = 1.25M  free = 2046.75M  (encrypted)".
+    # The C locale keeps the decimal point; Apple's sysctl honors LC_NUMERIC.
+    try:
+        result = subprocess.run(['sysctl', 'vm.swapusage'], capture_output=True, text=True, timeout=10,
+                                env=dict(os.environ, LC_ALL='C'))
+        if result.returncode:
+            return float('nan')
+        used, unit = re.search(r'used = ([0-9.]+)([MG])', result.stdout).groups()
+        return float(used) * (1024 if unit == 'G' else 1)
+    except (subprocess.TimeoutExpired, OSError, AttributeError, ValueError):
         return float('nan')
 
 
-def sample_runner(path, root, interval=60):
-    # Load and free disk every minute, and the large trees every fifth minute, show what a slow or failed case met.
-    # A hosted iOS shard ran out of disk (rehearsal 38181793360) without any record of what filled it.
+def runner_trees(path, root):
     home = Path.home()
-    trees = {'evidence': path.parent, 'scratch': root / 'scratch', 'products': root / 'products',
-             'simulators': home / 'Library/Developer/CoreSimulator/Devices',
-             'simulator-logs': home / 'Library/Logs/CoreSimulator',
-             'derived-data': home / 'Library/Developer/Xcode/DerivedData'}
+    try:
+        temporary = Path(tempfile.gettempdir())
+    except Exception:  # gettempdir probes by creating files; no failure of it may stop the journey.
+        temporary = None
+    return {'evidence': path.parent, 'scratch': root / 'scratch', 'products': root / 'products',
+            'simulators': home / 'Library/Developer/CoreSimulator/Devices',
+            'simulator-logs': home / 'Library/Logs/CoreSimulator',
+            'derived-data': home / 'Library/Developer/Xcode/DerivedData',
+            # The free disk of a hosted iOS shard fell by about 0.9 GiB per case outside the trees above (#498).
+            # `logs` contains `simulator-logs`: do not add the two.
+            'tmp': temporary, 'caches': home / 'Library/Caches', 'logs': home / 'Library/Logs',
+            'diagnostics': Path('/var/db/diagnostics')}
+
+
+def runner_sample_line(count, trees):
+    line = (time.strftime('%H:%M:%S') + ' load ' + ' '.join(f'{value:.2f}' for value in os.getloadavg())
+            + f' free {free_gib():.1f} GiB swap used {swap_used_mib():.0f} MiB')
+    if count % 5 == 0:
+        sizes = {name: float('nan') if tree is None else tree_gib(tree, TREE_TIMEOUTS.get(name, TREE_TIMEOUT_SECONDS))
+                 for name, tree in trees.items()}
+        line += ' |' + ''.join(f' {name} {tree_label(size)}' for name, size in sizes.items()) + ' GiB'
+    return line
+
+
+def sample_runner(path, root, interval=60):
+    # Load, free disk and swap every minute, and the large trees every fifth minute, show what a slow or failed case
+    # met. A hosted iOS shard ran out of disk (rehearsal 38181793360) without any record of what filled it.
     def sample():
+        trees = runner_trees(path, root)
         for count in range(sys.maxsize):
-            line = (time.strftime('%H:%M:%S') + ' load ' + ' '.join(f'{value:.2f}' for value in os.getloadavg())
-                    + f' free {free_gib():.1f} GiB')
-            if count % 5 == 0:
-                line += ' |' + ''.join(f' {name} {tree_gib(tree):.1f}' for name, tree in trees.items()) + ' GiB'
+            line = runner_sample_line(count, trees)
             try:
                 with open(path, 'a') as log:
                     log.write(line + '\n')
@@ -450,6 +502,10 @@ def wait_ui_test_start(process, log, label, reached=None, timeout=UI_STARTUP_SEC
 
 
 def main():
+    if sys.argv[1:] == ['--list-points']:
+        # The one list of interruption points. The release workflow builds its job matrix from this output.
+        print(' '.join(POINTS))
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', type=Path, required=True)
     parser.add_argument('--automation', type=Path, required=True)

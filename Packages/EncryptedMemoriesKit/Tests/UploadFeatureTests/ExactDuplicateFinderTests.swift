@@ -7,6 +7,9 @@ import XCTest
 final class ExactDuplicateFinderTests: XCTestCase {
     private var directory: URL!
     private var servers = ScenarioServers()
+    private var copyRemotes: [(remote: CopyingDuplicateRemote, downloads: Int, uploads: Int)] = []
+    private var unavailableProbes: [ObjectIdentifier: UnavailableCopyProbe] = [:]
+    private var unavailableBudgets: [ObjectIdentifier: UnavailableCopyProbe.Counts] = [:]
     private var server: EditScenarioServer! {
         didSet {
             if let server { servers.append(server) }
@@ -28,6 +31,9 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
     override func setUpWithError() throws {
         servers = ScenarioServers()
+        copyRemotes = []
+        unavailableProbes = [:]
+        unavailableBudgets = [:]
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("exact-duplicate-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -40,9 +46,22 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
     override func tearDownWithError() throws {
         if let server {
-            XCTAssertEqual(server.relatedFileTransferCallCount, 0, "Existing merge paths must not attempt a transfer")
+            let budget = unavailableBudgets[ObjectIdentifier(server)] ?? .init()
             XCTAssertEqual(
-                servers.relatedFileTransferCallCount, 0, "Replaced merge servers must not attempt a transfer")
+                server.relatedFileTransferCallCount, budget.downloads + budget.uploads,
+                "Existing merge paths keep a zero budget unless the test explicitly expects a failed copy")
+            XCTAssertEqual(
+                servers.relatedFileTransferCallCount,
+                unavailableBudgets.values.reduce(0) { $0 + $1.downloads + $1.uploads },
+                "Every replaced server retains its independently declared transfer budget")
+            for (id, probe) in unavailableProbes {
+                XCTAssertEqual(
+                    probe.counts, unavailableBudgets[id] ?? .init(), "Exact download/upload budget per server")
+            }
+        }
+        for budget in copyRemotes {
+            XCTAssertEqual(budget.remote.downloads.count, budget.downloads, "Exact download budget for this server")
+            XCTAssertEqual(budget.remote.requests.count, budget.uploads, "Exact upload budget for this server")
         }
         store = nil
         try? FileManager.default.removeItem(at: directory)
@@ -57,13 +76,21 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
     private func finder(
         resolver: (any UploadIdentityResolving)? = nil, identities: (any UploadIdentityStore)? = nil,
-        albums: (any SeriesAlbumCarryOver)? = nil, remote: (any ExactDuplicateRemote)? = nil
+        albums: (any SeriesAlbumCarryOver)? = nil, remote: (any ExactDuplicateRemote)? = nil,
+        checker: (any UploadDuplicateChecking)? = nil, mergeJournal: (any ExactDuplicateMergeJournaling)? = nil
     ) -> ExactDuplicateFinder {
-        ExactDuplicateFinder(
-            checker: server,
+        let id = ObjectIdentifier(server!)
+        let probe = unavailableProbes[id] ?? UnavailableCopyProbe(base: server)
+        unavailableProbes[id] = probe
+        var result = ExactDuplicateFinder(
+            checker: checker ?? server,
             resolver: resolver ?? UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
-            index: store, identities: identities ?? store, journal: journal, mergeJournal: mergeJournal,
-            remote: remote ?? server, albums: albums ?? server)
+            index: store, identities: identities ?? store, journal: journal,
+            mergeJournal: mergeJournal ?? self.mergeJournal,
+            remote: remote ?? probe, albums: albums ?? server)
+        result.copyNetwork = { BackupThrottleInputs(usesMobileData: false) }
+        result.relatedFileStagingParent = directory
+        return result
     }
 
     private func digest(_ seed: String) -> Data {
@@ -119,6 +146,1163 @@ final class ExactDuplicateFinderTests: XCTestCase {
     private var violations: [String] { server.steps.flatMap(\.violations) }
 
     private func count(_ action: String) -> Int { server.steps.filter { $0.action == action }.count }
+
+    func testCopyTransportUsesRealStagingAndTheSharedServer() async throws {
+        let kept = server.seedLink(digest: digest("main"))
+        let source = server.seedLink(digest: digest("main"))
+        let remote = CopyingDuplicateRemote(base: server)
+        copyRemotes.append((remote, 1, 1))
+        let bytes = Data("original bytes".utf8)
+        let related = try remote.seed(bytes, under: source, in: directory)
+        let file = directory.appendingPathComponent("control.partial")
+        let metadata = try await remote.downloadRelatedFile(related, to: file, allowsExpensiveNetwork: false)
+        let staged = try ExactDuplicateStagedFile.read(at: file)
+        var request = PhotoUploadRequest(
+            queueItemID: UUID(), cancellationToken: UUID(), fileURL: file,
+            name: metadata.filename, mediaType: metadata.mediaType, fileSize: staged.fileSize,
+            captureTime: metadata.captureTime, modificationDate: metadata.modificationDate,
+            tags: [], additionalMetadata: metadata.additionalMetadata, expectedSHA1: staged.sha1, mainPhotoUID: kept)
+        request.allowsExpensiveNetwork = false
+
+        let uploaded = try await remote.uploadRelatedFile(request)
+
+        let read = try await server.compound(ofMainLink: kept.nodeID)
+        let compound = try XCTUnwrap(read)
+        XCTAssertEqual(compound.related.map(\.linkID), [uploaded.nodeID])
+        XCTAssertEqual(compound.related.map(\.contentHash), [EditScenarioServer.contentHash(staged.sha1)])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertEqual(state(of: source), .active)
+        XCTAssertEqual(state(of: related), .active)
+        XCTAssertEqual(server.uploadRequestCount, 1)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testMergeCopiesDifferentRelatedFilesUnderTheFinalKeptPhoto() async throws {
+        let kept = server.seedLink(digest: digest("main"))
+        let source = server.seedLink(digest: digest("main"))
+        let remote = CopyingDuplicateRemote(base: server)
+        copyRemotes.append((remote, 1, 1))
+        let keptRelated = try remote.seed(Data("kept original".utf8), under: kept, in: directory)
+        let sourceRelated = try remote.seed(Data("source original".utf8), under: source, in: directory)
+        let sourceHash = try XCTUnwrap(server.links.first { $0.linkID == sourceRelated.nodeID }?.contentHash)
+        let sourceRow = row("copied-original", names: sourceRelated.nodeID, contentHash: sourceHash)
+        indexServer()
+        let group = try await onlyGroup()
+        let journal = mergeJournal
+        remote.beforeTrash = {
+            XCTAssertEqual(journal.pendingMerges()?.flatMap(\.members).map(\.link), [source.nodeID])
+        }
+
+        var copyingFinder = finder(remote: remote)
+        copyingFinder.copyNetwork = { BackupThrottleInputs(usesMobileData: false) }
+        let outcome = try await copyingFinder.merge(group, keeping: kept)
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [source], keptDuplicates: [:]))
+        let read = try await server.compound(ofMainLink: kept.nodeID)
+        let fresh = try XCTUnwrap(read)
+        XCTAssertEqual(fresh.related.count, 2)
+        XCTAssertTrue(fresh.related.contains { $0.linkID == keptRelated.nodeID })
+        let copied = try XCTUnwrap(fresh.related.first { $0.contentHash == sourceHash })
+        XCTAssertNotEqual(copied.linkID, sourceRelated.nodeID)
+        XCTAssertEqual(store.record(for: sourceRow)?.remoteLinkID, copied.linkID)
+        XCTAssertEqual(state(of: kept), .active)
+        XCTAssertEqual(state(of: source), .trashed)
+        let request = try XCTUnwrap(remote.requests.first)
+        XCTAssertEqual(request.mainPhotoUID, kept)
+        XCTAssertEqual(request.name, CopyingDuplicateRemote.metadata.filename)
+        XCTAssertEqual(request.expectedSHA1, try remote.digest(of: Data("source original".utf8), in: directory))
+        XCTAssertEqual(request.fileSize, Int64(Data("source original".utf8).count))
+        XCTAssertFalse(request.overrideExistingDraft)
+        XCTAssertEqual(request.additionalMetadata, CopyingDuplicateRemote.metadata.additionalMetadata)
+        XCTAssertEqual(request.captureTime, CopyingDuplicateRemote.metadata.captureTime)
+        XCTAssertEqual(request.modificationDate, CopyingDuplicateRemote.metadata.modificationDate)
+        XCTAssertEqual(request.tags, [])
+        XCTAssertTrue(remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(violations, [])
+    }
+
+    private func copyingFinder(
+        _ remote: CopyingDuplicateRemote,
+        network: @escaping @Sendable () -> BackupThrottleInputs = { BackupThrottleInputs(usesMobileData: false) }
+    ) -> ExactDuplicateFinder {
+        var result = finder(remote: remote)
+        result.copyNetwork = network
+        return result
+    }
+
+    private func copyingScenario(
+        downloads: Int = 1, uploads: Int = 1,
+        transfer: ExactDuplicateRelatedFileTransfer? = nil
+    ) throws -> (kept: PhotoUID, source: PhotoUID, related: PhotoUID, remote: CopyingDuplicateRemote) {
+        let kept = server.seedLink(digest: digest("main"))
+        let source = server.seedLink(digest: digest("main"))
+        let remote = CopyingDuplicateRemote(base: server, transfer: transfer)
+        copyRemotes.append((remote, downloads, uploads))
+        let related = try remote.seed(Data("source original".utf8), under: source, in: directory)
+        indexServer()
+        return (kept, source, related, remote)
+    }
+
+    func testFailedRelatedUploadKeepsTheSourceAndEveryOriginalFile() async throws {
+        let setup = try copyingScenario()
+        setup.remote.beforeUpload = { _ in throw ExactDuplicateRelatedFileTransferError.copyFailed(.transfer) }
+
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+        XCTAssertEqual(server.uploadRequestCount, 0)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testRestartAfterRelatedUploadReusesTheTwinBeforeTrash() async throws {
+        let setup = try copyingScenario()
+        setup.remote.afterUpload = { _ in throw ExactDuplicateRelatedFileTransferError.copyFailed(.transfer) }
+        let group = try await onlyGroup()
+
+        let interrupted = try await copyingFinder(setup.remote).merge(group, keeping: setup.kept)
+        XCTAssertEqual(interrupted, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(server.uploadRequestCount, 1)
+        setup.remote.afterUpload = nil
+        let resumed = try await copyingFinder(setup.remote).merge(group, keeping: setup.kept)
+
+        XCTAssertEqual(resumed, .merged(kept: setup.kept, trashed: [setup.source], keptDuplicates: [:]))
+        XCTAssertEqual(server.uploadRequestCount, 1, "the next finder must use the already committed twin")
+        XCTAssertEqual(setup.remote.downloads.count, 1)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testATwinAddedByAnotherDeviceSkipsThePendingUpload() async throws {
+        let setup = try copyingScenario(uploads: 0)
+        let remote = setup.remote
+        let kept = setup.kept
+        let directory = try XCTUnwrap(directory)
+        remote.afterDownload = { _ in _ = try remote.seed(Data("source original".utf8), under: kept, in: directory) }
+
+        let outcome = try await copyingFinder(remote).merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [setup.source], keptDuplicates: [:]))
+        XCTAssertEqual(server.uploadRequestCount, 0)
+        XCTAssertTrue(remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(violations, [])
+    }
+
+    func testRepeatedSourceHashesRequireDistinctRelatedTwins() async throws {
+        for existing in 0...2 {
+            server = EditScenarioServer()
+            let setup = try copyingScenario(downloads: 2 - existing, uploads: 2 - existing)
+            let bytes = Data("source original".utf8)
+            let second = try setup.remote.seed(bytes, under: setup.source, in: directory)
+            for _ in 0..<existing { _ = try setup.remote.seed(bytes, under: setup.kept, in: directory) }
+            let contentHash = EditScenarioServer.contentHash(try setup.remote.digest(of: bytes, in: directory))
+            let firstRow = row("first", names: setup.related.nodeID, contentHash: contentHash)
+            let secondRow = row("second", names: second.nodeID, contentHash: contentHash)
+            indexServer()
+
+            let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+
+            XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [setup.source], keptDuplicates: [:]))
+            let read = try await server.compound(ofMainLink: setup.kept.nodeID)
+            let compound = try XCTUnwrap(read)
+            XCTAssertEqual(compound.related.count, 2)
+            XCTAssertEqual(Set(compound.related.map(\.linkID)).count, 2)
+            XCTAssertNotEqual(store.record(for: firstRow)?.remoteLinkID, store.record(for: secondRow)?.remoteLinkID)
+            XCTAssertEqual(violations, [])
+        }
+    }
+
+    func testSharedSourceAndSharedCopyTargetNeverExposeAnExtraFile() async throws {
+        for shareKept in [true, false] {
+            server = EditScenarioServer()
+            let setup = try copyingScenario(downloads: 0, uploads: 0)
+            server.share(shareKept ? setup.kept : setup.source)
+            let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+            XCTAssertEqual(
+                outcome,
+                .merged(
+                    kept: setup.kept, trashed: [],
+                    keptDuplicates: [setup.source: shareKept ? .relatedFileWithoutTwin : .shared]))
+            for uid in [setup.kept, setup.source, setup.related] { XCTAssertEqual(state(of: uid), .active) }
+            XCTAssertEqual(setup.remote.trashes, [])
+        }
+    }
+
+    func testMobileDataOffKeepsTheSourceWaitingWithoutDownloading() async throws {
+        for determined in [true, false] {
+            server = EditScenarioServer()
+            let setup = try copyingScenario(downloads: 0, uploads: 0)
+            let outcome = try await copyingFinder(
+                setup.remote,
+                network: {
+                    BackupThrottleInputs(
+                        isNetworkExpensive: determined, usesMobileData: false, isNetworkDetermined: determined)
+                }
+            ).merge(try await onlyGroup(), keeping: setup.kept)
+            XCTAssertEqual(
+                outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .waitingForWiFi]))
+            XCTAssertEqual(setup.remote.streamCount, 0)
+            XCTAssertEqual(setup.remote.trashes, [])
+            XCTAssertEqual(state(of: setup.source), .active)
+            XCTAssertEqual(mergeJournal.pendingMerges(), [])
+        }
+    }
+
+    func testEachCopyPhaseSamplesTheCurrentMobileDataSetting() async throws {
+        let setup = try copyingScenario(downloads: 2, uploads: 2)
+        _ = try setup.remote.seed(Data("another original".utf8), under: setup.source, in: directory)
+        indexServer()
+        let settings = CopyPolicySequence([true, false, false, true])
+
+        let outcome = try await copyingFinder(
+            setup.remote,
+            network: {
+                BackupThrottleInputs(usesMobileData: settings.next())
+            }
+        ).merge(try await onlyGroup(), keeping: setup.kept)
+
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [setup.source], keptDuplicates: [:]))
+        XCTAssertEqual(settings.reads, 4)
+        XCTAssertEqual(setup.remote.downloadPolicies, [true, false])
+        XCTAssertEqual(setup.remote.requests.map(\.allowsExpensiveNetwork), [false, true])
+        XCTAssertEqual(violations, [])
+    }
+
+    func testARelatedFileMatchingTheOtherMainStillNeedsARelatedTwin() async throws {
+        let remote = CopyingDuplicateRemote(base: server)
+        copyRemotes.append((remote, 1, 1))
+        let bytes = Data("main and related bytes".utf8)
+        let digest = try remote.digest(of: bytes, in: directory)
+        let kept = server.seedLink(digest: digest)
+        let source = server.seedLink(digest: digest)
+        _ = try remote.seed(bytes, under: source, in: directory)
+        indexServer()
+
+        let outcome = try await copyingFinder(remote).merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [source], keptDuplicates: [:]))
+        let read = try await server.compound(ofMainLink: kept.nodeID)
+        let compound = try XCTUnwrap(read)
+        XCTAssertEqual(compound.related.count, 1)
+        XCTAssertEqual(compound.related.first?.contentHash, compound.main.contentHash)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testWrongStagedContentKeepsTheSourceBeforeUpload() async throws {
+        let setup = try copyingScenario(uploads: 0)
+        setup.remote.afterDownload = { file in
+            try Data(repeating: 0x77, count: Data("source original".utf8).count).write(to: file)
+        }
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testAReportedUploadWithTheWrongServerHashCannotAuthorizeTrash() async throws {
+        let setup = try copyingScenario()
+        let base = try XCTUnwrap(server)
+        let wrong = digest("wrong bytes")
+        setup.remote.uploadOverride = { request in base.seedLink(digest: wrong, main: request.mainPhotoUID) }
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testUnavailableUploadRemovesOnlyItsCompletedOwnedDownload() async throws {
+        let setup = try copyingScenario()
+        setup.remote.unavailableUpload = true
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(server.uploadRequestCount, 0)
+    }
+
+    func testRejectedDownloadNeverDeletesTheExistingDestination() async throws {
+        let setup = try copyingScenario(uploads: 0)
+        let preserved = Data("existing destination".utf8)
+        setup.remote.beforeDownload = { file in try preserved.write(to: file) }
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+        let destination = try XCTUnwrap(setup.remote.downloads.first)
+        defer { try? FileManager.default.removeItem(at: destination) }
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(try Data(contentsOf: destination), preserved)
+        XCTAssertEqual(setup.remote.streamCount, 0)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    func testRejectedDownloadPreservesDirectoryLiveSymlinkAndDanglingSymlinkEntries() async throws {
+        for kind in 0..<3 {
+            server = EditScenarioServer()
+            let setup = try copyingScenario(uploads: 0)
+            let target = directory.appendingPathComponent("rejected-target-\(kind)")
+            let bytes = Data("unowned target".utf8)
+            if kind == 1 { try bytes.write(to: target) }
+            setup.remote.beforeDownload = { file in
+                if kind == 0 {
+                    try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+                    try bytes.write(to: file.appendingPathComponent("unowned"))
+                } else {
+                    try FileManager.default.createSymbolicLink(at: file, withDestinationURL: target)
+                }
+            }
+            let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+            let destination = try XCTUnwrap(setup.remote.downloads.first)
+            defer { try? FileManager.default.removeItem(at: destination) }
+            XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+            if kind == 0 {
+                XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("unowned")), bytes)
+            } else {
+                XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: destination.path), target.path)
+                if kind == 1 {
+                    XCTAssertEqual(try Data(contentsOf: target), bytes)
+                } else {
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+                }
+            }
+            XCTAssertEqual(setup.remote.streamCount, 0)
+            XCTAssertEqual(setup.remote.trashes, [])
+            XCTAssertEqual(state(of: setup.source), .active)
+        }
+    }
+
+    func testInsufficientOrUnknownCapacityStartsNoRelatedStream() async throws {
+        let capacities: [Int64?] = [nil, 0]
+        for free in capacities {
+            server = EditScenarioServer()
+            let transfer = ExactDuplicateRelatedFileTransfer(
+                availableCapacity: { _ in free }, networkState: { .init() })
+            let setup = try copyingScenario(uploads: 0, transfer: transfer)
+            let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+            // Only a known shortfall names device storage; an unknown answer is a plain copy failure.
+            let reason: ExactDuplicateKeepReason = free == nil ? .copyFailed : .deviceStorageFull
+            XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: reason]))
+            XCTAssertEqual(setup.remote.streamCount, 0)
+            XCTAssertEqual(setup.remote.trashes, [])
+            XCTAssertEqual(state(of: setup.source), .active)
+            XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        }
+    }
+
+    func testAnUploadOutOfDeviceSpaceKeepsTheSourceForDeviceStorage() async throws {
+        let setup = try copyingScenario()
+        // The bridge reports an SDK out-of-space failure of the upload as this typed failure.
+        setup.remote.beforeUpload = { _ in throw ExactDuplicateRelatedFileTransferError.copyFailed(.capacity) }
+
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+
+        XCTAssertEqual(
+            outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .deviceStorageFull]))
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+        XCTAssertEqual(server.uploadRequestCount, 0)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testEachBatchEmptiesTheOwnedStagingFolderBeforeItsFirstCopy() async throws {
+        let setup = try copyingScenario()
+        let folder = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: directory)
+        let outside = directory.appendingPathComponent("outside-staging", isDirectory: true)
+        let outsideFile = outside.appendingPathComponent("must-stay")
+        try FileManager.default.createDirectory(
+            at: folder.appendingPathComponent("left-folder"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("outside".utf8).write(to: outsideFile)
+        try Data("left".utf8).write(to: folder.appendingPathComponent("left-by-an-ended-process"))
+        try FileManager.default.createSymbolicLink(
+            at: folder.appendingPathComponent("link"), withDestinationURL: outside)
+
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [setup.source], keptDuplicates: [:]))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), [])
+        XCTAssertEqual(try Data(contentsOf: outsideFile), Data("outside".utf8))
+        XCTAssertEqual(
+            setup.remote.downloads.map { $0.deletingLastPathComponent().standardizedFileURL },
+            [folder.standardizedFileURL])
+    }
+
+    func testAStagingFolderThatCannotBeEmptiedStartsNoCopy() async throws {
+        let setup = try copyingScenario(downloads: 0, uploads: 0)
+        let locked = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: directory)
+            .appendingPathComponent("locked", isDirectory: true)
+        let left = locked.appendingPathComponent("left-by-an-ended-process")
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try Data("left".utf8).write(to: left)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path) }
+
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.downloads, [])
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: left.path))
+    }
+
+    func testARunWithARegisteredCopyKeepsItsStagingAndStartsNoCopy() async throws {
+        let setup = try copyingScenario(downloads: 0, uploads: 0)
+        let group = try await onlyGroup()
+        let staged = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: directory)
+            .appendingPathComponent("staged-by-the-running-copy")
+        try FileManager.default.createDirectory(
+            at: staged.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("in flight".utf8).write(to: staged)
+        let run = ExactDuplicateMergeRun(members: group.members)
+        let gate = FinderGate()
+        let running = Task { try await run.copying { await gate.pass() } }
+        defer { gate.open() }
+        await gate.waitForArrival()
+
+        let results = await copyingFinder(setup.remote).merge(chosen([(group, setup.kept)]), in: run)
+        gate.open()
+        try await running.value
+
+        XCTAssertEqual(
+            try results.first?.get(),
+            .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: staged.path))
+        XCTAssertEqual(setup.remote.trashes, [])
+    }
+
+    func testAFullProtonAccountKeepsTheSourceForProtonStorage() async throws {
+        let setup = try copyingScenario()
+        let size = Int64(Data("source original".utf8).count)
+        setup.remote.beforeUpload = { request in
+            throw UploadError.accountStorageFull(request.name, requiredBytes: size, availableBytes: 0)
+        }
+
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+
+        XCTAssertEqual(
+            outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .protonStorageFull]))
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+        XCTAssertEqual(server.uploadRequestCount, 0)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testCancelDuringRelatedUploadStopsBeforeTrashAndRemovesStaging() async throws {
+        let setup = try copyingScenario()
+        let gate = FinderGate()
+        setup.remote.beforeUpload = { _ in await gate.pass() }
+        let copying = copyingFinder(setup.remote)
+        let group = try await onlyGroup()
+        let task = Task { try await copying.merge(group, keeping: setup.kept) }
+        defer { gate.open() }
+        await gate.waitForArrival()
+        XCTAssertEqual(setup.remote.requests.count, 1)
+        task.cancel()
+        gate.open()
+        let result = await task.result
+        if case .failure(let error) = result {
+            XCTAssertTrue(error is CancellationError)
+        } else {
+            XCTFail("cancel must propagate")
+        }
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    @MainActor
+    func testStoppingMergeAllCancelsTheActiveRelatedCopyBeforeTrash() async throws {
+        let setup = try copyingScenario()
+        _ = try setup.remote.seed(Data("kept original".utf8), under: setup.kept, in: directory)
+        server.setFavorite(true, of: setup.kept)
+        indexServer()
+        let gate = FinderGate()
+        setup.remote.beforeUpload = { _ in await gate.pass() }
+        let model = ExactDuplicatesModel(finder: copyingFinder(setup.remote))
+        await model.load(checkAllGroups: true)
+        let merge = Task { await model.mergeAll() }
+        defer { gate.open() }
+        await gate.waitForArrival()
+        XCTAssertEqual(setup.remote.requests.count, 1)
+        XCTAssertTrue(model.canStopMergeAll)
+
+        model.stopMergeAll()
+        gate.open()
+        await merge.value
+
+        XCTAssertEqual(setup.remote.trashes, [], "Stop must prevent this copy's source from reaching trash")
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(server.uploadRequestCount, 0, "Stop must cancel the held copy before transport commit")
+        XCTAssertEqual(model.notice, .stopped(merged: 0, total: 1), "A stopped copy is not a merged group")
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    @MainActor
+    func testStoppingMergeAllLetsTheActiveNoCopyBatchFinishOnTheRealRoute() async throws {
+        let kept = server.seedLink(digest: digest("main"))
+        let source = server.seedLink(digest: digest("main"))
+        server.setFavorite(true, of: kept)
+        indexServer()
+        let remote = CopyingDuplicateRemote(base: server)
+        copyRemotes.append((remote, 0, 0))
+        let gate = FinderGate()
+        remote.beforeTrash = { await gate.pass() }
+        let model = ExactDuplicatesModel(finder: copyingFinder(remote))
+        await model.load(checkAllGroups: true)
+        let merge = Task { await model.mergeAll() }
+        defer { gate.open() }
+        await gate.waitForArrival()
+
+        model.stopMergeAll()
+        gate.open()
+        await merge.value
+
+        XCTAssertEqual(remote.trashes, [[source]])
+        XCTAssertEqual(state(of: source), .trashed)
+        XCTAssertEqual(state(of: kept), .active)
+        XCTAssertFalse(model.canStopMergeAll)
+        XCTAssertFalse(model.isMerging)
+    }
+
+    @MainActor
+    func testStoppingMergeAllDuringDownloadOrLateUploadJoinsCleanupBeforeWorkEnds() async throws {
+        for lateUID in [false, true] {
+            server = EditScenarioServer()
+            let setup = try copyingScenario(uploads: lateUID ? 1 : 0)
+            _ = try setup.remote.seed(Data("kept original".utf8), under: setup.kept, in: directory)
+            server.setFavorite(true, of: setup.kept)
+            indexServer()
+            let gate = FinderGate()
+            if lateUID {
+                setup.remote.afterUpload = { _ in await gate.pass() }
+            } else {
+                setup.remote.beforeStream = { await gate.pass() }
+            }
+            defer { gate.open() }
+            let model = ExactDuplicatesModel(finder: copyingFinder(setup.remote))
+            await model.load(checkAllGroups: true)
+            let merge = Task { await model.mergeAll() }
+            await gate.waitForArrival()
+            model.stopMergeAll()
+            XCTAssertTrue(model.isMerging, "A noncooperative operation must join before the batch ends")
+            XCTAssertTrue(setup.remote.downloads.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+            let ended = Task { await model.runningMergeWorkEnded() }
+            gate.open()
+            await ended.value
+            XCTAssertEqual(setup.remote.trashes, [])
+            XCTAssertTrue(
+                setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) },
+                "Work-ended must join native staging cleanup, including a late committed UID")
+            await merge.value
+            XCTAssertEqual(state(of: setup.source), .active)
+            XCTAssertEqual(state(of: setup.related), .active)
+            XCTAssertEqual(server.uploadRequestCount, lateUID ? 1 : 0)
+            XCTAssertEqual(mergeJournal.pendingMerges(), [])
+        }
+    }
+
+    @MainActor
+    func testRetirementStopsASingleGroupCopyWhenStopMergeAllIsUnavailable() async throws {
+        let setup = try copyingScenario()
+        _ = try setup.remote.seed(Data("kept original".utf8), under: setup.kept, in: directory)
+        server.setFavorite(true, of: setup.kept)
+        indexServer()
+        let gate = FinderGate()
+        setup.remote.beforeUpload = { _ in await gate.pass() }
+        defer { gate.open() }
+        let model = ExactDuplicatesModel(finder: copyingFinder(setup.remote))
+        await model.load(checkAllGroups: true)
+        let group = try XCTUnwrap(model.groups.first)
+        let merge = Task { await model.merge(groupID: group.id) }
+        await gate.waitForArrival()
+        XCTAssertFalse(model.canStopMergeAll)
+
+        model.retire()
+        XCTAssertTrue(model.isMerging)
+        gate.open()
+        await model.runningMergeWorkEnded()
+        await merge.value
+
+        XCTAssertEqual(server.uploadRequestCount, 0)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertFalse(model.canMerge)
+    }
+
+    @MainActor
+    func testMergeAllResumesWithFreshCopyOwnershipAfterStop() async throws {
+        let setup = try copyingScenario(downloads: 2, uploads: 2)
+        _ = try setup.remote.seed(Data("kept original".utf8), under: setup.kept, in: directory)
+        server.setFavorite(true, of: setup.kept)
+        indexServer()
+        let gate = FinderGate()
+        setup.remote.beforeUpload = { _ in await gate.pass() }
+        defer { gate.open() }
+        let model = ExactDuplicatesModel(finder: copyingFinder(setup.remote))
+        await model.load(checkAllGroups: true)
+        let first = Task { await model.mergeAll() }
+        await gate.waitForArrival()
+        model.stopMergeAll()
+        gate.open()
+        await first.value
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertTrue(model.canMerge)
+
+        await model.mergeAll()
+
+        XCTAssertEqual(server.uploadRequestCount, 1)
+        XCTAssertEqual(setup.remote.trashes, [[setup.source]])
+        XCTAssertEqual(state(of: setup.source), .trashed)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    @MainActor
+    func testStopDuringThePostVerificationReadKeepsOnlyTheCopySourceInAMixedGroup() async throws {
+        let setup = try copyingScenario()
+        _ = try setup.remote.seed(Data("kept original".utf8), under: setup.kept, in: directory)
+        let noCopySource = server.seedLink(digest: digest("main"))
+        server.setFavorite(true, of: setup.kept)
+        indexServer()
+        let gate = FinderGate()
+        defer { gate.open() }
+        let checker = CopyBoundaryChecker(base: server, beforeSuccessors: { await gate.pass() })
+        let model = ExactDuplicatesModel(finder: finder(remote: setup.remote, checker: checker))
+        await model.load(checkAllGroups: true)
+        let merge = Task { await model.mergeAll() }
+        await gate.waitForArrival()
+        XCTAssertEqual(server.uploadRequestCount, 1, "The copy and its fresh verification have already completed")
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+
+        model.stopMergeAll()
+        gate.open()
+        await merge.value
+
+        XCTAssertEqual(setup.remote.trashes, [[noCopySource]], "Stop must preserve the old no-copy batch policy")
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertEqual(state(of: noCopySource), .trashed)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testStopDuringJournalRecordingKeepsTheCopySourceAndReconcilesTheIntent() async throws {
+        let setup = try copyingScenario()
+        let group = try await onlyGroup()
+        let run = ExactDuplicateMergeRun(members: group.members)
+        let journal = CopyStoppingJournal(base: mergeJournal, onRecord: { run.stopCopies() })
+        let real = finder(remote: setup.remote, mergeJournal: journal)
+
+        let results = await real.merge(chosen([(group, setup.kept)]), in: run)
+
+        XCTAssertEqual(
+            try results.first?.get(),
+            .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(server.uploadRequestCount, 1)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(mergeJournal.pendingMerges()?.flatMap(\.members).map(\.link), [setup.source.nodeID])
+        await real.resolvePendingMerges()
+        XCTAssertEqual(mergeJournal.pendingMerges(), [], "Normal reconciliation retires the undispatched intent")
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testTaskCancellationDuringJournalRecordingPreventsTheAlreadyVerifiedCopyTrash() async throws {
+        let setup = try copyingScenario()
+        let group = try await onlyGroup()
+        let gate = FinderGate()
+        let cancellation = CopyTaskCanceller()
+        setup.remote.beforeUpload = { _ in await gate.pass() }
+        let journal = CopyStoppingJournal(base: mergeJournal, onRecord: { cancellation.cancel() })
+        let real = finder(remote: setup.remote, mergeJournal: journal)
+        let requests = chosen([(group, setup.kept)])
+        let task = Task { await real.merge(requests) }
+        cancellation.register { task.cancel() }
+        defer { gate.open() }
+        await gate.waitForArrival()
+        gate.open()
+        let results = await task.value
+
+        if case .failure(let error) = results.first {
+            XCTAssertTrue(error is CancellationError)
+        } else {
+            XCTFail("Cancellation after the intent must not publish a merged receipt")
+        }
+        XCTAssertEqual(server.uploadRequestCount, 1)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(mergeJournal.pendingMerges()?.flatMap(\.members).map(\.link), [setup.source.nodeID])
+        await real.resolvePendingMerges()
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testARevokedRunRejectsLateCopyRegistrationWithoutCallingTheOperation() async {
+        let run = ExactDuplicateMergeRun(members: [])
+        run.stopCopies()
+        do {
+            let _: Void = try await run.copying { XCTFail("A revoked run must never start a late operation") }
+            XCTFail("Registration must reject the revoked run")
+        } catch { XCTAssertTrue(error is CancellationError) }
+    }
+
+    func testOldCopyCompletionCannotClearReplacementRunOwnership() async throws {
+        let old = ExactDuplicateMergeRun(members: [])
+        let replacement = ExactDuplicateMergeRun(members: [])
+        let oldGate = FinderGate()
+        let replacementGate = FinderGate()
+        defer {
+            oldGate.open()
+            replacementGate.open()
+        }
+        let first = Task {
+            try await old.copying {
+                await oldGate.pass()
+                try Task.checkCancellation()
+            }
+        }
+        await oldGate.waitForArrival()
+        old.stopCopies()
+        let second = Task {
+            try await replacement.copying {
+                await replacementGate.pass()
+                try Task.checkCancellation()
+            }
+        }
+        await replacementGate.waitForArrival()
+        oldGate.open()
+        if case .failure(let error) = await first.result {
+            XCTAssertTrue(error is CancellationError)
+        } else {
+            XCTFail("Old copy must cancel")
+        }
+        XCTAssertFalse(replacement.copiesStopped)
+        replacement.stopCopies()
+        replacementGate.open()
+        if case .failure(let error) = await second.result {
+            XCTAssertTrue(error is CancellationError)
+        } else {
+            XCTFail("Replacement registration must remain cancellable")
+        }
+        XCTAssertTrue(old.copiesStopped)
+    }
+
+    func testCompletingOneCopyCannotUnregisterAnotherCopyInTheSameRun() async throws {
+        let run = ExactDuplicateMergeRun(members: [])
+        let firstGate = FinderGate()
+        let secondGate = FinderGate()
+        defer {
+            firstGate.open()
+            secondGate.open()
+        }
+        let first = Task { try await run.copying { await firstGate.pass() } }
+        await firstGate.waitForArrival()
+        let second = Task {
+            try await run.copying {
+                await secondGate.pass()
+                try Task.checkCancellation()
+            }
+        }
+        await secondGate.waitForArrival()
+        firstGate.open()
+        try await first.value
+
+        run.stopCopies()
+        secondGate.open()
+
+        if case .failure(let error) = await second.result {
+            XCTAssertTrue(error is CancellationError)
+        } else {
+            XCTFail("Completing the first registration must not remove the second task's cancellation owner")
+        }
+    }
+
+    func testTwoDevicesCopyTheSameMissingFileWithAtMostOneHarmlessExtraTwin() async throws {
+        let setup = try copyingScenario(downloads: 2, uploads: 2)
+        _ = try setup.remote.seed(Data("kept original".utf8), under: setup.kept, in: directory)
+        indexServer()
+        let group = try await onlyGroup()
+        let rendezvous = CopyRendezvous(parties: 2)
+        setup.remote.beforeUpload = { _ in await rendezvous.arrive() }
+        let first = copyingFinder(setup.remote)
+        let second = copyingFinder(setup.remote)
+
+        async let a = first.merge(group, keeping: setup.kept)
+        async let b = second.merge(group, keeping: setup.kept)
+        await rendezvous.releaseWhenAllArrive()
+        let outcomes = try await [a, b]
+
+        XCTAssertTrue(
+            outcomes.contains { outcome in
+                if case .merged(_, let trashed, _) = outcome { return trashed == [setup.source] }
+                return false
+            })
+        let read = try await server.compound(ofMainLink: setup.kept.nodeID)
+        let kept = try XCTUnwrap(read)
+        let expected = EditScenarioServer.contentHash(
+            try setup.remote.digest(of: Data("source original".utf8), in: directory))
+        XCTAssertEqual(
+            kept.related.filter { $0.contentHash == expected }.count, 2,
+            "The controlled simultaneous re-read race permits exactly one harmless extra twin")
+        XCTAssertEqual(kept.related.count, 3)
+        XCTAssertEqual(state(of: setup.kept), .active)
+        XCTAssertEqual(state(of: setup.source), .trashed)
+        XCTAssertEqual(violations, [])
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testSharingThatAppearsDuringStagingPreventsTheUpload() async throws {
+        for shareKept in [false, true] {
+            server = EditScenarioServer()
+            let setup = try copyingScenario(uploads: 0)
+            let base = try XCTUnwrap(server)
+            setup.remote.afterDownload = { _ in base.share(shareKept ? setup.kept : setup.source) }
+            let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+            XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+            XCTAssertEqual(setup.remote.trashes, [])
+            XCTAssertEqual(state(of: setup.source), .active)
+            XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        }
+    }
+
+    func testAChangedSourceCompoundBeforeOrAfterUploadKeepsEverySourceFile() async throws {
+        for afterUpload in [false, true] {
+            server = EditScenarioServer()
+            let setup = try copyingScenario(uploads: afterUpload ? 1 : 0)
+            let base = try XCTUnwrap(server)
+            let newDigest = digest("new related while copying")
+            if afterUpload {
+                setup.remote.afterUpload = { _ in _ = base.seedLink(digest: newDigest, main: setup.source) }
+            } else {
+                setup.remote.afterDownload = { _ in _ = base.seedLink(digest: newDigest, main: setup.source) }
+            }
+            let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+            XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+            XCTAssertEqual(setup.remote.trashes, [])
+            XCTAssertEqual(state(of: setup.source), .active)
+            let read = try await base.compound(ofMainLink: setup.source.nodeID)
+            XCTAssertEqual(read?.related.count, 2)
+            XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        }
+    }
+
+    func testAMissingFreshKeptNodeCannotTurnAnUploadReceiptIntoTrashPermission() async throws {
+        let setup = try copyingScenario()
+        let base = try XCTUnwrap(server)
+        setup.remote.afterUpload = { _ in base.loseNode(setup.kept) }
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testSameNameOrQuotaRefusalNeverReplacesOrTrashesTheSource() async throws {
+        for quota in [false, true] {
+            server = EditScenarioServer()
+            let setup = try copyingScenario()
+            setup.remote.beforeUpload = { request in
+                XCTAssertEqual(request.name, CopyingDuplicateRemote.metadata.filename)
+                XCTAssertFalse(request.overrideExistingDraft)
+                // Both authoritative server refusals use only the existing private typed failure route.
+                if quota { throw URLError(.cannotWriteToFile) }
+                throw ExactDuplicateRelatedFileTransferError.copyFailed(.transfer)
+            }
+            let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+            XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+            XCTAssertEqual(server.uploadRequestCount, 0)
+            XCTAssertEqual(setup.remote.trashes, [])
+            for uid in [setup.kept, setup.source, setup.related] { XCTAssertEqual(state(of: uid), .active) }
+            XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        }
+    }
+
+    func testAReadOnlyScanAndRankingNeverStartsARelatedTransfer() async throws {
+        let setup = try copyingScenario(downloads: 0, uploads: 0)
+        let readOnly = copyingFinder(setup.remote)
+        let scan = try await readOnly.duplicateGroups()
+        await readOnly.rankMembers(of: scan.groups, ranked: { _ in })
+        XCTAssertEqual(scan.groups.count, 1)
+        XCTAssertEqual(setup.remote.streamCount, 0)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    func testAChangedKeyEpochDuringStagingRejectsTheCopyBeforeUpload() async throws {
+        let setup = try copyingScenario(uploads: 0)
+        let changed = CopyEvidenceSwitch()
+        setup.remote.afterDownload = { _ in changed.set() }
+        let checker = CopyBoundaryChecker(base: server, epoch: { changed.isSet ? "new-epoch" : "scenario-epoch" })
+        let real = finder(remote: setup.remote, checker: checker)
+        let outcome = try await real.merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testLocalOwnershipThatLosesUploadProofDuringCopyPreventsAllRowMovesAndTrash() async throws {
+        let setup = try copyingScenario()
+        let sourceHash = try XCTUnwrap(server.links.first { $0.linkID == setup.related.nodeID }?.contentHash)
+        let owner = row("changing-copy-proof", names: setup.related.nodeID, contentHash: sourceHash)
+        let manifest = try XCTUnwrap(store)
+        var unproven = try XCTUnwrap(manifest.record(for: owner))
+        unproven.outcome = nil
+        let changed = unproven
+        let completed = CopyEvidenceSwitch()
+        let identities = CountingIdentityStore(base: manifest)
+        setup.remote.afterUpload = { _ in completed.set() }
+        // The snapshot must still contain the owner when its record loses proof, as in the #639 race.
+        identities.afterOwnerSnapshot = {
+            if completed.isSet { XCTAssertTrue(manifest.upsert(changed)) }
+        }
+        let outcome = try await finder(identities: identities, remote: setup.remote).merge(
+            try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(
+            outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .neededByLocalSource]))
+        XCTAssertEqual(manifest.record(for: owner)?.remoteLinkID, setup.related.nodeID)
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testAnOwnedCleanupFailureKeepsTheSourceAndReportsOnlyCopyFailure() async throws {
+        let transfer = ExactDuplicateRelatedFileTransfer(
+            temporaryDirectory: FileManager.default.temporaryDirectory,
+            availableCapacity: { _ in Int64.max }, networkState: { LibraryNetworkState() },
+            stagingIO: .init(
+                write: { _, _ in throw POSIXError(.EIO) },
+                close: { handle in
+                    try handle.close()
+                    throw POSIXError(.EIO)
+                }))
+        let setup = try copyingScenario(uploads: 0, transfer: transfer)
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testAnOfflineCopyPolicyKeepsTheSourceBeforeAnyDownload() async throws {
+        let setup = try copyingScenario(downloads: 0, uploads: 0)
+        let outcome = try await copyingFinder(
+            setup.remote,
+            network: {
+                BackupThrottleInputs(
+                    runtime: LibraryRuntimeSnapshot(network: LibraryNetworkState(isReachable: false)),
+                    usesMobileData: true)
+            }
+        ).merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(setup.remote.streamCount, 0)
+    }
+
+    func testAFileCopiedForAnEarlierSourceSkipsTheNextDownload() async throws {
+        let setup = try copyingScenario()
+        let otherSource = server.seedLink(digest: digest("main"))
+        _ = try setup.remote.seed(Data("source original".utf8), under: otherSource, in: directory)
+        indexServer()
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [setup.source, otherSource], keptDuplicates: [:]))
+        let read = try await server.compound(ofMainLink: setup.kept.nodeID)
+        XCTAssertEqual(read?.related.count, 1)
+        XCTAssertEqual(violations, [])
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testARelatedFileAttachedToAnEarlierSourceDuringALaterCopyKeepsThatSource() async throws {
+        let (setup, second, outcome) = try await twoSourceCopyWithHeldSecondUpload { setup in
+            _ = try setup.remote.seed(Data("attached meanwhile".utf8), under: setup.source, in: self.directory)
+        }
+
+        XCTAssertEqual(
+            outcome, .merged(kept: setup.kept, trashed: [second], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertEqual(state(of: second), .trashed)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testTwoSourcesThatStayUnchangedDuringALaterCopyAreBothTrashed() async throws {
+        let (setup, second, outcome) = try await twoSourceCopyWithHeldSecondUpload { _ in }
+
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [setup.source, second], keptDuplicates: [:]))
+        let read = try await server.compound(ofMainLink: setup.kept.nodeID)
+        XCTAssertEqual(read?.related.count, 2)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAnAttachmentToAnEarlierGroupDuringALaterGroupsCopyKeepsThatSource() async throws {
+        let (earlier, later, results) = try await twoGroupCopyWithHeldLaterUpload { earlier in
+            _ = try earlier.remote.seed(Data("attached meanwhile".utf8), under: earlier.source, in: self.directory)
+        }
+
+        XCTAssertEqual(
+            try results[0].get(),
+            .merged(kept: earlier.kept, trashed: [], keptDuplicates: [earlier.source: .copyFailed]))
+        XCTAssertEqual(state(of: earlier.source), .active)
+        XCTAssertEqual(state(of: earlier.related), .active)
+        XCTAssertEqual(try results[1].get(), .merged(kept: later.kept, trashed: [later.source], keptDuplicates: [:]))
+        XCTAssertEqual(violations, [])
+    }
+
+    func testTwoGroupsThatStayUnchangedDuringALaterGroupsCopyAreBothTrashed() async throws {
+        let (earlier, later, results) = try await twoGroupCopyWithHeldLaterUpload { _ in }
+
+        XCTAssertEqual(
+            try results[0].get(), .merged(kept: earlier.kept, trashed: [earlier.source], keptDuplicates: [:]))
+        XCTAssertEqual(try results[1].get(), .merged(kept: later.kept, trashed: [later.source], keptDuplicates: [:]))
+        XCTAssertEqual(violations, [])
+    }
+
+    /// Two groups in one batch, each with a source whose related file the kept photo lacks. The upload of the later
+    /// group waits until `meanwhile` ran.
+    private func twoGroupCopyWithHeldLaterUpload(
+        meanwhile: (CopySetup) throws -> Void
+    ) async throws -> (
+        earlier: CopySetup, later: CopySetup, results: [Result<ExactDuplicateMergeOutcome, any Error>]
+    ) {
+        let earlier = try copyingScenario(downloads: 2, uploads: 2)
+        let laterKept = server.seedLink(digest: digest("other main"))
+        let laterSource = server.seedLink(digest: digest("other main"))
+        let laterBytes = Data("later original".utf8)
+        let laterRelated = try earlier.remote.seed(laterBytes, under: laterSource, in: directory)
+        let later: CopySetup = (laterKept, laterSource, laterRelated, earlier.remote)
+        indexServer()
+        let laterDigest = try earlier.remote.digest(of: laterBytes, in: directory)
+        let gate = FinderGate()
+        defer { gate.open() }
+        earlier.remote.beforeUpload = { request in
+            if request.expectedSHA1 == laterDigest { await gate.pass() }
+        }
+        let groups = try await finder.duplicateGroups().groups
+        let earlierGroup = try XCTUnwrap(groups.first { $0.members.contains(earlier.kept) })
+        let laterGroup = try XCTUnwrap(groups.first { $0.members.contains(laterKept) })
+        let requests = chosen([(earlierGroup, earlier.kept), (laterGroup, laterKept)])
+        let copying = copyingFinder(earlier.remote)
+        let merging = Task { await copying.merge(requests) }
+        await gate.waitForArrival()
+        try meanwhile(earlier)
+        gate.open()
+        return (earlier, later, await merging.value)
+    }
+
+    private typealias CopySetup = (kept: PhotoUID, source: PhotoUID, related: PhotoUID, remote: CopyingDuplicateRemote)
+
+    /// Two sources own different related files. The second upload waits until `meanwhile` ran.
+    private func twoSourceCopyWithHeldSecondUpload(
+        meanwhile: (CopySetup) throws -> Void
+    ) async throws -> (setup: CopySetup, second: PhotoUID, outcome: ExactDuplicateMergeOutcome) {
+        let setup = try copyingScenario(downloads: 2, uploads: 2)
+        let second = server.seedLink(digest: digest("main"))
+        let secondBytes = Data("second original".utf8)
+        _ = try setup.remote.seed(secondBytes, under: second, in: directory)
+        indexServer()
+        let secondDigest = try setup.remote.digest(of: secondBytes, in: directory)
+        let gate = FinderGate()
+        defer { gate.open() }
+        setup.remote.beforeUpload = { request in
+            if request.expectedSHA1 == secondDigest { await gate.pass() }
+        }
+        let group = try await onlyGroup()
+        let copying = copyingFinder(setup.remote)
+        let kept = setup.kept
+        let merging = Task { try await copying.merge(group, keeping: kept) }
+        await gate.waitForArrival()
+        try meanwhile(setup)
+        gate.open()
+        return (setup, second, try await merging.value)
+    }
+
+    func testASourceThatLeavesTheLibraryAfterItsUploadStaysUntrashed() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload { server, _, source in
+            server.setVisibility(
+                RemoteLinkVisibility(isActive: false, mainPhotoLinkID: nil, trashTime: 1), for: source.nodeID)
+        }
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+    }
+
+    func testAKeptPhotoThatLeavesTheLibraryAfterTheUploadKeepsTheSource() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload { server, kept, _ in
+            server.setVisibility(
+                RemoteLinkVisibility(isActive: false, mainPhotoLinkID: nil, trashTime: 1), for: kept.nodeID)
+        }
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    func testDetailsThatChangeAfterTheUploadKeepTheSource() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload { server, _, source in
+            server.setFingerprint(ExactDuplicateFingerprint(captureTime: Date(timeIntervalSince1970: 5)), of: source)
+        }
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    func testASourceMainThatChangesAfterTheUploadKeepsTheSource() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload(changedMain: \.source)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    func testAKeptMainThatChangesAfterTheUploadKeepsTheSource() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload(changedMain: \.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    /// The copy uploads its file; then one fact that the fresh verification checks changes.
+    private func copyWithAContextChangeAfterTheUpload(
+        changedMain: KeyPath<(kept: PhotoUID, source: PhotoUID), PhotoUID>? = nil,
+        change: @escaping @Sendable (EditScenarioServer, PhotoUID, PhotoUID) -> Void = { _, _, _ in }
+    ) async throws -> (setup: CopySetup, outcome: ExactDuplicateMergeOutcome) {
+        let setup = try copyingScenario()
+        let base = try XCTUnwrap(server)
+        let uploaded = CopyEvidenceSwitch()
+        let (kept, source) = (setup.kept, setup.source)
+        setup.remote.afterUpload = { _ in
+            change(base, kept, source)
+            uploaded.set()
+        }
+        let changedLink = changedMain.map { (kept: kept, source: source)[keyPath: $0].nodeID }
+        var checker = CopyBoundaryChecker(base: base)
+        checker.compoundRewrite = { linkID, read in
+            guard uploaded.isSet, linkID == changedLink, let read else { return read }
+            let main = UploadRemoteCompound.File(
+                linkID: read.main.linkID, contentHash: "changed after the upload", nameHash: read.main.nameHash,
+                mimeType: read.main.mimeType)
+            return UploadRemoteCompound(
+                main: main, related: read.related, tags: read.tags, externalIdentifier: read.externalIdentifier,
+                captureDate: read.captureDate, modificationDate: read.modificationDate)
+        }
+        var real = finder(remote: setup.remote, checker: checker)
+        real.copyNetwork = { BackupThrottleInputs(usesMobileData: false) }
+        return (setup, try await real.merge(try await onlyGroup(), keeping: setup.kept))
+    }
 
     func testTransferAccountingIncludesAReplacedScenarioServer() async throws {
         var servers = ScenarioServers()
@@ -2226,15 +3410,22 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let twin = server.seedLink(digest: digest("a"))
         let twinVideo = server.seedLink(digest: digest("video"), main: twin)
         let different = server.seedLink(digest: digest("a"))
-        _ = server.seedLink(digest: digest("other video"), main: different)
+        let remote = CopyingDuplicateRemote(base: server)
+        copyRemotes.append((remote, 1, 1))
+        let added = try remote.seed(Data("other video".utf8), under: different, in: directory)
+        let addedHash = try XCTUnwrap(server.links.first { $0.linkID == added.nodeID }?.contentHash)
         let videoRow = row("asset-video", names: twinVideo.nodeID, contentHash: hash("video"))
         indexServer()
 
-        let outcome = try await finder.merge(try await onlyGroup(), keeping: kept)
+        let outcome = try await copyingFinder(remote).merge(try await onlyGroup(), keeping: kept)
 
-        XCTAssertEqual(
-            outcome, .merged(kept: kept, trashed: [twin], keptDuplicates: [different: .relatedFileWithoutTwin]))
-        XCTAssertEqual(server.links.first { $0.linkID == different.nodeID }?.state, .active)
+        // This test deliberately changes meaning: the formerly retained copy can now leave after preserving its file.
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [twin, different], keptDuplicates: [:]))
+        XCTAssertEqual(server.links.first { $0.linkID == different.nodeID }?.state, .trashed)
+        let read = try await server.compound(ofMainLink: kept.nodeID)
+        let keptCompound = try XCTUnwrap(read)
+        XCTAssertTrue(keptCompound.related.contains { $0.contentHash == addedHash && $0.linkID != added.nodeID })
+        XCTAssertEqual(keptCompound.related.count, 2)
         XCTAssertEqual(store.record(for: videoRow)?.remoteLinkID, keptVideo.nodeID, "the related row moves to its twin")
         XCTAssertEqual(violations, [])
     }
@@ -2265,10 +3456,11 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let b = server.seedLink(digest: digest("a"))
         _ = server.seedLink(digest: digest("original"), main: b)
         indexServer()
+        unavailableBudgets[ObjectIdentifier(server!)] = .init(downloads: 1, uploads: 0)
 
         let outcome = try await finder.merge(try await onlyGroup(), keeping: a)
 
-        XCTAssertEqual(outcome, .merged(kept: a, trashed: [], keptDuplicates: [b: .relatedFileWithoutTwin]))
+        XCTAssertEqual(outcome, .merged(kept: a, trashed: [], keptDuplicates: [b: .copyFailed]))
         XCTAssertEqual(state(of: a), .active)
         XCTAssertEqual(state(of: b), .active)
         XCTAssertEqual(violations, [])
@@ -2299,11 +3491,12 @@ final class ExactDuplicateFinderTests: XCTestCase {
         _ = server.seedLink(digest: digest("x"), main: a)
         _ = server.seedLink(digest: digest("y"), main: b)
         indexServer()
+        unavailableBudgets[ObjectIdentifier(server!)] = .init(downloads: 1, uploads: 0)
 
         let results = await finder.merge(preselected(try await onlyGroup(), a))
 
         XCTAssertEqual(
-            try results[0].get(), .merged(kept: a, trashed: [], keptDuplicates: [b: .relatedFileWithoutTwin]))
+            try results[0].get(), .merged(kept: a, trashed: [], keptDuplicates: [b: .copyFailed]))
         XCTAssertEqual(state(of: a), .active)
         XCTAssertEqual(state(of: b), .active)
         XCTAssertEqual(violations, [])
@@ -2508,6 +3701,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
                 server.setFingerprint(.init(pixelWidth: 42), of: c)
             }
             indexServer()
+            unavailableBudgets[ObjectIdentifier(server!)] = .init(downloads: 1, uploads: 0)
 
             let results = await finder.merge(preselected(try await onlyGroup(), a))
 
@@ -2515,7 +3709,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
                 try results[0].get(),
                 .merged(
                     kept: a, trashed: [],
-                    keptDuplicates: [b: .relatedFileWithoutTwin, c: excludedMember ? .differentDetails : .unreadable]))
+                    keptDuplicates: [b: .copyFailed, c: excludedMember ? .differentDetails : .unreadable]))
             for uid in [a, b, c] { XCTAssertEqual(state(of: uid), .active) }
             XCTAssertEqual(violations, [])
         }
@@ -2565,6 +3759,40 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(state(of: duplicate), .active)
         XCTAssertEqual(manifest.record(for: source)?.remoteLinkID, duplicate.nodeID)
         XCTAssertEqual(manifest.record(for: source)?.outcome, "duplicateTrashed")
+    }
+
+    func testMergeKeepsADuplicateWhoseRowMovesToAnotherLinkAfterTheOwnerSnapshot() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset", names: duplicate.nodeID, contentHash: hash("a"))
+        indexServer()
+        let identities = CountingIdentityStore(base: store)
+        let manifest = try XCTUnwrap(store)
+        identities.afterOwnerSnapshot = {
+            guard var record = manifest.record(for: source) else { return }
+            record.remoteLinkID = "link-elsewhere"
+            _ = manifest.upsert(record)
+        }
+
+        let outcome = try await finder(identities: identities).merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(
+            outcome, .merged(kept: kept, trashed: [], keptDuplicates: [duplicate: .neededByLocalSource]))
+        XCTAssertEqual(state(of: duplicate), .active)
+    }
+
+    func testMergeKeepsEveryDuplicateWhenTheStoreCannotTellItsOwners() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let identities = CountingIdentityStore(base: store)
+        identities.ownersUnknown = true
+
+        let outcome = try await finder(identities: identities).merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(
+            outcome, .merged(kept: kept, trashed: [], keptDuplicates: [duplicate: .neededByLocalSource]))
+        XCTAssertEqual(state(of: duplicate), .active)
     }
 
     func testMergeKeepsADuplicateThatALocalSourceNeedsWhenItsRowCannotMove() async throws {
@@ -2631,6 +3859,142 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(store.record(for: current), moved, "a repeated move writes nothing")
         XCTAssertEqual(store.record(for: earlierKey)?.remoteLinkID, "link-dup")
         XCTAssertEqual(store.record(for: otherBytes)?.remoteLinkID, "link-dup")
+    }
+
+    /// Three duplicates whose details cannot be read, under a kept photo and a counting checker (#794).
+    private func unreadableGroup(
+        _ tag: String
+    ) async throws -> (group: ExactDuplicateGroup, kept: PhotoUID, unreadable: [PhotoUID], reads: VisibilityReadLog) {
+        let kept = server.seedLink(digest: digest(tag))
+        server.setFavorite(true, of: kept)
+        let unreadable = (0..<3).map { _ in server.seedLink(digest: digest(tag)) }
+        indexServer()
+        return (try await onlyGroup(), kept, unreadable, VisibilityReadLog())
+    }
+
+    private func unreadableChecker(_ unreadable: [PhotoUID], reads: VisibilityReadLog) -> CopyBoundaryChecker {
+        let unreadableLinks = Set(unreadable.map(\.nodeID))
+        var checker = CopyBoundaryChecker(base: server)
+        checker.compoundRewrite = { linkID, read in unreadableLinks.contains(linkID) ? nil : read }
+        checker.visibilityRead = { reads.record($0) }
+        return checker
+    }
+
+    private func groupReads(_ reads: VisibilityReadLog, of group: ExactDuplicateGroup) -> Int {
+        reads.calls.filter { Set($0) == Set(group.members.map(\.nodeID)) }.count
+    }
+
+    /// The plan reads the group's link states once before its members and once more at the first unreadable member.
+    /// A complete answer stands for the later unreadable members.
+    func testThreeUnreadableDuplicatesReadTheGroupStatesOnce() async throws {
+        let (group, kept, unreadable, reads) = try await unreadableGroup("unreadable")
+
+        let outcome = try await finder(checker: unreadableChecker(unreadable, reads: reads))
+            .merge(group, keeping: kept)
+
+        XCTAssertEqual(
+            outcome,
+            ExactDuplicateMergeOutcome.merged(
+                kept: kept, trashed: [],
+                keptDuplicates: Dictionary(uniqueKeysWithValues: unreadable.map { ($0, .unreadable) })))
+        XCTAssertEqual(groupReads(reads, of: group), 2, "one read before the members and one at the first unreadable")
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+    }
+
+    /// An answer that omits a member cannot stand for the later unreadable members: the next one reads again.
+    func testAnIncompleteAnswerLetsTheNextUnreadableDuplicateReadAgain() async throws {
+        let (group, kept, unreadable, reads) = try await unreadableGroup("incomplete")
+        let base = try XCTUnwrap(server)
+        var checker = unreadableChecker(unreadable, reads: reads)
+        let groupLinks = Set(group.members.map(\.nodeID))
+        let omitted = unreadable[2].nodeID
+        checker.visibilityRewrite = { linkIDs, answer in
+            guard Set(linkIDs) == groupLinks, reads.calls.filter({ Set($0) == groupLinks }).count == 2 else {
+                return answer
+            }
+            // The first reconciliation answer omits one member; then the person removes every other copy.
+            for link in unreadable { base.personTrash(link) }
+            return answer.filter { $0.key != omitted }
+        }
+
+        let outcome = try await finder(checker: checker).merge(group, keeping: kept)
+
+        XCTAssertEqual(outcome, ExactDuplicateMergeOutcome.skipped(.noDuplicateLeft))
+        XCTAssertEqual(groupReads(reads, of: group), 3)
+    }
+
+    /// Documented limit: a removal after a complete reconciliation answer is not seen by the same plan. The merge
+    /// keeps the three copies as unreadable and trashes nothing; the next load shows the removal.
+    func testARemovalAfterACompleteAnswerIsSeenOnlyByTheNextPlan() async throws {
+        let (group, kept, unreadable, reads) = try await unreadableGroup("late-removal")
+        let base = try XCTUnwrap(server)
+        var checker = unreadableChecker(unreadable, reads: reads)
+        let groupLinks = Set(group.members.map(\.nodeID))
+        checker.visibilityRewrite = { linkIDs, answer in
+            if Set(linkIDs) == groupLinks, reads.calls.filter({ Set($0) == groupLinks }).count == 2 {
+                for link in unreadable { base.personTrash(link) }
+            }
+            return answer
+        }
+
+        let outcome = try await finder(checker: checker).merge(group, keeping: kept)
+
+        XCTAssertEqual(
+            outcome,
+            ExactDuplicateMergeOutcome.merged(
+                kept: kept, trashed: [],
+                keptDuplicates: Dictionary(uniqueKeysWithValues: unreadable.map { ($0, .unreadable) })))
+        XCTAssertEqual(groupReads(reads, of: group), 2)
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+    }
+
+    /// A removal before the first reconciliation read still ends the plan.
+    func testARemovalBeforeTheFirstReconciliationReadEndsThePlan() async throws {
+        let (group, kept, unreadable, reads) = try await unreadableGroup("left")
+        let base = try XCTUnwrap(server)
+        let unreadableLinks = Set(unreadable.map(\.nodeID))
+        var checker = unreadableChecker(unreadable, reads: reads)
+        checker.compoundRewrite = { linkID, read in
+            guard unreadableLinks.contains(linkID) else { return read }
+            for link in unreadable { base.personTrash(link) }
+            return nil
+        }
+
+        let outcome = try await finder(checker: checker).merge(group, keeping: kept)
+
+        XCTAssertEqual(outcome, ExactDuplicateMergeOutcome.skipped(.noDuplicateLeft))
+        XCTAssertEqual(groupReads(reads, of: group), 2)
+    }
+
+    /// Every group of one merge batch reads its own link states at its own first unreadable member.
+    func testEachGroupOfABatchReadsItsOwnLinkStates() async throws {
+        var groups: [(kept: PhotoUID, unreadable: [PhotoUID])] = []
+        for tag in ["first", "second"] {
+            let kept = server.seedLink(digest: digest(tag))
+            server.setFavorite(true, of: kept)
+            groups.append((kept, (0..<3).map { _ in server.seedLink(digest: digest(tag)) }))
+        }
+        indexServer()
+        let scanned = try await finder.duplicateGroups().groups
+        XCTAssertEqual(scanned.count, 2)
+        let reads = VisibilityReadLog()
+        let checker = unreadableChecker(groups.flatMap(\.unreadable), reads: reads)
+        let requests = try groups.map { entry in
+            let group = try XCTUnwrap(scanned.first { $0.members.contains(entry.kept) })
+            return ExactDuplicateMergeRequest(group: group, kept: entry.kept, isKeptChosen: true)
+        }
+
+        let outcomes = await finder(checker: checker).merge(requests)
+
+        XCTAssertEqual(outcomes.count, groups.count)
+        for (index, entry) in groups.enumerated() {
+            XCTAssertEqual(groupReads(reads, of: requests[index].group), 2)
+            XCTAssertEqual(
+                try outcomes[index].get(),
+                ExactDuplicateMergeOutcome.merged(
+                    kept: entry.kept, trashed: [],
+                    keptDuplicates: Dictionary(uniqueKeysWithValues: entry.unreadable.map { ($0, .unreadable) })))
+        }
     }
 
     func testARetryAfterAFailedTrashRepeatsNoWriteAndLosesNothing() async throws {
@@ -3609,10 +4973,20 @@ private final class ConcurrencyCountingRemote: EditScenarioDuplicateRemote, @unc
 private actor FinderGate {
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var arrived = false
+    private let arrival = XCTestExpectation(description: "Held operation arrived")
+
+    func waitForArrival() async {
+        let result = await XCTWaiter.fulfillment(of: [arrival], timeout: 5)
+        if result != .completed { release() }
+        XCTAssertEqual(result, .completed, "The held route must actually execute")
+    }
 
     var hasWaiters: Bool { !waiters.isEmpty }
 
     func pass() async {
+        if !arrived { arrival.fulfill() }
+        arrived = true
         guard !isOpen else { return }
         await withCheckedContinuation { waiters.append($0) }
     }
@@ -3677,6 +5051,8 @@ private final class CountingIdentityStore: UploadIdentityStore, @unchecked Senda
     private let lock = NSLock()
     private var counted = Reads()
     var afterOwnerSnapshot: (@Sendable () -> Void)?
+    /// The batch owner read cannot tell which sources own the links.
+    var ownersUnknown = false
 
     init(base: UploadIdentityManifestStore) { self.base = base }
 
@@ -3695,7 +5071,7 @@ private final class CountingIdentityStore: UploadIdentityStore, @unchecked Senda
         lock.withLock { counted.batch += 1 }
         let snapshot = base.sources(withRemoteLinkIDs: linkIDs)
         afterOwnerSnapshot?()
-        return snapshot
+        return ownersUnknown ? nil : snapshot
     }
     func forgetRemoteLinks(_ linkIDs: Set<String>, of source: UploadSourceIdentity) -> Bool {
         base.forgetRemoteLinks(linkIDs, of: source)
@@ -3772,6 +5148,260 @@ private final class CountingAlbums: SeriesAlbumCarryOver, @unchecked Sendable {
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
         try await base.addPhotos(uids, toOwnAlbum: albumID)
     }
+}
+
+/// Uses the production staging/hash route and the same server for the uploaded related link and the trash.
+private final class CopyingDuplicateRemote: EditScenarioDuplicateRemote, @unchecked Sendable {
+    let base: EditScenarioServer
+    private let lock = NSLock()
+    private var bytesByLink: [PhotoUID: Data] = [:]
+    private var recordedDownloads: [URL] = []
+    private var recordedRequests: [PhotoUploadRequest] = []
+    var beforeTrash: (@Sendable () async throws -> Void)?
+    var beforeDownload: (@Sendable (URL) throws -> Void)?
+    var beforeStream: (@Sendable () async throws -> Void)?
+    var afterDownload: (@Sendable (URL) async throws -> Void)?
+    var beforeUpload: (@Sendable (PhotoUploadRequest) async throws -> Void)?
+    var afterUpload: (@Sendable (PhotoUID) async throws -> Void)?
+    var uploadOverride: (@Sendable (PhotoUploadRequest) async throws -> PhotoUID)?
+    var unavailableUpload = false
+    private var recordedPolicies: [Bool] = []
+    private var recordedTrashes: [[PhotoUID]] = []
+    private var streams = 0
+    private let transfer: ExactDuplicateRelatedFileTransfer
+
+    static let metadata = SeriesMemberSource(
+        filename: "related.jpg", mediaType: "image/jpeg", captureTime: Date(timeIntervalSince1970: 1),
+        modificationDate: Date(timeIntervalSince1970: 2),
+        additionalMetadata: [
+            PhotoUploadAdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Test":1}"#.utf8))
+        ])
+
+    init(base: EditScenarioServer, transfer: ExactDuplicateRelatedFileTransfer? = nil) {
+        self.base = base
+        self.transfer =
+            transfer
+            ?? ExactDuplicateRelatedFileTransfer(
+                availableCapacity: { _ in Int64.max }, networkState: { LibraryNetworkState() })
+    }
+    var downloads: [URL] { lock.withLock { recordedDownloads } }
+    var requests: [PhotoUploadRequest] { lock.withLock { recordedRequests } }
+    var downloadPolicies: [Bool] { lock.withLock { recordedPolicies } }
+    var streamCount: Int { lock.withLock { streams } }
+    var trashes: [[PhotoUID]] { lock.withLock { recordedTrashes } }
+
+    func digest(of bytes: Data, in directory: URL) throws -> Data {
+        let file = directory.appendingPathComponent(UUID().uuidString)
+        try bytes.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        return try UploadContentSHA1.digest(ofFileAt: file)
+    }
+
+    func seed(_ bytes: Data, under main: PhotoUID, in directory: URL) throws -> PhotoUID {
+        let uid = base.seedLink(digest: try digest(of: bytes, in: directory), main: main)
+        lock.withLock { bytesByLink[uid] = bytes }
+        return uid
+    }
+
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        let bytes = try lock.withLock {
+            recordedDownloads.append(destination)
+            recordedPolicies.append(allowsExpensiveNetwork)
+            guard let bytes = bytesByLink[uid] else { throw ExactDuplicateRelatedFileTransferError.unavailable }
+            return bytes
+        }
+        try beforeDownload?(destination)
+        let metadata = try await transfer.download(
+            to: destination, allowsExpensiveNetwork: allowsExpensiveNetwork,
+            source: { ExactDuplicateRelatedFileSource(metadata: Self.metadata, claimedSize: Int64(bytes.count)) },
+            stream: { [self] consume in
+                lock.withLock { streams += 1 }
+                try await beforeStream?()
+                try await consume(bytes)
+            })
+        do { try await afterDownload?(destination) } catch {
+            try transfer.discard(destination)
+            throw error
+        }
+        return metadata
+    }
+
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        lock.withLock { recordedRequests.append(request) }
+        if unavailableUpload { throw ExactDuplicateRelatedFileTransferError.unavailable }
+        return try await transfer.upload(request) { [self] checked in
+            try await beforeUpload?(checked)
+            try Task.checkCancellation()
+            let uid: PhotoUID
+            if let uploadOverride {
+                uid = try await uploadOverride(checked)
+            } else {
+                uid = try await base.upload(checked, onProgress: { _ in })
+            }
+            try await afterUpload?(uid)
+            return uid
+        }
+    }
+
+    func trashDuplicates(_ uids: [PhotoUID]) async throws {
+        lock.withLock { recordedTrashes.append(uids) }
+        try await beforeTrash?()
+        try await base.trashDuplicates(uids)
+    }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids)
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+}
+
+private final class CopyPolicySequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let values: [Bool]
+    private var position = 0
+    init(_ values: [Bool]) { self.values = values }
+    var reads: Int { lock.withLock { position } }
+    func next() -> Bool {
+        lock.withLock {
+            defer { position += 1 }
+            return position < values.count ? values[position] : false
+        }
+    }
+}
+
+/// Keep exact per-server transfer accounting while the default remote continues to throw typed unavailable.
+private final class UnavailableCopyProbe: EditScenarioDuplicateRemote, @unchecked Sendable {
+    struct Counts: Equatable {
+        var downloads = 0
+        var uploads = 0
+    }
+    let base: EditScenarioServer
+    private let lock = NSLock()
+    private var counted = Counts()
+    init(base: EditScenarioServer) { self.base = base }
+    var counts: Counts { lock.withLock { counted } }
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        lock.withLock { counted.downloads += 1 }
+        return try await base.downloadRelatedFile(uid, to: destination, allowsExpensiveNetwork: allowsExpensiveNetwork)
+    }
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        lock.withLock { counted.uploads += 1 }
+        return try await base.uploadRelatedFile(request)
+    }
+    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids)
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+}
+
+/// Holds the actual pre-trash lineage read after copy verification, while all other merge reads use the same server.
+private struct CopyBoundaryChecker: UploadDuplicateChecking {
+    let base: EditScenarioServer
+    var beforeSuccessors: @Sendable () async -> Void = {}
+    var epoch: (@Sendable () async throws -> String)?
+    /// Replaces the answer of a compound read, for example a main file whose content changed on the server.
+    var compoundRewrite: (@Sendable (String, UploadRemoteCompound?) -> UploadRemoteCompound?)?
+    /// Observes every link-state read, for example to count them.
+    var visibilityRead: (@Sendable ([String]) -> Void)?
+    /// Replaces the answer of a link-state read, for example an answer that omits a link.
+    var visibilityRewrite: (@Sendable ([String], [String: RemoteLinkVisibility]) -> [String: RemoteLinkVisibility])?
+    func nameHash(forCorrectedName name: String) async throws -> String {
+        try await base.nameHash(forCorrectedName: name)
+    }
+    func contentHash(forSHA1Hex sha1Hex: String) async throws -> String {
+        try await base.contentHash(forSHA1Hex: sha1Hex)
+    }
+    func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
+        try await base.findDuplicates(nameHashes: nameHashes)
+    }
+    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
+        try await base.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+    }
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        visibilityRead?(linkIDs)
+        let answer = try await base.linkVisibility(of: linkIDs)
+        return visibilityRewrite.map { $0(linkIDs, answer) } ?? answer
+    }
+    func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        let read = try await base.compound(ofMainLink: linkID)
+        return compoundRewrite.map { $0(linkID, read) } ?? read
+    }
+    func hashKeyEpoch() async throws -> String {
+        if let epoch { return try await epoch() }
+        return try await base.hashKeyEpoch()
+    }
+    func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        await beforeSuccessors()
+        return try await base.replacingMainLinkIDs(ofReplacedLink: linkID)
+    }
+}
+
+/// Revoke the real run synchronously after the real journal has recorded its intent.
+private struct CopyStoppingJournal: ExactDuplicateMergeJournaling {
+    let base: ExactDuplicateMergeJournalFileStore
+    let onRecord: @Sendable () -> Void
+    func prepareForWrites() -> ExactDuplicateMergeJournalState { base.prepareForWrites() }
+    func pendingMerges() -> [ExactDuplicateMergeIntent]? { base.pendingMerges() }
+    func record(_ intents: [ExactDuplicateMergeIntent]) -> Bool {
+        let recorded = base.record(intents)
+        if recorded { onRecord() }
+        return recorded
+    }
+    func clear(_ intents: [ExactDuplicateMergeIntent]) -> Bool { base.clear(intents) }
+}
+
+/// A deterministic simultaneous pre-upload race, without sleeps or shared production state.
+private actor CopyRendezvous {
+    let parties: Int
+    private var arrivals = 0
+    private let allArrived = XCTestExpectation(description: "Both devices reached upload after their re-read")
+    private let gate = FinderGate()
+    init(parties: Int) { self.parties = parties }
+    func arrive() async {
+        arrivals += 1
+        if arrivals == parties { allArrived.fulfill() }
+        await gate.pass()
+    }
+    func releaseWhenAllArrive() async {
+        let result = await XCTWaiter.fulfillment(of: [allArrived], timeout: 5)
+        gate.open()
+        XCTAssertEqual(result, .completed, "Always release both held device operations, including on failure")
+    }
+}
+
+private final class VisibilityReadLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [[String]] = []
+    var calls: [[String]] { lock.withLock { recorded } }
+    func record(_ linkIDs: [String]) { lock.withLock { recorded.append(linkIDs) } }
+}
+
+private final class CopyEvidenceSwitch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
+}
+
+private final class CopyTaskCanceller: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancellation: (@Sendable () -> Void)?
+    func register(_ body: @escaping @Sendable () -> Void) { lock.withLock { cancellation = body } }
+    func cancel() { lock.withLock { cancellation }?() }
 }
 
 /// Test-local proxy: preserve server behavior except the explicitly selected unreadable/unknown control.

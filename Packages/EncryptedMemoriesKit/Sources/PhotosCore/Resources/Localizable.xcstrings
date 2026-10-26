@@ -6479,8 +6479,32 @@
     },
     "duplicates.kept_reason_related_file": {
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "It has an extra file that would be lost." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Es hat eine Zusatzdatei, die sonst verloren ginge." } }
+        "en": { "stringUnit": { "state": "translated", "value": "It has an attached file, such as a Live Photo video, that can't be added to the photo you keep." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es hat eine zugehörige Datei, etwa ein Live-Foto-Video, die dem behaltenen Foto nicht hinzugefügt werden kann." } }
+      }
+    },
+    "duplicates.kept_reason_copy_failed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "It couldn't be merged. Try again later." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es ließ sich nicht zusammenführen. Versuche es später erneut." } }
+      }
+    },
+    "duplicates.kept_reason_waiting_for_wifi": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "It waits for Wi-Fi. Merge again then." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es wartet auf WLAN. Führe dann erneut zusammen." } }
+      }
+    },
+    "duplicates.kept_reason_device_storage": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not enough space on this device." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zu wenig Speicher auf diesem Gerät." } }
+      }
+    },
+    "duplicates.kept_reason_proton_storage": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Your Proton storage is full. Free up space or upgrade your plan." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dein Proton-Speicher ist voll. Gib Speicher frei oder erweitere dein Abo." } }
       }
     },
     "duplicates.kept_reason_pending_edit": {

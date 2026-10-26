@@ -62,6 +62,61 @@ final class PhotoLibraryResourceErrorTests: XCTestCase {
         }
     }
 
+    func testOnlyTheLivePhotoVideoThatPhotosReportsMissingOnTheLastCheckIsLeftOut() throws {
+        func plan(livePlaybackOff: Bool = false) throws -> PhotoBackupExportPlan {
+            let resources: [PhotoBackupAssetInfo.Resource] = [
+                .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.jpg", mimeType: "image/jpeg"),
+                .init(role: .originalPhoto, originalFilename: "IMG_0004.HEIC", mimeType: "image/heic"),
+                .init(role: .adjustmentData, originalFilename: "Adjustments.plist", mimeType: nil),
+                .init(role: .pairedVideo, originalFilename: "IMG_0004.MOV", mimeType: "video/quicktime"),
+            ]
+            return try XCTUnwrap(
+                PhotoBackupAssetPlanner.exportPlan(
+                    for: PhotoBackupAssetInfo(
+                        localIdentifier: "asset", creationDate: Date(timeIntervalSince1970: 100),
+                        modificationDate: Date(timeIntervalSince1970: 200), pixelWidth: 10, pixelHeight: 10,
+                        durationSeconds: 0, isLivePhoto: !livePlaybackOff, isVideo: false, resources: resources,
+                        hasAdjustments: true, livePlaybackOff: livePlaybackOff)))
+        }
+        let live = try plan()
+        let video = try XCTUnwrap(live.secondaries.first { $0.sourceResource == .livePairedVideo })
+        let missing = UploadError.sourceReportedMissing(video.uploadFilename)
+        func omits(_ item: PhotoBackupExportPlan.Item, _ error: any Error, _ allowed: Bool = true) -> Bool {
+            PhotoLibraryResourceResolver.omitsSecondary(item, failingWith: error, omittingMissingPairedVideo: allowed)
+        }
+
+        XCTAssertTrue(omits(video, missing))
+        XCTAssertTrue(
+            omits(video, photoKitFailure(.missingResource, for: video.uploadFilename)),
+            "PhotoKit's missing resource, as the identity pass reports it")
+        XCTAssertFalse(omits(video, missing, false), "before the last check the video keeps its failure")
+        // A video that waits for iCloud, a denied read, or any other failure keeps its handling.
+        for error: any Error in [
+            UploadError.sourceUnavailable(video.uploadFilename), UploadError.permissionDenied(video.uploadFilename),
+            UploadError.fileMissing(video.uploadFilename), UploadError.backend("read failed"), CancellationError(),
+            photoKitFailure(.networkAccessRequired, for: video.uploadFilename),
+        ] {
+            XCTAssertFalse(omits(video, error), "\(error)")
+        }
+        // Every other resource keeps its failure: the edit's original, its adjustments, a series photo, and the
+        // video of a photo whose Live effect is off, which carries no Live Photo tag.
+        let others = live.secondaries.filter { $0.sourceResource != .livePairedVideo }
+        XCTAssertEqual(others.count, 2)
+        let liveOffVideo = try XCTUnwrap(try plan(livePlaybackOff: true).secondaries.first { $0.role == .pairedVideo })
+        XCTAssertNotEqual(liveOffVideo.sourceResource, .livePairedVideo)
+        let member = PhotoBackupExportPlan.Item(
+            role: .burstMember, uploadFilename: "IMG_0005.HEIC", mimeType: "image/heic",
+            sourceResource: .burstMember(ordinal: 0))
+        for item in others + [liveOffVideo, member, live.primary] {
+            XCTAssertFalse(omits(item, UploadError.sourceReportedMissing(item.uploadFilename)), item.uploadFilename)
+        }
+    }
+
+    private func photoKitFailure(_ code: PHPhotosError.Code, for name: String) -> any Error {
+        PhotoLibraryResourceResolver.normalizedPhotoKitError(
+            NSError(domain: PHPhotosErrorDomain, code: code.rawValue), filename: name)
+    }
+
     func testAMissingPhotoKitResourceIsCheckedAgainBeforeThePhotoCountsAsGone() {
         // A download from iCloud that stops part-way can report a missing resource too.
         let native = NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.Code.missingResource.rawValue)

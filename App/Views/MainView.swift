@@ -1531,46 +1531,11 @@ struct MainView: View {
     /// Honest Map empty state, mirroring the iOS states and the standard macOS library empty surface.
     @ViewBuilder private var mapEmptyState: some View {
         let index = OfflineLibraryManager.shared.locationIndex
-        Group {
-            if !networkMonitor.isOnline {
-                OfflineContentUnavailableView()
-            } else {
-                switch index.scanProgress.phase {
-                case .scanning:
-                    ContentUnavailableView {
-                        Label(L10n.string("map.scanning_title"), systemImage: "location.magnifyingglass")
-                    } description: {
-                        Text(
-                            L10n.string(
-                                "map.scanning_message \(index.scanProgress.scanned) \(index.scanProgress.total)"))
-                    }
-                case .failed:
-                    ContentUnavailableView {
-                        Label(L10n.string("map.scan_failed_title"), systemImage: "exclamationmark.triangle")
-                    } description: {
-                        Text(L10n.string("map.scan_failed_message"))
-                    } actions: {
-                        // Scans the whole library again, like the automatic start and the iPhone map; the route
-                        // left under the map may hold only an album, a tag or Recently Deleted.
-                        RetryButton(.prominent) {
-                            OfflineLibraryManager.shared.restartLocationCrawl(
-                                items: timelineModel.wholeLibraryItemsForLocations, metadata: backend)
-                        }
-                    }
-                case .completed:
-                    ContentUnavailableView {
-                        Label(L10n.string("map.empty_title"), systemImage: "mappin.slash")
-                    } description: {
-                        Text(L10n.string("map.no_places_found_message"))
-                    }
-                case .idle:
-                    ContentUnavailableView {
-                        Label(L10n.string("map.empty_title"), systemImage: "mappin.slash")
-                    } description: {
-                        Text(L10n.string("map.empty_message"))
-                    }
-                }
-            }
+        MapEmptyStateView(MapEmptyState(isOnline: networkMonitor.isOnline, progress: index.scanProgress)) {
+            // Scans the whole library again, like the automatic start and the iPhone map; the route left under
+            // the map may hold only an album, a tag or Recently Deleted.
+            OfflineLibraryManager.shared.restartLocationCrawl(
+                items: timelineModel.wholeLibraryItemsForLocations, metadata: backend)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(ProtonColor.backgroundNorm)

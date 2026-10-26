@@ -1,5 +1,5 @@
 diff --git a/Sources/Plumbing/PublicTypes.swift b/Sources/Plumbing/PublicTypes.swift
-index b29bf93..ae06391 100644
+index ee8d8dc..dee1f47 100644
 --- a/Sources/Plumbing/PublicTypes.swift
 +++ b/Sources/Plumbing/PublicTypes.swift
 @@ -500 +500 @@ public struct FileNode: Sendable {

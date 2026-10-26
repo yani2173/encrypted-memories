@@ -45,10 +45,16 @@ public enum UploadBackupSyncQueueState: String, Sendable, Codable, CaseIterable 
 public struct UploadRemoteCommitQueueBinding: Sendable, Equatable, Codable {
     public let source: UploadSourceIdentity
     public let revision: UploadBackupRevision
+    /// The revision whose bytes were uploaded. It can be newer than the row's `revision` when the source changed
+    /// after the scan. Receipts of older builds have none; their row revision stands in.
+    public let uploadedRevision: UploadBackupRevision?
 
-    public init(source: UploadSourceIdentity, revision: UploadBackupRevision) {
+    public init(
+        source: UploadSourceIdentity, revision: UploadBackupRevision, uploadedRevision: UploadBackupRevision? = nil
+    ) {
         self.source = source
         self.revision = revision
+        self.uploadedRevision = uploadedRevision
     }
 }
 

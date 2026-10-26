@@ -29,6 +29,9 @@ public actor PendingBackupCoordinator {
         /// How long a change of the photo library waits before the excluded photos are checked again. A burst of
         /// changes, such as a large import, shares one check.
         public var libraryChangeDelay: Duration
+        /// First retry after a source state could not be read. Each further failed retry doubles it, up to the limit.
+        public var unreadableRetryDelay: Duration
+        public var unreadableRetryLimit: Duration
 
         public init(
             membershipInterval: Duration = .seconds(1),
@@ -38,7 +41,9 @@ public actor PendingBackupCoordinator {
             uncheckedAdmissionLimit: Int = 64,
             trashRetention: TimeInterval = 30 * 24 * 60 * 60,
             acknowledgedHandoffRetention: TimeInterval = 7 * 24 * 60 * 60,
-            libraryChangeDelay: Duration = .milliseconds(500)
+            libraryChangeDelay: Duration = .milliseconds(500),
+            unreadableRetryDelay: Duration = .seconds(60),
+            unreadableRetryLimit: Duration = .seconds(30 * 60)
         ) {
             self.membershipInterval = membershipInterval
             self.progressInterval = progressInterval
@@ -48,6 +53,9 @@ public actor PendingBackupCoordinator {
             self.trashRetention = trashRetention
             self.acknowledgedHandoffRetention = acknowledgedHandoffRetention
             self.libraryChangeDelay = libraryChangeDelay
+            // A zero delay would retry an unreadable row without pause.
+            self.unreadableRetryDelay = max(.seconds(1), unreadableRetryDelay)
+            self.unreadableRetryLimit = unreadableRetryLimit
         }
     }
 
@@ -77,6 +85,28 @@ public actor PendingBackupCoordinator {
     private var sourceStates: [PendingSourceKey: PendingSourceState] = [:] {
         didSet { excludedListsCache = nil }
     }
+    /// Sources whose last state read failed. Their owed work waits; it never counts as "nothing owed".
+    private var unreadableSourceStates = Set<PendingSourceKey>()
+    /// The last load of every source state was incomplete, so a source without a cached state is unknown.
+    private var sourceStatesIncomplete = false
+    /// The sources that incomplete load decoded. Only they may run actions until a complete load.
+    private var loadDecodedKeys = Set<PendingSourceKey>()
+    /// The current reconcile pass could not read every due source state. Set before the pass awaits any effect.
+    private var dueStatesIncomplete = false
+    /// The sources whose state the due reads of that pass decoded. Only they may run actions until a complete read.
+    private var dueDecodedKeys = Set<PendingSourceKey>()
+    /// The last read of the pending actions failed or left out a row that did not decode.
+    private var actionsIncomplete = false
+    /// Sources of pending actions whose latest handoff could not be read. Their actions wait for the backoff.
+    private var unreadableHandoffKeys = Set<PendingSourceKey>()
+    /// The current retry delay while a source state cannot be read; nil when every read succeeded.
+    private var unreadableRetry: Duration?
+    /// Some source state could not be read by the last load, the current due reads, or a keyed read.
+    private var sourceStatesDegraded: Bool {
+        dueStatesIncomplete || sourceStatesIncomplete || !unreadableSourceStates.isEmpty
+    }
+    /// The last pass over the pending actions could not read every action or every handoff it needed.
+    private var actionsDegraded: Bool { actionsIncomplete || !unreadableHandoffKeys.isEmpty }
     private var savedFromApp = Set<String>()
     private var metadata: [PendingSourceKey: PendingPresentationMetadata] = [:]
     /// The revision each cached metadata entry belongs to; a new revision can change the capture time.
@@ -181,6 +211,7 @@ public actor PendingBackupCoordinator {
         started = true
         guard store.isOperational() else { return }
         let handoffCutoff = now().addingTimeInterval(-configuration.acknowledgedHandoffRetention)
+        // Housekeeping only: a failed prune keeps rows longer; the SQL keeps those of unfinished work anyway.
         _ = store.pruneAcknowledgedHandoffs(olderThan: handoffCutoff)
         evidence = store.evidenceRevisions()
         for (key, revisions) in evidence {
@@ -188,9 +219,11 @@ public actor PendingBackupCoordinator {
                 if let record = recorder?.replacementLedger.evidence(for: key, revision: revision) { remember(record) }
             }
         }
+        // Display only: a handoff that cannot be read stays out of the tile memory; no owed work depends on it.
         for handoff in store.unacknowledgedHandoffs() { remember(handoff) }
-        sourceStates = Dictionary(uniqueKeysWithValues: store.sourceStates().map { ($0.key, $0) })
+        loadSourceStates()
         savedFromApp = store.savedFromAppIdentifiers()
+        // The favorites shown; `runDueActions` reads the owed actions itself.
         actions = store.actions()
 
         for (kind, queue) in queues {
@@ -258,14 +291,22 @@ public actor PendingBackupCoordinator {
         for key in keys {
             let revision = tilesByKey[key]?.revision ?? rows[key]?.revision
             var remote = handoffs[key].flatMap { $0.revision == revision ? $0.remote : nil }
+            var remoteUnknown = false
             if remote == nil {
                 let earlier = await hiddenEarlierUpload(of: key, before: revision)
                 guard !closed else { return false }
-                remote = earlier?.target
-                earlierLinks[key] = earlier?.links
+                switch earlier {
+                case .found(let target, let links):
+                    remote = target
+                    earlierLinks[key] = links
+                case .unknown: remoteUnknown = true
+                case .none: break
+                }
             }
             requests.append(
-                PendingExclusionRequest(key: key, presentation: metadata[key], remote: remote, revision: revision))
+                PendingExclusionRequest(
+                    key: key, presentation: metadata[key], remote: remote, revision: revision,
+                    remoteUnknown: remoteUnknown))
         }
         // A delete or restore of the same source during a lookup is the person's later decision, and it stands.
         requests.removeAll { actionTokens[$0.key] != tokens[$0.key] }
@@ -312,29 +353,41 @@ public actor PendingBackupCoordinator {
     private func hiddenEarlierUpload(
         of key: PendingSourceKey,
         before revision: UploadBackupRevision?
-    ) async -> (target: PhotoUID, links: Set<String>)? {
-        guard let revision, let tile = tilesByKey[key], tile.revision == revision else { return nil }
+    ) async -> EarlierUpload {
+        guard let revision, let tile = tilesByKey[key], tile.revision == revision else { return .none }
         let hidden = Set(tile.replaces.map(\.nodeID))
-        guard !hidden.isEmpty, let identities, let relations else { return nil }
+        guard !hidden.isEmpty, let identities, let relations else { return .none }
         let target: PhotoUID?
         // A stored handoff of this or a later revision is the edit's own commit, whose event has not arrived yet; the
         // journal still names the earlier upload. The store trashes the commit after it.
-        if let earlier = store.latestHandoffs(for: [key])[key], earlier.revision < revision {
+        switch store.latestHandoffsRead(for: [key])[key] ?? .unreadable {
+        case .unreadable:
+            // The handoff could name another photo than the journal; nothing chosen on an unknown goes to the trash.
+            return .unknown
+        case .readable(let earlier?) where earlier.revision < revision:
             target = earlier.kind == .uploaded && hidden.contains(earlier.remote.nodeID) ? earlier.remote : nil
-        } else {
+        case .readable:
             target = newestEarlierMain(of: key, among: tile.replaces)
         }
         guard let target,
             let related = try? await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
-        else { return nil }
+        else { return .none }
         // The tile can change during the lookup; only the photo that it still hides is the person's deletion.
         guard let current = tilesByKey[key], current.revision == revision,
             current.replaces.contains(where: { $0.nodeID == target.nodeID })
-        else { return nil }
+        else { return .none }
         let source = UploadSourceIdentity(kind: key.kind, identifier: key.identifier)
         let links = related.union([target.nodeID])
-        guard !identities.isNeededElsewhere(links, by: source) else { return nil }
-        return (target, links)
+        guard !identities.isNeededElsewhere(links, by: source) else { return .none }
+        return .found(target, links)
+    }
+
+    /// The earlier upload that the delete of an edit sends to the Proton trash. `unknown`: the handoff could not be
+    /// read, so the delete names no photo at all, not even one that the stored state still knows.
+    private enum EarlierUpload {
+        case found(PhotoUID, Set<String>)
+        case none
+        case unknown
     }
 
     /// Starts a new person action for `key`. A delete that awaits a lookup drops its decision for the source when
@@ -411,6 +464,7 @@ public actor PendingBackupCoordinator {
         let keys = uids.compactMap(PendingSourceKey.init(localUID:))
         let date = now()
         guard keys.allSatisfy({ store.setFavoriteIntent($0, favorite: favorite, at: date) }) else { return false }
+        // The favorites shown; `runDueActions` reads the owed actions itself.
         actions = store.actions()
         listsDirty = true
         publishMembership(force: true)
@@ -425,6 +479,7 @@ public actor PendingBackupCoordinator {
         let keys = uids.compactMap(PendingSourceKey.init(localUID:))
         let date = now()
         guard keys.allSatisfy({ store.addAlbumIntent($0, albumID: albumID, at: date) }) else { return false }
+        // The favorites shown; `runDueActions` reads the owed actions itself.
         actions = store.actions()
         await runDueActions()
         return true
@@ -686,11 +741,36 @@ public actor PendingBackupCoordinator {
             return handoffs[key]?.revision != row.revision
         }
         guard !settled.isEmpty else { return }
+        // Display only: an unreadable handoff stays out of the tile memory; no owed work depends on it.
         for handoff in store.latestHandoffs(for: settled).values { remember(handoff) }
     }
 
+    private func loadSourceStates() {
+        let read = store.sourceStatesRead()
+        let decoded = Dictionary(uniqueKeysWithValues: read.states.map { ($0.key, $0) })
+        if read.complete {
+            sourceStates = decoded
+            loadDecodedKeys = []
+        } else {
+            // A source missing from an incomplete list keeps its last known state for timing and restores, but that
+            // state may be stale, so only the sources this load decoded may run actions.
+            sourceStates.merge(decoded) { _, current in current }
+            loadDecodedKeys = Set(decoded.keys)
+        }
+        sourceStatesIncomplete = !read.complete
+    }
+
     private func reloadSourceStates(_ keys: [PendingSourceKey]) {
-        for key in keys { sourceStates[key] = store.sourceState(for: key) }
+        for key in keys {
+            switch store.sourceStateRead(for: key) {
+            case .readable(let state):
+                sourceStates[key] = state
+                unreadableSourceStates.remove(key)
+            case .unreadable:
+                // The last known state stays; the source waits until a read succeeds.
+                unreadableSourceStates.insert(key)
+            }
+        }
         dirty.formUnion(keys)
     }
 
@@ -768,6 +848,7 @@ public actor PendingBackupCoordinator {
     }
 
     /// Excluded by the person, or saved to Apple Photos from Proton by this app.
+    /// Display only: a source whose state cannot be read shows by its last known state.
     private func isHiddenByChoice(_ key: PendingSourceKey) -> Bool {
         sourceStates[key]?.desired == .excluded
             || (key.kind == .photoLibraryAsset && savedFromApp.contains(key.identifier))
@@ -1095,22 +1176,36 @@ public actor PendingBackupCoordinator {
         }
         reconcileRunning = true
         defer { reconcileRunning = false }
+        if sourceStatesIncomplete { loadSourceStates() }
+        if !unreadableSourceStates.isEmpty { reloadSourceStates(Array(unreadableSourceStates)) }
         repeat {
             reconcileAgain = false
+            var incomplete = false
+            var decoded = Set<PendingSourceKey>()
+            func due() -> [PendingSourceState] {
+                let read = store.dueSourceStatesRead(by: now())
+                if !read.complete { incomplete = true }
+                decoded.formUnion(read.states.map(\.key))
+                // Published before the effects of this pass await, so an action that runs meanwhile never uses the
+                // permission of an earlier pass.
+                dueStatesIncomplete = incomplete
+                dueDecodedKeys = decoded
+                return read.states
+            }
             await performRemote(
                 .remoteRestore,
-                store.dueSourceStates(by: now()).filter {
+                due().filter {
                     $0.needsRemoteRestore && $0.desired == .included && $0.remote != nil
                 })
             guard !closed else { return }
             await performQueueSync(
-                store.dueSourceStates(by: now()).filter {
+                due().filter {
                     $0.needsQueueSync && ($0.desired == .excluded || !$0.needsRemoteRestore)
                 })
             guard !closed else { return }
             await performRemote(
                 .remoteTrash,
-                store.dueSourceStates(by: now()).filter {
+                due().filter {
                     $0.needsRemoteTrash && $0.desired == .excluded && $0.remote != nil
                 })
             guard !closed else { return }
@@ -1171,8 +1266,11 @@ public actor PendingBackupCoordinator {
             Self.normalized(state.remote, volume: volume).map { !result.retry.contains($0) } ?? true
         }
         // A finished trash can leave the trash of a later commit due, see `PendingBackupManifestStore.completeEffect`.
+        // A source whose state cannot be read now is retried by the backoff timer of `scheduleReconcileTimer`.
         let movedOn = dispatched.contains { dispatchedState in
-            guard let state = sourceStates[dispatchedState.key] else { return false }
+            // A last known state can be older than the effect; only a fresh read shows that the trash moved on.
+            guard !unreadableSourceStates.contains(dispatchedState.key), let state = sourceStates[dispatchedState.key]
+            else { return false }
             return state.needsRemoteTrash && state.remoteOperation == nil
                 && state.remote?.nodeID != dispatchedState.remote?.nodeID
         }
@@ -1205,13 +1303,41 @@ public actor PendingBackupCoordinator {
     private func scheduleReconcileTimer() {
         reconcileTimer?.cancel()
         reconcileTimer = nil
-        guard !closed, let next = store.nextEffectDate() else { return }
-        let seconds = max(1, next.timeIntervalSince(now()))
+        guard !closed else { return }
+        let delay: Duration
+        if sourceStatesDegraded || actionsDegraded {
+            // An unreadable row stays due in the store, so the next effect date would retry it every second.
+            let limit = configuration.unreadableRetryLimit
+            let next = unreadableRetry.map { $0 > limit / 2 ? limit : $0 * 2 } ?? configuration.unreadableRetryDelay
+            // At least one second, whatever the configuration says, so a zero or negative limit never spins.
+            let backoff = max(.seconds(1), min(next, limit))
+            unreadableRetry = backoff
+            // Readable sources keep their own retry time; only the unreadable part waits for the backoff.
+            if let readable = readableNextEffectDate() {
+                delay = min(backoff, .seconds(max(1, readable.timeIntervalSince(now()))))
+            } else {
+                delay = backoff
+            }
+        } else {
+            unreadableRetry = nil
+            guard let next = store.nextEffectDate() else { return }
+            delay = .seconds(max(1, next.timeIntervalSince(now())))
+        }
         reconcileTimer = Task { [weak self, sleep] in
-            try? await sleep(.seconds(seconds))
+            try? await sleep(delay)
             guard !Task.isCancelled else { return }
             await self?.reconcile()
         }
+    }
+
+    /// The next future retry of a readable source with an owed effect, from the last known states.
+    private func readableNextEffectDate() -> Date? {
+        let current = now()
+        return sourceStates.values.filter { state in
+            !unreadableSourceStates.contains(state.key)
+                && (state.needsQueueSync || state.needsRemoteTrash || state.needsRemoteRestore)
+                && state.nextAttemptAt > current
+        }.map(\.nextAttemptAt).min()
     }
 
     private static func normalized(_ uid: PhotoUID?, volume: String) -> PhotoUID? {
@@ -1231,11 +1357,21 @@ public actor PendingBackupCoordinator {
         }
         actionsRunning = true
         defer { actionsRunning = false }
+        // What the dispatch reads of this call could not read. The scheduling read at the end keeps it, so a good
+        // scheduling read never hides a failed dispatch read.
+        var dispatchIncomplete = false
+        var dispatchUnreadable = Set<PendingSourceKey>()
         repeat {
             actionsAgain = false
-            let latest = store.latestHandoffs(for: Array(Set(store.dueActions(by: now()).map(\.key))))
-            // Actions of sources without a Proton photo wait for their handoff event, not for a timer.
-            let due = store.dueActions(by: now()).filter { latest[$0.key] != nil && actionIsEligible($0.key) }
+            // One read per pass, so the handoffs belong to exactly the actions that run.
+            let read = store.dueActionsRead(by: now())
+            if !read.complete { dispatchIncomplete = true }
+            let handoffs = store.latestHandoffsRead(for: Array(Set(read.actions.map(\.key))))
+            dispatchUnreadable.formUnion(handoffs.filter { $0.value == .unreadable }.keys)
+            let latest = handoffs.compactMapValues(\.handoff)
+            // Actions of sources without a Proton photo wait for their handoff event, not for a timer. An unreadable
+            // handoff or an incomplete read is retried through the reconcile backoff, see `scheduleActionTimer`.
+            let due = read.actions.filter { latest[$0.key] != nil && actionIsEligible($0.key) }
             guard !due.isEmpty else { break }
             let volume = await effects.photosVolumeID()
             guard !closed else { return }
@@ -1263,33 +1399,65 @@ public actor PendingBackupCoordinator {
                     PhotoDiagnostics.shared.increment("pending.actionFailed")
                 }
             }
+            // The favorites shown; the next pass reads the owed actions itself.
             actions = store.actions()
             listsDirty = true
             scheduleMembershipPublish()
         } while actionsAgain && !closed
-        scheduleActionTimer()
+        scheduleActionTimer(dispatchIncomplete: dispatchIncomplete, dispatchUnreadable: dispatchUnreadable)
     }
 
     /// Wakes for the earliest retry among actions whose Proton photo is known. Actions still waiting for an
     /// upload never pull the timer forward; their handoff event starts them.
     /// Actions wait while the source is excluded or its Proton photo still has to come back from the trash.
     private func actionIsEligible(_ key: PendingSourceKey) -> Bool {
-        guard let state = sourceStates[key] else { return true }
+        // An unreadable state is no "not excluded": the action waits for a successful read.
+        guard !unreadableSourceStates.contains(key) else { return false }
+        // An incomplete due read may have left out this source's current state.
+        guard !dueStatesIncomplete || dueDecodedKeys.contains(key) else { return false }
+        // After an incomplete load, a last known state of a source that this load did not decode may be stale.
+        guard !sourceStatesIncomplete || loadDecodedKeys.contains(key) else { return false }
+        // A source without a state here was read as absent. A keyed read cannot find a row whose key no longer
+        // decodes, so absence counts only while no load and no due read of the current states is incomplete.
+        guard let state = sourceStates[key] else { return !sourceStatesIncomplete && !dueStatesIncomplete }
         return state.desired == .included && !state.needsRemoteRestore
     }
 
-    private func scheduleActionTimer() {
+    private func scheduleActionTimer(
+        dispatchIncomplete: Bool = false, dispatchUnreadable: Set<PendingSourceKey> = []
+    ) {
         actionTimer?.cancel()
         actionTimer = nil
         guard !closed else { return }
-        let pending = store.actions().filter { !$0.failed }
+        let read = store.actionsRead()
+        let pending = read.actions.filter { !$0.failed }
+        let handoffs = store.latestHandoffsRead(for: Array(Set(pending.map(\.key))))
+        // A pass is clean only when its dispatch reads and this scheduling read both read everything.
+        actionsIncomplete = dispatchIncomplete || !read.complete
+        unreadableHandoffKeys = dispatchUnreadable.union(handoffs.filter { $0.value == .unreadable }.keys)
+        // Owed actions that cannot be read, or whose Proton photo cannot be read, wait for the reconcile backoff. A
+        // reconcile schedules it itself when it ends; a degraded wait that is already set keeps its delay.
+        if !reconcileRunning {
+            if actionsDegraded, unreadableRetry == nil {
+                scheduleReconcileTimer()
+            } else if !actionsDegraded, !sourceStatesDegraded, unreadableRetry != nil {
+                // Every read is clean again outside a reconcile: the episode ends, and a new failure starts over.
+                scheduleReconcileTimer()
+            }
+        }
         guard !pending.isEmpty else { return }
-        let withRemote = store.latestHandoffs(for: Array(Set(pending.map(\.key))))
+        let withRemote = handoffs.compactMapValues(\.handoff)
+        let current = now()
+        // While a pass could not read everything, an overdue action that it could not run waits for the backoff;
+        // only a future retry time pulls this timer forward.
         guard
-            let next = pending.filter({ withRemote[$0.key] != nil && actionIsEligible($0.key) })
-                .map(\.nextAttemptAt).min()
+            let next = pending.filter({
+                withRemote[$0.key] != nil && actionIsEligible($0.key)
+                    && (!actionsDegraded || $0.nextAttemptAt > current)
+            })
+            .map(\.nextAttemptAt).min()
         else { return }
-        let seconds = max(1, next.timeIntervalSince(now()))
+        let seconds = max(1, next.timeIntervalSince(current))
         actionTimer = Task { [weak self, sleep] in
             try? await sleep(.seconds(seconds))
             guard !Task.isCancelled else { return }

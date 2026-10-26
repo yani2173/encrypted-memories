@@ -197,6 +197,12 @@ public actor LibraryChangeMonitor {
             var observedToken = lastToken
             var lastChangeAt: ContinuousClock.Instant?
             var firstDeferredAt: ContinuousClock.Instant?
+            /// When a pending burst of changes refreshes: after `quiet` without a change, and at the latest
+            /// `maxTrailingInterval` after its first deferred change. Nil while no burst is pending.
+            func burstDeadline(quiet: Duration) -> ContinuousClock.Instant? {
+                guard let firstDeferredAt, let lastChangeAt else { return nil }
+                return min(lastChangeAt + quiet, firstDeferredAt + request.policy.maxTrailingInterval)
+            }
             while !Task.isCancelled {
                 do {
                     let token = try await request.provider.libraryChangeToken()
@@ -209,6 +215,9 @@ public actor LibraryChangeMonitor {
                         }
                         if let quiet = request.policy.trailingQuietInterval {
                             let now = clock.now()
+                            // A burst whose deadline has passed refreshes now. A change that arrives exactly then must
+                            // not start the quiet wait again.
+                            let burstExpired = burstDeadline(quiet: quiet).map { now >= $0 } ?? false
                             if token != observedToken {
                                 if let previousChange = lastChangeAt, now - previousChange < quiet,
                                     firstDeferredAt == nil
@@ -218,13 +227,9 @@ public actor LibraryChangeMonitor {
                                 observedToken = token
                                 lastChangeAt = now
                             }
-                            if let firstDeferredAt, let lastChangeAt {
-                                let deadline = min(
-                                    lastChangeAt + quiet, firstDeferredAt + request.policy.maxTrailingInterval)
-                                if now < deadline {
-                                    try await clock.sleepUntil(min(now + request.policy.interval, deadline))
-                                    continue
-                                }
+                            if !burstExpired, let deadline = burstDeadline(quiet: quiet), now < deadline {
+                                try await clock.sleepUntil(min(now + request.policy.interval, deadline))
+                                continue
                             }
                         }
                         try Task.checkCancellation()
@@ -278,7 +283,17 @@ public actor LibraryChangeMonitor {
                     )
                     return
                 } catch {
-                    try? await clock.sleep(request.policy.failureInterval)
+                    // A pending burst keeps its deadline: the failure wait ends at the absolute deadline when that is
+                    // sooner, however late the clock registers the sleep. A deadline that has passed adds no shorter
+                    // wait, so a failing probe is not polled hot.
+                    let now = clock.now()
+                    if let quiet = request.policy.trailingQuietInterval, let deadline = burstDeadline(quiet: quiet),
+                        deadline > now, deadline - now < request.policy.failureInterval
+                    {
+                        try? await clock.sleepUntil(deadline)
+                    } else {
+                        try? await clock.sleep(request.policy.failureInterval)
+                    }
                 }
             }
         }

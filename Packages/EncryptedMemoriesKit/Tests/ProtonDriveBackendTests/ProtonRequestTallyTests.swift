@@ -428,6 +428,22 @@ struct ProtonRequestTallyTests {
         #expect(await sources.requestSnapshot() == nil)
     }
 
+    @Test func theShutdownGateHandsTheEndOfAPassWithoutAnIndexBuildToItsResolver() async {
+        let base = NotNeededRecordingResolver()
+        let resolver = ShutdownGatedUploadIdentityResolver(base: base, admission: JoinedShutdownGate())
+        await resolver.remoteIndexPreparationNotNeeded()
+        #expect(base.count == 1)
+    }
+
+    @Test func aReportAfterTheShutdownGateClosedReachesNoResolver() async {
+        let base = NotNeededRecordingResolver()
+        let admission = JoinedShutdownGate()
+        let resolver = ShutdownGatedUploadIdentityResolver(base: base, admission: admission)
+        admission.closeAdmission()
+        await resolver.remoteIndexPreparationNotNeeded()
+        #expect(base.count == 0, "the account's stores may already be closed")
+    }
+
     private static func configuration(initial: Int) -> ProtonRequestGovernor.Configuration {
         let scope = ProtonRequestGovernor.Configuration.Scope(initialConcurrency: initial, maximumConcurrency: initial)
         return .init(
@@ -437,6 +453,31 @@ struct ProtonRequestTallyTests {
 }
 
 private struct EmptyResponse: Decodable {}
+
+/// Counts the reports of a pass that ended without an index build.
+private final class NotNeededRecordingResolver: UploadIdentityResolving, @unchecked Sendable {
+    private let lock = NSLock()
+    private var reports = 0
+    var count: Int { lock.withLock { reports } }
+
+    func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
+        throw CancellationError()
+    }
+
+    func recordUploaded(
+        _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String, remoteLinkID: String
+    ) async throws {}
+
+    func uploadDidFail(_ descriptor: UploadResourceDescriptor) async {}
+
+    func remoteCommitNeedsReconciliation(_ descriptor: UploadResourceDescriptor) async {}
+
+    func remoteMainsChangedHere() async {}
+
+    func remoteIndexPreparationNotNeeded() async {
+        lock.withLock { reports += 1 }
+    }
+}
 
 /// Sends one counted request from `prime`, the way the real pipeline reaches the network.
 private struct RequestingResolver: UploadIdentityResolving {

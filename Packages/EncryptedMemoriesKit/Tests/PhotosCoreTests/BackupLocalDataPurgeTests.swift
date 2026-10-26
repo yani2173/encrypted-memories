@@ -385,6 +385,101 @@ final class BackupLocalDataPurgeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: outsideFile.path))
     }
 
+    func testSignOutRemovesTheRelatedFileStagingFolder() throws {
+        let roots = BackupLocalDataPurge.localDataRoots()
+        XCTAssertTrue(roots.contains(BackupLocalDataPurge.relatedFileStagingDirectory()))
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("related-staging-purge-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let folder = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: parent)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("left".utf8).write(to: folder.appendingPathComponent("staged"))
+        XCTAssertTrue(BackupLocalDataPurge.purgeAllLocalAccountData(roots: [folder]).succeeded)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+    }
+
+    func testEmptyingRelatedFileStagingKeepsTheFolderAndNeverFollowsLinks() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("related-staging-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let folder = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: parent)
+        let outside = parent.appendingPathComponent("outside", isDirectory: true)
+        let outsideFile = outside.appendingPathComponent("must-survive.txt")
+        try FileManager.default.createDirectory(
+            at: folder.appendingPathComponent("left-folder"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("private".utf8).write(to: outsideFile)
+        try Data("left".utf8).write(to: folder.appendingPathComponent("left-folder/staged"))
+        try Data("left".utf8).write(to: folder.appendingPathComponent(".hidden-staged"))
+        try FileManager.default.createSymbolicLink(
+            at: folder.appendingPathComponent("outside-link"), withDestinationURL: outside)
+
+        XCTAssertTrue(BackupLocalDataPurge.emptyRelatedFileStaging(temporaryDirectory: parent))
+
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), [])
+        XCTAssertEqual(try Data(contentsOf: outsideFile), Data("private".utf8))
+    }
+
+    func testARemovalOutsideItsBoundaryIsRefused() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("related-staging-boundary-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let folder = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: parent)
+        let outside = parent.appendingPathComponent("outside.txt")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("private".utf8).write(to: outside)
+
+        XCTAssertThrowsError(try TransientPlaintextPurge.removeWithoutFollowingLinks(at: outside, boundary: folder))
+        XCTAssertEqual(try Data(contentsOf: outside), Data("private".utf8))
+    }
+
+    func testALinkInPlaceOfTheRelatedFileStagingFolderIsRemovedWithoutFollowing() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("related-staging-link-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let folder = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: parent)
+        let outside = parent.appendingPathComponent("outside", isDirectory: true)
+        let outsideFile = outside.appendingPathComponent("must-survive.txt")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("private".utf8).write(to: outsideFile)
+        try FileManager.default.createSymbolicLink(at: folder, withDestinationURL: outside)
+
+        XCTAssertTrue(BackupLocalDataPurge.emptyRelatedFileStaging(temporaryDirectory: parent))
+
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: folder.path))
+        XCTAssertEqual(try Data(contentsOf: outsideFile), Data("private".utf8))
+    }
+
+    func testAMissingRelatedFileStagingFolderIsEmptyAndStaysAbsent() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("related-staging-missing-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+
+        XCTAssertTrue(BackupLocalDataPurge.emptyRelatedFileStaging(temporaryDirectory: parent))
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: parent).path))
+    }
+
+    func testAnEntryThatCannotBeRemovedLeavesRelatedFileStagingUnclean() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("related-staging-locked-\(UUID().uuidString)", isDirectory: true)
+        let locked = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: parent)
+            .appendingPathComponent("locked", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try Data("left".utf8).write(to: locked.appendingPathComponent("staged"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: locked.path)
+
+        XCTAssertFalse(BackupLocalDataPurge.emptyRelatedFileStaging(temporaryDirectory: parent))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: locked.appendingPathComponent("staged").path))
+    }
+
     func testDisplayWakePolicyRequiresExplicitForegroundActiveBackup() {
         for optedIn in [false, true] {
             for foreground in [false, true] {

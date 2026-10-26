@@ -122,7 +122,40 @@ public enum BackupLocalDataPurge {
             roots.append(library.appendingPathComponent("Logs/EncryptedMemories", isDirectory: true))
         }
         roots.append(fm.temporaryDirectory.appendingPathComponent("ShareExports", isDirectory: true))
+        roots.append(relatedFileStagingDirectory())
         return roots
+    }
+
+    /// The one folder for the related-file copies of the duplicate merge. Each merge batch empties it before its first
+    /// copy, and sign-out removes it.
+    public static func relatedFileStagingDirectory(
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory
+    ) -> URL {
+        temporaryDirectory.standardizedFileURL.appendingPathComponent("RelatedFileStaging", isDirectory: true)
+    }
+
+    /// Removes every entry inside the related-file staging folder without following links, and keeps the folder. A link
+    /// or file in the folder's place is removed itself. A missing folder is already empty. False when anything stays.
+    public static func emptyRelatedFileStaging(
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory
+    ) -> Bool {
+        let folder = relatedFileStagingDirectory(temporaryDirectory: temporaryDirectory)
+        do {
+            switch try LocalPurgeItemState.read(at: folder) {
+            case .missing:
+                return true
+            case .other:
+                try TransientPlaintextPurge.removeWithoutFollowingLinks(at: folder, boundary: folder)
+                return try LocalPurgeItemState.read(at: folder) == .missing
+            case .directory:
+                for entry in try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) {
+                    try TransientPlaintextPurge.removeWithoutFollowingLinks(at: entry, boundary: folder)
+                }
+                return try FileManager.default.contentsOfDirectory(atPath: folder.path).isEmpty
+            }
+        } catch {
+            return false
+        }
     }
 
     /// Removes every local `EncryptedMemories` root. Best-effort per root so one failure never blocks the

@@ -29,38 +29,10 @@ struct MobileMapScreen: View {
                 if model.locationIndex.coordinates.isEmpty {
                     // Empty states distinguish scanning, no geotagged photos after completion, and probe
                     // failure. `.idle` keeps the generic message while the crawl has not started.
-                    if !networkMonitor.isOnline {
-                        OfflineContentUnavailableView()
-                    } else {
-                        switch model.locationIndex.scanProgress.phase {
-                        case .scanning:
-                            let progress = model.locationIndex.scanProgress
-                            ContentUnavailableView {
-                                Label(L10n.string("map.scanning_title"), systemImage: "location.magnifyingglass")
-                            } description: {
-                                Text(L10n.string("map.scanning_message \(progress.scanned) \(progress.total)"))
-                            }
-                        case .failed:
-                            ContentUnavailableView {
-                                Label(L10n.string("map.scan_failed_title"), systemImage: "exclamationmark.triangle")
-                            } description: {
-                                Text(L10n.string("map.scan_failed_message"))
-                            } actions: {
-                                RetryButton(.prominent) { model.restartLocationCrawlIfNeeded() }
-                            }
-                        case .completed:
-                            ContentUnavailableView {
-                                Label(L10n.string("map.empty_title"), systemImage: "mappin.slash")
-                            } description: {
-                                Text(L10n.string("map.no_places_found_message"))
-                            }
-                        case .idle:
-                            ContentUnavailableView {
-                                Label(L10n.string("map.empty_title"), systemImage: "mappin.slash")
-                            } description: {
-                                Text(L10n.string("map.empty_message"))
-                            }
-                        }
+                    MapEmptyStateView(
+                        MapEmptyState(isOnline: networkMonitor.isOnline, progress: model.locationIndex.scanProgress)
+                    ) {
+                        model.restartLocationCrawlIfNeeded()
                     }
                 } else {
                     MobileLibraryMap(

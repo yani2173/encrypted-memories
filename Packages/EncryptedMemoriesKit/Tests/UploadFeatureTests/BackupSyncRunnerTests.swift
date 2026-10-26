@@ -210,7 +210,41 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         lock.withLock { _resolveCounts[identifier] ?? 0 }
     }
 
+    /// The Live Photo video of `identifier` that Photos reports missing, like the photo library resolver: a resolve
+    /// throws `sourceReportedMissing` for it, and leaves it out only when the runner allows the omission.
+    private var missingPairedVideos: [String: String] = [:]
+    private var omissionRequests: [String: [Bool]] = [:]
+
+    func setPairedVideoReportedMissing(_ name: String?, for identifier: String) {
+        lock.withLock { missingPairedVideos[identifier] = name }
+    }
+
+    /// Whether the runner allowed the omission, per resolve of `identifier`.
+    func omissionRequests(for identifier: String) -> [Bool] {
+        lock.withLock { omissionRequests[identifier] ?? [] }
+    }
+
+    func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission,
+        omittingMissingPairedVideo: Bool
+    ) async throws -> BackupResolvedResource? {
+        lock.withLock { omissionRequests[entry.source.identifier, default: []].append(omittingMissingPairedVideo) }
+        try readAdmission()
+        guard omittingMissingPairedVideo else {
+            return try await resolve(entry, onPreparationProgress: onPreparationProgress)
+        }
+        return try await resolveScripted(entry, omittingMissingPairedVideo: true)
+    }
+
     func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+        try await resolveScripted(entry, omittingMissingPairedVideo: false)
+    }
+
+    private func resolveScripted(
+        _ entry: UploadBackupSyncQueueEntry, omittingMissingPairedVideo: Bool
+    ) async throws -> BackupResolvedResource? {
         let id = entry.source.identifier
         let isSlow = lock.withLock {
             activeResolves[id, default: 0] += 1
@@ -247,11 +281,17 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         case .standard, .needsFreeSpaceOnCopy:
             break
         }
+        // The main photo reads first, so its own failure above wins over a missing video.
+        let missingPairedVideo = lock.withLock { missingPairedVideos[id] }
+        if let missingPairedVideo, !omittingMissingPairedVideo {
+            throw UploadError.sourceReportedMissing(missingPairedVideo)
+        }
 
         // Standard resolution (also reached once a transient/disk-pressure budget is exhausted).
         do {
             let modified = lock.withLock { modifiedOverrides[id] } ?? defaultModified
-            let secondaries = lock.withLock { secondaryNames[id] } ?? []
+            let plannedSecondaries = lock.withLock { secondaryNames[id] } ?? []
+            let secondaries = plannedSecondaries.filter { $0 != missingPairedVideo }
             let secondaryResources = lock.withLock { self.secondaryResources }
             let burstMembers = lock.withLock { burstMemberNames[id] } ?? []
             let additionalMetadata = lock.withLock { metadataByIdentifier[id] } ?? []
@@ -260,7 +300,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
                 source: entry.source,
                 revision: UploadBackupRevision(date: modified),
                 editRevision: lock.withLock { editRevisions[id] } ?? .unavailable,
-                resourceCount: 1 + secondaries.count + burstMembers.count
+                resourceCount: 1 + plannedSecondaries.count + burstMembers.count
             )
             let descriptor = UploadResourceDescriptor(
                 source: entry.source,
@@ -343,7 +383,8 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
                             additionalMetadata: additionalMetadata
                         )
                     },
-                materialize: materialize
+                materialize: materialize,
+                omitsMissingPairedVideo: missingPairedVideo != nil
             )
         }
     }
@@ -388,6 +429,15 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         var digest = Data(repeating: 0, count: 20)
         for (index, byte) in seed.utf8.enumerated() { digest[index % 20] ^= byte }
         return digest
+    }
+}
+
+/// A resolver that implements only the plain resolve, like Album Sync and folder backups.
+private struct DefaultOnlyResolver: BackupResourceResolving {
+    let inner: ScriptedBackupResolver
+
+    func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+        try await inner.resolve(entry)
     }
 }
 
@@ -514,11 +564,19 @@ final class BackupProgressRecorder: @unchecked Sendable {
 final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private let inner: UploadBackupSyncQueueManifestStore
     private let log: BackupEventLog
+    private let failsRunnableDateRead: Bool
+    private let lock = NSLock()
+    private var readFailed = false
 
-    init(inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog) {
+    /// With `failsRunnableDateRead`, the read of the next due date fails as a broken SQLite read does: it returns nil
+    /// and leaves the store not operational.
+    init(inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog, failsRunnableDateRead: Bool = false) {
         self.inner = inner
         self.log = log
+        self.failsRunnableDateRead = failsRunnableDateRead
     }
+
+    func isOperational() -> Bool { lock.withLock { !readFailed } }
 
     func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
 
@@ -535,7 +593,11 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
 
     func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
-        inner.nextRunnableDate(excludingSourcesOf: excludedSources)
+        if failsRunnableDateRead {
+            lock.withLock { readFailed = true }
+            return nil
+        }
+        return inner.nextRunnableDate(excludingSourcesOf: excludedSources)
     }
 
     func claimRunnable(
@@ -739,6 +801,11 @@ final class SpyIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
         log.append("manifest.uploadDidFail")
         await inner.uploadDidFail(descriptor)
     }
+
+    func remoteIndexPreparationNotNeeded() async {
+        log.append("manifest.remoteIndexPreparationNotNeeded")
+        await inner.remoteIndexPreparationNotNeeded()
+    }
 }
 
 private final class TransportCancellingStageResolver: UploadIdentityResolving, @unchecked Sendable {
@@ -776,6 +843,7 @@ private final class TransportCancellingStageResolver: UploadIdentityResolving, @
     }
     func uploadDidFail(_ descriptor: UploadResourceDescriptor) async { await inner.uploadDidFail(descriptor) }
     func invalidateCachedRemoteState() async { await inner.invalidateCachedRemoteState() }
+    func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
 }
 
 final class PreparationFailingIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
@@ -788,6 +856,7 @@ final class PreparationFailingIdentityResolver: UploadIdentityResolving, @unchec
         await progress(.init(phase: .indexing, completed: 10, total: 100))
         throw UploadError.backend("index unavailable")
     }
+    func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         try await inner.resolve(descriptor)
     }
@@ -822,6 +891,8 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
         self.failure = failure
         self.failureFilename = failureFilename
     }
+
+    func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
 
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         try await inner.resolve(descriptor)
@@ -1523,6 +1594,511 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4)
         XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.automaticRetryAttempt, 1)
         XCTAssertEqual(row.updatedAt, planned, "the planned check keeps its time")
+    }
+
+    // MARK: - A Live Photo video that Photos reports missing
+
+    /// The note of a photo that backed up without the Live Photo video that Photos reported missing.
+    private var missingPairedVideoRecord: BackupIssueRecord {
+        BackupIssueRecord(
+            kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail, automaticRetryAttempt: 3)
+    }
+
+    /// A photo library backup runner: it may leave out a missing Live Photo video, and it holds the edit journal.
+    private func omittingRunner(
+        _ harness: ReplacementHarness, uploader: (any PhotoUploading)? = nil,
+        queue: UploadBackupSyncQueueManifestStore? = nil
+    ) -> BackupSyncRunner {
+        makeRunner(
+            uploader: uploader, identityResolver: harness.pipeline, editReplacement: harness.replacement, queue: queue,
+            leavesOutMissingLivePhotoVideos: true)
+    }
+
+    /// An unedited Live Photo whose video Photos reports missing on every check.
+    private func seedUneditedLivePhotoWithMissingVideo(_ name: String = "live.heic") -> UploadBackupSyncQueueEntry {
+        let entry = seedEntry(name)
+        resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        resolver.setPairedVideoReportedMissing("live.mov", for: entry.source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: entry.source.identifier)
+        return entry
+    }
+
+    /// Runs the three checks, one, two, and four hours apart, that a row whose file Photos reports missing waits.
+    /// Afterwards the last check is due.
+    private func runReportedMissingChecks(
+        _ runner: BackupSyncRunner, for entry: UploadBackupSyncQueueEntry,
+        in queue: UploadBackupSyncQueueManifestStore? = nil
+    ) async throws {
+        let queue = queue ?? queueStore!
+        for (checks, wait) in [(1, 3600.0), (2, 7200), (3, 14_400)] {
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(row.state, .discovered)
+            let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+            XCTAssertEqual(issue.detail, BackupFailedItem.sourceReportedMissingDetail)
+            XCTAssertEqual(issue.automaticRetryAttempt, checks)
+            clock.advance(by: wait)
+        }
+    }
+
+    /// Runs the checks and the last pass, then expects the end of a missing photo: no new upload and no trash call.
+    private func assertKeepsTheEndOfAMissingPhoto(
+        _ entry: UploadBackupSyncQueueEntry, runner: BackupSyncRunner, omissionAllowed: Bool = true,
+        harness: ReplacementHarness? = nil, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let uploads = uploader.requests.count
+        try await runReportedMissingChecks(runner, for: entry)
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(
+            Array(resolver.omissionRequests(for: entry.source.identifier).suffix(4)),
+            [false, false, false, omissionAllowed], file: file, line: line)
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision), file: file, line: line)
+        XCTAssertEqual(row.state, .sourceMissing, file: file, line: line)
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError), missingPairedVideoRecord, file: file, line: line)
+        XCTAssertEqual(progress.needsAttention, 1, file: file, line: line)
+        XCTAssertEqual(uploader.requests.count, uploads, "nothing uploads", file: file, line: line)
+        if let harness {
+            XCTAssertTrue(harness.remote.trashCalls.isEmpty, "nothing moves to the trash", file: file, line: line)
+        }
+    }
+
+    /// Backs up a Live Photo whose video Photos reports missing on every check, through the real queue, duplicate
+    /// pipeline, and edit replacement. Returns the queue with its own diagnostics trail.
+    private func backUpLivePhotoWithoutItsMissingVideo() async throws -> (
+        entry: UploadBackupSyncQueueEntry, queue: UploadBackupSyncQueueManifestStore, trail: SupportEventTrail,
+        runner: BackupSyncRunner
+    ) {
+        let trail = SupportEventTrail()
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: tempDir.appendingPathComponent("missing-video-queue.sqlite"), supportTrail: trail))
+        let entry = seedUneditedLivePhotoWithMissingVideo()
+        XCTAssertTrue(queue.upsert(entry))
+        let harness = try makeReplacementHarness()
+        let runner = omittingRunner(harness, queue: queue)
+        try await runReportedMissingChecks(runner, for: entry, in: queue)
+        XCTAssertTrue(uploader.requests.isEmpty, "nothing uploads while Photos can still deliver the video")
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(progress.needsAttention, 0)
+        XCTAssertEqual(progress.uploaded, 1)
+        XCTAssertTrue(harness.remote.trashCalls.isEmpty)
+        return (entry, queue, trail, runner)
+    }
+
+    func testALivePhotoWhoseVideoPhotosStillReportsMissingAfterItsChecksBacksUpAsAPlainPhoto() async throws {
+        let (entry, queue, trail, _) = try await backUpLivePhotoWithoutItsMissingVideo()
+        defer { queue.close() }
+
+        XCTAssertEqual(
+            resolver.omissionRequests(for: entry.source.identifier), [false, false, false, true],
+            "only the check that ends the row may leave the video out")
+        XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"], "the still uploads once, without its video")
+        XCTAssertEqual(uploader.requests.first?.tags, [], "a photo without its video carries no Live Photo tag")
+        let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .completed)
+        XCTAssertEqual(
+            BackupIssueRecord.decode(row.lastError), missingPairedVideoRecord,
+            "diagnostics keep why the video is missing")
+        let record = try XCTUnwrap(
+            stateStore.record(for: entry.source, revision: UploadBackupRevision(date: resolver.defaultModified)))
+        XCTAssertTrue(record.isComplete)
+        XCTAssertEqual(record.resourceCount, 2, "the backup record keeps the plan of the photo")
+        let events = trail.export(hashingWith: SupportReportIdentifierHasher()).events
+        XCTAssertEqual(events.last?.kind, .backupRowCompleted)
+        XCTAssertEqual(events.last?.reason, .sourceMissing)
+    }
+
+    func testAPlainPhotoBackupOfAMissingVideoStaysCompletedAndOutOfNeedsAttention() async throws {
+        let (entry, queue, _, runner) = try await backUpLivePhotoWithoutItsMissingVideo()
+        defer { queue.close() }
+        let settled = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+
+        // A library scan offers the photo again, and a later pass recovers stale rows first.
+        XCTAssertTrue(queue.upsert(entry))
+        let scan = try await UploadBackupSyncEngine(
+            preflight: preflight, queue: queue, now: { [clock] in clock!.now }
+        ).enqueue(
+            UploadBackupAssetCandidate(
+                snapshot: UploadBackupAssetSnapshot(
+                    source: entry.source, revision: entry.revision,
+                    editRevision: .revision(UploadBackupRevision(rawValue: 7)), resourceCount: 2),
+                originalFilename: entry.originalFilename, byteCount: entry.byteCount))
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(scan.alreadyBackedUp, 1)
+        let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .completed)
+        XCTAssertEqual(row.lastError, settled.lastError)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4, "the backed-up photo is not read again")
+        XCTAssertEqual(uploader.requests.count, 1)
+        var listed: [UploadBackupSyncQueueEntry] = []
+        queue.forEachProblemEntry {
+            listed.append($0)
+            return true
+        }
+        XCTAssertTrue(listed.isEmpty, "Needs Attention lists nothing")
+        let summary = queue.summary()
+        XCTAssertEqual(summary.uploaded, 1)
+        XCTAssertEqual(summary.sourceMissing, 0)
+        XCTAssertEqual(summary.failed, 0)
+        XCTAssertEqual(summary.dismissedFailures, 0)
+        XCTAssertEqual(summary.pendingSourceRechecks, 0)
+        XCTAssertFalse(summary.hasWork)
+        XCTAssertFalse(row.isDismissedSourceRecheck)
+    }
+
+    func testBackUpNowBeforeTheLastPlannedCheckKeepsTheVideoInTheBackup() async throws {
+        let entry = seedUneditedLivePhotoWithMissingVideo()
+        let runner = omittingRunner(try makeReplacementHarness())
+        for wait in [3600.0, 7200] {
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            clock.advance(by: wait)
+        }
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let planned = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+
+        // The person taps Back Up Now an hour before the planned last check.
+        clock.advance(by: 3600)
+        _ = await runner.makeRetryableWorkEligibleNow()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [false, false, false, false])
+        XCTAssertTrue(uploader.requests.isEmpty)
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.updatedAt, planned, "the planned check keeps its time")
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.automaticRetryAttempt, 3)
+
+        clock.advance(by: planned.timeIntervalSince(clock.now))
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"])
+    }
+
+    func testAMissingMainPhotoKeepsTodaysEndAlsoWhenItsVideoIsMissingToo() async throws {
+        let entry = seedUneditedLivePhotoWithMissingVideo()
+        resolver.set(
+            .failure(photoKitFailure(.missingResource, for: "live.heic"), times: 10), for: entry.source.identifier)
+
+        try await assertKeepsTheEndOfAMissingPhoto(entry, runner: omittingRunner(try makeReplacementHarness()))
+    }
+
+    func testAfterAReinstallAStillThatProtonHoldsKeepsTodaysEndWhenItsVideoIsMissing() async throws {
+        // A new install has no local backup record; the library scan queues the photo again.
+        let source = UploadSourceIdentity.file(URL(fileURLWithPath: "/backup/live.heic"))
+        let revision = UploadBackupRevision(date: resolver.defaultModified)
+        let scan = try await UploadBackupSyncEngine(
+            preflight: preflight, queue: queueStore, now: { [clock] in clock!.now }
+        ).enqueue(
+            UploadBackupAssetCandidate(
+                snapshot: UploadBackupAssetSnapshot(
+                    source: source, revision: revision, editRevision: .revision(UploadBackupRevision(rawValue: 7)),
+                    resourceCount: 2),
+                originalFilename: "live.heic", byteCount: 4))
+        XCTAssertEqual(scan.queuedForWork, 1)
+        let entry = try XCTUnwrap(queueStore.entry(for: source, revision: revision))
+        resolver.setSecondaries(["live.mov"], for: source.identifier)
+        resolver.setPairedVideoReportedMissing("live.mov", for: source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: source.identifier)
+        let hashes = expectedHashes(id: "live.heic")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .active, linkID: "in-proton")
+        ]
+
+        // Proton may hold this still with its Live Photo tag.
+        try await assertKeepsTheEndOfAMissingPhoto(entry, runner: omittingRunner(try makeReplacementHarness()))
+    }
+
+    func testAStillThatThisDeviceBackedUpKeepsTodaysEndWhenItsVideoIsMissing() async throws {
+        // This device backed up the still before; a later revision of the photo finds it in the manifest.
+        let harness = try makeReplacementHarness()
+        let first = seedEntry("live.heic")
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: first.source.identifier)
+        _ = await omittingRunner(harness).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: first), .completed)
+        let changed = resolver.defaultModified.addingTimeInterval(60)
+        resolver.setModified(changed, for: first.source.identifier)
+        var later = first
+        later.revision = UploadBackupRevision(date: changed)
+        later.state = .discovered
+        XCTAssertTrue(queueStore.upsert(later))
+        resolver.setSecondaries(["live.mov"], for: first.source.identifier)
+        resolver.setPairedVideoReportedMissing("live.mov", for: first.source.identifier)
+
+        try await assertKeepsTheEndOfAMissingPhoto(later, runner: omittingRunner(harness), harness: harness)
+        XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"], "no second upload and no video")
+    }
+
+    func testAnEditOfALivePhotoWithAMissingVideoKeepsTodaysEndAndMovesNothingToTheTrash() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadThenEdit(harness)
+        resolver.setPairedVideoReportedMissing("IMG_1.MOV", for: edited.source.identifier)
+
+        try await assertKeepsTheEndOfAMissingPhoto(edited, runner: omittingRunner(harness), harness: harness)
+        XCTAssertTrue(harness.journal.entry(for: edited.source).allSuperseded.isEmpty)
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV"], "the edit uploads nothing")
+    }
+
+    /// Backs up IMG_1.HEIC, unedited, with its Live Photo video, through the edit replacement.
+    private func backUpUneditedLivePhoto(_ harness: ReplacementHarness) async -> UploadBackupSyncQueueEntry {
+        let first = seedLibraryEntry("IMG_1.HEIC")
+        resolver.setSecondaries(["IMG_1.MOV"], for: first.source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: first.source.identifier)
+        _ = await omittingRunner(harness).runUntilDrained()
+        XCTAssertEqual(state(of: first), .completed)
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV"])
+        XCTAssertFalse(harness.journal.entry(for: first.source).lastUploadWasEdit, "the first upload is no edit")
+        XCTAssertTrue(harness.journal.entry(for: first.source).allSuperseded.isEmpty)
+        harness.remote.active = [testUID("IMG_1.HEIC")]
+        return first
+    }
+
+    func testAFirstEditOfAnUneditedLivePhotoWithAMissingVideoKeepsTodaysEnd() async throws {
+        let harness = try makeReplacementHarness()
+        let first = await backUpUneditedLivePhoto(harness)
+        // The person edits the photo: new bytes, and the original becomes a secondary of the edit.
+        let id = first.source.identifier
+        hasher.contentSeeds[id] = "rotated"
+        resolver.setEditRevision(.unavailable, for: id)
+        resolver.setSecondaries(["IMG_1.HEIC", "IMG_1.MOV"], for: id)
+        resolver.setSecondaryResource(.photoKit(role: "originalPhoto", ordinal: 0), forName: "IMG_1.HEIC")
+        resolver.setPairedVideoReportedMissing("IMG_1.MOV", for: id)
+
+        try await assertKeepsTheEndOfAMissingPhoto(
+            seedLibraryEntry("IMG_1.JPG", revisionOffset: 1), runner: omittingRunner(harness), harness: harness)
+    }
+
+    func testAnUndoOfAnEditWithAMissingVideoKeepsTodaysEnd() async throws {
+        let harness = try makeReplacementHarness()
+        let first = await backUpUneditedLivePhoto(harness)
+        let id = first.source.identifier
+        // The person edits the photo, and the edit with its video replaces the first upload.
+        hasher.contentSeeds[id] = "rotated"
+        harness.remote.active = [testUID("IMG_1.HEIC"), testUID("IMG_1.JPG")]
+        resolver.setEditRevision(.unavailable, for: id)
+        resolver.setSecondaries(["IMG_1.HEIC", "IMG_1.MOV"], for: id)
+        resolver.setSecondaryResource(.photoKit(role: "originalPhoto", ordinal: 0), forName: "IMG_1.HEIC")
+        let edited = seedLibraryEntry("IMG_1.JPG", revisionOffset: 1)
+        _ = await omittingRunner(harness).runUntilDrained()
+        XCTAssertEqual(state(of: edited), .completed)
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
+        XCTAssertTrue(harness.journal.entry(for: first.source).lastUploadWasEdit)
+
+        // Undo in Photos: the original bytes and no edit evidence, and Photos now reports the video missing.
+        hasher.contentSeeds[id] = nil
+        resolver.setSecondaries(["IMG_1.MOV"], for: id)
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: id)
+        resolver.setPairedVideoReportedMissing("IMG_1.MOV", for: id)
+        harness.remote.active = [testUID("IMG_1.JPG")]
+        try await assertKeepsTheEndOfAMissingPhoto(
+            seedLibraryEntry("IMG_1.HEIC", revisionOffset: 2), runner: omittingRunner(harness))
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]], "the edit keeps its video")
+    }
+
+    func testAPendingReplacementWithAMissingVideoKeepsTodaysEnd() async throws {
+        let harness = try makeReplacementHarness()
+        let first = await backUpUneditedLivePhoto(harness)
+        // An earlier photo still waits for its replacement, and this unedited photo has other bytes.
+        let id = first.source.identifier
+        try harness.journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "waiting-old"), for: first.source)
+        hasher.contentSeeds[id] = "other"
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 9)), for: id)
+        resolver.setPairedVideoReportedMissing("IMG_1.MOV", for: id)
+
+        try await assertKeepsTheEndOfAMissingPhoto(
+            seedLibraryEntry("IMG_1.HEIC", revisionOffset: 1), runner: omittingRunner(harness), harness: harness)
+    }
+
+    func testWithoutTheEditJournalAnEditedLivePhotoWithAMissingVideoKeepsTodaysEnd() async throws {
+        let entry = seedUneditedLivePhotoWithMissingVideo()
+        resolver.setEditRevision(.unavailable, for: entry.source.identifier)
+
+        // The journal file could not be read, so the backup cannot tell which earlier uploads an edit replaces.
+        try await assertKeepsTheEndOfAMissingPhoto(
+            entry, runner: makeRunner(editReplacement: nil, leavesOutMissingLivePhotoVideos: true))
+    }
+
+    func testAnAlbumBackupNeverLeavesAMissingVideoOut() async throws {
+        let entry = seedUneditedLivePhotoWithMissingVideo()
+        let harness = try makeReplacementHarness()
+        // An album backup uses the same resolver but keeps the setting off.
+        let album = makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+
+        try await assertKeepsTheEndOfAMissingPhoto(entry, runner: album, omissionAllowed: false, harness: harness)
+    }
+
+    func testADismissedMissingPhotoIsNeverBackedUpWithoutItsVideo() async throws {
+        let entry = seedLibraryEntry("IMG_1.HEIC")
+        // The person dismissed the photo that Photos reported missing after its checks.
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0,
+                lastError: missingPairedVideoRecord.persistedValue, updatedAt: clock.now.addingTimeInterval(-60)))
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.isDismissedSourceRecheck, true)
+        resolver.setSecondaries(["IMG_1.MOV"], for: entry.source.identifier)
+        resolver.setPairedVideoReportedMissing("IMG_1.MOV", for: entry.source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: entry.source.identifier)
+
+        _ = await omittingRunner(try makeReplacementHarness()).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [false])
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.state, .dismissedFailure)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testAStoppedPlainPhotoUploadKeepsItsChecksAndLeavesTheVideoOutAgain() async throws {
+        let entry = seedUneditedLivePhotoWithMissingVideo()
+        let harness = try makeReplacementHarness()
+        try await runReportedMissingChecks(omittingRunner(harness), for: entry)
+        let checked = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).lastError
+        let running = RunningUntilCancelledUploader()
+        let stopped = omittingRunner(harness, uploader: running)
+
+        let drain = Task {
+            let progress = await stopped.runUntilDrained(mode: .eligibleOnly)
+            // A pass that starts no upload ends the wait below as well.
+            await running.started.signal()
+            return progress
+        }
+        await running.started.wait()
+        guard !running.requests.isEmpty else {
+            XCTFail("the last check uploads the still")
+            _ = await drain.value
+            return
+        }
+        let uploading = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(uploading.state, .uploading)
+        XCTAssertNil(uploading.lastError, "the omission stays in memory, like every upload's state")
+        await stopped.stop()
+        _ = await drain.value
+
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .queuedForUpload)
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertEqual(row.lastError, checked, "the queue keeps the checks unchanged and stores no omission")
+        XCTAssertEqual(running.requests.map(\.tags), [[]])
+        _ = await omittingRunner(harness).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [false, false, false, true, true])
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"])
+        XCTAssertEqual(uploader.requests.first?.tags, [])
+    }
+
+    func testANetworkFailureOfThePlainPhotoUploadStartsTheChecksAgain() async throws {
+        let entry = seedUneditedLivePhotoWithMissingVideo()
+        let failing = MockUploader(
+            workDuration: .milliseconds(1), deliverProgress: false, networkFailures: ["live.heic": 1])
+        let runner = omittingRunner(try makeReplacementHarness(), uploader: failing)
+        try await runReportedMissingChecks(runner, for: entry)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        clock.advance(by: 600)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .discovered)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+        XCTAssertEqual(
+            issue.detail, BackupFailedItem.sourceReportedMissingDetail, "a different failure starts the checks again")
+        XCTAssertEqual(issue.automaticRetryAttempt, 1)
+        XCTAssertEqual(
+            Array(resolver.omissionRequests(for: entry.source.identifier).prefix(5)),
+            [false, false, false, true, false])
+        XCTAssertEqual(failing.requests.map(\.name), ["live.heic"])
+        XCTAssertEqual(failing.requests.first?.tags, [])
+    }
+
+    func testAResolverWithoutLivePhotoVideosNeverLeavesAnythingOut() async throws {
+        let entry = seedEntry("live.heic")
+        resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        let plain = DefaultOnlyResolver(inner: resolver)
+
+        let resolved = try await plain.resolve(
+            entry, onPreparationProgress: { _ in }, readAdmission: {}, omittingMissingPairedVideo: true)
+
+        XCTAssertEqual(resolved?.omitsMissingPairedVideo, false)
+        XCTAssertEqual(resolved?.secondaries.map(\.descriptor.filename), ["live.mov"])
+        XCTAssertEqual(
+            resolver.omissionRequests(for: entry.source.identifier), [], "the default resolves the whole entry")
+
+        // The composite forwards the runner's permission to the resolver of the source kind.
+        resolver.setPairedVideoReportedMissing("live.mov", for: entry.source.identifier)
+        let composite = CompositeBackupResourceResolver([.fileURL: resolver])
+        let omitted = try await composite.resolve(
+            entry, onPreparationProgress: { _ in }, readAdmission: {}, omittingMissingPairedVideo: true)
+        XCTAssertEqual(omitted?.omitsMissingPairedVideo, true)
+        XCTAssertEqual(omitted?.secondaries.isEmpty, true)
+        XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [true])
+    }
+
+    // MARK: - The first index build and the timeline order pass
+
+    /// A runner whose resolver logs every call, and the number of reports of a pass without an index build. The runner
+    /// itself never reports; it tells the controller whether any upload work is left.
+    private func signalRunner(
+        throttleInputs: BackupThrottleInputs = .unconstrained, queue: (any UploadBackupSyncQueueStore)? = nil
+    ) -> (BackupSyncRunner, () -> Int) {
+        let log = BackupEventLog()
+        let resolver = SpyIdentityResolver(inner: makePipeline(), log: log)
+        let runner = makeRunner(identityResolver: resolver, queue: queue, throttleInputs: { throttleInputs })
+        return (runner, { log.events.filter { $0 == "manifest.remoteIndexPreparationNotNeeded" }.count })
+    }
+
+    func testAPassWithNothingQueuedLeavesNoUploadWork() async {
+        let (runner, signals) = signalRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(progress.leavesNoUploadWork, "a backed-up library needs no index build")
+        XCTAssertEqual(signals(), 0, "the controller reports once it knows that the scan finished")
+    }
+
+    func testAPassThatWaitsForWiFiLeavesUploadWork() async {
+        _ = seedEntry("waiting.jpg")
+        let (runner, _) = signalRunner(
+            throttleInputs: BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false))
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+        XCTAssertFalse(progress.leavesNoUploadWork, "the index build can start as soon as Wi-Fi comes")
+    }
+
+    func testAPassWhoseNextPhotoIsDueLaterLeavesUploadWork() async {
+        let entry = seedEntry("later.jpg")
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(3_600)))
+        let (runner, _) = signalRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertFalse(progress.leavesNoUploadWork, "the index build can start when the photo is due")
+    }
+
+    func testAPassThatPreparesTheIndexLeavesNoClaimOfNoUploadWork() async {
+        let entry = seedEntry("ready.jpg")
+        let (runner, _) = signalRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertFalse(progress.leavesNoUploadWork, "this pass prepared the index")
+    }
+
+    func testAParkedDraftWithALaterRecheckLeavesUploadWork() async {
+        let issue = BackupIssueRecord(
+            kind: .remoteService, detail: "draft", nextAttemptAt: clock.now.addingTimeInterval(3_600))
+        let entry = seedEntry("draft.jpg", state: .blockedByDraft)
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .blockedByDraft, attempts: 0,
+                lastError: issue.persistedValue, updatedAt: clock.now.addingTimeInterval(3_600)))
+        let (runner, _) = signalRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .blockedByDraft, "the re-check is not due yet")
+        XCTAssertFalse(progress.leavesNoUploadWork, "the re-check of the draft can start an index build")
+    }
+
+    func testAFailedQueueReadLeavesNoClaimOfNoUploadWork() async {
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog(), failsRunnableDateRead: true)
+        let (runner, _) = signalRunner(queue: queue)
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertFalse(progress.leavesNoUploadWork, "an unreadable queue proves nothing")
     }
 
     func testAFileThatPhotosCannotFindForAListedPhotoIsCheckedAgainLater() async throws {
@@ -2385,7 +2961,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         events: (any BackupItemEventSink)? = nil,
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
         runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil,
-        schedulerClock: (any BackupSchedulerClock)? = nil
+        schedulerClock: (any BackupSchedulerClock)? = nil,
+        leavesOutMissingLivePhotoVideos: Bool = false
     ) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queue ?? queueStore,
@@ -2400,7 +2977,8 @@ final class BackupSyncRunnerTests: XCTestCase {
                 uploadStallTimeout: uploadStallTimeout,
                 uploadStallPollInterval: uploadStallPollInterval,
                 retry: retry,
-                throttle: throttle
+                throttle: throttle,
+                leavesOutMissingLivePhotoVideos: leavesOutMissingLivePhotoVideos
             ),
             throttleInputs: throttleInputs,
             runtimeChanges: runtimeChanges,
@@ -5102,6 +5680,7 @@ final class RecordHoldingIdentityResolver: UploadIdentityResolving, @unchecked S
     /// True while a held record waits.
     var holds: Bool { lock.withLock { holding > 0 } }
     func releaseAll() { lock.withLock { held.removeAll() } }
+    func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
 
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         try await inner.resolve(descriptor)

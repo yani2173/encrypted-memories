@@ -8,13 +8,18 @@ public enum LibraryHeavyWorkload: String, Sendable, Equatable {
     case backupHashing
     case cryptoPreparation
     case videoDerivative
+    /// The timeline order pass and the thumbnail crawl ask for admission only in an iOS background window.
+    case timelineOrderPass
+    case thumbnailCrawl
 
     /// Automatic work that fills the disk pauses while storage is critical. Backup is excluded: it checks
     /// free space itself and tells the person that the device needs storage.
     public var writesLargeData: Bool {
         switch self {
-        case .mlIndexing, .videoDerivative: true
-        case .mlModelLoading, .mlInference, .backupHashing, .backupMaterialization, .cryptoPreparation: false
+        case .mlIndexing, .videoDerivative, .thumbnailCrawl: true
+        case .mlModelLoading, .mlInference, .backupHashing, .backupMaterialization, .cryptoPreparation,
+            .timelineOrderPass:
+            false
         }
     }
 
@@ -23,7 +28,9 @@ public enum LibraryHeavyWorkload: String, Sendable, Equatable {
     var sharesAdmission: Bool {
         switch self {
         case .backupMaterialization, .backupHashing: true
-        case .mlModelLoading, .mlInference, .mlIndexing, .cryptoPreparation, .videoDerivative: false
+        case .mlModelLoading, .mlInference, .mlIndexing, .cryptoPreparation, .videoDerivative, .timelineOrderPass,
+            .thumbnailCrawl:
+            false
         }
     }
 }
@@ -150,17 +157,29 @@ public enum LibraryWorkContinuationDecision: Sendable, Equatable {
 public struct LibraryWorkLease: Sendable {
     public let budget: LibraryWorkBudget
     private let decision: @Sendable () -> LibraryWorkContinuationDecision
+    private let waitForYield: @Sendable () async -> LibraryWorkYieldReason?
     private let runtimeSnapshot: @Sendable () -> LibraryRuntimeSnapshot
+    #if DEBUG
+        /// Debug-only seam, set where the coordinator creates the lease.
+        fileprivate var yieldWaitEvaluationCount: @Sendable () -> Int = { 0 }
+    #endif
 
     fileprivate init(
         budget: LibraryWorkBudget,
         decision: @escaping @Sendable () -> LibraryWorkContinuationDecision,
+        waitForYield: @escaping @Sendable () async -> LibraryWorkYieldReason?,
         runtimeSnapshot: @escaping @Sendable () -> LibraryRuntimeSnapshot
     ) {
         self.budget = budget
         self.decision = decision
+        self.waitForYield = waitForYield
         self.runtimeSnapshot = runtimeSnapshot
     }
+
+    #if DEBUG
+        /// Debug-only seam: how often `nextYield` evaluated the decision, so a test can tell that the wait is in place.
+        var yieldWaitEvaluations: Int { yieldWaitEvaluationCount() }
+    #endif
 
     /// Feature code consults this only at an asset/chunk/file boundary. It never interrupts a
     /// remote commit or an already-running framework inference.
@@ -169,6 +188,10 @@ public struct LibraryWorkLease: Sendable {
     }
 
     public func continuationDecision() -> LibraryWorkContinuationDecision { decision() }
+
+    /// Waits until this lease should yield and returns why. It checks again on each runtime change, when a waiter with
+    /// a higher intent arrives, and at the end of the time slice; it never polls. Nil when the caller is cancelled.
+    public func nextYield() async -> LibraryWorkYieldReason? { await waitForYield() }
 
     /// Privacy-safe scalar resource classes used by Core diagnostics before and after a quantum.
     public func currentRuntimeSnapshot() -> LibraryRuntimeSnapshot { runtimeSnapshot() }
@@ -273,7 +296,9 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
                 && {
                     switch request.workload {
                     case .backupMaterialization, .backupHashing, .cryptoPreparation: true
-                    case .mlModelLoading, .mlInference, .mlIndexing, .videoDerivative: false
+                    case .mlModelLoading, .mlInference, .mlIndexing, .videoDerivative, .timelineOrderPass,
+                        .thumbnailCrawl:
+                        false
                     }
                 }()
             guard isSmallInteractiveInference || isUserBackupPreparation else {
@@ -294,7 +319,7 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
         }
         if snapshot.isLowPowerMode {
             switch request.workload {
-            case .mlModelLoading, .mlIndexing, .videoDerivative:
+            case .mlModelLoading, .mlIndexing, .videoDerivative, .timelineOrderPass, .thumbnailCrawl:
                 guard request.intent >= .userInitiated else {
                     return result(false, 0, .lowPowerMode)
                 }
@@ -344,11 +369,34 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
 private final class LibraryWorkPreemptionSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var generation: UInt64 = 0
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     func snapshot() -> UInt64 { lock.withLock { generation } }
 
     func signal() {
-        lock.withLock { generation &+= 1 }
+        let resumed = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            generation &+= 1
+            defer { waiters = [:] }
+            return Array(waiters.values)
+        }
+        resumed.forEach { $0.resume() }
+    }
+
+    /// Returns once the signal fired after `generation`, or when the caller is cancelled.
+    func wait(after generation: UInt64) async {
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let fired = lock.withLock { () -> Bool in
+                    guard self.generation == generation, !Task.isCancelled else { return true }
+                    waiters[id] = continuation
+                    return false
+                }
+                if fired { continuation.resume() }
+            }
+        } onCancel: {
+            lock.withLock { waiters.removeValue(forKey: id) }?.resume()
+        }
     }
 }
 
@@ -364,6 +412,9 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
     private let monotonicNow: @Sendable () -> UInt64
     private let lock = NSLock()
     private var recordedYieldReason: LibraryWorkYieldReason?
+    #if DEBUG
+        private var yieldWaitEvaluations = 0
+    #endif
 
     init(
         budget: LibraryWorkBudget,
@@ -406,6 +457,51 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
 
     func yieldReason() -> LibraryWorkYieldReason? {
         lock.withLock { recordedYieldReason }
+    }
+
+    #if DEBUG
+        func yieldWaitEvaluationCount() -> Int {
+            lock.withLock { yieldWaitEvaluations }
+        }
+    #endif
+
+    /// Evaluates the decision on each wake: a runtime change (the first is the current snapshot), a preemption, or the
+    /// end of the time slice.
+    func nextYield() async -> LibraryWorkYieldReason? {
+        let (wakes, wake) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let runtimeChanges = runtimeState.updates()
+        let preemptionSignal = self.preemptionSignal
+        let preemptionGeneration = self.preemptionGeneration
+        let deadlineNanoseconds = self.deadlineNanoseconds
+        let monotonicNow = self.monotonicNow
+        let watchers = [
+            Task {
+                for await _ in runtimeChanges { wake.yield() }
+            },
+            Task {
+                await preemptionSignal.wait(after: preemptionGeneration)
+                wake.yield()
+            },
+            Task {
+                guard let deadlineNanoseconds else { return }
+                let now = monotonicNow()
+                if deadlineNanoseconds > now { try? await Task.sleep(nanoseconds: deadlineNanoseconds - now) }
+                wake.yield()
+            },
+        ]
+        defer {
+            watchers.forEach { $0.cancel() }
+            wake.finish()
+        }
+        for await _ in wakes {
+            guard !Task.isCancelled else { return nil }
+            let current = decision()
+            #if DEBUG
+                lock.withLock { yieldWaitEvaluations += 1 }
+            #endif
+            if case .yield(let reason) = current { return reason }
+        }
+        return nil
     }
 
     private func liveYieldReason(snapshot: LibraryRuntimeSnapshot) -> LibraryWorkYieldReason? {
@@ -710,12 +806,16 @@ public actor LibraryResourceCoordinator {
                     "workload": candidate.request.workload.rawValue,
                 ])
             let runtimeState = self.runtimeState
-            candidate.continuation.resume(
-                returning: LibraryWorkLease(
-                    budget: budget,
-                    decision: { leaseState.decision() },
-                    runtimeSnapshot: { runtimeState.snapshot() }
-                ))
+            var lease = LibraryWorkLease(
+                budget: budget,
+                decision: { leaseState.decision() },
+                waitForYield: { await leaseState.nextYield() },
+                runtimeSnapshot: { runtimeState.snapshot() }
+            )
+            #if DEBUG
+                lease.yieldWaitEvaluationCount = { leaseState.yieldWaitEvaluationCount() }
+            #endif
+            candidate.continuation.resume(returning: lease)
             return true
         }
         return false

@@ -16,7 +16,9 @@ final class DriveSession: @unchecked Sendable {
     let requestGovernor: ProtonRequestGovernor
     private let lock = NSLock()
     private var session: ProtonSession
-    private var refreshing: Task<Bool, Never>?
+    private var refreshFlight = RefreshFlight()
+    /// Counts credential replacements, so a 401 for replaced credentials retries without a refresh.
+    private var credentialGeneration: UInt64 = 0
 
     init(
         session: ProtonSession,
@@ -52,13 +54,19 @@ final class DriveSession: @unchecked Sendable {
     }
 
     /// Auth headers for an arbitrary request (used by the SDK HTTP client too).
-    func authHeaders() -> [String: String] {
-        let s = current
-        return [
-            "x-pm-uid": s.uid,
-            "Authorization": "Bearer \(s.accessToken)",
-            "x-pm-appversion": config.appVersion,
-        ]
+    func authHeaders() -> [String: String] { authorization().headers }
+
+    /// Auth headers and the credential generation they belong to, read together.
+    func authorization() -> (headers: [String: String], generation: UInt64) {
+        let (s, generation) = lock.withLock { (session, credentialGeneration) }
+        return (
+            [
+                "x-pm-uid": s.uid,
+                "Authorization": "Bearer \(s.accessToken)",
+                "x-pm-appversion": config.appVersion,
+            ],
+            generation
+        )
     }
 
     // MARK: - Authenticated JSON
@@ -93,7 +101,8 @@ final class DriveSession: @unchecked Sendable {
     ) async throws -> Data {
         var req = URLRequest(url: makeURL(path))
         req.httpMethod = method
-        for (k, v) in authHeaders() { req.setValue(v, forHTTPHeaderField: k) }
+        let auth = authorization()
+        for (k, v) in auth.headers { req.setValue(v, forHTTPHeaderField: k) }
         if let body {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -130,7 +139,7 @@ final class DriveSession: @unchecked Sendable {
         }
 
         if http.statusCode == 401, retryOn401 {
-            if await refreshToken() {
+            if await refreshToken(after: auth.generation) {
                 return try await authedData(
                     path: path,
                     method: method,
@@ -148,15 +157,16 @@ final class DriveSession: @unchecked Sendable {
 
     // MARK: - Token refresh
 
-    func refreshToken() async -> Bool {
-        let task: Task<Bool, Never> = lock.withLock {
-            if let existing = refreshing { return existing }
-            let t = Task<Bool, Never> { await self.performRefresh() }
-            refreshing = t
-            return t
+    /// True when credentials newer than `generation` exist. Current credentials join the one refresh in flight
+    /// or start it. Replaced credentials never start a refresh: they wait for a running one, else retry at once.
+    func refreshToken(after generation: UInt64) async -> Bool {
+        let flight: (id: UInt64, task: Task<Bool, Never>)? = lock.withLock {
+            guard generation == credentialGeneration else { return refreshFlight.running }
+            return refreshFlight.join { Task<Bool, Never> { await self.performRefresh() } }
         }
-        let result = await task.value
-        lock.withLock { refreshing = nil }
+        guard let flight else { return true }
+        let result = await flight.task.value
+        lock.withLock { refreshFlight.retire(flight.id) }
         return result
     }
 
@@ -196,8 +206,34 @@ final class DriveSession: @unchecked Sendable {
         refreshed.accessToken = at
         if let rt = body.refreshToken { refreshed.refreshToken = rt }
         guard (try? store.save(refreshed)) != nil else { return false }
-        lock.withLock { session = refreshed }
+        lock.withLock {
+            session = refreshed
+            credentialGeneration += 1
+        }
         return true
+    }
+}
+
+/// The token refresh in flight. Callers join it instead of sending a second refresh.
+struct RefreshFlight {
+    private var current: (id: UInt64, task: Task<Bool, Never>)?
+    private var lastID: UInt64 = 0
+
+    var running: (id: UInt64, task: Task<Bool, Never>)? { current }
+    var id: UInt64? { current?.id }
+
+    mutating func join(starting start: () -> Task<Bool, Never>) -> (id: UInt64, task: Task<Bool, Never>) {
+        if let current { return current }
+        lastID += 1
+        let flight = (id: lastID, task: start())
+        current = flight
+        return flight
+    }
+
+    /// Only the waiters of the current flight retire it; a late waiter of an earlier flight changes nothing.
+    mutating func retire(_ id: UInt64) {
+        guard current?.id == id else { return }
+        current = nil
     }
 }
 
@@ -491,7 +527,10 @@ extension DriveSession {
         for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
             try Task.checkCancellation()
             let response = try await linkVisibilityResponse(shareID: shareID, linkIDs: chunk, retryOnRateLimit: true)
-            complete = complete && response.code == 1000 && response.hasKnownEnvelope
+            complete = complete && response.code == 1000 && response.envelope.isComplete
+            if response.envelope.isUnsupported {
+                PhotoDiagnostics.shared.increment("albumSync.deletionMetadataUnsupportedEnvelope")
+            }
             let requested = Set(chunk)
             for link in response.links {
                 guard let id = link.linkID, requested.contains(id), let state = link.state, states[id] == nil else {
@@ -710,13 +749,14 @@ private struct VolumeTrashResponse: Decodable {
 /// `links/fetch_metadata` fields that decide whether a photos listing can show a link.
 private struct LinkVisibilityResponse: Decodable {
     let code: Int?
-    let hasKnownEnvelope: Bool
+    /// What the shape of the answer says about its completeness; see `protonMetadataEnvelope`.
+    let envelope: ProtonMetadataEnvelope
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         code = try container.decodeIfPresent(Int.self, forKey: .code)
         links = try container.decode([Body].self, forKey: .links)
-        hasKnownEnvelope = try protonResponseContainsOnly(["Code", "Links"], decoder: decoder)
+        envelope = try protonMetadataEnvelope(decoder: decoder)
     }
     /// Required: a response without it is incomplete, not a list of deleted links.
     let links: [Body]

@@ -72,6 +72,16 @@ public enum BackupLockAcquisition: Sendable, Equatable {
     public var didAcquire: Bool { if case .acquired = self { return true } else { return false } }
 }
 
+/// Outcome of a heartbeat.
+public enum BackupLockHeartbeat: Sendable, Equatable {
+    /// The caller still owns the lock and its heartbeat moved forward.
+    case renewed
+    /// The lock row is gone or belongs to another run; the caller must stop its pass.
+    case lost
+    /// The store could not be read or written; ownership is unknown, so the caller tries again later.
+    case unavailable
+}
+
 /// Persistence seam for backup execution ownership. One store instance may guard several named
 /// locks (default `photoBackup`) so folder and photo backups never collide.
 public protocol BackupExecutionLockStore: Sendable {
@@ -82,10 +92,9 @@ public protocol BackupExecutionLockStore: Sendable {
     func acquire(
         owner: BackupExecutionOwner, runID: String, phase: String?, processContext: String?
     ) -> BackupLockAcquisition
-    /// Refresh our lock's heartbeat (and optional phase). Returns false when we no longer own it -
-    /// the caller should treat that as "lost the lock" and wind down.
+    /// Refresh our lock's heartbeat (and optional phase). `.lost` means another run owns the lock or nobody does.
     @discardableResult
-    func heartbeat(runID: String, phase: String?) -> Bool
+    func heartbeat(runID: String, phase: String?) -> BackupLockHeartbeat
     /// Release the lock iff `runID` still owns it. Returns whether a row was removed.
     @discardableResult
     func release(runID: String) -> Bool
@@ -100,7 +109,7 @@ public extension BackupExecutionLockStore {
     }
 
     @discardableResult
-    func heartbeat(runID: String) -> Bool {
+    func heartbeat(runID: String) -> BackupLockHeartbeat {
         heartbeat(runID: runID, phase: nil)
     }
 }
