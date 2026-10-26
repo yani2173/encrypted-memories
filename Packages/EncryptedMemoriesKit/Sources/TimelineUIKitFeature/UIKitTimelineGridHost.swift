@@ -51,6 +51,10 @@
         private let proxy: GridProxy<PhotoUID>?
         private let restoreScrollAnchor: GridScrollAnchor<PhotoUID>?
         private let restoreScrollSignal: Int
+        /// The photo to center and outline whenever `revealSignal` changes, for example after "Show in Library".
+        /// The host applies it after configuring the new item set, so the photo resolves in the grid's current items.
+        private let revealItem: PhotoUID?
+        private let revealSignal: Int
         /// Bumped only when the visible projection changes. The host uses it to dissolve the complete grid once,
         /// instead of making filtered items pop into their new topology during unrelated SwiftUI updates.
         private let contentTransitionSignal: Int
@@ -84,6 +88,8 @@
             proxy: GridProxy<PhotoUID>? = nil,
             restoreScrollAnchor: GridScrollAnchor<PhotoUID>? = nil,
             restoreScrollSignal: Int = 0,
+            revealItem: PhotoUID? = nil,
+            revealSignal: Int = 0,
             contentTransitionSignal: Int = 0,
             prefersReducedMotion: Bool = false,
             onFirstContentReady: (() -> Void)? = nil,
@@ -114,6 +120,8 @@
             self.proxy = proxy
             self.restoreScrollAnchor = restoreScrollAnchor
             self.restoreScrollSignal = restoreScrollSignal
+            self.revealItem = revealItem
+            self.revealSignal = revealSignal
             self.contentTransitionSignal = contentTransitionSignal
             self.prefersReducedMotion = prefersReducedMotion
             self.onFirstContentReady = onFirstContentReady
@@ -133,15 +141,17 @@
             var lastScrollToLatestSignal: Int
             var lastScrollToTopSignal: Int
             var lastRestoreScrollSignal: Int
+            var lastRevealSignal: Int
             var lastContentTransitionSignal: Int
 
             init(
-                initialScrollSignal: Int, initialTopSignal: Int, initialRestoreSignal: Int,
+                initialScrollSignal: Int, initialTopSignal: Int, initialRestoreSignal: Int, initialRevealSignal: Int,
                 initialContentTransitionSignal: Int
             ) {
                 lastScrollToLatestSignal = initialScrollSignal
                 lastScrollToTopSignal = initialTopSignal
                 lastRestoreScrollSignal = initialRestoreSignal
+                lastRevealSignal = initialRevealSignal
                 lastContentTransitionSignal = initialContentTransitionSignal
             }
         }
@@ -151,6 +161,7 @@
                 initialScrollSignal: scrollToLatestSignal,
                 initialTopSignal: scrollToTopSignal,
                 initialRestoreSignal: restoreScrollSignal,
+                initialRevealSignal: revealSignal,
                 initialContentTransitionSignal: contentTransitionSignal
             )
         }
@@ -223,6 +234,12 @@
                 context.coordinator.lastRestoreScrollSignal = restoreScrollSignal
                 if let restoreScrollAnchor {
                     uiView.restoreScrollAnchor(restoreScrollAnchor)
+                }
+            }
+            if revealSignal != context.coordinator.lastRevealSignal {
+                context.coordinator.lastRevealSignal = revealSignal
+                if let revealItem {
+                    uiView.revealItem(revealItem)
                 }
             }
         }
@@ -386,6 +403,8 @@
         /// anchoring it instead of choosing again in each intermediate layout. A real user scroll, an explicit
         /// placement, or a new item set forgets it.
         private var resizeAnchorItemID: PhotoUID?
+        /// The outline that briefly identifies a revealed photo. It lives in content coordinates, so it scrolls along.
+        private var revealOutline: UIView?
         private var lastLaidOutSafeAreaInsets: UIEdgeInsets = .zero
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
         private var needsInitialViewportPlacement = true
@@ -640,6 +659,7 @@
             if uidsChanged {
                 // A range anchored in the previous item order cannot continue in the new one.
                 swipeSelection.cancel()
+                removeRevealOutline()
                 resizeAnchorItemID = nil
                 contentGeneration &+= 1
                 if !isOrderCorrection { committedPhase = nil }
@@ -983,6 +1003,7 @@
 
         func refreshContentSize() {
             let size = resolvedContentSize()
+            if abs(size.width - contentView.bounds.width) > 0.5 { removeRevealOutline() }
             scrollView.contentSize = size
             contentView.frame = CGRect(origin: .zero, size: size)
             applyInitialViewportPlacementIfNeeded(contentSize: size)
@@ -1112,6 +1133,68 @@
         public func restoreScrollAnchor(_ anchor: GridScrollAnchor<PhotoUID>) {
             resizeAnchorItemID = nil
             restoreScrollAnchor(anchor, marksTimelineAsScrolled: true)
+        }
+
+        /// Centers a photo between the top and bottom bars at the current density and briefly outlines it. The photo
+        /// stays the resize anchor, so a following layout change such as a closing area above the grid keeps it in
+        /// view. Returns false and leaves the position untouched when the photo is not in this grid. The outline only
+        /// fades, so it also suits Reduce Motion.
+        @discardableResult
+        public func revealItem(_ uid: PhotoUID) -> Bool {
+            guard bounds.width > 0, bounds.height > 0,
+                let index = itemIndexByUID[uid]
+            else { return false }
+            let profile = currentProfile()
+            let level = activeLevel(profile: profile)
+            let engine = currentEngine(profile: profile)
+            guard
+                let rect = engine.slotRect(
+                    flatIndex: index,
+                    level: level,
+                    width: bounds.width,
+                    columnPhase: committedPhase
+                )
+            else { return false }
+            let usableHeight = bounds.height - safeAreaInsets.top - safeAreaInsets.bottom
+            let centeredY = rect.midY - safeAreaInsets.top - usableHeight / 2
+            let targetY = min(max(centeredY, -safeAreaInsets.top), maxContentOffsetY)
+            isApplyingProgrammaticScroll = true
+            scrollView.setContentOffset(CGPoint(x: 0, y: targetY), animated: false)
+            isApplyingProgrammaticScroll = false
+            needsInitialViewportPlacement = false
+            userHasScrolledTimeline = true
+            resizeAnchorItemID = uid
+            showRevealOutline(around: rect)
+            requestRender()
+            return true
+        }
+
+        private func showRevealOutline(around rect: CGRect) {
+            revealOutline?.removeFromSuperview()
+            let outline = UIView(frame: rect.insetBy(dx: -2, dy: -2))
+            outline.isUserInteractionEnabled = false
+            outline.isAccessibilityElement = false
+            outline.layer.borderColor = tintColor.cgColor
+            outline.layer.borderWidth = 3
+            outline.layer.cornerRadius = 4
+            contentView.addSubview(outline)
+            revealOutline = outline
+            UIView.animate(
+                withDuration: 0.4,
+                delay: 1.4,
+                options: [.allowUserInteraction, .beginFromCurrentState]
+            ) {
+                outline.alpha = 0
+            } completion: { [weak self, weak outline] _ in
+                outline?.removeFromSuperview()
+                if let self, self.revealOutline === outline { self.revealOutline = nil }
+            }
+        }
+
+        /// The outline belongs to one layout of one item set; a new set or column width ends it at once.
+        private func removeRevealOutline() {
+            revealOutline?.removeFromSuperview()
+            revealOutline = nil
         }
 
         private func restoreScrollAnchor(

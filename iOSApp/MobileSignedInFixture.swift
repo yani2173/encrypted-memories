@@ -81,6 +81,28 @@ import UploadCore
                 sections.append(
                     TimelineSection(id: "fixture-\(name)", date: sectionDate, title: "Fixture \(name)", items: items))
             }
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesOnThisDayFixture") {
+                // Two photos from today one year ago and one from two years ago, in the device's calendar like the
+                // library itself, so On This Day has two stacks.
+                let today = Calendar.current.startOfDay(for: Date())
+                var memories: [PhotoItem] = []
+                for (index, yearsAgo) in [1, 1, 2].enumerated() {
+                    guard let day = Calendar.current.date(byAdding: .year, value: -yearsAgo, to: today) else {
+                        continue
+                    }
+                    let uid = PhotoUID(volumeID: "fixture", nodeID: "memory-\(index)")
+                    thumbnails[uid] = thumbnails[sections[0].items[index].uid]
+                    memories.append(
+                        PhotoItem(
+                            uid: uid, captureTime: day.addingTimeInterval(TimeInterval(12 * 3_600 + index * 60)),
+                            mediaType: "image/jpeg"))
+                }
+                sections.insert(
+                    TimelineSection(
+                        id: "fixture-memories", date: memories[0].captureTime, title: "Fixture memories",
+                        items: memories),
+                    at: 0)
+            }
             let original = UIGraphicsImageRenderer(size: CGSize(width: 160, height: 160)).image { context in
                 UIColor.gray.setFill()
                 context.fill(CGRect(x: 0, y: 0, width: 160, height: 160))

@@ -6610,6 +6610,156 @@
         "en": { "stringUnit": { "state": "translated", "value": "Showing the original" } },
         "de": { "stringUnit": { "state": "translated", "value": "Original wird angezeigt" } }
       }
+    },
+    "memories.title": {
+      "comment": "On This Day: the calendar control and the area with photos from this day in earlier years.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "On This Day" } },
+        "de": { "stringUnit": { "state": "translated", "value": "An diesem Tag" } }
+      }
+    },
+    "memories.loading": {
+      "comment": "On This Day status while the library inventory is still incomplete.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Looking for memories from this day…" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Erinnerungen an diesen Tag werden gesucht …" } }
+      }
+    },
+    "memories.unavailable": {
+      "comment": "On This Day status when the library could not be loaded.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Memories can’t be shown while the library is unavailable." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Erinnerungen können nicht angezeigt werden, solange die Mediathek nicht verfügbar ist." } }
+      }
+    },
+    "memories.empty": {
+      "comment": "On This Day status of a complete library without photos from this day in earlier years.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "No photos or videos from this day in earlier years." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Keine Fotos oder Videos von diesem Tag aus früheren Jahren." } }
+      }
+    },
+    "memories.more_loading": {
+      "comment": "Note below the memories while the library inventory is still incomplete.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "More memories can appear while the library finishes loading." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Weitere Erinnerungen können erscheinen, während die Mediathek fertig lädt." } }
+      }
+    },
+    "memories.years_ago %lld": {
+      "comment": "Heading of one year's memories, counted from today.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld year ago" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld years ago" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "Vor %lld Jahr" } },
+              "other": { "stringUnit": { "state": "translated", "value": "Vor %lld Jahren" } }
+            }
+          }
+        }
+      }
+    },
+    "memories.position %lld %lld": {
+      "comment": "Position of the card on top of a memories stack: current number and total.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%1$lld of %2$lld" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%1$lld von %2$lld" } }
+      }
+    },
+    "memories.kind_photo": {
+      "comment": "Accessibility label of a photo card in a memories stack.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photo" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto" } }
+      }
+    },
+    "memories.kind_video": {
+      "comment": "Accessibility label of a video card in a memories stack.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Video" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Video" } }
+      }
+    },
+    "memories.open_hint": {
+      "comment": "Accessibility hint of a memories card.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Opens it in full size." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Öffnet es in voller Größe." } }
+      }
+    },
+    "memories.previous": {
+      "comment": "Button that shows the previous card of a memories stack.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Previous Memory" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Vorherige Erinnerung" } }
+      }
+    },
+    "memories.next": {
+      "comment": "Button that shows the next card of a memories stack.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Next Memory" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nächste Erinnerung" } }
+      }
+    },
+    "memories.show_in_library": {
+      "comment": "Button that closes the memories and shows the current photo in the library.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Show in Library" } },
+        "de": { "stringUnit": { "state": "translated", "value": "In Mediathek zeigen" } }
+      }
+    },
+    "memories.shown_in_library": {
+      "comment": "Accessibility announcement after a memory was revealed in the library.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Shown in the library." } },
+        "de": { "stringUnit": { "state": "translated", "value": "In der Mediathek gezeigt." } }
+      }
+    },
+    "memories.unseen": {
+      "comment": "Accessibility value of the calendar control while today's memories are unopened.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "New memories" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Neue Erinnerungen" } }
+      }
+    },
+    "memories.reveal_missing_title": {
+      "comment": "Alert title when a memory left the library before Show in Library.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "No Longer in Your Library" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht mehr in deiner Mediathek" } }
+      }
+    },
+    "memories.reveal_missing_message": {
+      "comment": "Alert message when a memory left the library before Show in Library.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "This photo or video was removed from your library, so it can’t be shown there." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dieses Foto oder Video wurde aus deiner Mediathek entfernt und kann dort nicht gezeigt werden." } }
+      }
     }
   },
   "version": "1.0"

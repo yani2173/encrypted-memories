@@ -273,13 +273,28 @@ private struct MobileSearchSubtitleLabelStyle: LabelStyle {
 }
 
 /// A square preview from the authenticated thumbnail cache, with a symbol while it loads or when no item exists.
+/// `failureSymbol` replaces the placeholder when the thumbnail could not be loaded.
 struct MobileSearchThumbnail: View {
     let uid: PhotoUID?
     let size: CGFloat
     let cornerRadius: CGFloat
     let placeholderSymbol: String
+    let failureSymbol: String?
     let thumbnailFeed: UIKitThumbnailFeed?
     @State private var image: UIImage?
+    @State private var failed = false
+
+    init(
+        uid: PhotoUID?, size: CGFloat, cornerRadius: CGFloat, placeholderSymbol: String,
+        failureSymbol: String? = nil, thumbnailFeed: UIKitThumbnailFeed?
+    ) {
+        self.uid = uid
+        self.size = size
+        self.cornerRadius = cornerRadius
+        self.placeholderSymbol = placeholderSymbol
+        self.failureSymbol = failureSymbol
+        self.thumbnailFeed = thumbnailFeed
+    }
 
     private struct LoadIdentity: Equatable {
         let uid: PhotoUID?
@@ -294,7 +309,7 @@ struct MobileSearchThumbnail: View {
                     .scaledToFill()
             } else {
                 ProtonColor.primary.opacity(0.18)
-                Image(systemName: placeholderSymbol)
+                Image(systemName: failed ? failureSymbol ?? placeholderSymbol : placeholderSymbol)
                     .font(.system(size: size * 0.36, weight: .medium))
                     .foregroundStyle(ProtonColor.primary)
             }
@@ -303,6 +318,7 @@ struct MobileSearchThumbnail: View {
         .clipShape(.rect(cornerRadius: cornerRadius))
         .accessibilityHidden(true)
         .task(id: LoadIdentity(uid: uid, feed: thumbnailFeed.map { ObjectIdentifier($0) })) {
+            failed = false
             guard let uid, let thumbnailFeed else {
                 image = nil
                 return
@@ -312,6 +328,7 @@ struct MobileSearchThumbnail: View {
                 let loaded = await thumbnailFeed.image(for: uid)
                 guard !Task.isCancelled else { return }
                 image = loaded
+                failed = loaded == nil
             }
         }
     }
