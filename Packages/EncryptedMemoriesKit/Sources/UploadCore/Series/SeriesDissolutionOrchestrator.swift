@@ -283,7 +283,8 @@ public actor SeriesDissolutionOrchestrator {
         currentClientUID: String?
     ) {
         self.remote = remote
-        self.albums = albums
+        // The copies join the albums that the series photos are in now, not those of an earlier, cached read.
+        self.albums = CurrentAlbumCarryOver(base: albums)
         self.uploader = uploader
         self.duplicateChecker = duplicateChecker
         self.journalStore = journalStore
