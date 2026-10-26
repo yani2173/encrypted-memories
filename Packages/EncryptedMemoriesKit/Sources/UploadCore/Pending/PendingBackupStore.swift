@@ -455,8 +455,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     /// Writes desired = included for excluded sources in one transaction and returns the new states.
-    /// Sources without a row were never excluded and are skipped.
-    public func include(_ keys: [PendingSourceKey], at date: Date) -> [PendingSourceState]? {
+    /// Sources without a row were never excluded and are skipped. `restoredRemoteLinkIDs` names Proton photos that
+    /// the person already restored from the Proton trash: a source whose trashed photo is one of them owes no restore.
+    public func include(
+        _ keys: [PendingSourceKey], restoredRemoteLinkIDs: Set<String> = [], at date: Date
+    ) -> [PendingSourceState]? {
         guard !keys.isEmpty else { return [] }
         return connection.withLock {
             var states: [PendingSourceState] = []
@@ -464,6 +467,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 for key in keys {
                     guard case .readable(let current) = sourceStateLocked(key) else { return false }
                     guard let previous = current, previous.desired == .excluded else { continue }
+                    // A trash request that is still on the wire can trash the photo again, so it keeps its restore.
+                    let restored =
+                        previous.remoteOperation == nil
+                        && previous.remote.map { restoredRemoteLinkIDs.contains($0.nodeID) } == true
                     guard
                         execute(
                             """
@@ -471,16 +478,20 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                             SET desired='included', generation=generation+1, needs_queue_sync=1,
                                 needs_remote_trash=0,
                                 needs_remote_restore=CASE
+                                  WHEN ? = 1 THEN 0
                                   WHEN remote_trashed=1 OR remote_op='remoteTrash' THEN 1 ELSE 0
                                 END,
+                                remote_trashed=CASE WHEN ? = 1 THEN 0 ELSE remote_trashed END,
                                 listed_in_trash=0,
                                 attempts=0, next_attempt_at=?, updated_at=?
                             WHERE source_kind=? AND source_id=?;
                             """,
                             bind: { stmt in
-                                sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
-                                sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970)
-                                bindKey(stmt, key, from: 3)
+                                sqlite3_bind_int(stmt, 1, restored ? 1 : 0)
+                                sqlite3_bind_int(stmt, 2, restored ? 1 : 0)
+                                sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
+                                sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
+                                bindKey(stmt, key, from: 5)
                             }),
                         let state = sourceStateLocked(key).state
                     else { return false }
