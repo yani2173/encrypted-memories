@@ -56,6 +56,7 @@
         private let contentTransitionSignal: Int
         private let prefersReducedMotion: Bool
         private let onFirstContentReady: (() -> Void)?
+        private let onVisibleDatesChanged: ((String?) -> Void)?
         private let onOpenPhoto: ((PhotoItem) -> Void)?
         private let onToggleSelection: ((PhotoItem) -> Void)?
         private let onSelectionChanged: ((Set<PhotoUID>) -> Void)?
@@ -86,6 +87,7 @@
             contentTransitionSignal: Int = 0,
             prefersReducedMotion: Bool = false,
             onFirstContentReady: (() -> Void)? = nil,
+            onVisibleDatesChanged: ((String?) -> Void)? = nil,
             onOpenPhoto: ((PhotoItem) -> Void)? = nil,
             onToggleSelection: ((PhotoItem) -> Void)? = nil,
             onSelectionChanged: ((Set<PhotoUID>) -> Void)? = nil,
@@ -115,6 +117,7 @@
             self.contentTransitionSignal = contentTransitionSignal
             self.prefersReducedMotion = prefersReducedMotion
             self.onFirstContentReady = onFirstContentReady
+            self.onVisibleDatesChanged = onVisibleDatesChanged
             self.onOpenPhoto = onOpenPhoto
             self.onToggleSelection = onToggleSelection
             self.onSelectionChanged = onSelectionChanged
@@ -156,6 +159,7 @@
         public func makeUIView(context: Context) -> UIKitTimelineGridHostView {
             let view = UIKitTimelineGridHostView()
             view.onFirstContentReady = onFirstContentReady
+            view.onVisibleDatesChanged = onVisibleDatesChanged
             view.onOpenPhoto = onOpenPhoto
             view.onToggleSelection = onToggleSelection
             view.onSelectionChanged = onSelectionChanged
@@ -179,6 +183,7 @@
         @MainActor
         public func updateUIView(_ uiView: UIKitTimelineGridHostView, context: Context) {
             uiView.onFirstContentReady = onFirstContentReady
+            uiView.onVisibleDatesChanged = onVisibleDatesChanged
             uiView.onOpenPhoto = onOpenPhoto
             uiView.onToggleSelection = onToggleSelection
             uiView.onSelectionChanged = onSelectionChanged
@@ -416,6 +421,13 @@
         /// signal that the launch/loading UI can lift onto a real grid. The remaining thumbnails may still load.
         /// One-shot per content set.
         public var onFirstContentReady: (() -> Void)?
+
+        /// Called on the main actor with the localized date range of the photos on screen, for example
+        /// "Oct 24 – 25, 2026", whenever it changes after a drawn frame; nil when no photo is visible.
+        public var onVisibleDatesChanged: ((String?) -> Void)?
+        private let visibleDatesFormatter = TimelineVisibleDateRangeFormatter()
+        private var visibleDateRange: TimelineVisibleDateRange?
+        private var visibleDatesText: String?
 
         /// Called on the main actor when the user taps a photo cell, with the tapped item. The shell presents the viewer.
         public var onOpenPhoto: ((PhotoItem) -> Void)?
@@ -1325,6 +1337,7 @@
             advancePinchSettleIfNeeded()
             let outcome = renderNow()
             activeDisplayFrame = nil
+            publishVisibleDates()
             let keepTicking = framePump.completeTick(outcome)
             var drawableFailed = false
             if case .noDrawable = outcome { drawableFailed = true }
@@ -1791,6 +1804,24 @@
                 overscan: 0,
                 columnPhase: committedPhase
             )
+        }
+
+        /// Reports the date range of the photos between the top and bottom bars. Runs once per frame, so the
+        /// label follows scrolling, pinch zoom and content changes; it formats only when the range changes.
+        func publishVisibleDates() {
+            let range = accessibilityFramePlan().flatMap { plan in
+                TimelineVisibleDateRange(
+                    items: items,
+                    slots: plan.visibleSlots,
+                    visibleTop: scrollView.contentOffset.y + safeAreaInsets.top,
+                    visibleBottom: scrollView.contentOffset.y + bounds.height - safeAreaInsets.bottom)
+            }
+            guard range != visibleDateRange else { return }
+            visibleDateRange = range
+            let text = range.map(visibleDatesFormatter.string(for:))
+            guard text != visibleDatesText else { return }
+            visibleDatesText = text
+            onVisibleDatesChanged?(text)
         }
 
         func invalidateAccessibilityElements() {

@@ -80,6 +80,8 @@ struct MobileTimelineScreen: View {
     /// The native toolbar keeps its slots mounted from frame one, but its content appears only after the
     /// launch cover has finished dissolving. This prevents both chrome-over-cover and title relocation.
     @State private var launchChromeVisible = false
+    /// Date range of the photos on screen, reported by the grid; shown in the top leading corner for orientation.
+    @State private var visibleDatesText: String?
 
     init(
         surface: MobileTimelineSurface = .library,
@@ -467,6 +469,7 @@ struct MobileTimelineScreen: View {
                     contentTransitionSignal: contentTransitionSignal,
                     prefersReducedMotion: reduceMotion,
                     onFirstContentReady: { withAnimation(.spring(duration: 0.55)) { model.markFirstContentReady() } },
+                    onVisibleDatesChanged: { visibleDatesText = $0 },
                     onOpenPhoto: open,
                     onToggleSelection: selection.toggle,
                     onSelectionChanged: selection.replace(with:),
@@ -485,6 +488,10 @@ struct MobileTimelineScreen: View {
                 .accessibilityHidden(!launchChromeVisible || showsLibraryLoadingCover)
                 .accessibilityHidden(showsSearchLanding)
                 .opacity(showsSearchLanding ? 0 : 1)
+
+                if let visibleDatesText, showsVisibleDates {
+                    visibleDatesLabel(visibleDatesText)
+                }
             }
 
             if showsSearchLanding {
@@ -501,6 +508,28 @@ struct MobileTimelineScreen: View {
             await Task.yield()
             topFrostHeight = mobileTopBarFrostHeight(in: sceneContext)
         }
+    }
+
+    /// The date label belongs to a settled grid: not over the launch cover, the search landing or a pending result.
+    private var showsVisibleDates: Bool {
+        launchChromeVisible && !showsLibraryLoadingCover && !showsSearchLanding && !isProjectionPending
+    }
+
+    /// Apple Photos-style orientation label: white bold text over the photos, below the navigation bar.
+    private func visibleDatesLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.title2.bold())
+            .foregroundStyle(.white)
+            .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+            // The stack keeps the safe area, so the label starts just below the navigation bar.
+            .padding(.top, 4)
+            .padding(.horizontal, 16)
+            .allowsHitTesting(false)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier("library.visibleDates")
+            .transition(.opacity)
     }
 
     private var showsLibraryLoadingCover: Bool {
