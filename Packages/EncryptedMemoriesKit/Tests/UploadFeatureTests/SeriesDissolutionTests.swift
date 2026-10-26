@@ -271,6 +271,22 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.trashCalls.map { Set($0) }, [[main, member("m2")]])
     }
 
+    /// The person moved the series photo to another album on another device while a cached read still shows the old
+    /// album. The copies join the album that the photo is in now (#724).
+    func testTheCopiesJoinTheCurrentAlbumsOfTheSeriesNotTheCachedOnes() async throws {
+        server.addAlbum("album-before", volumeID: "own", members: ["m1"])
+        server.addAlbum("album-now", volumeID: "own", members: [])
+        server.cacheAlbumMemberships()
+        server.addAlbum("album-before", volumeID: "own", members: [])
+        server.addAlbum("album-now", volumeID: "own", members: ["m1"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.albumMembers("album-now"), expected(["m1"], copies))
+        XCTAssertEqual(server.albumMembers("album-before"), [], "the photo has left this album")
+    }
+
     func testTheCopyOfAStandaloneMemberDoesNotJoinAnAlbumOfTheMainPhoto() async throws {
         server.makeStandalone(["m2", "m3", "m4"])
         server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
@@ -813,6 +829,8 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     private var _favorites = Set<String>()
     /// Album memberships of this fake Proton, keyed by album node id, plus the volume the album lives in.
     private var _albums: [String: (volumeID: String, members: Set<String>)] = [:]
+    /// The memberships that a cached read still reports after `cacheAlbumMemberships()`.
+    private var cachedAlbums: [String: (volumeID: String, members: Set<String>)]?
     /// Links whose state answer carries no Photo role data.
     private var _withheldRoles = Set<String>()
     private var _trashRemainsActive = false
@@ -877,6 +895,9 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     func addAlbum(_ albumID: String, volumeID: String, members: [String]) {
         lock.withLock { _albums[albumID] = (volumeID, Set(members)) }
     }
+    /// Later reads of `albums(containing:)` report the current memberships, as a membership cache does after a change
+    /// on another device. `currentAlbums(containing:)` reads the albums as they are.
+    func cacheAlbumMemberships() { lock.withLock { cachedAlbums = _albums } }
     /// Makes the nodes related photos of the series main photo on the server, even when the caller does not know them.
     func addServerRelatedNodeIDs(_ ids: [String]) {
         lock.withLock {
@@ -990,13 +1011,26 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     // SeriesAlbumCarryOver
 
     func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
+        try readAlbums(containing: uid, current: false)
+    }
+
+    func currentAlbums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        var albumsByPhoto: [PhotoUID: [SeriesAlbumReference]] = [:]
+        for uid in uids where albumsByPhoto[uid] == nil {
+            try Task.checkCancellation()
+            albumsByPhoto[uid] = try readAlbums(containing: uid, current: true)
+        }
+        return albumsByPhoto
+    }
+
+    private func readAlbums(containing uid: PhotoUID, current: Bool) throws -> [SeriesAlbumReference] {
         try lock.withLock {
             if albumReadFailures > 0 {
                 albumReadFailures -= 1
                 throw UploadError.retryableBackend(code: 503, message: "album read unavailable")
             }
             return
-                _albums
+                ((current ? nil : cachedAlbums) ?? _albums)
                 .filter { $0.value.members.contains(uid.nodeID) }
                 .map { SeriesAlbumReference(volumeID: $0.value.volumeID, albumID: $0.key) }
                 .sorted { $0.albumID < $1.albumID }
