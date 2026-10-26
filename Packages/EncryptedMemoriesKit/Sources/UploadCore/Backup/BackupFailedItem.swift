@@ -11,7 +11,12 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
     public let category: BackupIssueCategory
     /// Raw detail is for support reports, never for the list.
     public let technicalDetail: String?
+    /// The error that a failed item stopped on, as Proton or the app reported it. Only items that wait for the
+    /// person's retry carry it, and only when it says more than `reason`.
+    public let failureDetail: String?
     public let isPermanent: Bool
+    /// The person can hide the warning: the item can never be backed up, or it stopped retrying after its failures.
+    public let isDismissible: Bool
     public let issue: BackupIssueKind
     public let nextAttemptAt: Date?
     public let isRetryable: Bool
@@ -35,14 +40,18 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         source: UploadSourceIdentity? = nil,
         revision: UploadBackupRevision? = nil,
         category: BackupIssueCategory? = nil,
-        technicalDetail: String? = nil
+        technicalDetail: String? = nil,
+        failureDetail: String? = nil,
+        isDismissible: Bool? = nil
     ) {
         self.category = category ?? issue.category
         self.technicalDetail = technicalDetail
+        self.failureDetail = failureDetail
         self.id = id
         self.filename = filename
         self.reason = reason
         self.isPermanent = isPermanent || self.category == .permanent
+        self.isDismissible = issue != .deletedElsewhere && (isDismissible ?? self.isPermanent)
         self.issue = issue
         self.nextAttemptAt = nextAttemptAt
         self.isRetryable = isRetryable ?? (!self.isPermanent && issue.isRetryable)
@@ -88,6 +97,7 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         } else {
             reason = Self.localizedReason(for: issue)
         }
+        let technicalDetail = record?.detail ?? entry.lastError
         self.init(
             id: "\(entry.source.kind.rawValue)/\(entry.source.identifier)/\(entry.source.resource.rawValue)"
                 + "#\(entry.revision.rawValue)",
@@ -95,7 +105,21 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
             isPermanent: isPermanentState,
             issue: issue, nextAttemptAt: Self.effectiveNextAttempt(record, entry: entry), source: entry.source,
             revision: entry.revision,
-            category: category, technicalDetail: record?.detail ?? entry.lastError)
+            category: category, technicalDetail: technicalDetail,
+            failureDetail: isManualRetry && category == .userResolvable
+                ? Self.failureDetail(technicalDetail, reason: reason) : nil,
+            // A failed row runs again only on the person's retry, so the person may also hide it.
+            isDismissible: entry.state == .failed ? true : nil)
+    }
+
+    /// The stored error, when it is a message and not one of the app's own reason keys or the reason itself.
+    static func failureDetail(_ detail: String?, reason: String) -> String? {
+        guard let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines), !detail.isEmpty,
+            detail != reason,
+            // The app's reason keys, such as "error.upload_source_not_ready", contain no space.
+            detail.contains(where: \.isWhitespace)
+        else { return nil }
+        return detail
     }
 
     /// A manual retry makes a row due before the date that its reason names; the row's own date then wins.

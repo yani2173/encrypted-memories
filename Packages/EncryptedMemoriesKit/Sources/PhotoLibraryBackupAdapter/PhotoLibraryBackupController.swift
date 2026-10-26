@@ -738,13 +738,16 @@ public final class PhotoLibraryBackupController {
         return entries
     }
 
-    /// Hides a permanent item warning without ever changing the backup-success count.
+    /// Hides the warning of a permanent item, or of a failed item that waits for the person's retry, without ever
+    /// changing the backup-success count. A hidden failed item is not retried.
     public func dismissFailedItem(_ item: BackupFailedItem) {
-        guard item.isPermanent, item.issue != .deletedElsewhere,
+        guard item.isDismissible, item.issue != .deletedElsewhere,
             let source = item.source,
             let revision = item.revision,
-            BackupIssueRecord.decode(queueStore?.entry(for: source, revision: revision)?.lastError)?.kind
-                != .deletedElsewhere,
+            let row = queueStore?.entry(for: source, revision: revision),
+            BackupIssueRecord.decode(row.lastError)?.kind != .deletedElsewhere,
+            // A failed row that Try again reopened meanwhile backs up again and stays.
+            item.isPermanent || row.state == .failed,
             queueStore?.dismissPermanentFailure(
                 source: source,
                 revision: revision,
@@ -1318,7 +1321,12 @@ public final class PhotoLibraryBackupController {
             let retryAt = Date().addingTimeInterval(3_600)
             for kind in kinds {
                 let state: UploadBackupSyncQueueState =
-                    kind == .deletedElsewhere ? .failedPermanent : kind == .unsupported ? .failed : .discovered
+                    switch kind {
+                    case .deletedElsewhere: .failedPermanent
+                    // A remote-service row is failed: it stopped retrying and waits for the person.
+                    case .unsupported, .remoteService: .failed
+                    default: .discovered
+                    }
                 let source = UploadSourceIdentity(
                     kind: .photoLibraryAsset, identifier: "fixture-\(kind.rawValue)")
                 guard

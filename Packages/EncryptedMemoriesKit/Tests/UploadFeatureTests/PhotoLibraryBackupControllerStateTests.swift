@@ -82,6 +82,60 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
+    /// A failed item shows the error that stopped it, and the person can stop backing it up.
+    func testFailedItemShowsItsErrorAndCanBeDismissedWithoutRetry() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-failed-dismissal")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        func row(_ id: String, _ kind: BackupIssueKind, _ state: UploadBackupSyncQueueState, detail: String)
+            -> UploadBackupSyncQueueEntry
+        {
+            UploadBackupSyncQueueEntry(
+                source: .init(kind: .photoLibraryAsset, identifier: id), revision: .init(rawValue: 1),
+                originalFilename: "\(id).mp4", state: state, attempts: 8,
+                lastError: BackupIssueRecord(kind: kind, detail: detail).persistedValue, updatedAt: Date())
+        }
+        let failed = row("failed", .remoteService, .failed, detail: "  Proton rejected the file  ")
+        let keyed = row("keyed", .remoteService, .failed, detail: "backup.issue_remote_service")
+        let waiting = row("waiting", .remoteService, .discovered, detail: "Proton rejected the file")
+        let reopened = row("reopened", .remoteService, .failed, detail: "Proton rejected the file")
+        for entry in [failed, keyed, waiting, reopened] { XCTAssertTrue(queue.upsert(entry)) }
+
+        let items = fixture.controller.failedItems()
+        func item(_ entry: UploadBackupSyncQueueEntry) throws -> BackupFailedItem {
+            try XCTUnwrap(items.first { $0.source == entry.source })
+        }
+        let failedItem = try item(failed)
+        XCTAssertEqual(failedItem.failureDetail, "Proton rejected the file")
+        XCTAssertTrue(failedItem.isDismissible)
+        XCTAssertFalse(failedItem.isPermanent)
+        XCTAssertNil(try item(keyed).failureDetail, "an app reason key is not an error message")
+        XCTAssertNil(try item(waiting).failureDetail, "a row that retries by itself shows no error")
+        XCTAssertFalse(try item(waiting).isDismissible)
+
+        fixture.controller.dismissFailedItem(failedItem)
+        let dismissed = try XCTUnwrap(queue.entry(for: failed.source, revision: failed.revision))
+        XCTAssertEqual(dismissed.state, .dismissedFailure)
+        XCTAssertEqual(dismissed.lastError, failed.lastError)
+        XCTAssertFalse(fixture.controller.failedItems().contains { $0.id == failedItem.id })
+        XCTAssertEqual(queue.summary().resolved, 0, "dismissal is not a successful backup")
+        XCTAssertEqual(queue.summary().dismissedFailures, 1)
+
+        // Try again reopened the row after the list was read: the dismissal must leave it backing up.
+        let reopenedItem = try item(reopened)
+        XCTAssertTrue(queue.reopenForUserRetry(reopened, attempts: 0, updatedAt: Date()))
+        fixture.controller.dismissFailedItem(reopenedItem)
+        XCTAssertEqual(queue.entry(for: reopened.source, revision: reopened.revision)?.state, .discovered)
+
+        await fixture.controller.retryUserResolvableWork()
+        XCTAssertEqual(
+            queue.entry(for: failed.source, revision: failed.revision)?.state, .dismissedFailure,
+            "Try again must not bring a dismissed item back")
+        await fixture.controller.shutdown()
+    }
+
     /// A list read that started before the person dismissed a row must not bring that row back.
     func testProblemListReadOvertakenByADismissalIsReadAgain() async throws {
         let fixture = try makeControllerFixture(prefix: "backup-problem-overtaken")

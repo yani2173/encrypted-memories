@@ -1343,6 +1343,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "Warnung ausblenden" } }
       }
     },
+    "backup.failed_item_ignore": {
+      "extractionState": "manual",
+      "comment": "Stops retrying a failed backup item and hides its warning without claiming that the item was backed up.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Don’t back up" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht sichern" } }
+      }
+    },
     "backup.failed_sheet_unavailable": {
       "extractionState": "manual",
       "comment": "Shown in the failed-items sheet when the list stayed empty although the summary counts photos.",
