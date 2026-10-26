@@ -25,6 +25,18 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Select"].exists)
     }
 
+    /// The top leading corner names the dates of the photos on screen, also after scrolling.
+    func testTheLibraryShowsTheDatesOfTheVisiblePhotos() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        let dates = app.descendants(matching: .any)["library.visibleDates"]
+        XCTAssertTrue(dates.waitForExistence(timeout: 10), "the library shows no date label")
+        XCTAssertTrue(
+            wait(for: dates, "label MATCHES '.*[0-9]{4}.*'"), "the date label names no year: \(dates.label)")
+
+        app.windows.firstMatch.swipeDown()
+        XCTAssertTrue(dates.waitForExistence(timeout: 10), "the date label disappeared after scrolling")
+    }
+
     func testAPhotoOpensInTheViewerAndClosesAgain() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         firstPhoto.tap()
