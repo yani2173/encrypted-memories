@@ -517,6 +517,67 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(store.dueSourceStates(by: date).map(\.key), [key])
     }
 
+    /// The trash of the earlier upload confirms while the handoff of the committed edit cannot be read. The trash stays
+    /// due with the backoff; once the handoff reads again, the next confirmation moves on to the edit exactly once.
+    func testAnUnreadableHandoffKeepsTheTrashOfTheEarlierUploadDue() throws {
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "link-earlier")
+        let excluded = try XCTUnwrap(
+            store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: key, presentation: presentation(), remote: earlier,
+                        revision: UploadBackupRevision(rawValue: 4))
+                ],
+                at: date)
+        )
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: excluded), [key])
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key, revision: UploadBackupRevision(rawValue: 4), remote: remote, kind: .uploaded,
+                    createdAt: date)),
+            .excludedRemoteNeedsTrash)
+        try withRawPendingDatabase {
+            XCTAssertEqual(sqlite3_exec($0, "UPDATE handoff SET kind='invalid';", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertEqual(store.latestHandoffsRead(for: [key])[key], .unreadable)
+
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key, generation: 1, remoteLinkID: earlier.nodeID, at: date))
+
+        let waiting = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertEqual(waiting.remote, earlier, "no photo is chosen on an unreadable handoff")
+        XCTAssertTrue(waiting.needsRemoteTrash, "the trash stays due")
+        XCTAssertFalse(waiting.remoteTrashed, "nothing is completed on an unreadable handoff")
+        XCTAssertEqual(waiting.remoteOperation, .remoteTrash, "the sent trash may have happened")
+        XCTAssertEqual(waiting.attempts, 1)
+        XCTAssertTrue(store.dueSourceStates(by: date).isEmpty, "the retry waits for the backoff")
+        XCTAssertEqual(store.nextEffectDate(), date.addingTimeInterval(60))
+
+        try withRawPendingDatabase {
+            XCTAssertEqual(sqlite3_exec($0, "UPDATE handoff SET kind='uploaded';", nil, nil, nil), SQLITE_OK)
+        }
+        let retry = date.addingTimeInterval(60)
+        let due = store.dueSourceStates(by: retry)
+        XCTAssertEqual(due.map(\.key), [key])
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: due), [key])
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key, generation: 1, remoteLinkID: earlier.nodeID, at: retry))
+        let movedOn = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertEqual(movedOn.remote, remote, "the repaired handoff names the photo for the trash")
+        XCTAssertTrue(movedOn.needsRemoteTrash)
+        XCTAssertNil(movedOn.remoteOperation)
+        XCTAssertEqual(movedOn.attempts, 0)
+
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [movedOn]), [key])
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key, generation: 1, remoteLinkID: remote.nodeID, at: retry))
+        let done = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertTrue(done.remoteTrashed)
+        XCTAssertFalse(done.needsRemoteTrash, "the edit goes to the trash once")
+        XCTAssertTrue(store.dueSourceStates(by: retry.addingTimeInterval(86_400)).isEmpty)
+    }
+
     func testUndoDuringATrashRequestRestoresEvenAfterACrash() throws {
         let excluded = try XCTUnwrap(
             store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date)

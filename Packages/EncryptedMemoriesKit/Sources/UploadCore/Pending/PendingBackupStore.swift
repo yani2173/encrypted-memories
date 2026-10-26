@@ -498,7 +498,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// decision. An included source without due effects is deleted. `remoteLinkID` names the photo that the
     /// effect handled; a trash of a photo that a later commit replaced leaves the trash of the new photo due.
     /// A finished trash of an excluded source moves on to its latest handoff when that names another photo: the
-    /// edit of a deleted photo can commit before the trash of the earlier upload is sent.
+    /// edit of a deleted photo can commit before the trash of the earlier upload is sent. When that handoff cannot be
+    /// read, the trash stays due with the shared backoff, and the result says whether that retry was stored.
     @discardableResult
     public func completeEffect(
         _ effect: PendingSourceEffect,
@@ -535,14 +536,21 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         """
                 }
                 sql += " WHERE source_kind=? AND source_id=?;"
+                var latest: PendingHandoff?
+                if movesOn, state.desired == .excluded {
+                    // An unreadable handoff is no "no later photo": the trash stays due, so a later upload of the
+                    // deleted photo still goes to the trash once the handoff reads again.
+                    guard case .readable(let handoff) = latestHandoffLocked(key) else {
+                        return deferLocked(state, at: date)
+                    }
+                    latest = handoff
+                }
                 let updated = execute(sql) { stmt in
                     sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
                     bindKey(stmt, key, from: 2)
                 }
                 guard updated else { return false }
-                if movesOn, state.desired == .excluded, let latest = latestHandoffLocked(key).handoff,
-                    latest.remote.nodeID != state.remote?.nodeID
-                {
+                if let latest, latest.remote.nodeID != state.remote?.nodeID {
                     guard
                         execute(
                             """
@@ -614,14 +622,18 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         connection.withLock {
             guard case .readable(let current) = sourceStateLocked(key) else { return false }
             guard let state = current else { return true }
-            let next = date.addingTimeInterval(PendingRetrySchedule.delay(afterAttempts: state.attempts))
-            return execute(
-                "UPDATE source_state SET attempts=attempts+1, next_attempt_at=?, updated_at=? WHERE source_kind=? AND source_id=?;"
-            ) { stmt in
-                sqlite3_bind_double(stmt, 1, next.timeIntervalSince1970)
-                sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970)
-                bindKey(stmt, key, from: 3)
-            }
+            return deferLocked(state, at: date)
+        }
+    }
+
+    private func deferLocked(_ state: PendingSourceState, at date: Date) -> Bool {
+        let next = date.addingTimeInterval(PendingRetrySchedule.delay(afterAttempts: state.attempts))
+        return execute(
+            "UPDATE source_state SET attempts=attempts+1, next_attempt_at=?, updated_at=? WHERE source_kind=? AND source_id=?;"
+        ) { stmt in
+            sqlite3_bind_double(stmt, 1, next.timeIntervalSince1970)
+            sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970)
+            bindKey(stmt, state.key, from: 3)
         }
     }
 
