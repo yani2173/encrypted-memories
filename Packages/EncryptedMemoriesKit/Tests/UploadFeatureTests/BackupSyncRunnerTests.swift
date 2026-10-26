@@ -567,6 +567,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private let failsRunnableDateRead: Bool
     private let lock = NSLock()
     private var readFailed = false
+    private var beforeRemoteCommitMark: (@Sendable (UploadRemoteCommitReconciliation) -> Void)?
 
     /// With `failsRunnableDateRead`, the read of the next due date fails as a broken SQLite read does: it returns nil
     /// and leaves the store not operational.
@@ -642,6 +643,29 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         inner.removeSources(kind: kind, identifiers: identifiers)
+    }
+
+    /// Runs `hook` before the receipt of each finished upload is marked, after the upload passed its removal check.
+    func setBeforeRemoteCommitMark(_ hook: (@Sendable (UploadRemoteCommitReconciliation) -> Void)?) {
+        lock.withLock { beforeRemoteCommitMark = hook }
+    }
+
+    /// The protocol's default write, after the hook.
+    @discardableResult
+    func markNeedsRemoteReconciliation(
+        source: UploadSourceIdentity,
+        revision: UploadBackupRevision,
+        reconciliation: UploadRemoteCommitReconciliation,
+        lastError: String?,
+        updatedAt: Date
+    ) -> Bool {
+        lock.withLock { beforeRemoteCommitMark }?(reconciliation)
+        guard var entry = entry(for: source, revision: revision) else { return false }
+        entry.state = .needsRemoteReconciliation
+        entry.lastError = lastError
+        entry.remoteCommitReconciliation = reconciliation
+        entry.updatedAt = updatedAt
+        return upsert(entry)
     }
 
     func summary() -> UploadBackupSyncQueueSummary { inner.summary() }
@@ -3390,6 +3414,61 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertNil(identityStore.record(for: removed.source)?.remoteLinkID)
         XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
         XCTAssertEqual(progress.failed, 0)
+    }
+
+    /// A deletion or exclusion lands after the upload passed its removal check, while its commit settles. The receipt
+    /// of the removed row cannot be marked; only the work of that photo ends, and the pass goes on (#756).
+    func testARemovalWhileTheCommitSettlesEndsOnlyThatPhoto() async throws {
+        let removed = seedEntry("removed-while-settling.jpg", ageSeconds: 600)
+        let next = seedEntry("after-the-settlement.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        let removals = removeBeforeTheCommitMark(of: removed.source, row: removed.source, on: queue, runner: runner)
+
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(removals.events, ["removed"], "the removal must land during the settlement")
+        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
+        XCTAssertEqual(progress.failed, 0)
+    }
+
+    /// The same removal while the video of a Live Photo settles.
+    func testARemovalWhileALivePhotoVideoSettlesEndsOnlyThatPhoto() async throws {
+        let removed = seedEntry("removed-live.heic", ageSeconds: 600)
+        resolver.setSecondaries(["removed-live.mov"], for: removed.source.identifier)
+        let next = seedEntry("after-the-live-photo.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        let video = UploadSourceIdentity(
+            kind: removed.source.kind, identifier: removed.source.identifier, resource: .livePairedVideo)
+        let removals = removeBeforeTheCommitMark(of: video, row: removed.source, on: queue, runner: runner)
+
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(removals.events, ["removed"], "the removal must land while the video settles")
+        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
+        XCTAssertEqual(progress.failed, 0)
+    }
+
+    /// Removes `row` through the runner right before the commit of `resource` is marked. The mark runs off the runner
+    /// actor and waits there until the removal finished, so the order does not depend on scheduling.
+    private func removeBeforeTheCommitMark(
+        of resource: UploadSourceIdentity, row: UploadSourceIdentity, on queue: SpyQueueStore, runner: BackupSyncRunner
+    ) -> BackupEventLog {
+        let removals = BackupEventLog()
+        queue.setBeforeRemoteCommitMark { reconciliation in
+            guard reconciliation.source == resource else { return }
+            let done = DispatchSemaphore(value: 0)
+            Task {
+                _ = await runner.removeSources(kind: row.kind, identifiers: [row.identifier])
+                removals.append("removed")
+                done.signal()
+            }
+            _ = done.wait(timeout: .now() + 5)
+        }
+        return removals
     }
 
     func testStopAfterUploadDecisionSettlesClaimBeforeRevertingQueueRow() async throws {
