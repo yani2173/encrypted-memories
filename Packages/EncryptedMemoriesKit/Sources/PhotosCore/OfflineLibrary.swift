@@ -37,6 +37,9 @@ public enum AppSettingsKey {
         "EncryptedMemories.keepDisplayAwakeDuringForegroundBackup"
     /// Lets the backup upload on cellular data and Personal Hotspot. Viewing and downloading are not affected.
     public static let backupUsesMobileData = "EncryptedMemories.backupUsesMobileData"
+    /// The On This Day memories that the signed-in account has opened: their day and count, no photo identity.
+    /// Sign-out removes it with the other account data.
+    public static let onThisDaySeen = "EncryptedMemories.onThisDaySeen.v1"
 }
 
 /// Fallbacks for preferences with no stored value, including on existing installations.

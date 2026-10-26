@@ -416,6 +416,9 @@ final class MobileLibraryModel {
     private(set) var sourceAnalysisRevision: UInt64 = 0
     private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
     private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
+    /// Completeness of the library inventory. A feature that reads the snapshot claims nothing complete before
+    /// it is authoritative.
+    var inventoryAuthority: SourceInventoryAuthority { primaryInventoryAuthority }
     /// Successful trash and restore mutations of this session, laid over every later listing.
     @ObservationIgnored private var timelineRemovals = TimelineRemovalOverlay()
     @ObservationIgnored private var timelineMutationGeneration = 0
@@ -1293,6 +1296,7 @@ final class MobileLibraryModel {
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
         primaryInventoryAuthority = .hydrating
+        OnThisDaySeenStore().clear()
         configuredUID = nil
         session = nil
         cacheContext = nil

@@ -82,6 +82,13 @@ struct MobileTimelineScreen: View {
     @State private var launchChromeVisible = false
     /// Date range of the photos on screen, reported by the grid; shown in the top leading corner for orientation.
     @State private var visibleDatesText: String?
+    /// On This Day: the expandable memories area above the library grid, and the photo that "Show in Library" reveals.
+    @State private var onThisDay = MobileOnThisDayModel()
+    @State private var onThisDayReference = Date()
+    @State private var revealUID: PhotoUID?
+    @State private var revealSignal = 0
+    @State private var revealMissing = false
+    @Environment(\.scenePhase) private var scenePhase
 
     init(
         surface: MobileTimelineSurface = .library,
@@ -191,6 +198,21 @@ struct MobileTimelineScreen: View {
                         }
                     }
                 }
+                .task(id: onThisDayRequest) {
+                    guard let request = onThisDayRequest else { return }
+                    await onThisDay.refresh(
+                        items: model.items, request: request, reference: onThisDayReference, calendar: .current)
+                }
+                .task { await followOnThisDayCalendar() }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active { onThisDayReference = Date() }
+                }
+                .onChange(of: model.facade.map { ObjectIdentifier($0) }) { _, _ in onThisDay.reset() }
+                .alert(L10n.string("memories.reveal_missing_title"), isPresented: $revealMissing) {
+                    Button(L10n.string("action.ok"), role: .cancel) {}
+                } message: {
+                    Text(L10n.string("memories.reveal_missing_message"))
+                }
         }
         .overlay {
             LibraryActivityBannerOverlay(
@@ -220,6 +242,28 @@ struct MobileTimelineScreen: View {
             }
             .sharedBackgroundVisibility(launchChromeVisible && !selection.isSelecting ? .automatic : .hidden)
             // Also reachable through the Settings command (⌘,), so it may leave a compressed bar first.
+            .mobileVisibilityPriority(.low)
+
+            // Mounted from the first frame like the other slots, so the title never relocates when it appears.
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    toggleOnThisDay()
+                } label: {
+                    Label(
+                        L10n.string("memories.title"),
+                        systemImage: showsOnThisDayBadge ? "calendar.badge" : "calendar"
+                    )
+                }
+                .disabled(selection.isSelecting || !canSelect)
+                .opacity(launchChromeVisible && !selection.isSelecting ? 1 : 0)
+                .allowsHitTesting(launchChromeVisible && !selection.isSelecting)
+                .accessibilityLabel(L10n.string("memories.title"))
+                .accessibilityValue(showsOnThisDayBadge ? L10n.string("memories.unseen") : "")
+                .accessibilityAddTraits(onThisDay.isExpanded ? .isSelected : [])
+                .accessibilityHidden(!launchChromeVisible || selection.isSelecting)
+                .accessibilityIdentifier("library.memories.toggle")
+            }
+            .sharedBackgroundVisibility(launchChromeVisible && !selection.isSelecting ? .automatic : .hidden)
             .mobileVisibilityPriority(.low)
         }
         // Keep every trailing slot present from the first rendered frame. Adding either control after the
@@ -448,50 +492,66 @@ struct MobileTimelineScreen: View {
         ZStack(alignment: .topLeading) {
             ProtonColor.backgroundNorm.ignoresSafeArea()
 
-            if let feed = model.thumbnailFeed, !visibleItems.isEmpty {
-                UIKitTimelineGrid(
-                    items: visibleItems,
-                    contentRevision: visibleContentRevision,
-                    thumbnailFeed: feed,
-                    metadataProvider: model.backend,
-                    fillOrder: usesTopLeadingProjection ? .topLeading : .newestBottomTrailing,
-                    initialViewportPlacement: usesTopLeadingProjection ? .oldest : .automatic,
-                    displayMode: displayMode,
-                    selectionMode: selection.isSelecting,
-                    selectedUIDs: selection.selected,
-                    uploadBadges: hasProjectionCriteria ? .empty : model.pendingPresentation.uploadBadges,
-                    isActive: isActive && !showsSearchLanding,
-                    scrollToLatestSignal: scrollToLatestSignal,
-                    scrollToTopSignal: refinementTopPlacementSignal,
-                    proxy: gridProxy,
-                    restoreScrollAnchor: projectionRestoreAnchor,
-                    restoreScrollSignal: projectionRestoreSignal,
-                    contentTransitionSignal: contentTransitionSignal,
-                    prefersReducedMotion: reduceMotion,
-                    onFirstContentReady: { withAnimation(.spring(duration: 0.55)) { model.markFirstContentReady() } },
-                    onVisibleDatesChanged: { visibleDatesText = $0 },
-                    onOpenPhoto: open,
-                    onToggleSelection: selection.toggle,
-                    onSelectionChanged: selection.replace(with:),
-                    dragOutProvider: model.backend == nil ? nil : model.viewerMedia,
-                    onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
-                    contextMenuActions: { contextMenu.actions(for: $0, model: model) },
-                    onContextMenuAction: { action, items in
-                        contextMenu.perform(action, items: items, model: model, router: viewerRouter)
-                    }
-                )
-                // Extend the scroll surface below the floating navigation and tab bars. The UIKit grid keeps
-                // its safe-area content inset, so only the newest edge exposes protected space below the final
-                // row; as soon as the user scrolls away, thumbnails move naturally beneath Liquid Glass.
-                .ignoresSafeArea(.container, edges: [.top, .horizontal, .bottom])
-                .allowsHitTesting(launchChromeVisible && !showsLibraryLoadingCover && !showsSearchLanding)
-                .accessibilityHidden(!launchChromeVisible || showsLibraryLoadingCover)
-                .accessibilityHidden(showsSearchLanding)
-                .opacity(showsSearchLanding ? 0 : 1)
-
-                if let visibleDatesText, showsVisibleDates {
-                    visibleDatesLabel(visibleDatesText)
+            // The memories area takes real layout space above the grid. The grid keeps its anchor photo at the same
+            // distance below the area while it opens or closes, like any other change of its height.
+            VStack(spacing: 0) {
+                if showsOnThisDayArea {
+                    onThisDayArea
+                        .transition(.move(edge: .top).combined(with: .opacity))
                 }
+
+                if let feed = model.thumbnailFeed, !visibleItems.isEmpty {
+                    UIKitTimelineGrid(
+                        items: visibleItems,
+                        contentRevision: visibleContentRevision,
+                        thumbnailFeed: feed,
+                        metadataProvider: model.backend,
+                        fillOrder: usesTopLeadingProjection ? .topLeading : .newestBottomTrailing,
+                        initialViewportPlacement: usesTopLeadingProjection ? .oldest : .automatic,
+                        displayMode: displayMode,
+                        selectionMode: selection.isSelecting,
+                        selectedUIDs: selection.selected,
+                        uploadBadges: hasProjectionCriteria ? .empty : model.pendingPresentation.uploadBadges,
+                        isActive: isActive && !showsSearchLanding,
+                        scrollToLatestSignal: scrollToLatestSignal,
+                        scrollToTopSignal: refinementTopPlacementSignal,
+                        proxy: gridProxy,
+                        restoreScrollAnchor: projectionRestoreAnchor,
+                        restoreScrollSignal: projectionRestoreSignal,
+                        revealItem: revealUID,
+                        revealSignal: revealSignal,
+                        contentTransitionSignal: contentTransitionSignal,
+                        prefersReducedMotion: reduceMotion,
+                        onFirstContentReady: {
+                            withAnimation(.spring(duration: 0.55)) { model.markFirstContentReady() }
+                        },
+                        onVisibleDatesChanged: { visibleDatesText = $0 },
+                        onOpenPhoto: open,
+                        onToggleSelection: selection.toggle,
+                        onSelectionChanged: selection.replace(with:),
+                        dragOutProvider: model.backend == nil ? nil : model.viewerMedia,
+                        onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
+                        contextMenuActions: { contextMenu.actions(for: $0, model: model) },
+                        onContextMenuAction: { action, items in
+                            contextMenu.perform(action, items: items, model: model, router: viewerRouter)
+                        }
+                    )
+                    // Extend the scroll surface below the floating navigation and tab bars. The UIKit grid keeps
+                    // its safe-area content inset, so only the newest edge exposes protected space below the final
+                    // row; as soon as the user scrolls away, thumbnails move naturally beneath Liquid Glass.
+                    .ignoresSafeArea(.container, edges: [.top, .horizontal, .bottom])
+                    .allowsHitTesting(launchChromeVisible && !showsLibraryLoadingCover && !showsSearchLanding)
+                    .accessibilityHidden(!launchChromeVisible || showsLibraryLoadingCover)
+                    .accessibilityHidden(showsSearchLanding)
+                    .opacity(showsSearchLanding ? 0 : 1)
+                }
+            }
+
+            // The date label sits below the navigation bar; the open memories area takes that place instead.
+            if let visibleDatesText, showsVisibleDates, !showsOnThisDayArea, model.thumbnailFeed != nil,
+                !visibleItems.isEmpty
+            {
+                visibleDatesLabel(visibleDatesText)
             }
 
             if showsSearchLanding {
@@ -530,6 +590,85 @@ struct MobileTimelineScreen: View {
             .accessibilityAddTraits(.isHeader)
             .accessibilityIdentifier("library.visibleDates")
             .transition(.opacity)
+    }
+
+    private var onThisDayRequest: MobileOnThisDayModel.Request? {
+        guard surface == .library else { return nil }
+        return MobileOnThisDayModel.Request(
+            timelineRevision: model.timelineRevision, reference: onThisDayReference, calendar: .current)
+    }
+
+    private var onThisDayAvailability: OnThisDayAvailability {
+        guard let request = onThisDayRequest else { return .loading }
+        return onThisDay.availability(
+            for: request, authority: model.inventoryAuthority, loadFailed: model.loadState.failure != nil)
+    }
+
+    private var showsOnThisDayBadge: Bool {
+        onThisDayAvailability.showsUnseenBadge(seen: onThisDay.seenRecord)
+    }
+
+    private var showsOnThisDayArea: Bool {
+        surface == .library && onThisDay.isExpanded && canSelect && launchChromeVisible && !selection.isSelecting
+    }
+
+    private var onThisDayArea: some View {
+        MobileOnThisDayArea(
+            availability: onThisDayAvailability,
+            browser: $onThisDay.browser,
+            thumbnailFeed: model.thumbnailFeed,
+            onOpen: openMemory,
+            onShowInLibrary: showInLibrary
+        )
+    }
+
+    private func toggleOnThisDay() {
+        withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) {
+            onThisDay.isExpanded.toggle()
+        }
+        if onThisDay.isExpanded { onThisDay.markSeen() }
+    }
+
+    /// The memories of one year page in the existing viewer, starting with the card on top of the stack.
+    private func openMemory(_ year: OnThisDayYear) {
+        viewerRouter.presentation = MobileViewerPresentation(
+            index: onThisDay.browser.currentIndex(in: year), items: year.items,
+            context: ViewerCollectionContext(filter: .all)
+        )
+    }
+
+    /// Closes the area and centers the photo in the ordinary library. A filter is removed first, so the photo is in
+    /// the grid; a photo that left the library is explained instead of revealing another one.
+    private func showInLibrary(_ item: PhotoItem) {
+        guard model.gridIndex(of: item.uid) != nil else {
+            revealMissing = true
+            return
+        }
+        if refinement.isActive { resetRefinement() }
+        revealUID = item.uid
+        withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) {
+            onThisDay.isExpanded = false
+            revealSignal &+= 1
+        }
+        AccessibilityNotification.Announcement(L10n.string("memories.shown_in_library")).post()
+    }
+
+    /// A new day, time zone or calendar choice selects other memories. The scene's return to the foreground is
+    /// handled by `scenePhase`.
+    private func followOnThisDayCalendar() async {
+        guard surface == .library else { return }
+        let names: [Notification.Name] = [
+            .NSCalendarDayChanged, .NSSystemTimeZoneDidChange, NSLocale.currentLocaleDidChangeNotification,
+        ]
+        await withTaskGroup(of: Void.self) { group in
+            for name in names {
+                group.addTask { @MainActor in
+                    for await _ in NotificationCenter.default.notifications(named: name) {
+                        onThisDayReference = Date()
+                    }
+                }
+            }
+        }
     }
 
     private var showsLibraryLoadingCover: Bool {
