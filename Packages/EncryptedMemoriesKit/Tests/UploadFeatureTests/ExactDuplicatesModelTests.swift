@@ -2272,6 +2272,53 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.notice)
     }
 
+    /// The app was suspended while a batch ran, and one request of it ended with a timeout when the app came back. That
+    /// group merges once more after the return, and Merge All reports no failure (#500).
+    func testAGroupThatTheSuspensionInterruptedMergesOnceMoreAfterTheReturn() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        let interrupted = model.groups[3].id
+        let merge = await mergeAllPausedDuringTheFirstBatch(model, finder, failing: interrupted)
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(finder.batches.count, 1, "nothing merges again during the pause")
+        finder.mergeErrors[interrupted] = nil
+
+        model.resumeMerging()
+        await merge.value
+        XCTAssertEqual(finder.batches.count, 4)
+        XCTAssertEqual(finder.batches[1], [interrupted], "only the interrupted group merges again")
+        XCTAssertTrue(model.groups.isEmpty)
+        XCTAssertNil(model.notice, "a working connection reports no failed merge")
+    }
+
+    /// A group that fails again after the return reports the failed merge: the connection does not work.
+    func testAGroupThatFailsAgainAfterTheReturnReportsTheFailedMerge() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        let failing = model.groups[3].id
+        let merge = await mergeAllPausedDuringTheFirstBatch(model, finder, failing: failing)
+
+        model.resumeMerging()
+        await merge.value
+        XCTAssertEqual(finder.batches.count, 4)
+        XCTAssertEqual(finder.batches[1], [failing], "the group merges again only once")
+        XCTAssertEqual(model.groups.map(\.id), [failing])
+        XCTAssertEqual(model.notice, .failed)
+    }
+
+    /// Starts Merge All and pauses it, as the app does in the background, while its first batch runs. The request of
+    /// `groupID` in that batch ends with a timeout. Returns the run once the batch ended.
+    private func mergeAllPausedDuringTheFirstBatch(
+        _ model: ExactDuplicatesModel, _ finder: FakeDuplicateFinder, failing groupID: String
+    ) async -> Task<Void, Never> {
+        finder.mergeErrors[groupID] = URLError(.timedOut)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+        model.pauseMerging()
+        finder.mergeGate.open()
+        await model.runningMergeWorkEnded()
+        return merge
+    }
+
     func testCancellingAPausedMergeAllEndsTheRunAndReleasesTheModel() async {
         let finished = expectation(description: "The cancelled merge finishes")
         var loaded: (ExactDuplicatesModel, FakeDuplicateFinder, TrashLog)? = await loadedModel(groups: 60)
