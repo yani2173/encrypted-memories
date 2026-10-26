@@ -545,10 +545,15 @@ public actor SeriesDissolutionOrchestrator {
         // Every copy is confirmed in this phase. A missing identifier would silently skip a carry-over write.
         guard journal.allFavoritesConfirmed else { throw SeriesDissolutionError.copyNotConfirmed }
         let mainUID = journal.seriesMainUID
+        let sources = try await albumSources(of: journal)
         let favorites = try await remote.favoriteUIDs(among: journal.seriesUIDs)
         let untagged = journal.favorites.indices.filter { index in
-            !journal.favorites[index].favoriteTagAdded
-                && (favorites.contains(mainUID) || favorites.contains(journal.favorites[index].memberUID))
+            let memberUID = journal.favorites[index].memberUID
+            // Proton tags the main photo of a favorited series for its related photos. A standalone member, whose
+            // albums are its own, has a tag of its own as well.
+            let isStandalone = memberUID != mainUID && sources[index] == memberUID
+            return !journal.favorites[index].favoriteTagAdded
+                && (favorites.contains(memberUID) || (!isStandalone && favorites.contains(mainUID)))
         }
         if !untagged.isEmpty {
             try await remote.markFavorite(try untagged.map { try copyUID(of: journal.favorites[$0]) })
@@ -556,7 +561,6 @@ public actor SeriesDissolutionOrchestrator {
             try journalStore.save(journal)
         }
 
-        let sources = try await albumSources(of: journal)
         let albumIDsBySource = try await albums.ownAlbumIDsByPhoto(
             containing: Self.union(sources, []), ownVolumeID: try await remote.ownPhotosVolumeID())
         var seenAlbumIDs = Set<String>()

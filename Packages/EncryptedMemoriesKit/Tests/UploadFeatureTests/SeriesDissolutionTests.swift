@@ -249,6 +249,21 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.favoriteNodeIDs, ["m2", copyOfM2.nodeID])
     }
 
+    /// A series that only capture times group: its members are standalone photos with tags of their own. The tag of the
+    /// series main photo is not theirs, so only the copy of a member that has the tag gets it (#723).
+    func testTheCopyOfAStandaloneMemberKeepsOnlyItsOwnFavoriteTag() async throws {
+        server.makeStandalone(["m2", "m3", "m4"])
+        server.markFavoriteNodeIDs(["m1", "m3"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")])
+
+        let copyOfM3 = try XCTUnwrap(copies.last)
+        XCTAssertEqual(copies.count, 2)
+        XCTAssertEqual(
+            server.favoriteNodeIDs, ["m1", "m3", copyOfM3.nodeID], "the copy of m2 takes no tag from the main photo")
+    }
+
     func testTheCopyOfAStandaloneMemberJoinsItsOwnAlbumsAndARelatedPhotoFollowsTheMainPhoto() async throws {
         server.makeStandalone(["m2"])
         server.addAlbum("album-of-m2", volumeID: "own", members: ["m2"])
