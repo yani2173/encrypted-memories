@@ -1102,6 +1102,9 @@ public actor BackupSyncRunner {
             if settlement.reconciliationPersisted {
                 adjustProgress(from: .uploading, to: .needsRemoteReconciliation)
                 emitProgress()
+            } else if sourceWasRemoved(entry) {
+                // A deletion or exclusion removed the row while the commit settled: only the work of this photo ends.
+                revert(entry, from: persistedState)
             } else {
                 stopRequested = true
             }
@@ -1998,7 +2001,8 @@ public actor BackupSyncRunner {
                 if settlement.reconciliationPersisted {
                     return .reconciliationPending
                 }
-                stopRequested = true
+                // A row that a deletion or exclusion removed while the video settled ends only the work of this photo.
+                if !sourceWasRemoved(entry) { stopRequested = true }
                 return .cancelled
             } catch is BackupWorkDeferredError {
                 return .cancelled
