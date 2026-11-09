@@ -10,7 +10,12 @@ public struct ThumbnailCacheConfiguration: Sendable, Equatable {
 
     /// Shared Core preview default. The thumbnail feed promises complete persisted coverage, so an automatic
     /// thumbnail cap would evict older blobs while its coverage checkpoint still reports them as present.
-    public static let defaultPreviewDiskBudgetBytes: Int64 = 2_147_483_648
+    public static let defaultPreviewDiskBudgetBytes: Int64 = {
+        switch DiskCacheBudgetPolicy(platform: .mobile).previewBudget {
+        case .bytes(let bytes): return bytes
+        case .unlimited: return Int64.max
+        }
+    }()
 
     public init(
         dataMemoryBudgetBytes: Int = 128 * 1024 * 1024,
@@ -41,6 +46,118 @@ public enum ThumbnailCacheStoreResult: Sendable, Equatable {
 /// the corrupt blob is deleted, while a missing key (locked cache) is a plain miss that keeps the blob - never
 /// a crash.
 public actor ThumbnailCache {
+    public nonisolated func thumbnailCacheSupportSnapshot(
+        deadline: ContinuousClock.Instant
+    ) async -> ThumbnailCacheSupportSnapshot {
+        await supportSnapshotForProbe(deadline: deadline, onEntry: {}, afterLease: {})
+    }
+
+    #if DEBUG
+        nonisolated func supportSnapshotForTesting(
+            deadline: ContinuousClock.Instant, onEntry: @Sendable () -> Void,
+            afterLease: @Sendable () -> Void = {},
+            iteratorProbe: @escaping @Sendable (ThumbnailSupportMetadataIterator.ProbeStep) -> Void = { _ in },
+            now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
+        ) async -> ThumbnailCacheSupportSnapshot {
+            await supportSnapshotForProbe(
+                deadline: deadline, onEntry: onEntry, afterLease: afterLease,
+                iteratorProbe: iteratorProbe, now: now)
+        }
+
+        package nonisolated func setSupportLockProbeForTesting(
+            _ probe: (@Sendable (SupportLockPath, UUID?) -> Void)?
+        ) {
+            writerGeneration.setSupportLockProbeForTesting(probe)
+        }
+    #endif
+
+    private nonisolated func supportSnapshotForProbe(
+        deadline: ContinuousClock.Instant, onEntry: @Sendable () -> Void, afterLease: @Sendable () -> Void,
+        iteratorProbe: @escaping @Sendable (ThumbnailSupportMetadataIterator.ProbeStep) -> Void = { _ in },
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
+    ) async -> ThumbnailCacheSupportSnapshot {
+        onEntry()
+        guard !Task.isCancelled, now() < deadline,
+            let lease = writerGeneration.tryCaptureDiagnosticLease()
+        else { return .unavailable }
+        afterLease()
+        let iterator = ThumbnailSupportMetadataIterator(directory: directory, probe: iteratorProbe) {
+            Task.isCancelled || now() >= deadline
+                || !self.writerGeneration.isCurrentDiagnosticLease(lease)
+        }
+        guard iterator.available else { return .unavailable }
+        let result = await thumbnailCacheSupportSnapshot(
+            deadline: deadline, nextBlobSize: { try iterator.next() },
+            shouldStop: { !self.writerGeneration.isCurrentDiagnosticLease(lease) })
+        return writerGeneration.isCurrentDiagnosticLease(lease) ? result : .unavailable
+    }
+
+    package nonisolated func thumbnailCacheSupportSnapshot(
+        deadline: ContinuousClock.Instant,
+        nextBlobSize: @Sendable () async throws -> Int64?,
+        shouldStop: @Sendable () -> Bool,
+        now: @Sendable () -> ContinuousClock.Instant = { .now }
+    ) async -> ThumbnailCacheSupportSnapshot {
+        let kind: ThumbnailCacheSupportSnapshot.Kind
+        switch storageKind {
+        case .thumbnail: kind = .thumbnail
+        case .preview: kind = .preview
+        case .original: kind = .original
+        case .video: return .unavailable
+        }
+        var buckets = Array(repeating: 0, count: 6)
+        var count = 0
+        var total: Int64 = 0
+        var readErrors = 0
+        var availability = ThumbnailCacheSupportSnapshot.Availability.complete
+        while true {
+            if Task.isCancelled || shouldStop() || now() >= deadline {
+                availability = .partial
+                break
+            }
+            do {
+                guard let size = try await nextBlobSize() else {
+                    if Task.isCancelled || shouldStop() || now() >= deadline { availability = .partial }
+                    break
+                }
+                guard size >= 0 else {
+                    readErrors += 1
+                    availability = .partial
+                    break
+                }
+                let index: Int
+                switch size {
+                case ..<16_384: index = 0
+                case ..<65_536: index = 1
+                case ..<262_144: index = 2
+                case ..<1_048_576: index = 3
+                case ..<4_194_304: index = 4
+                default: index = 5
+                }
+                count += 1
+                buckets[index] += 1
+                let (sum, overflow) = total.addingReportingOverflow(size)
+                total = overflow ? Int64.max : sum
+            } catch is CancellationError {
+                availability = .partial
+                break
+            } catch is ThumbnailSupportMetadataIterator.Stopped {
+                availability = .partial
+                break
+            } catch {
+                readErrors += 1
+                availability = .partial
+                break
+            }
+        }
+        let totalMiB = total / 1_048_576 + (total % 1_048_576 == 0 ? 0 : 1)
+        return ThumbnailCacheSupportSnapshot(
+            availability: availability,
+            caches: [
+                .init(kind: kind, blobCount: count, buckets: buckets, totalMiB: totalMiB, readErrors: readErrors)
+            ])
+    }
+
     private nonisolated(unsafe) let memory = NSCache<NSString, NSData>()  // NSCache is thread-safe
     /// Encrypted blob directory (`<namespace>.enc`).
     private nonisolated let directory: URL
@@ -188,7 +305,7 @@ public actor ThumbnailCache {
     public func data(for uid: PhotoUID) -> Data? {
         guard retentionAuthorization.isAllowed(uid) else { return nil }
         let generation = writerGeneration.capture()
-        let mk = Self.memKey(uid)
+        let mk = uid.cacheKey
         if let cached = memory.object(forKey: mk) {
             return writerGeneration.performIfCurrent(generation) {
                 retentionAuthorization.isAllowed(uid) ? cached as Data : nil
@@ -435,17 +552,17 @@ public actor ThumbnailCache {
         let generation = writerGeneration.capture()
         let result = storeToDisk(data, for: uid, ifCurrent: generation)
         guard result == .stored || result == .storagePaused else {
-            memory.removeObject(forKey: Self.memKey(uid))
+            memory.removeObject(forKey: uid.cacheKey)
             return
         }
         let published =
             writerGeneration.performIfCurrent(generation) {
                 guard retentionAuthorization.isAllowed(uid) else { return false }
                 // Plaintext remains process-local and is published only after the fenced encrypted write.
-                memory.setObject(data as NSData, forKey: Self.memKey(uid), cost: data.count)
+                memory.setObject(data as NSData, forKey: uid.cacheKey, cost: data.count)
                 return true
             } ?? false
-        if !published { memory.removeObject(forKey: Self.memKey(uid)) }
+        if !published { memory.removeObject(forKey: uid.cacheKey) }
     }
 
     // MARK: - LRU size cap
@@ -616,7 +733,7 @@ public actor ThumbnailCache {
             if let removedUIDs {
                 for uid in removedUIDs {
                     let name = filename(uid: uid, account: account)
-                    memory.removeObject(forKey: Self.memKey(uid))
+                    memory.removeObject(forKey: uid.cacheKey)
                     let url = directory.appendingPathComponent(name)
                     guard FileManager.default.fileExists(atPath: url.path) else { continue }
                     do {
@@ -881,7 +998,7 @@ public actor ThumbnailCache {
 
     private static let lowercaseHexDigits = Array("0123456789abcdef".utf8)
 
-    private nonisolated static func lowercaseHex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
+    package nonisolated static func lowercaseHex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
         var output: [UInt8] = []
         output.reserveCapacity(64)
         for byte in bytes {
@@ -889,11 +1006,6 @@ public actor ThumbnailCache {
             output.append(lowercaseHexDigits[Int(byte & 0x0F)])
         }
         return String(decoding: output, as: UTF8.self)
-    }
-
-    /// In-RAM NSCache key (process-local plaintext tier; not security sensitive).
-    private static func memKey(_ uid: PhotoUID) -> NSString {
-        "\(uid.volumeID)~\(uid.nodeID)" as NSString
     }
 
     private static func defaultDerivative(for namespace: String) -> String {

@@ -35,14 +35,18 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
     private let coordinator: LibraryResourceCoordinator
     /// The runtime snapshots that held a pass back, so a test can tell that the task waits.
     private var heldSnapshots = 0
+    /// Production runs the passes at background priority. A test names a higher priority: on a machine under heavy load
+    /// a background task can wait longer than any test limit for its first turn.
+    private let taskPriority: TaskPriority
 
     public init(
         startGate: TimelineMetadataStartGate? = nil, runtimeState: LibraryRuntimeState = .shared,
-        coordinator: LibraryResourceCoordinator = .shared
+        coordinator: LibraryResourceCoordinator = .shared, taskPriority: TaskPriority = .background
     ) {
         self.startGate = startGate
         self.runtimeState = runtimeState
         self.coordinator = coordinator
+        self.taskPriority = taskPriority
     }
 
     var heldSnapshotCount: Int { lock.withLock { heldSnapshots } }
@@ -67,7 +71,7 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
             activeSignature = signature
             input = inventory
             let runGeneration = generation
-            task = Task(priority: .background) { [self] in
+            task = Task(priority: taskPriority) { [self] in
                 await startGate?.wait()
                 // Only an owed pass waits: after the last pass, the task ends instead of waiting untracked.
                 while hasOwedInput(generation: runGeneration), let opportunity = await waitUntilAPassMayRun() {

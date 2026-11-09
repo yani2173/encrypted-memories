@@ -5,14 +5,22 @@ import SwiftUI
 public struct LibraryEmptyView: View {
     private let filter: PhotoFilter
     private let backupAction: LibraryEmptyBackupAction?
+    private let copy: PhotoFilterEmptyStateCopy
 
     public init(filter: PhotoFilter = .all, backupAction: LibraryEmptyBackupAction? = nil) {
         self.filter = filter
         self.backupAction = backupAction
+        copy = filter.emptyStateCopy
+    }
+
+    /// Reuses the library's empty screen for a list with its own copy and no backup setup action.
+    public init(copy: PhotoFilterEmptyStateCopy) {
+        filter = .all
+        backupAction = nil
+        self.copy = copy
     }
 
     public var body: some View {
-        let copy = filter.emptyStateCopy
         ContentUnavailableView {
             Label {
                 Text(copy.title)

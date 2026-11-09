@@ -8,6 +8,7 @@ package enum MetalGridQuadMode: Int32 {
     case textured = 0
     case solid = 1
     case border = 2
+    case thumbnailPlaceholder = 3
 }
 
 /// One quad in viewport coordinates, with its texture UV window, corner radius, alpha, and shader mode.

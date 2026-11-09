@@ -314,6 +314,28 @@ if sys.argv[1:2] == ['xcodebuild']:
                 if parallel:
                     self.assertEqual(invocation[invocation.index('-parallel-testing-worker-count') + 1], '2')
 
+    def test_extra_xcodebuild_arguments_reach_the_run_that_sets_them(self):
+        self.write_xctestrun('EncryptedMemoriesMobileCI_iphonesimulator27.0-arm64.xctestrun')
+        result = self.run_script('ui', IOS_TEST_ACTION='test-without-building', IOS_TEST_PREPARED='1',
+                                 IOS_TEST_SCHEME='EncryptedMemoriesMobileCI',
+                                 IOS_TEST_EXTRA_XCODEBUILD_ARGS='-retry-tests-on-failure -test-iterations 2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        invocation = self.commands[-1]
+        self.assertIn('-retry-tests-on-failure', invocation)
+        self.assertEqual(invocation[invocation.index('-test-iterations') + 1], '2')
+        self.assertEqual(invocation[-1], 'test-without-building')
+        # A build takes no test run option; a value there is an error, not a silent drop.
+        result = self.run_script('ui', IOS_TEST_ACTION='build-for-testing', IOS_TEST_PREPARED='1',
+                                 IOS_TEST_SCHEME='EncryptedMemoriesMobileCI',
+                                 IOS_TEST_EXTRA_XCODEBUILD_ARGS='-retry-tests-on-failure')
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn('takes no test run option', result.stderr)
+        # A caller that does not set the variable keeps the command without the extra options.
+        result = self.run_script('ui')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('-retry-tests-on-failure', self.commands[-1])
+        self.assertNotIn('-test-iterations', self.commands[-1])
+
     def test_a_prepared_run_without_exactly_one_test_run_file_fails_before_xcodebuild_starts(self):
         cases = {
             'none': [],

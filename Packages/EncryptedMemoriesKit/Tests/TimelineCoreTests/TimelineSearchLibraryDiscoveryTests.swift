@@ -180,10 +180,10 @@ import Testing
         let autumnItem = item("k-autumn", date(2023, 10, 1))
         let first = TimelineSearchPlaceCandidate(
             id: "a", latitude: 48.3, longitude: 16.3,
-            uids: springItems.prefix(3).map(\.uid), dates: [], isHome: false)
+            uids: springItems.prefix(3).map(\.uid), isHome: false)
         let second = TimelineSearchPlaceCandidate(
             id: "b", latitude: 48.31, longitude: 16.33,
-            uids: springItems.suffix(3).map(\.uid) + [autumnItem.uid], dates: [], isHome: false)
+            uids: springItems.suffix(3).map(\.uid) + [autumnItem.uid], isHome: false)
         let itemsByUID = Dictionary(uniqueKeysWithValues: (springItems + [autumnItem]).map { ($0.uid, $0) })
 
         let result = TimelineSearchDiscovery.placeSuggestions(

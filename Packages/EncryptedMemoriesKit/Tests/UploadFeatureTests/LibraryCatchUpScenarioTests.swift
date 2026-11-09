@@ -313,12 +313,14 @@ private actor CatchUpEditRepository: PhotosRepository, PhotoLibraryProvider, Lib
         heldProbe = nil
     }
     var probeCount: Int { probes }
-    func waitForBaseline(of monitor: LibraryChangeMonitor) async {
-        let deadline = ContinuousClock.now + .seconds(3)
-        while await monitor.testingBaseline() != currentCursor, ContinuousClock.now < deadline {
-            await Task.yield()
+    #if DEBUG
+        func waitForBaseline(of monitor: LibraryChangeMonitor) async {
+            let deadline = ContinuousClock.now + .seconds(3)
+            while await monitor.testingBaseline() != currentCursor, ContinuousClock.now < deadline {
+                await Task.yield()
+            }
         }
-    }
+    #endif
     func waitForProbes(_ count: Int) async {
         let deadline = ContinuousClock.now + .seconds(3)
         while probes < count, ContinuousClock.now < deadline { await Task.yield() }

@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   triage:
-    name: Check duplicates and bug priority
+    name: Check duplicates and priority
     # Repo-global LLM kill switch: runs only when the LLM_ENABLED repository
     # variable is "1" or "true" (GitHub compares case-insensitively, so "True"
     # also enables it). Missing, "0", "false", or any other value skips this

@@ -146,59 +146,63 @@ import Testing
         await feed.stopPrefetch()
     }
 
-    @MainActor @Test(.timeLimit(.minutes(1)), arguments: [WarmStartCorrection.mediaType, .order])
-    func warmStartPublishesLocalCorrectionsBeforeAcknowledgingTheirRevision(
-        correction: WarmStartCorrection
-    ) async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let repository = HeldWarmStartRepository(correction: correction)
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
-        let model = TimelineViewModel(repository: repository, feed: feed)
-        let loading = Task { await model.load() }
-        #expect(await repository.waitUntilSeedProbeIsHeld())
-        await repository.completeCorrectionAndReleaseProbe()
-        await loading.value
+    #if DEBUG
+        @MainActor @Test(.timeLimit(.minutes(1)), arguments: [WarmStartCorrection.mediaType, .order])
+        func warmStartPublishesLocalCorrectionsBeforeAcknowledgingTheirRevision(
+            correction: WarmStartCorrection
+        ) async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let repository = HeldWarmStartRepository(correction: correction)
+            let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+            let model = TimelineViewModel(repository: repository, feed: feed)
+            let loading = Task { await model.load() }
+            #expect(await repository.waitUntilSeedProbeIsHeld())
+            await repository.completeCorrectionAndReleaseProbe()
+            await loading.value
 
-        let monitor = LibraryChangeMonitor()
-        await monitor.start(
-            provider: repository, policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
-            initialToken: model.initialLibraryChangeToken
-        ) {
-            let result = await model.refreshLibrary()
-            return result.failureReason == nil ? .refreshed(token: result.publishedLibraryChangeToken) : .retry
+            let monitor = LibraryChangeMonitor()
+            await monitor.start(
+                provider: repository, policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+                initialToken: model.initialLibraryChangeToken
+            ) {
+                let result = await model.refreshLibrary()
+                return result.failureReason == nil ? .refreshed(token: result.publishedLibraryChangeToken) : .retry
+            }
+            #expect(await repository.waitForProbes(4))
+            await monitor.stop()
+            #expect(await repository.cachedReads == 2, "Warm validation adds exactly one local cache read")
+            #expect(await repository.fullLoads == 0, "A local correction must not require another full server listing")
+            let correctedItems = repository.correctedItems
+            #expect(
+                model.allItems == correctedItems,
+                "A local correction after cache capture must appear without needing another remote event")
+            #expect(
+                await monitor.testingBaseline() != repository.correctedToken || model.allItems == correctedItems,
+                "The monitor must not certify corrected metadata while the earlier cached projection is still visible")
+            await feed.stopPrefetch()
         }
-        #expect(await repository.waitForProbes(4))
-        await monitor.stop()
-        #expect(await repository.cachedReads == 2, "Warm validation adds exactly one local cache read")
-        #expect(await repository.fullLoads == 0, "A local correction must not require another full server listing")
-        let correctedItems = repository.correctedItems
-        #expect(
-            model.allItems == correctedItems,
-            "A local correction after cache capture must appear without needing another remote event")
-        #expect(
-            await monitor.testingBaseline() != repository.correctedToken || model.allItems == correctedItems,
-            "The monitor must not certify corrected metadata while the earlier cached projection is still visible")
-        await feed.stopPrefetch()
-    }
+    #endif
 
-    @MainActor @Test(.timeLimit(.minutes(1)))
-    func publicationValidationRejectsAnUnprovenRereadAfterMacStartupCancellation() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let repository = HeldWarmStartRepository(correction: .mediaType)
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
-        let model = TimelineViewModel(repository: repository, feed: feed)
-        let loading = Task { await model.load() }
-        #expect(await repository.waitUntilSeedProbeIsHeld())
-        model.cancelInitialLoadForTesting()
-        await repository.completeCorrectionAndReleaseProbe()
-        await loading.value
-        #expect(model.allItems == repository.originalItems)
-        #expect(model.initialLibraryChangeToken == "", "Cancelled warm validation must retain a retry seed")
-        #expect(await repository.fullLoads == 0, "Cancellation must not enter the authoritative fallback")
-        await feed.stopPrefetch()
-    }
+    #if DEBUG
+        @MainActor @Test(.timeLimit(.minutes(1)))
+        func publicationValidationRejectsAnUnprovenRereadAfterMacStartupCancellation() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let repository = HeldWarmStartRepository(correction: .mediaType)
+            let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+            let model = TimelineViewModel(repository: repository, feed: feed)
+            let loading = Task { await model.load() }
+            #expect(await repository.waitUntilSeedProbeIsHeld())
+            model.cancelInitialLoadForTesting()
+            await repository.completeCorrectionAndReleaseProbe()
+            await loading.value
+            #expect(model.allItems == repository.originalItems)
+            #expect(model.initialLibraryChangeToken == "", "Cancelled warm validation must retain a retry seed")
+            #expect(await repository.fullLoads == 0, "Cancellation must not enter the authoritative fallback")
+            await feed.stopPrefetch()
+        }
+    #endif
 
     @MainActor @Test(.timeLimit(.minutes(1)))
     func publicationValidationRejectsAnUnprovenRereadAfterRouteChange() async throws {

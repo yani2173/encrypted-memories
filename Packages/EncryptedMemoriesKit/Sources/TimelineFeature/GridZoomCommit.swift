@@ -21,20 +21,6 @@ enum GridZoomAnchorLog {
             ])
     }
 
-    static func live(
-        levelPosition: CGFloat, cursorViewportPoint: CGPoint, indexUnderCursor: Int?,
-        transactionAnchorIndex: Int, focusRow: [Int]
-    ) {
-        PhotoDiagnostics.shared.emit(
-            "GridZoomAnchor",
-            [
-                "phase": "live", "levelPosition": String(format: "%.2f", levelPosition),
-                "cursorViewportPoint": pt(cursorViewportPoint), "indexUnderCursor": idx(indexUnderCursor),
-                "transactionAnchorIndex": "\(transactionAnchorIndex)",
-                "anchorStillUnderCursor": "\(indexUnderCursor == transactionAnchorIndex)", "focusRow": "\(focusRow)",
-            ])
-    }
-
     static func release(
         targetLevel: Int, cursorViewportPoint: CGPoint, indexUnderCursorBeforeCommit: Int?,
         transactionAnchorIndex: Int, committedPhase: Int, targetScrollY: CGFloat, bridgeWillRun: Bool

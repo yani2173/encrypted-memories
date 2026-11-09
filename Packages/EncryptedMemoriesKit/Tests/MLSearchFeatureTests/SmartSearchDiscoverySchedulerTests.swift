@@ -827,6 +827,230 @@ import TimelineCore
         }
     }
 
+    /// The saved rows of a library that changed since (a running backup adds photos) come back at once, without
+    /// inference. They stay provisional: not settled, never saved again, replaced by the next refresh.
+    @Test func relaunchWithAChangedLibraryShowsTheSavedSuggestionsAsProvisionalRows() async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let items = (0..<9).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let saved = Array(items.prefix(8))
+        func apply(
+            _ scheduler: SmartSearchDiscoveryScheduler, library: [PhotoItem], revision: UInt64,
+            libraryIsSettled: Bool
+        ) {
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: Date(), title: "", items: library)],
+                timelineRevision: revision, favoriteUIDs: Set(saved.map(\.uid)), coordinates: [],
+                snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+                searchEvidence: {
+                    await probe.query(
+                        sensitive: items[0].uid, conceptUIDs: saved.map(\.uid), scanned: Set(library.map(\.uid)))
+                },
+                libraryIsSettled: libraryIsSettled, cacheContentIsSettled: true,
+                cacheAccess: { await cache.access() })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in nil }
+        apply(first, library: saved, revision: 1, libraryIsSettled: true)
+        try await waitUntilHangLimit { first.discovery.lastRefreshCompleted && !first.isRefreshing }
+        try #require(first.discovery.lastRefreshCompleted && !first.isRefreshing)
+        try #require(first.discovery.forYou.contains { $0.kind == .concept })
+        first.reset()
+
+        let runtime = LibraryRuntimeState()
+        runtime.update { $0.activeSearchCount = 1 }
+        let relaunched = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { relaunched.reset() }
+        apply(relaunched, library: items, revision: 2, libraryIsSettled: false)
+        for _ in 0..<400 where !relaunched.discovery.hasComputed { try await Task.sleep(for: .milliseconds(5)) }
+
+        try #require(relaunched.discovery.hasComputed, "a changed library must not hide the saved suggestions")
+        let content = SmartSearchContentIdentity(timelineRevision: 2, favoriteUIDs: Set(saved.map(\.uid)))
+        let shown = relaunched.discovery.forYou(content: content, snapshot: visualSnapshot(settled: 8, ready: true))
+        #expect(!shown.isEmpty)
+        #expect(await probe.calls == 1, "restoring needs no new scan")
+        #expect(!relaunched.discovery.isSettled(content: content), "provisional rows are not a finished refresh")
+        #expect(relaunched.discovery.persistedSnapshot() == nil, "provisional rows are never saved as final")
+    }
+
+    /// A library change during the session (a backup uploads a photo) must not swap the rows on screen for a
+    /// filtered copy of the saved ones: the places stay until a finished refresh replaces them.
+    @Test func aLibraryChangeDuringTheSessionKeepsTheRowsOnScreen() async throws {
+        let cache = SnapshotCache()
+        let probe = EvidenceProbe()
+        let captured = Date(timeIntervalSince1970: 1_700_000_000)
+        // Photos months apart give date rows next to the place row.
+        let items = (0..<9).map {
+            PhotoItem(
+                uid: PhotoUID(volumeID: "v", nodeID: "\($0)"),
+                captureTime: captured.addingTimeInterval(Double($0) * 40 * 86_400), mediaType: "image/jpeg")
+        }
+        let coordinates = items.map {
+            PhotoCoordinate(uid: $0.uid, latitude: 20, longitude: 30, date: $0.captureTime)
+        }
+        let visual = visualSnapshot(settled: 8, ready: true)
+        let runtime = LibraryRuntimeState()
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in "Place" }
+        defer { scheduler.reset() }
+        func apply(_ library: [PhotoItem], revision: UInt64, libraryIsSettled: Bool) {
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: captured, title: "", items: library)],
+                timelineRevision: revision, favoriteUIDs: [], coordinates: coordinates,
+                snapshot: visual, indexedAssetCount: { 8 },
+                searchEvidence: {
+                    await probe.query(
+                        sensitive: items[0].uid, conceptUIDs: items.prefix(8).map(\.uid),
+                        scanned: Set(items.map(\.uid)))
+                },
+                libraryIsSettled: libraryIsSettled, cacheContentIsSettled: true,
+                cacheAccess: { await cache.access() })
+        }
+        apply(Array(items.prefix(8)), revision: 1, libraryIsSettled: true)
+        try await waitUntilHangLimit { scheduler.discovery.lastRefreshCompleted && !scheduler.isRefreshing }
+        try #require(await cache.saves >= 1)
+        let before = SmartSearchContentIdentity(timelineRevision: 1, favoriteUIDs: [])
+        try #require(
+            scheduler.discovery.forYou.contains { $0.kind == .concept },
+            "SETUP: rows that a provisional restore would keep")
+        try #require(
+            scheduler.discovery.resolvableSuggestions(content: before, snapshot: visual).contains { $0.kind == .place })
+        let reads = await cache.reads
+
+        runtime.update { $0.activeSearchCount = 1 }
+        apply(items, revision: 2, libraryIsSettled: false)
+        for _ in 0..<400 where await cache.reads == reads { try await Task.sleep(for: .milliseconds(5)) }
+        try #require(await cache.reads > reads, "the changed library read the saved suggestions again")
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(
+            scheduler.discovery.resolvableSuggestions(content: before, snapshot: visual).contains { $0.kind == .place },
+            "the places on screen stay until a finished refresh replaces them")
+    }
+
+    /// Saved rows for the exact same content restore as final even while rows are on screen: a photo that changed
+    /// and changed back leaves its rows unsettled until the saved ones settle them again.
+    @Test func unchangedContentSettlesTheRowsOnScreenAgain() async throws {
+        let cache = SnapshotCache()
+        let captured = Date(timeIntervalSince1970: 1_700_000_000)
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: captured, mediaType: "image/jpeg")
+        }
+        var edited = items
+        edited[3] = PhotoItem(
+            uid: items[3].uid, captureTime: captured.addingTimeInterval(86_400), mediaType: "image/jpeg")
+        let coordinates = items.map { PhotoCoordinate(uid: $0.uid, latitude: 20, longitude: 30, date: captured) }
+        let runtime = LibraryRuntimeState()
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in "Place" }
+        defer { scheduler.reset() }
+        func apply(_ library: [PhotoItem], revision: UInt64, libraryIsSettled: Bool) {
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: captured, title: "", items: library)],
+                timelineRevision: revision, favoriteUIDs: [], coordinates: coordinates, snapshot: .disabled,
+                indexedAssetCount: { 0 }, searchEvidence: nil, libraryIsSettled: libraryIsSettled,
+                cacheContentIsSettled: true, cacheAccess: { await cache.access() })
+        }
+        apply(items, revision: 1, libraryIsSettled: true)
+        try await waitUntilHangLimit { scheduler.discovery.lastRefreshCompleted && !scheduler.isRefreshing }
+        try #require(await cache.saves >= 1)
+        runtime.update { $0.activeSearchCount = 1 }
+
+        apply(edited, revision: 2, libraryIsSettled: false)
+        func identity(_ revision: UInt64) -> SmartSearchContentIdentity {
+            SmartSearchContentIdentity(timelineRevision: revision, favoriteUIDs: [])
+        }
+        try #require(!scheduler.discovery.isSettled(content: identity(2)), "SETUP: the change unsettled the rows")
+        let reads = await cache.reads
+        apply(items, revision: 3, libraryIsSettled: false)
+        for _ in 0..<400 where await cache.reads == reads { try await Task.sleep(for: .milliseconds(5)) }
+        try #require(await cache.reads > reads)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(scheduler.discovery.isSettled(content: identity(3)))
+    }
+
+    @Test func provisionalRowsNeverNameAPhotoThatLeftTheLibrary() async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let removed = items[7].uid
+        func apply(_ scheduler: SmartSearchDiscoveryScheduler, library: [PhotoItem], revision: UInt64) {
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: Date(), title: "", items: library)],
+                timelineRevision: revision, favoriteUIDs: Set(items.prefix(7).map(\.uid)), coordinates: [],
+                snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+                searchEvidence: {
+                    await probe.query(
+                        sensitive: items[0].uid, conceptUIDs: items.prefix(7).map(\.uid),
+                        scanned: Set(items.map(\.uid)))
+                },
+                libraryIsSettled: revision == 1, cacheContentIsSettled: true,
+                cacheAccess: { await cache.access() })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in nil }
+        apply(first, library: items, revision: 1)
+        try await waitUntilHangLimit { first.discovery.lastRefreshCompleted && !first.isRefreshing }
+        try #require(first.discovery.lastRefreshCompleted && !first.isRefreshing)
+        first.reset()
+
+        let runtime = LibraryRuntimeState()
+        runtime.update { $0.activeSearchCount = 1 }
+        let relaunched = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { relaunched.reset() }
+        apply(relaunched, library: Array(items.prefix(7)), revision: 2)
+        for _ in 0..<400 where !relaunched.discovery.hasComputed { try await Task.sleep(for: .milliseconds(5)) }
+
+        try #require(relaunched.discovery.hasComputed)
+        let rows = relaunched.discovery.forYou + relaunched.discovery.chips
+        try #require(!rows.isEmpty)
+        for row in rows {
+            #expect(!row.representativeUIDs.contains(removed))
+            #expect(row.matchingUIDs?.contains(removed) != true)
+        }
+    }
+
+    /// Saved rows belong to the Smart Search model that computed them. Another model restores nothing,
+    /// also not as provisional rows.
+    @Test func rowsOfAnotherSmartSearchModelNeverRestore() async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: Date(), title: "", items: items)]
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in nil }
+        first.update(
+            sections: sections, timelineRevision: 1, favoriteUIDs: [], coordinates: [],
+            snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+            searchEvidence: { await probe.query(sensitive: items[0].uid, conceptUIDs: items.map(\.uid)) },
+            cacheAccess: { await cache.access() })
+        try await waitUntilHangLimit { first.discovery.lastRefreshCompleted && !first.isRefreshing }
+        try #require(first.discovery.lastRefreshCompleted)
+        try #require(await cache.saves >= 1, "the first launch saved its suggestions")
+        first.reset()
+        let readsBefore = await cache.reads
+
+        let runtime = LibraryRuntimeState()
+        runtime.update { $0.activeSearchCount = 1 }
+        let relaunched = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { relaunched.reset() }
+        let progress = MLSmartSearchAggregateProgress(
+            totalWorkUnits: 8, settledWorkUnits: 8, permanentlyUnavailableAssets: 0)
+        let coverage = MLIndexCoverage(total: 8, indexed: 8, permanentlyUnindexable: 0)
+        let otherModel = MLSmartSearchSnapshot(
+            isEnabled: true, selectedModelID: MLModelID("other-model"), phase: .ready(coverage),
+            installedModelBytes: 0, availableModels: [], isSearchAvailable: true, indexingState: .ready(progress))
+        relaunched.update(
+            sections: sections, timelineRevision: 2, favoriteUIDs: [], coordinates: [], snapshot: otherModel,
+            indexedAssetCount: { 8 }, searchEvidence: nil, libraryIsSettled: false, cacheContentIsSettled: true,
+            cacheAccess: { await cache.access() })
+        for _ in 0..<400 where await cache.reads == readsBefore { try await Task.sleep(for: .milliseconds(5)) }
+        try #require(await cache.reads > readsBefore, "the relaunch read the saved suggestions")
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(!relaunched.discovery.hasComputed)
+        #expect(relaunched.discovery.forYou.isEmpty)
+    }
+
     @Test func placePolicyFingerprintKeepsTheExactSaltedDigest() throws {
         struct Content: Encodable {
             let items: [PhotoItem]
@@ -907,8 +1131,12 @@ import TimelineCore
         apply(next)
         for _ in 0..<200 where await cache.reads < 2 { try await Task.sleep(for: .milliseconds(5)) }
         try await Task.sleep(for: .milliseconds(50))
-        #expect(!next.discovery.hasComputed)
-        #expect(next.discovery.forYou.isEmpty)
+        // Rows that do not depend on the place policy may come back as provisional rows. A place never does.
+        let content = SmartSearchContentIdentity(timelineRevision: 1, favoriteUIDs: [])
+        let restored = next.discovery.resolvableSuggestions(content: content, snapshot: .disabled)
+        #expect(!restored.contains { $0.kind == .place || $0.kind == .placeSeason })
+        let shown = next.discovery.forYou + next.discovery.chips
+        #expect(!shown.contains { $0.kind == .place || $0.kind == .placeSeason })
     }
 
     @Test func disabledSmartSearchNamesOnlyEligibleCoordinatesAndReusesTheIndexEvidence() async throws {

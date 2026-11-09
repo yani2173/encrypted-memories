@@ -88,6 +88,131 @@ func repository(_ backend: FakeAlbumBackend) -> AlbumsRepository {
 }
 
 final class AlbumsRepositoryTests: XCTestCase {
+    func testAlbumWriteCancellationRemainsCancellation() async {
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        backend.addError = CancellationError()
+        do {
+            try await repository(backend).addPhotos([uid("1")], to: "album")
+            XCTFail("the cancelled add must not succeed")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "a cancelled add remains cancelled")
+        }
+        XCTAssertTrue(backend.added.isEmpty)
+    }
+
+    func testOfflineAndTimeoutKeepTheirCauseInsteadOfBecomingBackendStrings() async {
+        for code in [URLError.notConnectedToInternet, URLError.timedOut] {
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            backend.addError = URLError(code)
+            do {
+                try await repository(backend).addPhotos([uid("1")], to: "album")
+                XCTFail("the failed add must not succeed")
+            } catch let error as AlbumError {
+                if case .backend = error { XCTFail("the transient cause must not become a backend string") }
+                guard case .requestFailed(let cause) = error else {
+                    XCTFail("the transient cause must stay typed")
+                    continue
+                }
+                XCTAssertEqual(cause.kind, .network(code: code.rawValue))
+                XCTAssertTrue(cause.isTransient)
+                XCTAssertEqual((cause.underlyingError as? URLError)?.code, code)
+                XCTAssertEqual(error.errorDescription, AlbumError.backend("redacted").errorDescription)
+            } catch {
+                XCTFail("the album error must retain a typed cause: \(error)")
+            }
+            XCTAssertTrue(backend.added.isEmpty)
+        }
+    }
+
+    func testCancelledAddAfterCreatingAlbumKeepsIDAndCancellationForRetry() async throws {
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        backend.addError = CancellationError()
+        let repo = repository(backend)
+        var createdID: AlbumID?
+        do {
+            _ = try await repo.createAlbum(name: "Trip", adding: [uid("1")])
+            XCTFail("the cancelled add must not succeed")
+        } catch let error as AlbumError {
+            if case .albumCreatedButPhotosNotAdded(let id, _, _, _) = error { createdID = id }
+            let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey]
+            XCTAssertTrue(underlying is CancellationError, "the created-album error keeps cancellation")
+            XCTAssertTrue(error.underlyingCause is CancellationError)
+            XCTAssertEqual(error.writeCause?.kind, .cancelled)
+            XCTAssertFalse(error.writeCause?.isTransient ?? true)
+        }
+        let albumID = try XCTUnwrap(createdID)
+        XCTAssertEqual(albumID, "album-0")
+        backend.addError = nil
+        try await repo.addPhotos([uid("1")], to: albumID)
+        XCTAssertEqual(backend.created, ["Trip"], "retry uses the created album")
+        XCTAssertEqual(backend.added.map(\.album), [albumID])
+    }
+
+    func testUnrecognizedNetworkErrorIsNotCalledTransientOrRefusal() async {
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        backend.addError = URLError(.unsupportedURL)
+        do {
+            try await repository(backend).addPhotos([uid("1")], to: "album")
+            XCTFail("the failed add must stop")
+        } catch let AlbumError.requestFailed(cause) {
+            XCTAssertEqual(cause.kind, .network(code: URLError.unsupportedURL.rawValue))
+            XCTAssertFalse(cause.isTransient)
+            XCTAssertEqual((cause.underlyingError as? URLError)?.code, .unsupportedURL)
+        } catch {
+            XCTFail("the cause must stay typed: \(error)")
+        }
+        XCTAssertTrue(backend.added.isEmpty)
+    }
+
+    func testUnknownWriteFailureKeepsItsCauseAndStops() async {
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        backend.addError = NSError(domain: "AlbumTestFailure", code: 73)
+        do {
+            try await repository(backend).addPhotos([uid("1")], to: "album")
+            XCTFail("an unknown failure must stop")
+        } catch let AlbumError.requestFailed(cause) {
+            XCTAssertEqual(cause.kind, .unknown)
+            XCTAssertFalse(cause.isTransient)
+            XCTAssertEqual((cause.underlyingError as NSError).domain, "AlbumTestFailure")
+            XCTAssertEqual((cause.underlyingError as NSError).code, 73)
+        } catch {
+            XCTFail("the unknown cause must stay typed: \(error)")
+        }
+        XCTAssertTrue(backend.added.isEmpty)
+    }
+
+    func testCreatedAlbumKeepsHTTPStatusAndPartialResultForMembershipRetry() async throws {
+        let errors: [AlbumError] = [
+            .requestFailed(AlbumWriteCause(URLError(.badServerResponse), httpStatus: 503)),
+            .partialAddWithCauses(
+                succeeded: 1, total: 2, message: "later",
+                failures: [AlbumWriteItemFailure(linkID: "2", code: 429, message: "later")]),
+        ]
+        for underlying in errors {
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            backend.addError = underlying
+            let repo = repository(backend)
+            var createdID: AlbumID?
+            do {
+                _ = try await repo.createAlbum(name: "Trip", adding: [uid("1"), uid("2")])
+                XCTFail("an incomplete add must stop")
+            } catch let error as AlbumError {
+                if case .albumCreatedButPhotosNotAdded(let id, _, _, _) = error { createdID = id }
+                if case .requestFailed = underlying {
+                    XCTAssertEqual(error.writeCause?.kind, .http(status: 503))
+                    XCTAssertTrue(error.writeCause?.isTransient == true)
+                } else {
+                    XCTAssertEqual(error.underlyingCause as? AlbumError, underlying)
+                }
+            }
+            let albumID = try XCTUnwrap(createdID)
+            backend.addError = nil
+            try await repo.addPhotos([uid("1"), uid("2")], to: albumID)
+            XCTAssertEqual(backend.created, ["Trip"])
+            XCTAssertEqual(backend.added.map(\.album), [albumID])
+        }
+    }
+
     func testHTTPBackendCapabilityPresetIncludesEveryWiredAlbumOperation() {
         let capabilities = AlbumCapabilities.sdkCatalogWithHTTPWrites
         XCTAssertTrue(capabilities.canList)
@@ -286,7 +411,7 @@ final class AlbumsRepositoryTests: XCTestCase {
         do {
             _ = try await repo.createAlbum(name: "Trip", adding: [uid("1")])
             XCTFail("expected partial creation")
-        } catch let AlbumError.albumCreatedButPhotosNotAdded(albumID, albumName, message) {
+        } catch let AlbumError.albumCreatedButPhotosNotAdded(albumID, albumName, message, _) {
             XCTAssertEqual(albumID, "album-0")
             XCTAssertEqual(albumName, "Trip")
             XCTAssertTrue(message.contains("membership unavailable"))

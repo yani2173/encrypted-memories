@@ -166,6 +166,8 @@
     /// 1,500 groups found at once, a library check that reports progress every 100 ms, and a ranking that answers
     /// each page after 50 ms, as a large library does while the person scrolls.
     private final class ChurnFinder: ExactDuplicateMerging, @unchecked Sendable {
+        func confirmNoPendingMerges() async -> Bool { true }
+        func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
         let groups: [ExactDuplicateGroup]
 
         init(groups: [ExactDuplicateGroup]) { self.groups = groups }

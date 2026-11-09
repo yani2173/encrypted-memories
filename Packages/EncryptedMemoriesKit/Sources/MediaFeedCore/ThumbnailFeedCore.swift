@@ -214,19 +214,7 @@ public final class FileThumbnailCoverageCheckpointStore: ThumbnailCoverageCheckp
     private func token(for uid: PhotoUID, key: String) -> String {
         let material = "\(tokenScope)\u{1f}\(key)\u{1f}\(uid.volumeID)\u{1f}\(uid.nodeID)"
         let digest = SHA256.hash(data: Data(material.utf8))
-        return Self.lowercaseHex(digest)
-    }
-
-    private static let lowercaseHexDigits = Array("0123456789abcdef".utf8)
-
-    private static func lowercaseHex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
-        var output: [UInt8] = []
-        output.reserveCapacity(64)
-        for byte in bytes {
-            output.append(lowercaseHexDigits[Int(byte >> 4)])
-            output.append(lowercaseHexDigits[Int(byte & 0x0F)])
-        }
-        return String(decoding: output, as: UTF8.self)
+        return ThumbnailCache.lowercaseHex(digest)
     }
 
     private static func safeComponent(_ value: String) -> String {
@@ -296,6 +284,19 @@ private final class VisibleThumbnailLifetime: @unchecked Sendable {
 /// adaptive download concurrency, decoded `CGImage` residency, and diagnostics. Platform targets adapt
 /// `DecodedThumbnail` to their presentation image type outside this module.
 public actor ThumbnailFeedCore {
+    /// Registers a presentation with a source-fenced loader. Direct loaders need no separate registration.
+    public nonisolated func beginProvisionalThumbnailAccess() async -> UUID? {
+        await (loader as? any ProvisionalThumbnailAuthorizing)?.beginProvisionalThumbnailAccess()
+    }
+
+    public nonisolated func updateProvisionalThumbnailAccess(_ uids: [PhotoUID], using lease: UUID) async {
+        await (loader as? any ProvisionalThumbnailAuthorizing)?.updateProvisionalThumbnailAccess(uids, using: lease)
+    }
+
+    public nonisolated func endProvisionalThumbnailAccess(_ lease: UUID) async {
+        await (loader as? any ProvisionalThumbnailAuthorizing)?.endProvisionalThumbnailAccess(lease)
+    }
+
     private struct PriorityReservation: Sendable {
         let uid: PhotoUID
         var priority: ThumbnailPriority
@@ -307,7 +308,6 @@ public actor ThumbnailFeedCore {
     private nonisolated let visibleAccessOwner = UUID()
     private nonisolated let visibleAccessLifetime = VisibleThumbnailLifetime()
     private nonisolated let loader: ThumbnailBatchLoader
-    private nonisolated let onDecoded: @Sendable (PhotoUID, DecodedThumbnail) -> Void
     private nonisolated let decoded: DecodedThumbnailCache
     private nonisolated let diskPresence = DiskPresenceCache()
     /// Thumbnail reads are authorized by the thumbnail retention scope: every accessible thumbnail-capable
@@ -391,8 +391,8 @@ public actor ThumbnailFeedCore {
     private var lastErrors: [String] = []
     private var prefetchEnabled = true
     private var prefetchPaused = false
-    /// Wakes the crawl after storage leaves the critical level. It exists only while the crawl sleeps for storage.
-    /// Wakes the crawl when the condition that held it ends: storage recovers, or the app is in the foreground.
+    /// Wakes the crawl once nothing holds it: storage is below the critical level and the app is no longer
+    /// suspended (foreground, or a background window).
     private var crawlWakeTask: Task<Void, Never>?
     /// The workers' waits for the coordinator's permit in a background window.
     private var windowPermitWaits: [UUID: Task<LibraryBackgroundWindowPermit?, Never>] = [:]
@@ -542,8 +542,7 @@ public actor ThumbnailFeedCore {
         coverageStore: (any ThumbnailCoverageCheckpointStore)? = nil,
         diagnostics: PhotoDiagnostics = .shared,
         clock: @escaping @Sendable () -> Date = { Date() },
-        resourceCoordinator: LibraryResourceCoordinator = .shared,
-        onDecoded: @escaping @Sendable (PhotoUID, DecodedThumbnail) -> Void = { _, _ in }
+        resourceCoordinator: LibraryResourceCoordinator = .shared
     ) {
         self.cache = cache
         self.resourceCoordinator = resourceCoordinator
@@ -553,7 +552,6 @@ public actor ThumbnailFeedCore {
         self.diagnostics = diagnostics
         self.clock = clock
         self.unfetchable = UnfetchableThumbnailBox(clock: clock)
-        self.onDecoded = onDecoded
         self.decoded = DecodedThumbnailCache(costLimit: configuration.decodedMemoryBudgetBytes)
         self.decodePermits = DecodePermitPool(permits: configuration.maxConcurrentDecodes)
         self.decodeExecutor = ThumbnailDecodeWorkExecutor()
@@ -651,7 +649,6 @@ public actor ThumbnailFeedCore {
         // Local pending photos live in memory only.
         guard !uid.isLocalPending else { return nil }
         diagnostics.increment("thumb.ramDecodeMiss")
-        diagnostics.recordDiskReadDuringPinch()
         let cache = self.cache
         let generation = access?.cacheGeneration ?? cache.captureWriterGeneration()
         let maxPixels = configuration.targetPixels
@@ -1185,10 +1182,10 @@ public actor ThumbnailFeedCore {
         diskPresence.set(tile.uid, present: true)
         diagnostics.increment("thumb.diskCacheHit")
         prefetchDecodeStarted += 1
-        diagnostics.recordDecodeStarted(queueDepth: visibleDiskDemand.pendingCount)
+        diagnostics.increment("thumb.ramDecodeStarted")
         guard let image = tile.decoded else {
             diagnostics.increment("thumb.diskDecodeFailed")
-            diagnostics.recordDecodeFailed(queueDepth: visibleDiskDemand.pendingCount)
+            diagnostics.increment("thumb.ramDecodeFailed")
             recordError("decode failed for \(Self.key(tile.uid))")
             return
         }
@@ -1196,10 +1193,7 @@ public actor ThumbnailFeedCore {
         notifyHostOfAvailableImageIfVisible()
         if tile.isUpgrade { diagnostics.increment("thumb.decodedUpgrade") }
         prefetchDecodeCompleted += 1
-        diagnostics.recordDecodeCompleted(
-            durationMs: tile.durationMs,
-            queueDepth: visibleDiskDemand.pendingCount
-        )
+        diagnostics.increment("thumb.ramDecodeCompleted")
     }
 
     private func warmDecodedImpl(
@@ -1308,7 +1302,7 @@ public actor ThumbnailFeedCore {
                             diskPresence.set(tile.uid, present: true)
                             diagnostics.increment("thumb.diskCacheHit")
                             prefetchDecodeStarted += 1
-                            diagnostics.recordDecodeStarted(queueDepth: 0)
+                            diagnostics.increment("thumb.ramDecodeStarted")
                             if let image = tile.decoded {
                                 // Publish each completed decode immediately. Waiting for the slowest member of
                                 // a large visible batch made every already-finished tile remain a placeholder,
@@ -1317,12 +1311,12 @@ public actor ThumbnailFeedCore {
                                 notifyHostOfAvailableImageIfVisible()
                                 if tile.isUpgrade { diagnostics.increment("thumb.decodedUpgrade") }
                                 prefetchDecodeCompleted += 1
-                                diagnostics.recordDecodeCompleted(durationMs: tile.durationMs, queueDepth: 0)
+                                diagnostics.increment("thumb.ramDecodeCompleted")
                                 decodedFromDisk += 1
                             } else {
                                 missing += 1
                                 diagnostics.increment("thumb.diskDecodeFailed")
-                                diagnostics.recordDecodeFailed(queueDepth: 0)
+                                diagnostics.increment("thumb.ramDecodeFailed")
                                 recordError("decode failed for \(Self.key(tile.uid))")
                             }
                         } else {
@@ -1445,7 +1439,6 @@ public actor ThumbnailFeedCore {
         let cache = self.cache
         let writerGeneration = access?.cacheGeneration ?? cache.captureWriterGeneration()
         guard cache.isCurrentWriterGeneration(writerGeneration) else { return nil }
-        diagnostics.recordNetworkRequestDuringPinch()
         if batchesInFlight.values.contains(where: { $0.contains(uid) }) {
             diagnostics.increment("thumb.directLoadOverlapsBatch")
         }
@@ -2388,7 +2381,6 @@ public actor ThumbnailFeedCore {
             let batchID = UUID()
             batchesInFlight[batchID] = Set(chunk)
             prefetchDownloadStarted += reportedCount(in: chunk)
-            diagnostics.recordNetworkRequestDuringPinch()
             let writerGeneration = cache.captureWriterGeneration()
             let snapshot = await Self.loadBatch(
                 chunk,
@@ -2895,7 +2887,6 @@ public actor ThumbnailFeedCore {
                 #if DEBUG
                     testingHooks.beforeDiskProbe()
                 #endif
-                self.diagnostics.recordDiskPresenceCheckDuringPinch()
                 let usable =
                     forceAuthentication
                     ? cache.hasAuthenticatedDiskData(uid)
@@ -2973,12 +2964,6 @@ public actor ThumbnailFeedCore {
     /// waits behind more than this many filesystem stats.
     private static let coverageScanChunk = 512
 
-    /// Advances the end-of-crawl disk-coverage re-scan by one bounded chunk of disk checks, returning the
-    /// refreshed coverage only when a full pass just completed (else `nil` - "call again"). Bounded so it can
-    /// never hold the serial actor for an O(library) scan, and it bails to `nil` the instant a viewport goes
-    /// live, so it can never starve a visible warm decode. Workers share `coverageScanCursor`, so together they
-    /// complete one pass in bounded steps; no single worker runs a full scan. All filesystem probes run on the
-    /// decode executor, never on this actor.
     /// One step of the end-of-crawl coverage scan.
     private enum CoverageScanStep {
         case finished((present: Int, total: Int, percent: Double))
@@ -2987,6 +2972,13 @@ public actor ThumbnailFeedCore {
         case stale
     }
 
+    /// Advances the end-of-crawl disk-coverage re-scan by one bounded chunk of disk checks. It returns
+    /// `.finished` with the refreshed coverage when a full pass just completed, `.unfinished` to call again
+    /// (also the instant a viewport goes live, so it can never starve a visible warm decode), and `.stale`
+    /// when the session or the cache writer changed. Bounded so it can never hold the serial actor for an
+    /// O(library) scan. Workers share `coverageScanCursor`, so together they complete one pass in bounded
+    /// steps; no single worker runs a full scan. All filesystem probes run on the decode executor, never on
+    /// this actor.
     private func advanceDiskCoverageScan() async -> CoverageScanStep {
         #if DEBUG
             testingHooks.beforeCoverageScanStep()
@@ -3029,7 +3021,6 @@ public actor ThumbnailFeedCore {
                     else {
                         return nil
                     }
-                    self.diagnostics.recordDiskPresenceCheckDuringPinch()
                     probes.append(DiskProbe(uid: uid, usable: cache.hasUsableDiskData(uid)))
                 }
                 return probes
@@ -3269,7 +3260,7 @@ public actor ThumbnailFeedCore {
         access: VisibleThumbnailAccess? = nil
     ) -> DecodedThumbnail? {
         guard ownerLeaseIsCurrent(), readAllowed(uid, access: access) else { return nil }
-        let becameCurrent = decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
+        decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
@@ -3278,7 +3269,6 @@ public actor ThumbnailFeedCore {
             decoded.remove(uid)
             return nil
         }
-        if becameCurrent { onDecoded(uid, image) }
         return decoded.image(for: uid)
     }
 
@@ -3627,9 +3617,7 @@ public actor ThumbnailFeedCore {
         #endif
     }
 
-    private static func key(_ uid: PhotoUID) -> NSString {
-        "\(uid.volumeID)~\(uid.nodeID)" as NSString
-    }
+    private static func key(_ uid: PhotoUID) -> NSString { uid.cacheKey }
 }
 
 #if DEBUG

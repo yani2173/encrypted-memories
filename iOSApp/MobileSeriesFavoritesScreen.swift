@@ -27,7 +27,10 @@ final class MobileSeriesFavoritesModel: Identifiable {
     enum Operation: Equatable {
         case idle
         case running(SeriesDissolutionProgress?)
-        case failed(String)
+        case failed(SeriesFailurePresentation)
+        /// The operation ended, but members without a known role stayed in the library. The mode stays open
+        /// until the person read the notice that those photos stay.
+        case finishedWithKeptMembers(count: Int)
     }
 
     private(set) var selection: SeriesFavoritesSelection
@@ -37,6 +40,8 @@ final class MobileSeriesFavoritesModel: Identifiable {
     private let abandonKeepOnlyFavorites: @MainActor () -> Void
     /// True after a failed attempt that no later attempt finished: its journal can still be pending.
     private var hasUnfinishedAttempt = false
+    /// Members without a known role that stayed in the library, learned from the last progress report.
+    private var keptMembersWithoutRole = 0
     private let onFinished: @MainActor (_ seriesDissolved: Bool) -> Void
 
     init(
@@ -62,8 +67,23 @@ final class MobileSeriesFavoritesModel: Identifiable {
     }
 
     var failureMessage: String? {
-        if case .failed(let message) = operation { return message }
+        if case .failed(let failure) = operation { return failure.message }
         return nil
+    }
+
+    var canRetryFailure: Bool {
+        if case .failed(let failure) = operation { return failure.canRetry }
+        return false
+    }
+
+    var failureAlertMessage: String {
+        failureMessage ?? ""
+    }
+
+    /// True while the person must read the notice that members without a role stayed in the library.
+    var isPresentingKeptMembersNotice: Bool {
+        if case .finishedWithKeptMembers = operation { return true }
+        return false
     }
 
     func focus(index: Int) {
@@ -106,25 +126,42 @@ final class MobileSeriesFavoritesModel: Identifiable {
     /// Runs or resumes "Keep Only N Favorites". The journaled operation makes a repeated call safe.
     func keepOnlyMarkedFavorites() async {
         guard !isRunning else { return }
+        keptMembersWithoutRole = 0
         operation = .running(nil)
         do {
             try await keepOnlyFavorites(selection.orderedFavoriteUIDs) { [weak self] progress in
                 Task { @MainActor in
+                    guard let self else { return }
                     // Each callback hops to the main actor on its own, so callbacks can arrive out of order.
+                    // The kept-members count is recorded before the filter, so a later event cannot erase it.
+                    if case .running = self.operation, case .membersStayedWithoutARole(let count) = progress.step {
+                        self.keptMembersWithoutRole = count
+                    }
                     // The bar only moves forward.
-                    guard let self, case .running(let shown) = self.operation,
+                    guard case .running(let shown) = self.operation,
                         progress.fraction >= shown?.fraction ?? 0
                     else { return }
                     self.operation = .running(progress)
                 }
             }
             hasUnfinishedAttempt = false
-            operation = .idle
-            onFinished(true)
+            if keptMembersWithoutRole > 0 {
+                operation = .finishedWithKeptMembers(count: keptMembersWithoutRole)
+            } else {
+                operation = .idle
+                onFinished(true)
+            }
         } catch {
             hasUnfinishedAttempt = true
-            operation = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            operation = .failed(SeriesFailurePresentation(error: error))
         }
+    }
+
+    /// The person read the notice that photos stayed in the library, so the mode can close.
+    func finishAfterKeptMembers() {
+        guard isPresentingKeptMembersNotice else { return }
+        operation = .idle
+        onFinished(true)
     }
 
     func dismissFailure() {
@@ -162,6 +199,19 @@ struct MobileSeriesFavoritesScreen: View {
                 carousel
                 filmstrip
             }
+            .alert(
+                String(localized: "series.kept_members_title"),
+                isPresented: Binding(
+                    get: { model.isPresentingKeptMembersNotice },
+                    set: { if !$0 { model.finishAfterKeptMembers() } }
+                )
+            ) {
+                Button(L10n.string("action.ok")) { model.finishAfterKeptMembers() }
+            } message: {
+                if case .finishedWithKeptMembers(let count) = model.operation {
+                    Text(String(localized: "series.kept_members_message \(count)"))
+                }
+            }
             .padding(.bottom, 8)
             .background(Color.black.ignoresSafeArea())
             .navigationTitle(
@@ -175,7 +225,7 @@ struct MobileSeriesFavoritesScreen: View {
             .overlay { progressOverlay }
         }
         .tint(nil)
-        .interactiveDismissDisabled(model.isRunning)
+        .interactiveDismissDisabled(model.isRunning || model.isPresentingKeptMembersNotice)
         .alert(
             String(localized: "series.failed_title"),
             isPresented: Binding(
@@ -183,14 +233,12 @@ struct MobileSeriesFavoritesScreen: View {
                 set: { if !$0 { model.dismissFailure() } }
             )
         ) {
-            Button(RetryButton.title) { Task { await model.keepOnlyMarkedFavorites() } }
+            if model.canRetryFailure {
+                Button(RetryButton.title) { Task { await model.keepOnlyMarkedFavorites() } }
+            }
             Button(L10n.string("action.cancel"), role: .cancel) {}
         } message: {
-            Text(
-                [model.failureMessage, String(localized: "series.failed_recovery")]
-                    .compactMap { $0 }
-                    .joined(separator: "\n\n")
-            )
+            Text(model.failureAlertMessage)
         }
     }
 
@@ -199,7 +247,7 @@ struct MobileSeriesFavoritesScreen: View {
             Button(role: .close) {
                 model.cancel()
             }
-            .disabled(model.isRunning)
+            .disabled(model.isRunning || model.isPresentingKeptMembersNotice)
             .accessibilityIdentifier("series.cancel")
         }
         if model.selection.canKeepOnlyFavorites {
@@ -207,7 +255,7 @@ struct MobileSeriesFavoritesScreen: View {
                 Button(role: .confirm) {
                     model.confirm()
                 }
-                .disabled(model.isRunning)
+                .disabled(model.isRunning || model.isPresentingKeptMembersNotice)
                 .accessibilityIdentifier("series.confirm")
                 // The choice is anchored to Confirm, so a regular-width window shows it as a popover there.
                 .confirmationDialog(
@@ -305,6 +353,9 @@ struct MobileSeriesFavoritesScreen: View {
             String(localized: "series.progress_trashing")
         case .copyingFavorite(let index, let count):
             String(localized: "series.progress_copying \(index + 1) \(count)")
+        case .membersStayedWithoutARole:
+            // The step happens during the trash phase; the separate alert carries the actual notice.
+            String(localized: "series.progress_trashing")
         case nil:
             String(localized: "series.progress_copying \(1) \(model.selection.favoriteUIDs.count)")
         }

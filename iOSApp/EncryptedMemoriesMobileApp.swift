@@ -1,6 +1,7 @@
 import DesignSystemCore
 import DesignSystemUIKitAdapter
 import Foundation
+import GridCore
 import LibraryRuntimeAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import MLSearchCore
@@ -22,6 +23,7 @@ struct EncryptedMemoriesMobileApp: App {
     private let metal3Supported: Bool
 
     init() {
+        RequestTraceClock.start()
         if let domain = Bundle.main.bundleIdentifier {
             BackupLocalDataPurge.prepareRequestedResetForLaunch(persistentDomainName: domain)
         }
@@ -36,6 +38,8 @@ struct EncryptedMemoriesMobileApp: App {
 
         AppleLibraryRuntimeAdapter.shared.install()
         MobileMetricKitCollector.shared.install()
+        // A background launch may connect no scene; its windows start the account through this one start.
+        BackgroundLaunchAccountStart.shared.install { MobileAccountRuntime.shared.start() }
         PhotoBackupBackgroundCoordinator.shared.register()
         AppleSmartSearchBackgroundCoordinator.shared.register()
     }
@@ -491,10 +495,12 @@ private struct MobileAdaptiveTabShell: View {
 /// `.searchable` to the parent `TabView` propagates ordinary top search chrome into the library on iOS 26.
 private struct MobileSearchTabScreen: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
+    @Environment(\.tabBarPlacement) private var tabBarPlacement
     let isActive: Bool
     @Binding var searchText: String
     @Binding var searchScope: MLSearchScope
     @State private var history = TimelineSearchHistory()
+    @FocusState private var isSearchFocused: Bool
     /// Structured suggestions that were selected from the landing, keyed by their title in the history.
     @State private var historySuggestions: [String: TimelineSearchSuggestion] = [:]
     @State private var recentRepresentatives: [String: PhotoUID] = [:]
@@ -505,6 +511,8 @@ private struct MobileSearchTabScreen: View {
         MobileTimelineScreen(
             surface: .search,
             isActive: isActive,
+            // Issue #944: one shared margin below the scope picker, the grid's standard outer margin.
+            scopeBarGap: SquareTileGridEngine.standardOuterMargin,
             searchText: $searchText,
             searchScope: $searchScope,
             searchLanding: MobileSearchLandingContent(
@@ -519,8 +527,13 @@ private struct MobileSearchTabScreen: View {
         )
         .searchable(
             text: $searchText,
+            placement: tabBarPlacement == .topBar ? .navigationBarDrawer(displayMode: .always) : .automatic,
             prompt: Text(L10n.string("search.prompt \(L10n.string("library.title"))"))
         )
+        .searchFocused($isSearchFocused)
+        .onChange(of: isActive, initial: true) { _, active in
+            isSearchFocused = active && tabBarPlacement == .topBar
+        }
         .smartSearchScopes(
             scope: $searchScope,
             availableScopes: libraryModel.smartSearch?.availableSearchScopes ?? [.all],
@@ -626,7 +639,10 @@ private struct MobileSearchTabScreen: View {
             break
         case .drop:
             self.activeSuggestion = nil
-            if activeSuggestion.owns(searchText: searchText) {
+            // A scope that searches the title as text keeps it: there, the title is an ordinary search.
+            if activeSuggestion.owns(searchText: searchText),
+                SmartSearchDiscoveryModel.usesSuggestionResults(in: searchScope)
+            {
                 searchText = ""
             }
         }

@@ -1,5 +1,14 @@
 import Foundation
 
+#if DEBUG
+    package enum SupportLockPath: Sendable, Equatable { case capture, validate }
+    package enum SupportLockProbeScope {
+        @TaskLocal package static var token: UUID?
+    }
+#endif
+
+package final class ThumbnailDiagnosticLease: Sendable {}
+
 /// A small, synchronous fence for cache writers that can outlive the operation that started them.
 ///
 /// A destructive clear invalidates the captured token before it removes files. A writer that already
@@ -18,6 +27,16 @@ public final class CacheWriterGeneration: @unchecked Sendable {
     }
 
     private let condition = NSCondition()
+    private let diagnosticLock = NSLock()
+    private var diagnosticLease: ThumbnailDiagnosticLease? = ThumbnailDiagnosticLease()
+    #if DEBUG
+        private let supportProbeLock = NSLock()
+        private var supportProbe: (@Sendable (SupportLockPath, UUID?) -> Void)?
+
+        package func setSupportLockProbeForTesting(_ probe: (@Sendable (SupportLockPath, UUID?) -> Void)?) {
+            supportProbeLock.withLock { supportProbe = probe }
+        }
+    #endif
     private var value: UInt64 = 0
     private var sessionValue: UInt64 = 0
     private var invalidating = false
@@ -38,7 +57,7 @@ public final class CacheWriterGeneration: @unchecked Sendable {
     /// Captures the account/session lease for a long-lived owner. Ordinary destructive cache clears do not
     /// invalidate this lease; account reconfiguration does.
     public func captureSession() -> SessionToken {
-        condition.lock()
+        lockForSupportCapture()
         while invalidating {
             condition.wait()
         }
@@ -78,6 +97,7 @@ public final class CacheWriterGeneration: @unchecked Sendable {
         while invalidating {
             condition.wait()
         }
+        diagnosticLock.withLock { diagnosticLease = nil }
         value &+= 1
         if invalidatesSession { sessionValue &+= 1 }
         invalidating = true
@@ -89,6 +109,7 @@ public final class CacheWriterGeneration: @unchecked Sendable {
 
         condition.lock()
         invalidating = false
+        diagnosticLock.withLock { diagnosticLease = ThumbnailDiagnosticLease() }
         condition.broadcast()
         condition.unlock()
         return (token, sessionToken, result)
@@ -116,9 +137,37 @@ public final class CacheWriterGeneration: @unchecked Sendable {
     }
 
     public func isCurrentSession(_ token: SessionToken) -> Bool {
-        condition.lock()
+        lockForSupportValidation()
         let current = !invalidating && sessionValue == token.value
         condition.unlock()
         return current
+    }
+
+    package func tryCaptureDiagnosticLease() -> ThumbnailDiagnosticLease? {
+        guard diagnosticLock.try() else { return nil }
+        defer { diagnosticLock.unlock() }
+        return diagnosticLease
+    }
+
+    package func isCurrentDiagnosticLease(_ lease: ThumbnailDiagnosticLease) -> Bool {
+        guard diagnosticLock.try() else { return false }
+        defer { diagnosticLock.unlock() }
+        return diagnosticLease === lease
+    }
+
+    private func lockForSupportCapture() {
+        #if DEBUG
+            let probe = supportProbeLock.withLock { supportProbe }
+            probe?(.capture, SupportLockProbeScope.token)
+        #endif
+        condition.lock()
+    }
+
+    private func lockForSupportValidation() {
+        #if DEBUG
+            let probe = supportProbeLock.withLock { supportProbe }
+            probe?(.validate, SupportLockProbeScope.token)
+        #endif
+        condition.lock()
     }
 }

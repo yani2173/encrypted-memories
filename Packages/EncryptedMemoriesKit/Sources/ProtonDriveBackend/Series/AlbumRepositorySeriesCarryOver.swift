@@ -51,7 +51,22 @@ struct AlbumRepositorySeriesCarryOver: SeriesAlbumCarryOver {
     }
 
     private func named<T>(_ operation: () async throws -> T) async throws -> T {
-        guard let requestCause else { return try await operation() }
-        return try await requestCause.run(operation: operation)
+        do {
+            guard let requestCause else { return try await operation() }
+            return try await requestCause.run(operation: operation)
+        } catch let error as AlbumError {
+            if error.underlyingCause is CancellationError || Task.isCancelled { throw CancellationError() }
+            guard case .requestFailed(let cause) = error, cause.isTransient else { throw error }
+            switch cause.kind {
+            case .network:
+                guard let networkError = cause.underlyingError as? URLError else { throw error }
+                throw networkError
+            case .http(let status):
+                throw UploadError.retryableBackend(
+                    code: status, message: error.errorDescription ?? "Album write failed")
+            case .cancelled, .unknown:
+                throw error
+            }
+        }
     }
 }

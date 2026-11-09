@@ -13,44 +13,42 @@ final class SharedPhotoLibraryObservationTests: XCTestCase {
             tokenURL: directory.appendingPathComponent("first"), operations: probe.operations)
         let second = PhotoLibraryChangeMonitor(
             tokenURL: directory.appendingPathComponent("second"), operations: probe.operations)
-        defer {
-            first.stopObserving()
-            second.stopObserving()
-        }
         let calls = ChangeCallCounter()
-        first.startObserving { calls.increment("first") }
-        second.startObserving { calls.increment("second") }
+        let firstSubscription = first.subscribe { calls.increment("first") }
+        let secondSubscription = second.subscribe { calls.increment("second") }
+        defer {
+            firstSubscription.cancel()
+            secondSubscription.cancel()
+        }
         await changeCondition { probe.registeredCount == 2 }
         XCTAssertEqual(probe.fetchCount, 2)
         probe.emit()
         XCTAssertEqual(calls.value("first"), 1)
         XCTAssertEqual(calls.value("second"), 1)
         XCTAssertEqual(probe.detailCount, 2)
-        first.stopObserving()
+        firstSubscription.cancel()
         probe.emit()
         XCTAssertEqual(calls.value("first"), 1)
         XCTAssertEqual(calls.value("second"), 2)
     }
 
-    func testLegacyStartReplacesOnlyItsCallbackAndNilDetailsDoNotNotify() async throws {
+    func testNilDetailsDoNotNotify() async throws {
         let probe = PhotoChangeOperationsProbe()
         let monitor = PhotoLibraryChangeMonitor(
             tokenURL: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString),
             operations: probe.operations)
-        defer { monitor.stopObserving() }
         let calls = ChangeCallCounter()
-        monitor.startObserving { calls.increment("old") }
-        monitor.startObserving { calls.increment("current") }
+        let subscription = monitor.subscribe { calls.increment("current") }
+        defer { subscription.cancel() }
         await changeCondition { probe.registeredCount == 1 }
         probe.emit()
-        XCTAssertEqual(calls.value("old"), 0)
         XCTAssertEqual(calls.value("current"), 1)
         probe.hasDetails = false
         probe.emit()
         XCTAssertEqual(calls.value("current"), 1)
         XCTAssertEqual(probe.fetchCount, 1)
     }
-    func testSubscriptionsAndLegacyObservationCancelIndependentlyAndCanReenter() async throws {
+    func testSubscriptionsCancelIndependentlyAndCanReenter() async throws {
         let probe = PhotoChangeOperationsProbe()
         let monitor = PhotoLibraryChangeMonitor(
             tokenURL: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString),
@@ -62,19 +60,19 @@ final class SharedPhotoLibraryObservationTests: XCTestCase {
             holder.cancel()
         }
         let other = monitor.subscribe { calls.increment("other") }
+        let third = monitor.subscribe { calls.increment("third") }
         defer {
             holder.cancel()
             other.cancel()
-            monitor.stopObserving()
+            third.cancel()
         }
-        monitor.startObserving { calls.increment("legacy") }
         await changeCondition { probe.registeredCount == 1 }
         probe.emit()
-        monitor.stopObserving()
+        third.cancel()
         probe.emit()
         XCTAssertEqual(calls.value("once"), 1)
         XCTAssertEqual(calls.value("other"), 2)
-        XCTAssertEqual(calls.value("legacy"), 1)
+        XCTAssertEqual(calls.value("third"), 1)
         XCTAssertEqual(probe.fetchCount, 1)
         XCTAssertEqual(probe.detailCount, 2)
         other.cancel()
@@ -111,25 +109,23 @@ final class SharedPhotoLibraryObservationTests: XCTestCase {
         XCTAssertEqual(calls.value("first") + calls.value("second"), 2)
     }
 
-    func testReleasingAReplacedOrStoppedCallbackCanCancelItsCapturedSubscription() async throws {
+    func testReleasingACancelledCallbackCanCancelItsCapturedSubscription() async throws {
         let probe = PhotoChangeOperationsProbe()
         let monitor = PhotoLibraryChangeMonitor(
             tokenURL: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString),
             operations: probe.operations)
-        func installCapturedSubscription() {
+        func installCapturedSubscription() -> PhotoLibraryChangeMonitor.Subscription {
             let captured = PhotoSubscriptionHolder()
             captured.subscription = monitor.subscribe {}
-            monitor.startObserving { _ = captured.subscription }
+            return monitor.subscribe { _ = captured.subscription }
         }
-        installCapturedSubscription()
+        var outer = installCapturedSubscription()
         await changeCondition { probe.registeredCount == 1 }
-        monitor.startObserving {}
-        XCTAssertEqual(probe.registeredCount, 1)
-        monitor.stopObserving()
+        outer.cancel()
         XCTAssertEqual(probe.registeredCount, 0)
-        installCapturedSubscription()
+        outer = installCapturedSubscription()
         await changeCondition { probe.registeredCount == 1 }
-        monitor.stopObserving()
+        outer.cancel()
         XCTAssertEqual(probe.registeredCount, 0)
     }
 

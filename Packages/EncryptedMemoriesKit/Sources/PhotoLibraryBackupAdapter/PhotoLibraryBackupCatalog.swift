@@ -22,14 +22,7 @@ public struct PhotoLibraryBackupCatalog: UploadBackupAssetCatalog {
         let chunkSize = chunkSize
         return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .utility) {
-                let fetchResult: PHFetchResult<PHAsset>
-                if let identifiers {
-                    fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
-                } else {
-                    let options = PHFetchOptions()
-                    options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-                    fetchResult = PHAsset.fetchAssets(with: options)
-                }
+                let fetchResult = PhotoKitAssetMapper.fetchAssets(identifiers: identifiers)
 
                 let total = fetchResult.count
                 var index = 0

@@ -1,4 +1,5 @@
 import DesignSystemCore
+import GridCore
 import PhotosCore
 import SwiftUI
 import TimelineCore
@@ -24,14 +25,32 @@ struct MobileLibraryLoadingView: View {
     }
 
     var body: some View {
-        LibraryLoadingCover(
-            isPresented: isPresented,
-            accessibilityLabel: accessibilityLabel,
-            activityMessage: activityMessage,
-            activityState: activityState
-        ) { isActive in
-            MobileFrostedBackdrop(isActive: isActive)
+        GeometryReader { geometry in
+            LibraryLoadingCover(
+                isPresented: isPresented,
+                accessibilityLabel: accessibilityLabel,
+                activityMessage: activityMessage,
+                activityState: activityState,
+                contentBounds: loadingBounds(in: geometry)
+            ) { isActive in
+                MobileFrostedBackdrop(isActive: isActive)
+            }
         }
+        .ignoresSafeArea()
+    }
+
+    private func loadingBounds(in geometry: GeometryProxy) -> CGRect? {
+        #if canImport(SwiftUI, _version: 8.0.85)
+            if #available(iOS 27.1, *) {
+                return ReservedRegionLayout(
+                    areas: geometry.reservedRegions(kind: .division).map {
+                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive, isDivision: true)
+                    }, bounds: CGRect(origin: .zero, size: geometry.size)
+                )
+                .centeredLoadingBounds
+            }
+        #endif
+        return nil
     }
 }
 

@@ -2,6 +2,8 @@
 public enum GridRenderOutcome: Equatable, Sendable {
     case skippedNoSurface
     case noDrawable
+    /// A drawable existed, but the GPU frame could not be encoded (for example a failed buffer allocation).
+    case encodingFailed
     case drawn(hasPendingWork: Bool)
 }
 
@@ -13,6 +15,10 @@ public struct GridFramePump: Equatable, Sendable {
     /// Whether the host surface is the active one. A fresh pump is active (the common single-surface case).
     private var active = true
     private var invalidationVersion: UInt64 = 0
+    private var encodingFailures = 0
+
+    /// How often one unchanged frame request retries after an encoding failure before it waits for an invalidation.
+    public static let maximumEncodingRetries = 3
     private var tickVersion: UInt64?
 
     public init() {}
@@ -21,6 +27,7 @@ public struct GridFramePump: Equatable, Sendable {
     public mutating func invalidate() {
         dirty = true
         invalidationVersion &+= 1
+        encodingFailures = 0
     }
 
     /// Whether the host surface is currently active (its tab/window is foreground).
@@ -52,10 +59,15 @@ public struct GridFramePump: Equatable, Sendable {
     public mutating func completeTick(_ outcome: GridRenderOutcome) -> Bool {
         switch outcome {
         case .skippedNoSurface:
+            encodingFailures = 0
             return completeTick(presented: true, hasPendingWork: false)
         case .noDrawable:
             return completeTick(presented: false, hasPendingWork: false)
+        case .encodingFailed:
+            encodingFailures += 1
+            return completeTick(presented: encodingFailures > Self.maximumEncodingRetries, hasPendingWork: false)
         case .drawn(let hasPendingWork):
+            encodingFailures = 0
             return completeTick(presented: true, hasPendingWork: hasPendingWork)
         }
     }

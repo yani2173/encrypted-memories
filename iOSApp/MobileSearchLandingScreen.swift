@@ -128,7 +128,10 @@ struct MobileSearchLandingScreen: View {
 
     @ViewBuilder private var forYouSection: some View {
         let suggestions = displayedForYou
-        let isLoading = content.isUpdatingSuggestions && discovery?.hasComputed != true
+        let phase = SmartSearchDiscoveryModel.landingPhase(
+            hasSuggestions: !suggestions.isEmpty, hasComputed: discovery?.hasComputed == true,
+            isComputing: content.isUpdatingSuggestions, libraryIsEmpty: libraryModel.isCompletelyEmpty)
+        let isLoading = phase == .loading || phase == .preparing
         if isLoading || !suggestions.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 sectionTitle(L10n.string("search.for_you"))
@@ -136,6 +139,12 @@ struct MobileSearchLandingScreen: View {
                     Text(L10n.string("search.suggestions_loading"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                } else if phase == .preparing {
+                    Text(L10n.string("search.suggestions_preparing"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        // The placeholder rows below carry the same text for VoiceOver.
+                        .accessibilityHidden(true)
                 }
                 VStack(spacing: 0) {
                     if isLoading {
@@ -153,7 +162,9 @@ struct MobileSearchLandingScreen: View {
                         .placeholderShimmer()
                         // VoiceOver hears that suggestions are loading, also when Reduce Motion stops the sweep.
                         .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(L10n.string("search.suggestions_loading"))
+                        .accessibilityLabel(
+                            L10n.string(
+                                phase == .preparing ? "search.suggestions_preparing" : "search.suggestions_loading"))
                     } else {
                         ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
                             if index > 0 { Divider().padding(.leading, 132) }

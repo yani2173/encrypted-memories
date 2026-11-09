@@ -6,15 +6,16 @@
 
     @Suite("Upgrade test link visibility")
     struct UpgradeTestLinkVisibilityTests {
-        @Test("the synthetic server gives no explicit photo role data")
-        func answersAreNotExplicit() {
+        @Test("the synthetic server gives explicit photo state")
+        func answersAreExplicit() {
             let visibility = UpgradeTestBackend.linkVisibility(
                 of: ["listed", "missing"], activeLinkIDs: ["listed", "other"])
             func answer(isActive: Bool) -> RemoteLinkVisibility {
-                RemoteLinkVisibility(isActive: isActive, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+                RemoteLinkVisibility(
+                    isActive: isActive, mainPhotoLinkID: nil, hasExplicitState: false, hasExplicitPhotoState: true)
             }
             #expect(visibility == ["listed": answer(isActive: true), "missing": answer(isActive: false)])
-            #expect(visibility.values.allSatisfy { !$0.hasExplicitPhotoState })
+            #expect(visibility.values.allSatisfy { $0.hasExplicitPhotoState })
         }
 
         @Test("the state of a listed link still decides whether it is active")

@@ -17,7 +17,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     struct Link: Sendable {
         let linkID: String
-        let nameHash: String
+        var nameHash: String
         let contentHash: String
         var state: State
         let mainLinkID: String?
@@ -74,6 +74,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var visibilityOverrides: [String: RemoteLinkVisibility] = [:]
     private var visibilityAfterContentLookup: [String: RemoteLinkVisibility] = [:]
     private var cancelContentCaller = false
+    private var cancelVisibilityCaller = false
     private var includeInactiveContent = false
     private var failTrash = false
     enum LineageRead: Sendable, Equatable { case identity, successors, ancestry, external }
@@ -113,6 +114,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         lock.withLock { visibilityAfterContentLookup[linkID] = visibility }
     }
     func cancelCallerAtContentLookup(_ enabled: Bool) { lock.withLock { cancelContentCaller = enabled } }
+    func cancelCallerAtVisibility(_ enabled: Bool) { lock.withLock { cancelVisibilityCaller = enabled } }
     var contentLookupCount: Int { lock.withLock { contentQueries } }
     func setVisibilityError(_ error: (any Error)?, whenAskingFor linkID: String) {
         lock.withLock { visibilityErrors[linkID] = error }
@@ -233,13 +235,6 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
-        lock.withLock {
-            guard let link = table[linkID], link.state == .active, link.mainLinkID == nil else { return nil }
-            return link.modificationDate
-        }
-    }
-
     /// The person trashes this main right after its compound read, before any later read of the same pass.
     var trashAfterCompoundRead: String? {
         get { lock.withLock { pendingTrashAfterCompoundRead } }
@@ -282,6 +277,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
     var readCounts: ReadCounts { lock.withLock { counted } }
     private var counted = ReadCounts()
+    /// The most links that one visibility read asked for.
+    var largestVisibilityRead: Int { lock.withLock { largestVisibility } }
+    private var largestVisibility = 0
 
     /// The album read of this photo answers these albums, as a stale membership cache does.
     func reportStaleAlbums(_ albums: Set<SeriesAlbumReference>, of uid: PhotoUID) {
@@ -327,6 +325,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func setTags(_ tags: Set<Int>, of uid: PhotoUID) {
         lock.withLock { table[uid.nodeID]?.tags = tags }
+    }
+
+    /// Adds tags to a link without clearing the tags it already carries, like a backend tag update.
+    func addTags(_ tags: Set<Int>, to uid: PhotoUID) {
+        lock.withLock { table[uid.nodeID]?.tags.formUnion(tags) }
     }
 
     func activeMainLinkIDs(
@@ -539,8 +542,61 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         guard !linkIDs.isEmpty else { return [:] }
-        return try lock.withLock {
+        if lock.withLock({ cancelVisibilityCaller }) { withUnsafeCurrentTask { $0?.cancel() } }
+        await passVisibilityGate()
+        let answer = try visibilityAnswer(linkIDs)
+        // The answer is on its way when something changes on the server, as with another device.
+        let after = lock.withLock { () -> (() -> Void)? in
+            defer { afterNextVisibilityRead = nil }
+            return afterNextVisibilityRead
+        }
+        after?()
+        return answer
+    }
+
+    /// Runs once, right after the next visibility read answered.
+    func afterNextVisibilityRead(_ action: @escaping @Sendable () -> Void) {
+        lock.withLock { afterNextVisibilityRead = action }
+    }
+    private var afterNextVisibilityRead: (@Sendable () -> Void)?
+
+    /// Holds every visibility read until `releaseVisibilityReads()`.
+    func holdVisibilityReads() { lock.withLock { visibilityReadsHeld = true } }
+
+    func releaseVisibilityReads() {
+        let waiting = lock.withLock {
+            visibilityReadsHeld = false
+            defer { visibilityReadWaiters = [] }
+            return visibilityReadWaiters
+        }
+        waiting.forEach { $0.resume() }
+    }
+
+    /// The visibility reads that wait for `releaseVisibilityReads()`.
+    var heldVisibilityReads: Int { lock.withLock { visibilityReadWaiters.count } }
+    private var visibilityReadsHeld = false
+    private var visibilityReadWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func passVisibilityGate() async {
+        await withCheckedContinuation { continuation in
+            let passes = lock.withLock {
+                if visibilityReadsHeld { visibilityReadWaiters.append(continuation) }
+                return !visibilityReadsHeld
+            }
+            if passes { continuation.resume() }
+        }
+    }
+
+    /// The next `count` visibility reads fail.
+    func failNextVisibilityReads(_ count: Int) { lock.withLock { armedVisibilityFailures = count } }
+
+    /// Gives `uid` the name `name`, as an upload under that name does.
+    func rename(_ uid: PhotoUID, to name: String) { lock.withLock { table[uid.nodeID]?.nameHash = "nh(\(name))" } }
+
+    private func visibilityAnswer(_ linkIDs: [String]) throws -> [String: RemoteLinkVisibility] {
+        try lock.withLock {
             counted.visibility += 1
+            largestVisibility = max(largestVisibility, linkIDs.count)
             for linkID in linkIDs {
                 if let error = visibilityErrors[linkID] { throw error }
             }
@@ -1092,10 +1148,6 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
     func invalidateCachedRemoteState() async {
         await server.invalidateCachedRemoteState()
         lock.withLock { lineageInvalidated = true }
-    }
-
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
-        try await server.modificationDate(ofMainLink: linkID)
     }
 
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {

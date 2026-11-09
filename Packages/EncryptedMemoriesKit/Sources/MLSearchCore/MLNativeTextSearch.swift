@@ -66,12 +66,11 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
 
     public init(
         accountIdentifier: String,
-        capabilitySnapshot: MLNativeAnalysisCapabilitySnapshot,
-        enabledKinds: Set<MLNativeAnalysisKind> = Set(Self.indexedStillImageKinds)
+        capabilitySnapshot: MLNativeAnalysisCapabilitySnapshot
     ) throws {
         var mapping: [MLDerivedArtifactIdentity: MLSearchBackend] = [:]
         var artifacts: Set<MLDerivedArtifactIdentity> = []
-        for stage in Self.analysisStages where enabledKinds.contains(stage.kind) {
+        for stage in Self.analysisStages {
             let kind = stage.kind
             guard let capability = capabilitySnapshot.capability(for: kind),
                 capability.isAvailable,
@@ -93,7 +92,7 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
                 schemaEpoch: stage.schemaEpoch
             )
             artifacts.insert(artifact)
-            if let backend = stage.backend { mapping[artifact] = backend }
+            mapping[artifact] = stage.backend
         }
         guard !artifacts.isEmpty else { throw MLNativeSearchConfigurationError.noSearchableCapabilities }
         executionKey = try MLPipelineExecutionKey(
@@ -149,23 +148,17 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
         )
     }
 
-    /// Search scheduling contains only stages with a serving backend. The capability inventory
-    /// remains broader so on-demand and qualification evidence can still name every Vision stage.
-    public static let indexedStillImageKinds: [MLNativeAnalysisKind] = analysisStages.compactMap { stage in
-        stage.backend == nil ? nil : stage.kind
-    }
-
     private struct AnalysisStage: Sendable {
         let kind: MLNativeAnalysisKind
         let output: MLAnalysisOutputDescriptor
-        let backend: MLSearchBackend?
+        let backend: MLSearchBackend
         let stageID: String
         let schemaEpoch: Int
 
         init(
             kind: MLNativeAnalysisKind,
             output: MLAnalysisOutputDescriptor,
-            backend: MLSearchBackend?,
+            backend: MLSearchBackend,
             stageID: String,
             schemaEpoch: Int = 1
         ) {
@@ -177,59 +170,14 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
         }
     }
 
+    /// Search scheduling contains only stages with a serving backend. The capability inventory
+    /// is broader so on-demand and qualification evidence can still name every Vision stage.
     private static let analysisStages: [AnalysisStage] = [
         .init(kind: .textRecognition, output: .recognizedText, backend: .recognizedText, stageID: "recognized-text"),
         .init(
             kind: .documentRecognition, output: .structuredDocument, backend: .documentText,
             stageID: "structured-document"),
         .init(kind: .barcodeDetection, output: .barcodePayload, backend: .barcodePayload, stageID: "barcode-payload"),
-        .init(kind: .documentSegmentation, output: .geometry, backend: nil, stageID: "document-region"),
-        .init(kind: .imageClassification, output: .classifications, backend: nil, stageID: "classifications"),
-        .init(
-            kind: .animalRecognition,
-            output: .regions(labels: ["cat", "dog"], species: [.cat, .dog], landmarkSchema: nil), backend: nil,
-            stageID: "animals"),
-        .init(
-            kind: .humanDetection, output: .regions(labels: ["human"], species: [.human], landmarkSchema: nil),
-            backend: nil, stageID: "humans"),
-        .init(kind: .imageFeaturePrint, output: .featurePrint, backend: nil, stageID: "feature-print"),
-        .init(
-            kind: .faceDetection, output: .regions(labels: ["face"], species: [.human], landmarkSchema: nil),
-            backend: nil, stageID: "faces"),
-        .init(
-            kind: .faceLandmarks,
-            output: .regions(labels: ["face"], species: [.human], landmarkSchema: "apple-face-landmarks"), backend: nil,
-            stageID: "face-landmarks"),
-        .init(kind: .faceCaptureQuality, output: .qualityMetrics, backend: nil, stageID: "face-quality"),
-        .init(
-            kind: .animalBodyPose,
-            output: .regions(labels: ["animal-pose"], species: [.cat, .dog], landmarkSchema: "apple-animal-pose"),
-            backend: nil, stageID: "animal-pose"),
-        .init(
-            kind: .foregroundInstanceMask, output: .mask(format: .label8), backend: nil, stageID: "foreground-instances"
-        ),
-        .init(kind: .personInstanceMask, output: .mask(format: .label8), backend: nil, stageID: "person-instances"),
-        .init(kind: .personSegmentation, output: .mask(format: .alpha8), backend: nil, stageID: "person-segmentation"),
-        .init(kind: .imageAesthetics, output: .qualityMetrics, backend: nil, stageID: "aesthetics"),
-        .init(kind: .attentionSaliency, output: .saliency, backend: nil, stageID: "attention-saliency"),
-        .init(kind: .objectnessSaliency, output: .saliency, backend: nil, stageID: "objectness-saliency"),
-        .init(kind: .lensSmudgeDetection, output: .qualityMetrics, backend: nil, stageID: "lens-smudge"),
-        .init(
-            kind: .humanBodyPose,
-            output: .regions(labels: ["human-pose"], species: [.human], landmarkSchema: "apple-human-body-pose"),
-            backend: nil, stageID: "human-body-pose"),
-        .init(
-            kind: .humanHandPose,
-            output: .regions(labels: ["hand-pose"], species: [.human], landmarkSchema: "apple-human-hand-pose"),
-            backend: nil, stageID: "human-hand-pose"),
-        .init(
-            kind: .humanBodyPose3D,
-            output: .regions(labels: ["human-pose-3d"], species: [.human], landmarkSchema: "apple-human-body-pose-3d"),
-            backend: nil, stageID: "human-body-pose-3d"),
-        .init(kind: .contours, output: .geometry, backend: nil, stageID: "contours"),
-        .init(kind: .horizon, output: .geometry, backend: nil, stageID: "horizon"),
-        .init(kind: .rectangles, output: .geometry, backend: nil, stageID: "rectangles"),
-        .init(kind: .textRectangles, output: .geometry, backend: nil, stageID: "text-regions"),
     ]
 }
 
@@ -240,20 +188,7 @@ public enum MLNativeSearchConfigurationError: Error, Equatable {
 public protocol MLNativeSearchServing: Sendable {
     func availableBackends() async -> Set<MLSearchBackend>
     func maximumConcurrentAssets() async -> Int
-    func index(
-        assets: [MLPipelineAssetRevision],
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome
-    func indexQuantum(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64,
-        allowsDestructiveReconciliation: Bool,
-        maximumAssets: Int,
-        maximumConcurrentAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome
+    func hasIndexedTextEntries() async -> Bool
     func indexQuantum(
         assets: [MLPipelineAssetRevision],
         libraryGeneration: UInt64,
@@ -274,56 +209,9 @@ public protocol MLNativeSearchServing: Sendable {
 public extension MLNativeSearchServing {
     func maximumConcurrentAssets() async -> Int { 1 }
 
-    func indexQuantum(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64,
-        allowsDestructiveReconciliation: Bool,
-        destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
-        maximumAssets: Int,
-        maximumConcurrentAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome {
-        // Legacy conformers cannot revalidate after their awaited work. Keep them additive until
-        // they implement this requirement and can enforce the fence at their deletion boundary.
-        _ = destructiveReconciliationIsAuthorized
-        return await indexQuantum(
-            assets: assets,
-            libraryGeneration: libraryGeneration,
-            allowsDestructiveReconciliation: false,
-            maximumAssets: maximumAssets,
-            maximumConcurrentAssets: maximumConcurrentAssets,
-            shouldContinue: shouldContinue,
-            observer: observer
-        )
-    }
-
-    func indexQuantum(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64,
-        allowsDestructiveReconciliation: Bool,
-        maximumAssets: Int,
-        maximumConcurrentAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome {
-        await index(
-            assets: assets,
-            shouldContinue: shouldContinue,
-            observer: observer
-        )
-    }
-
-    func index(
-        assets: [MLPipelineAssetRevision],
-        shouldContinue: @escaping @Sendable () -> Bool
-    ) async -> MLDerivedPipelinePassOutcome {
-        await index(
-            assets: assets,
-            shouldContinue: shouldContinue,
-            observer: MLDerivedPipelineObserver()
-        )
-    }
+    /// Conservative default: a conformer that does not report its text index is treated as having
+    /// none, so the OCR scope stays hidden instead of offering a scope that cannot answer.
+    func hasIndexedTextEntries() async -> Bool { false }
 
     func unavailableAssetUIDs() async -> Set<PhotoUID> { [] }
 }
@@ -368,33 +256,12 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
     public func index(
         assets: [MLPipelineAssetRevision],
         shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
+        observer: MLDerivedPipelineObserver = MLDerivedPipelineObserver()
     ) async -> MLDerivedPipelinePassOutcome {
         await index(
             assets: assets,
             libraryGeneration: nil,
             maximumAssets: nil,
-            shouldContinue: shouldContinue,
-            observer: observer
-        )
-    }
-
-    public func indexQuantum(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64,
-        allowsDestructiveReconciliation: Bool = true,
-        maximumAssets: Int,
-        maximumConcurrentAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome {
-        await index(
-            assets: assets,
-            libraryGeneration: libraryGeneration,
-            allowsDestructiveReconciliation: allowsDestructiveReconciliation,
-            destructiveReconciliationIsAuthorized: { true },
-            maximumAssets: maximumAssets,
-            maximumConcurrentAssets: maximumConcurrentAssets,
             shouldContinue: shouldContinue,
             observer: observer
         )
@@ -495,6 +362,13 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
         guard let key = configuration.key(for: scope) else { return [] }
         let tokens = MLTextIndexNormalizer.tokens(in: text, limit: 16)
         return store.search(normalizedTokens: tokens, in: key, limit: limit).map(\.uid)
+    }
+
+    /// The OCR scope is offered only when the current library's text index holds at least one
+    /// committed entry. A missing text configuration or an unreadable store both report `false`.
+    public func hasIndexedTextEntries() -> Bool {
+        guard let key = configuration.key(for: .text) else { return false }
+        return store.hasIndexedEntries(for: key)
     }
 
     public func progress() -> MLDerivedPipelineProgress {

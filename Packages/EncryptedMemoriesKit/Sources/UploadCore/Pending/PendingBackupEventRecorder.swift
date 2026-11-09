@@ -85,8 +85,8 @@ public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked S
         return outcome
     }
 
-    public func isExcluded(source: UploadSourceIdentity) -> Bool? {
-        store.excludedIdentifiers(kind: source.kind, among: [source.identifier]).map { $0.contains(source.identifier) }
+    public func exclusion(of source: UploadSourceIdentity) -> BackupSourceExclusion? {
+        store.exclusions(kind: source.kind, among: [source.identifier]).map { $0[source.identifier] ?? .included }
     }
 
     public func reportProgress(source: UploadSourceIdentity, revision: UploadBackupRevision, step: Int?) {

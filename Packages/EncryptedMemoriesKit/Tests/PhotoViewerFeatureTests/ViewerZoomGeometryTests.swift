@@ -32,24 +32,12 @@ final class ViewerZoomGeometryTests: XCTestCase {
         )
     }
 
-    func testScaledMediaSizeAndCenteredInsetsCoverBothAxes() {
+    func testCenteredInsetsCoverBothAxes() {
         let fit = ViewerZoomGeometry.aspectFitSize(
             mediaSize: CGSize(width: 1920, height: 1080),
             viewportSize: CGSize(width: 390, height: 844)
         )
-        let intermediate = ViewerZoomGeometry.scaledMediaSize(
-            mediaSize: CGSize(width: 1920, height: 1080),
-            viewportSize: CGSize(width: 390, height: 844),
-            zoomScale: 2
-        )
-        let maximum = ViewerZoomGeometry.scaledMediaSize(
-            mediaSize: CGSize(width: 1920, height: 1080),
-            viewportSize: CGSize(width: 390, height: 844),
-            zoomScale: 4
-        )
         XCTAssertEqual(fit.width, 390, accuracy: 0.0001)
-        XCTAssertEqual(intermediate.width, fit.width * 2, accuracy: 0.0001)
-        XCTAssertEqual(maximum.height, fit.height * 4, accuracy: 0.0001)
 
         let centered = ViewerZoomGeometry.centeredInsets(
             contentSize: fit, viewportSize: CGSize(width: 390, height: 844))
@@ -132,10 +120,6 @@ final class ViewerZoomGeometryTests: XCTestCase {
             ViewerZoomGeometry.aspectFitSize(
                 mediaSize: CGSize(width: CGFloat.infinity, height: 1), viewportSize: CGSize(width: 10, height: 10)),
             .zero)
-        assertSize(
-            ViewerZoomGeometry.scaledMediaSize(
-                mediaSize: CGSize(width: 10, height: 10), viewportSize: CGSize(width: 10, height: 10), zoomScale: .nan),
-            equals: CGSize(width: 10, height: 10))
         let invalidOrigin = ViewerZoomGeometry.settledOrigin(
             proposedOrigin: CGPoint(x: CGFloat.infinity, y: 0), contentSize: CGSize(width: 20, height: 20),
             viewportSize: CGSize(width: 10, height: 10))

@@ -160,6 +160,41 @@ actor AlbumSyncLastRunFile {
         var issue: BackupIssueKind
         var isPermanent: Bool
         var isRetryable: Bool
+        var source: UploadSourceIdentity?
+
+        /// Memberwise initializer used by `write()`.
+        init(
+            id: String, filename: String, reason: String, category: String,
+            issue: BackupIssueKind, isPermanent: Bool, isRetryable: Bool,
+            source: UploadSourceIdentity?
+        ) {
+            self.id = id
+            self.filename = filename
+            self.reason = reason
+            self.category = category
+            self.issue = issue
+            self.isPermanent = isPermanent
+            self.isRetryable = isRetryable
+            self.source = source
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, filename, reason, category, issue, isPermanent, isRetryable, source
+        }
+
+        /// A `source` value that no longer decodes becomes nil instead of dropping the whole file.
+        /// This keeps each row and every album alive despite a bad `source`.
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            filename = try container.decode(String.self, forKey: .filename)
+            reason = try container.decode(String.self, forKey: .reason)
+            category = try container.decode(String.self, forKey: .category)
+            issue = try container.decode(BackupIssueKind.self, forKey: .issue)
+            isPermanent = try container.decode(Bool.self, forKey: .isPermanent)
+            isRetryable = try container.decode(Bool.self, forKey: .isRetryable)
+            source = try? container.decodeIfPresent(UploadSourceIdentity.self, forKey: .source)
+        }
     }
 
     private let url: URL
@@ -177,7 +212,7 @@ actor AlbumSyncLastRunFile {
                 // An unknown category falls back to the issue's own category.
                 BackupFailedItem(
                     id: item.id, filename: item.filename, reason: item.reason, isPermanent: item.isPermanent,
-                    issue: item.issue, isRetryable: item.isRetryable,
+                    issue: item.issue, isRetryable: item.isRetryable, source: item.source,
                     category: BackupIssueCategory(rawValue: item.category))
             }
         }
@@ -190,7 +225,7 @@ actor AlbumSyncLastRunFile {
                 StoredItem(
                     id: item.id, filename: item.filename, reason: item.reason,
                     category: item.category.rawValue, issue: item.issue, isPermanent: item.isPermanent,
-                    isRetryable: item.isRetryable)
+                    isRetryable: item.isRetryable, source: item.source)
             }
         }
         if stored.isEmpty {

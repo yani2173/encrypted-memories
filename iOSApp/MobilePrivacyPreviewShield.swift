@@ -8,7 +8,8 @@ import os
 final class MobilePrivacyPreviewShield {
     private weak var window: UIWindow?
     private var preview: UIImageView?
-    private var animator: UIViewPropertyAnimator?
+    /// Internal and read-only for deterministic tests, which pause and finish fades without wall-clock sleeps.
+    private(set) var animator: UIViewPropertyAnimator?
     private var covered = false
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "PrivacyPreview")
 

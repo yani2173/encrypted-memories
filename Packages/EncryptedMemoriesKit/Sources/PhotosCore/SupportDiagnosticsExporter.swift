@@ -38,6 +38,12 @@ public enum SupportDiagnosticsExporter {
             let pendingGrid: PendingGridSupportSnapshot
         }
 
+        /// The background milestone lines of the device log, oldest first, and the older lines that its bound dropped.
+        struct BackgroundLog: Codable {
+            let lines: [String]
+            let droppedLines: Int
+        }
+
         struct RecentEvents: Codable {
             let events: [SupportEventTrail.ExportedEvent]
             /// Older events that the bounded trail no longer holds.
@@ -48,6 +54,11 @@ public enum SupportDiagnosticsExporter {
         let librarySync: LibrarySyncSupportSnapshot
         let backup: Backup
         let recentEvents: RecentEvents
+        /// The last OS background windows of iOS. macOS records none: it has no such windows, so the section is empty.
+        /// Each record has one of the eight outcomes of `BackgroundWindowOutcome`; `unfinished` marks a window whose end
+        /// was never recorded.
+        let backgroundWindows: BackgroundWindowSupportSnapshot
+        let backgroundLog: BackgroundLog
         let schemaVersion: Int
         let generatedAt: Date
         let appVersion: String
@@ -59,6 +70,8 @@ public enum SupportDiagnosticsExporter {
         let diagnostics: PhotoDiagnosticsSupportSnapshot
         /// Nil without a signed-in session.
         let requests: RemoteRequestSupportSnapshot?
+        let measurements: SupportWorkMeasurementSnapshot
+        let thumbnailCaches: ThumbnailCacheSupportSnapshot
     }
 
     public static func makeJSONData(
@@ -67,7 +80,9 @@ public enum SupportDiagnosticsExporter {
         diagnostics: PhotoDiagnostics = .shared,
         bundle: Bundle = .main,
         sources: SupportDiagnosticsSources = .shared,
-        trail: SupportEventTrail = .shared
+        trail: SupportEventTrail = .shared,
+        backgroundWindows: BackgroundWindowLedger = .shared,
+        backgroundLog: BackgroundWorkLogFile = .shared
     ) async throws -> Data {
         let snapshot = runtimeState.snapshot()
         let metrics = await resourceCoordinator.metrics()
@@ -76,6 +91,7 @@ public enum SupportDiagnosticsExporter {
         let librarySync = await sources.librarySnapshot(now: now)
         // One salt per report: hashes link the events of one report, never two reports.
         let trailExport = trail.export(hashingWith: SupportReportIdentifierHasher())
+        let logExport = backgroundLog.export()
         let report = Report(
             placeCandidates: await sources.placeSnapshot(),
             librarySync: librarySync,
@@ -85,7 +101,9 @@ public enum SupportDiagnosticsExporter {
                 pendingGrid: sources.pendingGridSnapshot()
             ),
             recentEvents: Report.RecentEvents(events: trailExport.events, dropped: trailExport.dropped),
-            schemaVersion: 2,
+            backgroundWindows: backgroundWindows.supportSnapshot(),
+            backgroundLog: Report.BackgroundLog(lines: logExport.lines, droppedLines: logExport.droppedLines),
+            schemaVersion: 4,
             generatedAt: now,
             appVersion: buildInfo.version ?? "unknown",
             appBuild: buildInfo.build ?? "unknown",
@@ -118,7 +136,10 @@ public enum SupportDiagnosticsExporter {
                 maximumWaitMilliseconds: metrics.maximumWaitMilliseconds
             ),
             diagnostics: diagnostics.supportSnapshot(),
-            requests: await sources.requestSnapshot()
+            requests: await sources.requestSnapshot(),
+            measurements: sources.workMeasurementSnapshot(),
+            thumbnailCaches: await sources.thumbnailCacheSnapshot(
+                deadline: ContinuousClock.now.advanced(by: .seconds(2)))
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

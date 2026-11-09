@@ -18,24 +18,12 @@ final class OfflineLibraryManager {
 
     /// Disk thumbnail cache (decoded grid previews) - shared with `MainView`'s `ThumbnailFeed`. Encrypted
     /// per-account (AES-GCM); `configure(session:)` installs a key derived from the restored Proton session.
-    let cache = ThumbnailCache(
-        namespace: "thumbnails",
-        derivative: "thumbnail",
-        configuration: MacMediaCachePolicy.thumbnailByteCacheConfiguration()
-    )
+    let cache: ThumbnailCache
     /// Larger display-preview derivatives, persisted when the viewer fetches them. Also encrypted.
-    let previewCache = ThumbnailCache(
-        namespace: "previews",
-        derivative: "preview",
-        configuration: MacMediaCachePolicy.thumbnailByteCacheConfiguration()
-    )
+    let previewCache: ThumbnailCache
     /// Full-resolution originals viewed in the photo viewer, persisted encrypted when the Offline Library is on
     /// and bounded by an LRU size cap.
-    let originalsCache = ThumbnailCache(
-        namespace: "originals",
-        derivative: "original",
-        configuration: MacMediaCachePolicy.thumbnailByteCacheConfiguration()
-    )
+    let originalsCache: ThumbnailCache
 
     /// Whole-library GPS index for the Map view. GPS is sensitive PII, so it is encrypted at rest
     /// (`PhotoLocationStore`, same per-account key as the media caches) and decrypted only into the in-memory
@@ -44,10 +32,11 @@ final class OfflineLibraryManager {
     var locationStore: PhotoLocationStore { locationCrawl.store }
     var locationIndex: PhotoLocationIndex { locationCrawl.index }
     /// Loads the area the map opens at into MapKit's cache, so the map draws at once.
-    @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
+    @ObservationIgnored private let mapPrewarmer: PhotoMapPrewarmer
     /// The GPS crawl session shared with iOS. The account configuration and the prewarmer stay here.
-    @ObservationIgnored private let locationCrawl = LocationCrawlSession(
-        platform: .init(headStart: .seconds(8), requiresStoreSession: false))
+    @ObservationIgnored private let locationCrawl: LocationCrawlSession
+    @ObservationIgnored private let diagnosticsSources: SupportDiagnosticsSources
+    @ObservationIgnored private let defaults: UserDefaults
     private var locationConfigurationGeneration: UInt64 = 0
     private var locationConfigurationTask: Task<Void, Never>?
     private var originalsCapEnforcementTask: Task<Void, Never>?
@@ -63,7 +52,7 @@ final class OfflineLibraryManager {
 
     /// Current originals-cache byte budget, or `nil` when the user chose "unbounded".
     var originalsCapBytes: Int64? {
-        let d = UserDefaults.standard
+        let d = defaults
         if d.bool(forKey: AppSettingsKey.offlineOriginalsCapUnlimited) { return nil }
         let gb =
             d.object(forKey: AppSettingsKey.offlineOriginalsCapGB) as? Double
@@ -78,6 +67,7 @@ final class OfflineLibraryManager {
     private(set) var isLibraryActivityActive = false
     private let thumbnailUpdateCoordinator = LibraryThumbnailUpdateCoordinator()
 
+    @ObservationIgnored private var thumbnailSupportSource: (any ThumbnailCacheSupportSource)?
     private var feed: ThumbnailFeed?
     private var statsProvider: (any LibraryStatsProvider)?
     private let statsCoordinator = OfflineLibraryStatsCoordinator()
@@ -101,8 +91,23 @@ final class OfflineLibraryManager {
         let liveAssetCount: Int
     }
 
-    private init() {
-        let defaults = UserDefaults.standard
+    private init(root: URL? = nil, sources: SupportDiagnosticsSources = .shared, defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        self.diagnosticsSources = sources
+        let media = root?.appendingPathComponent("media", isDirectory: true)
+        let policy = MacMediaCachePolicy.thumbnailByteCacheConfiguration()
+        cache = ThumbnailCache(
+            namespace: "thumbnails", derivative: "thumbnail", configuration: policy, rootDirectory: media)
+        previewCache = ThumbnailCache(
+            namespace: "previews", derivative: "preview", configuration: policy, rootDirectory: media)
+        originalsCache = ThumbnailCache(
+            namespace: "originals", derivative: "original", configuration: policy, rootDirectory: media)
+        let locations =
+            root?.appendingPathComponent("locations", isDirectory: true) ?? PhotoLocationStore.defaultDirectory
+        locationCrawl = LocationCrawlSession(
+            platform: .init(headStart: .seconds(8), requiresStoreSession: false),
+            store: PhotoLocationStore(directory: locations))
+        mapPrewarmer = PhotoMapPrewarmer(defaults: defaults)
         defaults.register(defaults: [
             AppSettingsKey.offlineLibraryEnabled: AppSettingsDefault.offlineLibraryEnabled,
             AppSettingsKey.offlineOriginalsCapUnlimited: AppSettingsDefault.offlineOriginalsCapUnlimited,
@@ -111,6 +116,17 @@ final class OfflineLibraryManager {
         offlineEnabled = defaults.bool(forKey: AppSettingsKey.offlineLibraryEnabled)
     }
 
+    #if DEBUG
+        convenience init(testRoot: URL, testSources: SupportDiagnosticsSources, testDefaults: UserDefaults) {
+            self.init(root: testRoot, sources: testSources, defaults: testDefaults)
+        }
+
+        func installSupportSourceForTesting(_ source: any ThumbnailCacheSupportSource) {
+            thumbnailSupportSource = source
+            diagnosticsSources.registerThumbnailCaches(source)
+        }
+    #endif
+
     /// Called by `MainView` after backend and feed creation. Thumbnail crawling is grid infrastructure
     /// and remains enabled independently of the offline-originals setting.
     func attach(feed: ThumbnailFeed, stats: any LibraryStatsProvider) {
@@ -118,13 +134,17 @@ final class OfflineLibraryManager {
         self.statsProvider = stats
         markStatusDirty()
         Task {
-            await feed.setPrefetchEnabled(OfflineLibraryPolicy.shouldCrawlThumbnails(offlineEnabled: offlineEnabled))
+            await feed.setPrefetchEnabled(true)
         }
     }
 
     /// Clears account-derived values from observable Settings state before asynchronous teardown begins.
     func prepareForAccountTeardown() {
         accountTeardownInProgress = true
+        if let source = thumbnailSupportSource {
+            diagnosticsSources.unregisterThumbnailCaches(source)
+            thumbnailSupportSource = nil
+        }
         if let statsSession {
             statsCoordinator.invalidate(statsSession)
             statsTeardownSession = statsSession
@@ -167,6 +187,9 @@ final class OfflineLibraryManager {
         // publication; account teardown still joins readers before closing provider stores.
         statsSession = statsCoordinator.beginSession()
         context.configure(cache, previewCache, originalsCache)
+        let supportSource = ThumbnailCacheSupportGroup([cache, previewCache, originalsCache])
+        thumbnailSupportSource = supportSource
+        diagnosticsSources.registerThumbnailCaches(supportSource)
         let previousCrawlStarted = locationCrawl.isStarted
         let accountChanged = previousAccountUID != nil && previousAccountUID != context.accountUID
         locationConfigurationGeneration &+= 1
@@ -235,6 +258,10 @@ final class OfflineLibraryManager {
     /// Stops account-bound location and activity work before any facade or cache owner is closed.
     /// Kept separate from cache deletion so the shared account teardown stages stay explicit.
     func stopForAccountTeardown() async {
+        if let source = thumbnailSupportSource {
+            diagnosticsSources.unregisterThumbnailCaches(source)
+            thumbnailSupportSource = nil
+        }
         originalsCapGate.closeAdmission()
         let retiringStatsSession = statsTeardownSession
         let activeLocationConfiguration = locationConfigurationTask
@@ -360,7 +387,7 @@ final class OfflineLibraryManager {
 
     /// Persists the Offline Photo Library setting. Enabled mode stores viewed originals in the encrypted
     /// `originals` cache; disabled mode stops retention and lets Settings purge existing originals.
-    /// Thumbnail crawling remains enabled by `OfflineLibraryPolicy`.
+    /// Thumbnail crawling stays enabled in both modes.
     func setOfflineEnabled(_ enabled: Bool) {
         guard enabled != offlineEnabled else { return }
         offlineEnabled = enabled

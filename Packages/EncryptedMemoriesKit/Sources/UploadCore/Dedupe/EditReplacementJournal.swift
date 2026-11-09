@@ -105,6 +105,43 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     }
 }
 
+/// The three fields of an entry that a deletion decision writes.
+public struct EditReplacementDeletionChoice: Sendable, Equatable {
+    public var keptDeleted: Bool?
+    public var backUpAgainRevision: UploadBackupRevision?
+    public var deletionCheckStartedAt: Date?
+
+    public init(keptDeleted: Bool?, backUpAgainRevision: UploadBackupRevision?, deletionCheckStartedAt: Date?) {
+        self.keptDeleted = keptDeleted
+        self.backUpAgainRevision = backUpAgainRevision
+        self.deletionCheckStartedAt = deletionCheckStartedAt
+    }
+
+    /// What `keepDeleted(for:)` writes.
+    public static let keptDeleted = EditReplacementDeletionChoice(
+        keptDeleted: true, backUpAgainRevision: nil, deletionCheckStartedAt: nil)
+
+    /// What `backUpAgain(revision:for:)` writes.
+    public static func backUpAgain(_ revision: UploadBackupRevision) -> EditReplacementDeletionChoice {
+        EditReplacementDeletionChoice(keptDeleted: nil, backUpAgainRevision: revision, deletionCheckStartedAt: nil)
+    }
+}
+
+extension EditReplacementJournalEntry {
+    public var deletionChoice: EditReplacementDeletionChoice {
+        get {
+            EditReplacementDeletionChoice(
+                keptDeleted: keptDeleted, backUpAgainRevision: backUpAgainRevision,
+                deletionCheckStartedAt: deletionCheckStartedAt)
+        }
+        set {
+            keptDeleted = newValue.keptDeleted
+            backUpAgainRevision = newValue.backUpAgainRevision
+            deletionCheckStartedAt = newValue.deletionCheckStartedAt
+        }
+    }
+}
+
 /// Durable record of edited photos that replace their earlier upload. The dedupe pipeline adds the earlier
 /// photo before its manifest record forgets it; the backup runner retires it after the trash write.
 public protocol EditReplacementJournaling: Sendable {
@@ -113,6 +150,11 @@ public protocol EditReplacementJournaling: Sendable {
     func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws
     func clearDeletionCheck(for source: UploadSourceIdentity) throws
     func clearDeletionChoice(for source: UploadSourceIdentity) throws
+    /// Writes `previous` back in one line while the entry still holds `written`, the choice of a decision whose queue
+    /// write failed. A newer choice or wait written meanwhile stays. The entry's other fields stay.
+    func restoreDeletionChoice(
+        _ previous: EditReplacementDeletionChoice, ifStill written: EditReplacementDeletionChoice,
+        for source: UploadSourceIdentity) throws
     func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry
     /// One in-memory snapshot for admission after a queue reset, without reading each queued source.
     func supersededSourceIdentifiers() -> Set<String>
@@ -135,14 +177,8 @@ public protocol EditReplacementJournaling: Sendable {
     /// Removes photos from `retired`: the person restored them, so they are in the library again.
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
     /// True when an entry names one of `linkIDs`. The edit replacement still owns such a link, so the merge of exact
-    /// duplicates leaves it.
+    /// duplicates leaves it. A journal that cannot list its links protects every link.
     func namesAnyLink(_ linkIDs: Set<String>) -> Bool
-}
-
-extension EditReplacementJournaling {
-    public func supersededSourceIdentifiers() -> Set<String> { [] }
-    /// A journal that cannot list its links protects every link.
-    public func namesAnyLink(_ linkIDs: Set<String>) -> Bool { true }
 }
 
 /// A log of JSON lines in the account data directory, so the sign-out purge removes it with the other stores. Each
@@ -354,19 +390,11 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     }
 
     public func keepDeleted(for source: UploadSourceIdentity) throws {
-        try update(source) { entry in
-            entry.keptDeleted = true
-            entry.backUpAgainRevision = nil
-            entry.deletionCheckStartedAt = nil
-        }
+        try update(source) { entry in entry.deletionChoice = .keptDeleted }
     }
 
     public func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws {
-        try update(source) { entry in
-            entry.keptDeleted = nil
-            entry.backUpAgainRevision = revision
-            entry.deletionCheckStartedAt = nil
-        }
+        try update(source) { entry in entry.deletionChoice = .backUpAgain(revision) }
     }
 
     public func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws {
@@ -384,6 +412,16 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             entry.keptDeleted = nil
             entry.backUpAgainRevision = nil
             entry.deletionCheckStartedAt = nil
+        }
+    }
+
+    public func restoreDeletionChoice(
+        _ previous: EditReplacementDeletionChoice, ifStill written: EditReplacementDeletionChoice,
+        for source: UploadSourceIdentity
+    ) throws {
+        try update(source) { entry in
+            guard entry.deletionChoice == written else { return }
+            entry.deletionChoice = previous
         }
     }
 
@@ -408,7 +446,8 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             try append(Line(key: key, entry: next))
             entries[key] = next
             lineCount += 1
-            if lineCount > max(1_000, entries.count * 2) { try rewrite() }
+            // The change is saved in the log. A failed compaction loses nothing; the next change tries it again.
+            if lineCount > max(1_000, entries.count * 2) { try? rewrite() }
         }
     }
 

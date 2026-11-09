@@ -2,7 +2,7 @@ import DeviceRootCore
 import Foundation
 import ProtonDriveSDK
 
-/// SDK 0.32.1 operations for the app-owned Computer or My files fallback.
+/// SDK 0.33.0 operations for the app-owned Computer or My files fallback.
 /// Construct this only after the account Labs gate opens.
 struct ProtonDriveDeviceRootTransport: DeviceRootSDKTransport {
     private let client: ProtonDriveClient
@@ -82,7 +82,7 @@ struct ProtonDriveDeviceRootTransport: DeviceRootSDKTransport {
                 let folder = try await SDKCancellableOperation.run { token in
                     try await client.createFolder(
                         parentFolderUid: root.uid, folderName: name,
-                        lastModificationTime: Date(), cancellationToken: token)
+                        lastModificationTime: try SDKModificationTime.string(from: Date()), cancellationToken: token)
                 } cancel: { token in
                     try? await client.cancelCreateFolder(cancellationToken: token)
                 }
@@ -155,7 +155,7 @@ struct ProtonDriveDeviceRootTransport: DeviceRootSDKTransport {
         let marker = try await SDKCancellableOperation.run { token in
             try await client.createFolder(
                 parentFolderUid: folderUID, folderName: name,
-                lastModificationTime: Date(), cancellationToken: token)
+                lastModificationTime: try SDKModificationTime.string(from: Date()), cancellationToken: token)
         } cancel: { token in
             try? await client.cancelCreateFolder(cancellationToken: token)
         }

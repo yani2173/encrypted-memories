@@ -1,3 +1,5 @@
+import AVFoundation
+import AVKit
 import PhotoViewerCore
 import PhotosCore
 import SwiftUI
@@ -22,6 +24,230 @@ import XCTest
 /// fixture verifies the width adaptation, not the OS presentation transition; that initial-inset miss is recorded
 /// as an open iPadOS 27 finding (Onyx: viewer-inspector-compact-viewport-regression).
 final class MobileViewerInspectorTests: XCTestCase {
+    @MainActor func testVideoSurfaceStaysInsideHorizontalSafeArea() async throws {
+        let clip = try await makeVideoClip()
+        defer { try? FileManager.default.removeItem(at: clip) }
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 2, includesVideo: true)
+        defer { fixture.removeCache() }
+        var backend = fixture.backend
+        backend.streamingAssetLoader = { _ in
+            let asset = AVURLAsset(url: clip)
+            return StreamingVideoAsset(asset: asset, retaining: asset)
+        }
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model, backend: backend, sections: fixture.sections, thumbnailFeed: fixture.feed,
+            thumbnailCache: fixture.cache)
+        let router = MobileViewerRouter()
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = scene.coordinateSpace.bounds
+        let root = UIHostingController(rootView: ViewerPresentationHost(router: router, libraryModel: model))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer {
+            root.presentedViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+            previous?.makeKey()
+        }
+        let videoIndex = try XCTUnwrap(fixture.items.firstIndex(where: \.isVideo))
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            router.presentation = MobileViewerPresentation(
+                index: videoIndex, items: fixture.items, context: ViewerCollectionContext(filter: .all),
+                showsInfoInitially: false)
+        }
+        try await Task.sleep(for: .seconds(2))
+        let viewer = try XCTUnwrap(root.presentedViewController, "SETUP: viewer presented")
+        viewer.additionalSafeAreaInsets.right = 80
+        viewer.view.setNeedsLayout()
+        viewer.view.layoutIfNeeded()
+        try await Task.sleep(for: .seconds(1))
+        func findPlayer(_ controller: UIViewController) -> AVPlayerViewController? {
+            if let player = controller as? AVPlayerViewController { return player }
+            return controller.children.lazy.compactMap { findPlayer($0) }.first
+        }
+        let player = try XCTUnwrap(findPlayer(viewer), "SETUP: native video player must be mounted")
+        XCTAssertEqual(player.player?.currentItem?.status, .readyToPlay, "SETUP: the local clip must be playable")
+        let safe = viewer.view.safeAreaLayoutGuide.layoutFrame
+        let frame = player.view.convert(player.view.bounds, to: viewer.view)
+        XCTAssertGreaterThan(viewer.view.bounds.maxX - safe.maxX, 50, "SETUP: horizontal safe area is required")
+        print("issue924 video frame=\(frame) safe=\(safe)")
+        XCTAssertLessThanOrEqual(frame.maxX, safe.maxX + 1, "Video must remain inside the horizontal safe area")
+        XCTAssertGreaterThanOrEqual(frame.minX, safe.minX - 1)
+    }
+
+    @MainActor func testPausedVideoKeepsPlayerStreamAndSeekTimeAcrossResizes() async throws {
+        try await verifyVideoContinuity(playing: false)
+    }
+
+    @MainActor func testPlayingVideoKeepsPlayerStreamAndProgressAcrossResizes() async throws {
+        try await verifyVideoContinuity(playing: true)
+    }
+
+    /// Window resizing is a hosted baseline, not a simulated fold or display handoff.
+    @MainActor private func verifyVideoContinuity(playing: Bool) async throws {
+        let clip = try await makeVideoClip(frameCount: 60)
+        defer { try? FileManager.default.removeItem(at: clip) }
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 2, includesVideo: true)
+        defer { fixture.removeCache() }
+        let lifetime = ViewerVideoLifetimeProbe()
+        var backend = fixture.backend
+        backend.streamingAssetLoader = { uid in
+            lifetime.recordLoad(uid)
+            return StreamingVideoAsset(asset: AVURLAsset(url: clip), retaining: lifetime)
+        }
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model, backend: backend, sections: fixture.sections, thumbnailFeed: fixture.feed,
+            thumbnailCache: fixture.cache)
+        let router = MobileViewerRouter()
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let originalBounds = scene.coordinateSpace.bounds
+        window.frame = originalBounds
+        let root = UIHostingController(rootView: ViewerPresentationHost(router: router, libraryModel: model))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer {
+            root.presentedViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+            previous?.makeKey()
+        }
+        let videoIndex = try XCTUnwrap(fixture.items.firstIndex(where: \.isVideo))
+        let uid = fixture.items[videoIndex].uid
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            router.presentation = MobileViewerPresentation(
+                index: videoIndex, items: fixture.items, context: ViewerCollectionContext(filter: .all),
+                showsInfoInitially: false)
+        }
+        func findPlayers(_ controller: UIViewController) -> [AVPlayerViewController] {
+            if let player = controller as? AVPlayerViewController { return [player] }
+            return controller.children.flatMap(findPlayers)
+        }
+        try await waitForVideo("SETUP: production viewer mounts one ready player") {
+            guard let viewer = root.presentedViewController else { return false }
+            let controllers = findPlayers(viewer)
+            return controllers.count == 1 && controllers[0].player?.currentItem?.status == .readyToPlay
+        }
+        let viewer = try XCTUnwrap(root.presentedViewController)
+        let controller = try XCTUnwrap(findPlayers(viewer).first)
+        let player = try XCTUnwrap(controller.player)
+        let playerItem = try XCTUnwrap(player.currentItem)
+        XCTAssertGreaterThan(playerItem.duration.seconds, 30, "SETUP: clip must outlast the resize sequence")
+        player.pause()
+        let seekCompleted = await player.seek(
+            to: CMTime(seconds: 8, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        XCTAssertTrue(seekCompleted, "SETUP: native seek must complete")
+        try await waitForVideo("SETUP: pause and seek reach the requested position") {
+            player.timeControlStatus == .paused && abs(player.currentTime().seconds - 8) < 0.1
+        }
+        if playing {
+            player.play()
+            try await waitForVideo("SETUP: video actually progresses before resizing") {
+                player.timeControlStatus == .playing && player.currentTime().seconds > 8.2
+            }
+        }
+        let sizes = [
+            CGSize(width: 466, height: 678), CGSize(width: 951, height: 669), originalBounds.size,
+        ]
+        var report: [String] = []
+        for (step, size) in sizes.enumerated() {
+            let before = player.currentTime().seconds
+            let traits: UIUserInterfaceSizeClass = size.width > 820 ? .regular : .compact
+            window.traitOverrides.horizontalSizeClass = traits
+            root.traitOverrides.horizontalSizeClass = traits
+            viewer.traitOverrides.horizontalSizeClass = traits
+            window.frame = CGRect(origin: .zero, size: size)
+            window.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(350))
+            XCTAssertEqual(window.bounds.size, size, "step \(step): the requested resize must occur")
+            let mounted = findPlayers(viewer)
+            XCTAssertEqual(mounted.count, 1, "step \(step): exactly one native controller stays mounted")
+            XCTAssertTrue(mounted.first === controller, "step \(step): resize retains the native controller")
+            XCTAssertTrue(controller.player === player, "step \(step): resize retains the player")
+            XCTAssertTrue(player.currentItem === playerItem, "step \(step): resize retains the stream's item")
+            XCTAssertEqual(lifetime.loadedUIDs, [uid], "step \(step): resize must not reload the stream")
+            XCTAssertEqual(lifetime.closeCount, 0, "step \(step): resize must not close the live stream")
+            XCTAssertEqual(router.presentation?.items[videoIndex].uid, uid)
+            if playing {
+                try await waitForVideo("step \(step): playback continues after resizing") {
+                    player.timeControlStatus == .playing && player.currentTime().seconds > before + 0.2
+                }
+            } else {
+                XCTAssertEqual(player.timeControlStatus, .paused, "step \(step): resize must not resume playback")
+                XCTAssertEqual(player.currentTime().seconds, 8, accuracy: 0.1, "step \(step): seek time survives")
+            }
+            report.append("step=\(step) size=\(size) time=\(player.currentTime().seconds) playing=\(playing)")
+        }
+        withTransaction(transaction) { router.presentation = nil }
+        try await waitForVideo("Closing the viewer releases its stream") { lifetime.closeCount == 1 }
+        XCTAssertNil(player.currentItem, "Closing the viewer detaches the native item")
+        XCTAssertEqual(lifetime.loadedUIDs, [uid])
+        XCTAssertEqual(lifetime.closeCount, 1)
+        let attachment = XCTAttachment(string: report.joined(separator: "\n"))
+        attachment.name = playing ? "playing-video-resize" : "paused-video-resize"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor private func waitForVideo(_ message: String, condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while !condition(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        _ = try XCTUnwrap(condition() ? true : nil, message)
+    }
+
+    private func makeVideoClip(frameCount: Int = 3) async throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 160, AVVideoHeightKey: 160])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: 160, kCVPixelBufferHeightKey as String: 160,
+            ])
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting())
+        defer { if writer.status == .writing { writer.cancelWriting() } }
+        writer.startSession(atSourceTime: .zero)
+        let pool = try XCTUnwrap(adaptor.pixelBufferPool)
+        var buffer: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer), kCVReturnSuccess)
+        let frame = try XCTUnwrap(buffer)
+        CVPixelBufferLockBaseAddress(frame, [])
+        if let data = CVPixelBufferGetBaseAddress(frame) {
+            memset(data, 128, CVPixelBufferGetDataSize(frame))
+        }
+        CVPixelBufferUnlockBaseAddress(frame, [])
+        for index in 0..<frameCount {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while !input.isReadyForMoreMediaData, writer.status == .writing, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            _ = try XCTUnwrap(
+                input.isReadyForMoreMediaData ? true : nil,
+                "SETUP: frame \(index) was not accepted before the deadline; status=\(writer.status) error=\(String(describing: writer.error))"
+            )
+            XCTAssertTrue(adaptor.append(frame, withPresentationTime: CMTime(value: Int64(index), timescale: 1)))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        XCTAssertEqual(writer.status, .completed, "SETUP: local video generation must succeed")
+        return url
+    }
+
     @MainActor func testInspectorAdaptsBetweenColumnAndSheetWhileTheViewerStaysMounted() async throws {
         try XCTSkipUnless(
             UIDevice.current.userInterfaceIdiom == .pad, "column-to-sheet adaptation requires an iPad window")
@@ -116,6 +342,21 @@ final class MobileViewerInspectorTests: XCTestCase {
         // Native chrome: the viewer's own navigation bar is mounted inside the cover, and the media surface keeps
         // the touch centre (the Live Photo press and the chrome tap land on the zoomable page, not on a bar).
         func viewerDescendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(viewerDescendants) }
+        func verifyEdgeEffects(_ stage: String) throws {
+            let strip = try XCTUnwrap(
+                viewerDescendants(viewerHost.view).compactMap { $0 as? MobileViewerFilmstripCollectionView }.first,
+                "The viewer must contain the route filmstrip")
+            let pagerScroll = try XCTUnwrap(
+                try XCTUnwrap(pager()).view.subviews.compactMap { $0 as? UIScrollView }.first,
+                "The viewer must contain its native paging scroll view")
+            for (name, scroll) in [
+                ("filmstrip", strip as UIScrollView), ("pager", pagerScroll), ("photo", try zoomableViewport()),
+            ] {
+                XCTAssertTrue(scroll.leftEdgeEffect.isHidden, "\(stage): \(name) must hide its left edge effect")
+                XCTAssertTrue(scroll.rightEdgeEffect.isHidden, "\(stage): \(name) must hide its right edge effect")
+            }
+        }
+        try verifyEdgeEffects("initial")
         let viewerBars = viewerDescendants(viewerHost.view).filter { $0 is UINavigationBar }
         XCTAssertFalse(viewerBars.isEmpty, "the production viewer must mount a native navigation bar")
         let mediaCenter = initialViewport.convert(
@@ -248,6 +489,7 @@ final class MobileViewerInspectorTests: XCTestCase {
                 XCTAssertTrue(pager() === initialPager)
                 XCTAssertTrue(try zoomableViewport() === initialViewport)
                 XCTAssertEqual(initialViewport.zoomScale, zoom, accuracy: 0.01, "rotation preserves the photo zoom")
+                try verifyEdgeEffects("rotated")
                 let usable = window.safeAreaLayoutGuide.layoutFrame
                 let media = initialViewport.convert(initialViewport.bounds, to: window)
                 XCTAssertEqual(
@@ -263,6 +505,17 @@ final class MobileViewerInspectorTests: XCTestCase {
             try await rotate(to: originalOrientation)
             XCTAssertEqual(initialViewport.zoomScale, zoom, accuracy: 0.01)
         }
+
+        let previousPage = try XCTUnwrap(initialPager.viewControllers?.first)
+        let nextPage = try XCTUnwrap(
+            initialPager.dataSource?.pageViewController(initialPager, viewControllerAfter: previousPage))
+        initialPager.setViewControllers([nextPage], direction: .forward, animated: false)
+        initialPager.delegate?.pageViewController?(
+            initialPager, didFinishAnimating: true, previousViewControllers: [previousPage], transitionCompleted: true)
+        try await Task.sleep(for: .milliseconds(750))
+        XCTAssertTrue(initialPager.viewControllers?.first === nextPage, "paging must show the next photo")
+        XCTAssertFalse(try zoomableViewport() === initialViewport, "paging must mount the next photo viewport")
+        try verifyEdgeEffects("after paging")
 
         let text = report.joined(separator: "\n")
         let attachment = XCTAttachment(string: text)
@@ -289,6 +542,18 @@ final class MobileViewerInspectorTests: XCTestCase {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         try? data.write(to: url.appendingPathComponent(name))
     }
+}
+
+private final class ViewerVideoLifetimeProbe: VideoStreamLifetime, @unchecked Sendable {
+    private let lock = NSLock()
+    private var loads: [PhotoUID] = []
+    private var closes = 0
+
+    var loadedUIDs: [PhotoUID] { lock.withLock { loads } }
+    var closeCount: Int { lock.withLock { closes } }
+
+    func recordLoad(_ uid: PhotoUID) { lock.withLock { loads.append(uid) } }
+    func close() { lock.withLock { closes += 1 } }
 }
 
 /// The production viewer presentation: one `.fullScreenCover(item:)` bound to the viewer router, the way

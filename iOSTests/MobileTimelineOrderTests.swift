@@ -10,7 +10,7 @@ import XCTest
 
 final class MobileTimelineOrderTests: XCTestCase {
     @MainActor func testVisibleCorrectionWaitsUntilOffscreenAndKeepsTheScrollAnchor() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let feed = UIKitThumbnailFeed(cache: ThumbnailCache(rootDirectory: directory), loader: ChromeProbeLoader())

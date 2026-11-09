@@ -85,7 +85,6 @@ public enum VideoPlayerItemStatus: Int, Sendable {
 
 /// Builds the `[VideoViewer]` diagnostic line.
 public func videoViewerLogFields(
-    uid: PhotoUID,
     filename: String? = nil,
     mime: String? = nil,
     detectedKind: MediaKind? = nil,
@@ -97,7 +96,6 @@ public func videoViewerLogFields(
     error: String?
 ) -> [String: String] {
     var fields: [String: String] = [
-        "uid": "\(uid.volumeID)~\(uid.nodeID)",
         "state": state.label,
         "progress": String(format: "%.2f", state.progress),
         "localURLExists": "\(localURLExists)",

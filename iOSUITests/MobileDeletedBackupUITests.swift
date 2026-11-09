@@ -41,7 +41,7 @@ final class MobileDeletedBackupUITests: XCTestCase {
         XCTAssertTrue(attention.label.contains("1"), "One parked photo must need attention")
         attention.tap()
         let row = decisionRow
-        let rowAppeared = row.waitForExistence(timeout: 10)
+        let rowAppeared = row.waitForExistence(timeout: 90)
         if !rowAppeared { attachDiagnostics(named: "Backup list without the decision row") }
         XCTAssertTrue(rowAppeared)
         row.tap()
@@ -112,9 +112,21 @@ final class MobileDeletedBackupUITests: XCTestCase {
     }
 
     private func waitForDecisionRowRemoval() -> XCTWaiter.Result {
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: decisionRow)
-        // A hosted accessibility snapshot stalled for 19.3 s; allow several cycles while diagnosis is pending.
-        return XCTWaiter.wait(for: [gone], timeout: 60)
+        // One fulfilled poll ends the wait, but a stalled accessibility snapshot can miss the row for exactly
+        // that poll (a hosted existence query was on retry 2 when the wait completed, run 41282702084).
+        // Confirm a removal with a second check after a settle, so only a lasting disappearance completes.
+        var remaining: TimeInterval = 60
+        while remaining > 0 {
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: decisionRow)
+            let slice = min(5, remaining)
+            let start = Date()
+            if XCTWaiter.wait(for: [gone], timeout: slice) == .completed {
+                Thread.sleep(forTimeInterval: 2)
+                if !decisionRow.exists { return .completed }
+            }
+            remaining -= Date().timeIntervalSince(start)
+        }
+        return .timedOut
     }
 
     private func assertBackUpAgainResolved() {

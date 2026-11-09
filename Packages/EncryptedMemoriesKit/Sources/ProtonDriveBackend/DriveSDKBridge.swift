@@ -23,12 +23,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let uploadClientUID: String
     private let driveSession: DriveSession
     private let requestGovernor: ProtonRequestGovernor
+    private nonisolated let workMeasurements: SupportWorkMeasurements
     private let expensiveUploadAccess: ExpensiveUploadAccess
     private let relatedFileOperations: RelatedFileOperations
     /// Keeps uploads that avoid expensive networks apart from uploads that may use them, so `expensiveUploadAccess`
     /// always describes every running upload.
     private nonisolated let uploadNetworkAdmission = UploadNetworkAdmission()
     private nonisolated let sharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
+    private nonisolated let presentationNodeReads = SDKPresentationNodeReads()
+    private nonisolated let rootMaterialResolver = PhotosRootMaterialResolver()
     private var photosRoot: SDKNodeUid?
     private var photosShareID: String?
     /// App-owned SQLite timeline metadata store (`library-v1.sqlite`, PhotosCore). The bridge is
@@ -63,6 +66,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// work across awaits; without this, foreground lifecycle, upload refresh and a second Mac window can all
     /// enumerate the same 20k-item library concurrently.
     private var timelineLoadTask: (generation: UInt64, task: Task<TimelineLoadSnapshot, any Error>)?
+    private let timelineLoadWaiters = SharedInFlightOperations<UInt64, TimelineLoadSnapshot>()
+    private var timelineProvisionalObservers:
+        [UUID: (generation: UInt64, continuation: AsyncStream<ProvisionalTimelineSnapshot>.Continuation)] = [:]
+    private var timelineProvisionalSnapshot: (generation: UInt64, value: ProvisionalTimelineSnapshot)?
     /// What the last persisted load was built from. A later load for the same server cursor whose local revisions
     /// differ is rebuilt from the local store instead of a listing (`TimelineLocalRebuild`).
     private var timelineLoadBasis: TimelineLoadBasis?
@@ -99,6 +106,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// uploads recorded before that refresh started. The capacity check subtracts the rest from the account quota.
     private var uploadedBytes: Int64 = 0
     private var uploadedBytesInQuota: Int64 = 0
+    /// Automatic callers share only a running refresh for the same uploaded-byte snapshot in this session.
+    nonisolated let accountInfoRefreshes = SharedInFlightOperations<Int64, Void>()
     private var quotaRefresh: Task<Void, Never>?
     private var quotaRefreshWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var lastQuotaRefreshAt: ContinuousClock.Instant?
@@ -108,6 +117,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// (same directory, same purge coverage).
     let uploadManifestURL: URL
     let uploadManifestPolicy: LibraryDatabasePolicy
+    private nonisolated let seriesRestoreReplay: TrashedSeriesRestoreReplay
+    private nonisolated let seriesRestoreFlights = SharedInFlightOperations<Set<PhotoUID>, Void>()
+    /// Only complete Restore discovery grants this cache authority. Display listings never populate it.
+    private var checkedSeriesRestoreCandidates: [PhotoUID: [PhotoUID]]?
 
     /// Full sign-out / master-reset: erase the SDK metadata SQLite stores for `uid` (security
     /// follow-up #2 - non-secret node metadata that must not survive sign-out) AND the app-owned
@@ -204,11 +217,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         static let sdk = Self()
     }
 
-    init(prepared: PreparedSession, relatedFileOperations: RelatedFileOperations = .sdk) {
+    init(
+        prepared: PreparedSession, relatedFileOperations: RelatedFileOperations = .sdk,
+        seriesRestoreRetry: BackupRetryPolicy = .init(baseDelay: 60, maxDelay: 900),
+        checkedSeriesRestoreCandidates: [PhotoUID: [PhotoUID]]? = nil
+    ) {
         self.photosClient = prepared.photosClient
         self.uploadClientUID = prepared.uploadClientUID
         self.driveSession = prepared.driveSession
         self.requestGovernor = prepared.requestGovernor
+        self.workMeasurements = prepared.requestGovernor.workMeasurements
         self.expensiveUploadAccess = prepared.expensiveUploadAccess
         self.timelineStore = prepared.timelineStore
         self.timelineOrderStore = prepared.timelineOrderStore
@@ -222,6 +240,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         self.uploadManifestURL = prepared.uploadManifestURL
         self.uploadManifestPolicy = prepared.uploadManifestPolicy
         self.relatedFileOperations = relatedFileOperations
+        self.checkedSeriesRestoreCandidates = checkedSeriesRestoreCandidates
+        self.seriesRestoreReplay = TrashedSeriesRestoreReplay(
+            url: prepared.uploadManifestURL.deletingLastPathComponent()
+                .appendingPathComponent(TrashedSeriesRestoreJournal.fileName),
+            policy: prepared.uploadManifestPolicy, retry: seriesRestoreRetry)
     }
 
     init(
@@ -341,6 +364,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             relatedFileOperations: .sdk)
         SupportDiagnosticsSources.shared.registerLibrary(self)
         SupportDiagnosticsSources.shared.registerRequests(requestGovernor)
+        SupportDiagnosticsSources.shared.registerWorkMeasurements(workMeasurements)
         DebugLog.log("bridge: EncryptedMemoriesClient created ✓")
     }
 
@@ -351,6 +375,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             isShutDown = true
             SupportDiagnosticsSources.shared.unregisterLibrary(self)
             SupportDiagnosticsSources.shared.unregisterRequests(requestGovernor)
+            SupportDiagnosticsSources.shared.unregisterWorkMeasurements(workMeasurements)
+            workMeasurements.close()
             timelineLoadGeneration &+= 1
             shutdownGate.closeAdmission()
             timelineLoadTask?.task.cancel()
@@ -359,6 +385,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             quotaRefresh?.cancel()
             photoNameBackfill.close()
         }
+        await rootMaterialResolver.shutdown()
         await shutdownGate.run { [weak self] in
             await self?.performShutdown()
         }
@@ -383,9 +410,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func performShutdown() async {
+        await seriesRestoreFlights.invalidateAndJoin()
+        await seriesRestoreReplay.shutdown()
         // Admission is closed and every published operation has settled before this teardown runs.
         // Drain cache-owned SDK tasks now, including flights orphaned by admission cancellation.
         await sharedAlbumSnapshotCache.invalidateAll()
+        await presentationNodeReads.invalidateAndJoin()
+        await accountInfoRefreshes.invalidateAndJoin()
 
         let timelineTask = timelineLoadTask?.task
         timelineLoadTask = nil
@@ -397,6 +428,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         trashTask?.cancel()
 
         _ = await timelineTask?.result
+        await timelineLoadWaiters.invalidateAndJoin()
         await metadataReconciliation.waitForCurrentPass()
         await trashTask?.value
         // A cancelled waiter no longer waits for the remote index build; end the build before the identity stores
@@ -427,27 +459,117 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
+    func loadTimelineSnapshot(
+        onProvisional: @escaping @Sendable (ProvisionalTimelineSnapshot) async -> Void
+    ) async throws -> TimelineLoadSnapshot {
+        try await withOpenSession(cause: .timelineFull) { bridge in
+            try await bridge.loadTimelineSnapshotImpl(onProvisional: onProvisional)
+        }
+    }
+
+    private func loadTimelineSnapshotImpl(
+        onProvisional: @escaping @Sendable (ProvisionalTimelineSnapshot) async -> Void
+    ) async throws -> TimelineLoadSnapshot {
+        try Task.checkCancellation()
+        let generation = timelineLoadTask?.generation ?? (timelineLoadGeneration &+ 1)
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<ProvisionalTimelineSnapshot>.makeStream(
+            bufferingPolicy: .bufferingNewest(1))
+        timelineProvisionalObservers[id] = (generation, continuation)
+        if let current = timelineProvisionalSnapshot, current.generation == generation {
+            continuation.yield(current.value)
+        }
+        let delivery = Task {
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                await onProvisional(snapshot)
+            }
+        }
+        return try await withTaskCancellationHandler {
+            do {
+                let completed = try await loadTimelineSnapshotImpl()
+                timelineProvisionalObservers[id] = nil
+                continuation.finish()
+                await delivery.value
+                try Task.checkCancellation()
+                return completed
+            } catch {
+                timelineProvisionalObservers[id] = nil
+                continuation.finish()
+                delivery.cancel()
+                await delivery.value
+                throw error
+            }
+        } onCancel: {
+            continuation.finish()
+            delivery.cancel()
+        }
+    }
+
     private func loadTimelineSnapshotImpl() async throws -> TimelineLoadSnapshot {
         guard !isShutDown else { throw CancellationError() }
         if let timelineLoadTask {
-            return try await timelineLoadTask.task.value
+            return try await timelineLoadWaiters.run(timelineLoadTask.generation) {
+                try await timelineLoadTask.task.value
+            }
         }
 
         timelineLoadGeneration &+= 1
         let generation = timelineLoadGeneration
-        let task = Task { try await self.performTimelineLoad(generation: generation) }
+        timelineProvisionalSnapshot = nil
+        let task = Task {
+            do {
+                let snapshot = try await self.performTimelineLoad(generation: generation)
+                self.finishTimelineLoad(generation: generation)
+                return snapshot
+            } catch {
+                self.finishTimelineLoad(generation: generation)
+                throw error
+            }
+        }
         timelineLoadTask = (generation, task)
-        do {
-            let snapshot = try await task.value
-            if timelineLoadTask?.generation == generation { timelineLoadTask = nil }
-            return snapshot
-        } catch {
-            if timelineLoadTask?.generation == generation { timelineLoadTask = nil }
-            throw error
+        return try await timelineLoadWaiters.run(generation) { try await task.value }
+    }
+
+    private func finishTimelineLoad(generation: UInt64) {
+        guard timelineLoadTask?.generation == generation else { return }
+        timelineLoadTask = nil
+        timelineProvisionalSnapshot = nil
+    }
+
+    private func publishProvisionalTimeline(
+        _ entries: [PhotosListEntry], volumeID: String, mediaTypeEvidence: [String: String],
+        remoteChanges: TimelineRemoteEventChanges?, readAt: Date, generation: UInt64
+    ) throws {
+        try checkTimelineLoad(generation: generation)
+        let removed = remoteChanges?.removed ?? []
+        var seen = Set<String>()
+        var known = entries.filter { !removed.contains($0.linkID) && seen.insert($0.linkID).inserted }
+        if recentlyDeleted.hasPhotosAwaitingLibrary {
+            let listing = LibraryListingRead(
+                listed: Set(known.map { PhotoUID(volumeID: volumeID, nodeID: $0.linkID) }),
+                restoredElsewhere: Set(
+                    (remoteChanges?.active ?? []).map { PhotoUID(volumeID: volumeID, nodeID: $0) }),
+                readAt: readAt)
+            let lagging = recentlyDeleted.lagging(in: listing, now: Date())
+            known.removeAll { lagging.contains(PhotoUID(volumeID: volumeID, nodeID: $0.linkID)) }
+        }
+        guard !known.isEmpty else { return }
+        let provisional = ProvisionalTimelineSnapshot(
+            sections: Self.group(known, volumeID: volumeID, mediaTypeOverrides: mediaTypeEvidence, sectionID: "all"))
+        timelineProvisionalSnapshot = (generation, provisional)
+        for observer in timelineProvisionalObservers.values where observer.generation == generation {
+            observer.continuation.yield(provisional)
         }
     }
 
     private func performTimelineLoad(generation: UInt64) async throws -> TimelineLoadSnapshot {
+        let measurement = workMeasurements.begin(.timelineLoad)
+        var measurementOutcome = SupportMeasurementOutcome.failure
+        defer {
+            measurement?.finish(
+                WorkMeasurementOperation.resolveOutcome(recorded: measurementOutcome, taskCancelled: Task.isCancelled))
+        }
         var supportSource = LibrarySyncSupportSnapshot.SourcePath.preparation
         do {
             try checkTimelineLoad(generation: generation)
@@ -542,6 +664,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             switch source {
             case .authoritativePhotosList:
                 supportSource = continuityRecoveryRequired ? .continuity : .authoritative
+                measurement?.setTimelineSource(.authoritative)
                 let remoteChanges: TimelineRemoteEventChanges?
                 if continuityRecoveryRequired {
                     remoteChanges = nil
@@ -586,7 +709,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         try await driveSession.fetchPhotosList(volumeID: root.volumeID)
                     }
                 } else {
-                    entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID)
+                    entries = []
+                    try await driveSession.forEachPhotosListPage(volumeID: root.volumeID) { [self] page in
+                        entries.append(contentsOf: page)
+                        try publishProvisionalTimeline(
+                            entries, volumeID: root.volumeID, mediaTypeEvidence: mediaTypeEvidence,
+                            remoteChanges: remoteChanges, readAt: listingReadAt, generation: generation)
+                    }
                 }
                 librarySupport.listedPhotoCount = entries.count
                 if recentlyDeleted.hasPhotosAwaitingLibrary {
@@ -646,6 +775,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
             case .localStore:
                 supportSource = .localStore
+                measurement?.setTimelineSource(.localStore)
                 guard let localSections else { throw TimelineLocalRebuildUnavailableError() }
                 sections = localSections
                 reconciliationItems = localSections.flatMap(\.items)
@@ -658,30 +788,39 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
             case .sdkCache:
                 supportSource = .sdkCache
+                measurement?.setTimelineSource(.sdkCache)
                 let collector = SDKEnumerationCollector<PhotoTimelineItem>()
-                let items = try await SDKCancellableOperation.run { [photosClient] cancellationToken in
-                    try await photosClient.enumerateTimeline(
-                        in: root,
-                        cancellationToken: cancellationToken,
-                        onPhotoEnumerated: { result in collector.receive(result) }
-                    )
-                    return try collector.collected()
-                } cancel: { [photosClient] cancellationToken in
-                    try? await photosClient.cancelEnumerateTimeline(cancellationToken: cancellationToken)
+                let items = try await WorkMeasurementOperation.phase(.enumeration, pass: measurement) {
+                    [photosClient] in
+                    try await SDKCancellableOperation.run { [photosClient] cancellationToken in
+                        try await photosClient.enumerateTimeline(
+                            in: root,
+                            cancellationToken: cancellationToken,
+                            onPhotoEnumerated: { result in collector.receive(result) }
+                        )
+                        return try collector.collected()
+                    } cancel: { [photosClient] cancellationToken in
+                        try? await photosClient.cancelEnumerateTimeline(cancellationToken: cancellationToken)
+                    }
                 }
                 try checkTimelineLoad(generation: generation)
                 librarySupport.listedPhotoCount = items.count
                 DebugLog.log("timeline: SDK cache enumerated \(items.count) items ✓")
-                let enrichment = await TimelineTagEnrichmentLoader.load {
-                    [driveSession, volumeID = root.volumeID] tag, onPage in
-                    try await driveSession.forEachPhotosListPage(
-                        volumeID: volumeID,
-                        tag: tag.rawValue,
-                        onPage: onPage
-                    )
+                let enrichment = await WorkMeasurementOperation.phase(.tags, pass: measurement) {
+                    [driveSession, volumeID = root.volumeID] in
+                    await TimelineTagEnrichmentLoader.load { tag, onPage in
+                        try await driveSession.forEachPhotosListPage(
+                            volumeID: volumeID,
+                            tag: tag.rawValue,
+                            onPage: onPage
+                        )
+                    }
                 }
                 try checkTimelineLoad(generation: generation)
-                if enrichment.wasCancelled { throw CancellationError() }
+                if enrichment.wasCancelled {
+                    measurementOutcome = .cancelled
+                    throw CancellationError()
+                }
 
                 let videoNodeIDs: Set<String>
                 if let videos = enrichment.videos.value {
@@ -865,6 +1004,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             recordSupportEvent(
                 .libraryLoadSucceeded, sourcePath: supportSource,
                 count: source == .localStore ? nil : librarySupport.listedPhotoCount)
+            measurementOutcome = enrichmentComplete ? .success : .partial
             return TimelineLoadSnapshot(sections: sections, validationToken: validationToken)
         } catch is TimelineContinuityRecoveryPendingError {
             librarySupport.lastFailedLoad = .init(
@@ -874,6 +1014,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             DebugLog.log("timeline: continuity recovery is still converging")
             throw TimelineContinuityRecoveryPendingError()
         } catch {
+            measurementOutcome = UploadError.isCancellation(error) ? .cancelled : .failure
             let errorKind = Self.supportLoadErrorKind(error)
             librarySupport.lastFailedLoad = .init(timestamp: Date(), sourcePath: supportSource, errorKind: errorKind)
             recordSupportEvent(.libraryLoadFailed, sourcePath: supportSource, errorKind: errorKind)
@@ -894,11 +1035,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Last-known timeline from disk, for instant startup (no spinner). Reads from SQLite - then
     /// `loadTimeline()` refreshes in the background.
-    func cachedTimeline() -> [TimelineSection]? {
-        guard !isShutDown else { return nil }
-        return cachedTimelineSnapshot()?.sections
-    }
-
     func cachedTimelineSnapshot() -> CachedTimelineSnapshot? {
         guard !isShutDown else { return nil }
         guard let store = timelineStore else { return nil }
@@ -927,11 +1063,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             ? []
             : [TimelineSection(id: "all", date: items.first?.captureTime ?? .distantPast, title: "", items: items)]
         return CachedTimelineSnapshot(sections: sections, validationToken: validationToken)
-    }
-
-    func cachedTimelineValidationToken() -> String? {
-        guard !isShutDown else { return nil }
-        return timelineStore?.validationToken()
     }
 
     /// One bounded SDK event probe. A changed cursor tells the shared foreground monitor to perform
@@ -963,12 +1094,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 remote = try bridge.eventCursor(from: probe)
             }
             return bridge.monitorToken(remoteToken: remote)
-        }
-    }
-
-    func launchValidationToken() async throws -> String {
-        try await withOpenSession(cause: .timelineValidation) { bridge in
-            try await bridge.launchValidationTokenImpl()
         }
     }
 
@@ -1102,6 +1227,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func reconcileTimelineMetadata(pass: TimelineMetadataReconciliation.Pass) async {
         guard metadataReconciliation.isCurrent(pass), !Task.isCancelled else { return }
+        let measurement = workMeasurements.begin(.timelineReconcile)
+        var measurementOutcome = SupportMeasurementOutcome.failure
+        defer { measurement?.finish(Task.isCancelled ? .cancelled : measurementOutcome) }
         let pageReader = TimelineMetadataPageReader(
             inventory: pass.inventory, orderStore: timelineOrderStore, timelineStore: timelineStore)
         var changed = false
@@ -1201,7 +1329,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                                     continue
                                 }
                                 let unlocked = try crypto.unlockNode(key: key, passphrase: passphrase, parent: rootKey)
-                                order[candidate.uid] = decoder.decode(try crypto.decryptXAttr(xattr, node: unlocked))
+                                measurement?.record(.unlockSucceeded)
+                                let decrypted = try crypto.decryptXAttr(xattr, node: unlocked)
+                                measurement?.record(.decryptSucceeded)
+                                order[candidate.uid] = decoder.decode(decrypted)
                             } else {
                                 order[candidate.uid] = TimelineOrderMetadata()
                             }
@@ -1219,7 +1350,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     throw TimelineOrderMetadataError.unavailable
                 }
             }
+            measurementOutcome = .success
         } catch is CancellationError {
+            measurementOutcome = .cancelled
             DebugLog.log("timeline: metadata reconciliation cancelled; persisted pages will resume")
         } catch is TimelineOrderMetadataError {
             timelineOrderStore?.rebuildUnlessBusy()
@@ -1240,8 +1373,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Splits links into the web client's `fetch_metadata` batch size, which every metadata read stays within.
     private static func metadataBatches<Element>(_ items: [Element]) -> [[Element]] {
-        let size = UploadDedupePipeline.protonDuplicateBatchSize
-        return stride(from: 0, to: items.count, by: size).map { Array(items[$0..<min($0 + size, items.count)]) }
+        items.chunked(by: UploadDedupePipeline.protonDuplicateBatchSize)
     }
 
     /// The MIME types that a `fetch_metadata` batch names, by link ID.
@@ -1313,6 +1445,31 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
         editedOriginals[item.uid.nodeID] = .some(original)
         return original
+    }
+
+    /// The decrypted names of an edited photo and its hidden original, which decide the name of the restored photo.
+    /// One batched name read, like the lookup of the original. Nil outside the own library or when a name does not
+    /// decrypt, so the revert starts nothing without a name.
+    func editedRevertNames(main: PhotoUID, original: PhotoUID) async throws -> EditedPhotoRevertNames? {
+        try await withOpenSession(cause: .carryOver) { bridge in
+            try await bridge.editedRevertNamesImpl(main: main, original: original)
+        }
+    }
+
+    private func editedRevertNamesImpl(main: PhotoUID, original: PhotoUID) async throws -> EditedPhotoRevertNames? {
+        let root = try await resolvePhotosRoot()
+        guard main.volumeID == root.volumeID, original.volumeID == root.volumeID,
+            let shareID = photosShareID, let keySource = try? await fileSource()
+        else { return nil }
+        let links = try await driveSession.fetchPhotoLinksMetadata(
+            shareID: shareID, linkIDs: [main.nodeID, original.nodeID])
+        // Photos are children of the photos root, whose key decrypts their names.
+        let rootKey = try await keySource.nodeKey(ofLinkID: root.nodeID)
+        let files = Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
+        guard let mainName = files[main.nodeID]?.name, let originalName = files[original.nodeID]?.name else {
+            return nil
+        }
+        return EditedPhotoRevertNames(main: mainName, original: originalName)
     }
 
     /// A listing without the given photos: its sections, and the burst entries that the burst catalog reads. A kept
@@ -1545,6 +1702,24 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         return result
     }
 
+    /// Runs a viewer or export read: it promotes API and download requests and holds new uploads. The scope ends on
+    /// every exit, also after an error. The thumbnail batch loader keeps its own scope, because it never throws.
+    private func withViewerPriorityScope<T: Sendable>(_ operation: () async throws -> T) async throws -> T {
+        let priorityScope = await requestGovernor.beginPriorityScope(
+            .immediate,
+            promoting: [.api, .storageDownload],
+            suspending: [.storageUpload]
+        )
+        do {
+            let result = try await operation()
+            await requestGovernor.endPriorityScope(priorityScope)
+            return result
+        } catch {
+            await requestGovernor.endPriorityScope(priorityScope)
+            throw error
+        }
+    }
+
     // MARK: - FullMediaProvider
 
     func preview(for uid: PhotoUID) async throws -> Data {
@@ -1574,20 +1749,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         onChunk: @escaping @Sendable (Data) async throws -> Void,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        do {
+        try await withViewerPriorityScope {
             try await ProtonRequestContext.$priority.withValue(.immediate) {
                 let source = try await fileSource()
                 try await source.streamOriginalBytes(uid: uid, onChunk: onChunk, onProgress: onProgress)
             }
-            await requestGovernor.endPriorityScope(priorityScope)
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
         }
     }
 
@@ -1595,21 +1761,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         for uid: PhotoUID,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> Data {
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        do {
-            let result = try await ProtonRequestContext.$priority.withValue(.immediate) {
+        try await withViewerPriorityScope {
+            try await ProtonRequestContext.$priority.withValue(.immediate) {
                 let source = try await fileSource()
                 return try await source.originalData(uid: uid, onProgress: onProgress)
             }
-            await requestGovernor.endPriorityScope(priorityScope)
-            return result
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
         }
     }
 
@@ -1637,49 +1793,52 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
         let token = UUID()
         let sdkUID = SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID)
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
         do {
-            let operation = try await ProtonRequestContext.$priority.withValue(.immediate) {
-                try await photosClient.downloadOperation(
-                    photoUid: sdkUID,
-                    destinationUrl: partial,
-                    cancellationToken: token,
-                    progressCallback: { onProgress($0.fractionCompleted) }
-                )
-            }
-            // Keep the export's partial file and open-session lease alive until native cancel
-            // has settled, even when the download's terminal callback arrives first.
-            let verificationIssue = try await SDKCancellableOperation.run(token: token) { _ in
-                try await operation.awaitDownloadWithResilience(
-                    operationalResilience: BasicOperationalResilience.default,
-                    onRetriableErrorReceived: { error in
-                        DebugLog.log("original file transfer retry: \(error.localizedDescription)")
-                    }
-                )
-            } cancel: { _ in
-                try? await operation.cancel()
-            }
-            try Task.checkCancellation()
-            if fileManager.fileExists(atPath: destination.path) {
-                _ = try fileManager.replaceItemAt(destination, withItemAt: partial)
-            } else {
-                try fileManager.moveItem(at: partial, to: destination)
-            }
-            onProgress(1)
-            if let verificationIssue {
-                DebugLog.log(
-                    "original file completed with verification warning: \(verificationIssue.localizedDescription)")
+            try await withViewerPriorityScope {
+                try await writeOriginalFile(token: token, sdkUID: sdkUID, partial: partial, to: destination, onProgress)
             }
         } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
             if Task.isCancelled { throw CancellationError() }
             throw Self.originalTransferError(from: error)
         }
-        await requestGovernor.endPriorityScope(priorityScope)
+    }
+
+    private func writeOriginalFile(
+        token: UUID, sdkUID: SDKNodeUid, partial: URL, to destination: URL,
+        _ onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        let fileManager = FileManager.default
+        let operation = try await ProtonRequestContext.$priority.withValue(.immediate) {
+            try await photosClient.downloadOperation(
+                photoUid: sdkUID,
+                destinationUrl: partial,
+                cancellationToken: token,
+                progressCallback: { onProgress($0.fractionCompleted) }
+            )
+        }
+        // Keep the export's partial file and open-session lease alive until native cancel
+        // has settled, even when the download's terminal callback arrives first.
+        let verificationIssue = try await SDKCancellableOperation.run(token: token) { _ in
+            try await operation.awaitDownloadWithResilience(
+                operationalResilience: BasicOperationalResilience.default,
+                onRetriableErrorReceived: { error in
+                    DebugLog.log("original file transfer retry: \(error.localizedDescription)")
+                }
+            )
+        } cancel: { _ in
+            try? await operation.cancel()
+        }
+        try Task.checkCancellation()
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: partial)
+        } else {
+            try fileManager.moveItem(at: partial, to: destination)
+        }
+        onProgress(1)
+        if let verificationIssue {
+            DebugLog.log(
+                "original file completed with verification warning: \(verificationIssue.localizedDescription)")
+        }
     }
 
     /// Exports stop on a full device through `DeviceStorage.isOutOfSpace`, which cannot read the SDK's own
@@ -1700,12 +1859,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private func singleThumbnail(_ uid: PhotoUID, type: ThumbnailData.ThumbnailType) async throws -> Data {
         let sdkUid = SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID)
         let box = DataBox()
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        do {
+        try await withViewerPriorityScope {
             try await ProtonRequestContext.$priority.withValue(.immediate) {
                 try await photosClient.downloadThumbnails(
                     photoUids: [sdkUid],
@@ -1718,11 +1872,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     }
                 )
             }
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
         }
-        await requestGovernor.endPriorityScope(priorityScope)
         guard let data = box.value else { throw CocoaError(.fileReadUnknown) }
         return data
     }
@@ -1769,7 +1919,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             client: photosClient,
             admission: shutdownGate,
             sharedAlbumSnapshotCache: sharedAlbumSnapshotCache,
-            requestCause: requestCause(.albums)
+            presentationNodeReads: presentationNodeReads,
+            requestCause: requestCause(.albums),
+            workMeasurements: workMeasurements
         )
     }
 
@@ -1807,12 +1959,30 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Refreshes the lightweight account snapshot used by Settings (email and Drive quota). The existing
     /// account-data request also updates the encrypted offline cache; it does not rebuild the signed-in client.
     func refreshAccountInfo() async throws {
-        let recordedBefore = uploadedBytes
         try await withOpenSession(cause: .account) { bridge in
-            _ = try await bridge.driveSession.fetchAccountData()
+            switch ProtonRequestContext.cause {
+            case .accountForeground, .accountSettings:
+                try await bridge.accountInfoRefreshes.run(bridge.uploadedBytes) {
+                    try await bridge.refreshAccountInfoImpl()
+                }
+            default:
+                // An explicit or quota refresh needs a new answer. Later automatic callers must not join
+                // an older automatic operation either; its existing waiters still receive its result.
+                await bridge.accountInfoRefreshes.invalidate()
+                try await bridge.refreshAccountInfoImpl()
+            }
         }
+    }
+
+    private func refreshAccountInfoImpl() async throws {
+        let recordedBefore = uploadedBytes
+        _ = try await driveSession.fetchAccountData()
         // Uploads recorded during the request stay counted; the response may not contain them yet.
         uploadedBytesInQuota = max(uploadedBytesInQuota, recordedBefore)
+    }
+
+    func recordCompletedUpload(bytes: Int64) {
+        uploadedBytes += max(0, bytes)
     }
 
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
@@ -1919,72 +2089,196 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func moveToTrash(_ uids: [PhotoUID]) async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
+            try await bridge.seriesRestoreReplay.exclusive {
+                try await bridge.moveToTrashImpl(uids)
+            }
+        }
+    }
+
+    private func moveToTrashImpl(_ uids: [PhotoUID]) async throws {
+        checkedSeriesRestoreCandidates = nil
+        try await seriesRestoreReplay.forget(Set(uids))
+        let root = try await resolvePhotosRoot()
+        try await driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
+        // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted. They
+        // join the stored listing at once, so a relaunch before the next listing keeps them too.
+        let known = (timelineStore?.items(for: uids) ?? []).map {
+            RecentlyDeletedItem.make(
+                volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, captureTime: $0.captureTime, isVideo: $0.isVideo)
+        }
+        recentlyDeleted.trashed(uids, items: known)
+        recentlyDeletedStore.save(recentlyDeleted.persisted)
+        // The launch shows the stored timeline before the next listing; it must not show these photos.
+        timelineStore?.remove(uids)
+        await reportRecentlyDeleted()
+        // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
+        // listing (this is the seam that silently broke before - trash "succeeded" but Recently Deleted
+        // stayed empty). Costs one extra listing round-trip, only when the debug log is on.
+        if DebugLog.isEnabled {
+            let trashed = Set(
+                (try? await driveSession.listTrash(volumeID: root.volumeID))?.compactMap(\.linkID) ?? []
+            )
+            let missing = uids.map(\.nodeID).filter { !trashed.contains($0) }
+            DebugLog.log(
+                "trash-verify: \(uids.count - missing.count)/\(uids.count) moved links visible in trash listing"
+                    + (missing.isEmpty
+                        ? "" : " MISSING=\(missing.map { $0.prefix(8) + "…" }.joined(separator: ","))"))
+        }
+    }
+
+    /// Account startup resumes saved frame duties without restoring any still-trashed main photo.
+    func startTrashedSeriesRestoreReplay() async {
+        guard !isShutDown else { return }
+        await seriesRestoreReplay.start(
+            read: { [weak self] uids in
+                guard let self else { throw CancellationError() }
+                return try await self.readSeriesRestoreStates(uids)
+            },
+            restore: { [weak self] uids in
+                guard let self else { throw CancellationError() }
+                try await self.restoreSeriesFrames(uids)
+            })
+    }
+
+    private func readSeriesRestoreStates(_ uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
+        try await withOpenSession(cause: .trashWrite) { bridge in
+            let context = try await bridge.photosShareContextImpl()
+            guard uids.allSatisfy({ $0.volumeID == context.volumeID }) else { throw DriveBridgeError.noPhotosShare }
+            let links = try await TrashedRelatedPhotos.checkedVisibility(
+                session: bridge.driveSession, shareID: context.shareID, ids: uids.map(\.nodeID), retryOnRateLimit: true)
+            return Dictionary(
+                uniqueKeysWithValues: links.map { (PhotoUID(volumeID: context.volumeID, nodeID: $0.key), $0.value) })
+        }
+    }
+
+    private func restoreSeriesFrames(_ uids: [PhotoUID]) async throws {
+        try await withOpenSession(cause: .trashWrite) { bridge in
             let root = try await bridge.resolvePhotosRoot()
-            try await bridge.driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
-            // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted. They
-            // join the stored listing at once, so a relaunch before the next listing keeps them too.
-            let known = (bridge.timelineStore?.items(for: uids) ?? []).map {
-                RecentlyDeletedItem.make(
-                    volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, captureTime: $0.captureTime, isVideo: $0.isVideo)
-            }
-            bridge.recentlyDeleted.trashed(uids, items: known)
-            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
-            // The launch shows the stored timeline before the next listing; it must not show these photos.
-            bridge.timelineStore?.remove(uids)
-            await bridge.reportRecentlyDeleted()
-            // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
-            // listing (this is the seam that silently broke before - trash "succeeded" but Recently Deleted
-            // stayed empty). Costs one extra listing round-trip, only when the debug log is on.
-            if DebugLog.isEnabled {
-                let trashed = Set(
-                    (try? await bridge.driveSession.listTrash(volumeID: root.volumeID))?.compactMap(\.linkID) ?? []
-                )
-                let missing = uids.map(\.nodeID).filter { !trashed.contains($0) }
-                DebugLog.log(
-                    "trash-verify: \(uids.count - missing.count)/\(uids.count) moved links visible in trash listing"
-                        + (missing.isEmpty
-                            ? "" : " MISSING=\(missing.map { $0.prefix(8) + "…" }.joined(separator: ","))"))
-            }
+            guard uids.allSatisfy({ $0.volumeID == root.volumeID }) else { throw DriveBridgeError.noPhotosShare }
+            try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
         }
     }
 
     func restore(_ uids: [PhotoUID]) async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
-            let root = try await bridge.resolvePhotosRoot()
+            try await bridge.seriesRestoreFlights.run(Set(uids)) {
+                try await bridge.seriesRestoreReplay.exclusive {
+                    try await bridge.restoreSeriesImpl(uids)
+                }
+            }
+        }
+    }
+
+    private func restoreSeriesImpl(_ uids: [PhotoUID]) async throws {
+        let root = try await resolvePhotosRoot()
+        guard uids.allSatisfy({ $0.volumeID == root.volumeID }) else { throw DriveBridgeError.noPhotosShare }
+        try await listTrashForRelatedPhotos(of: uids)
+        var candidates = checkedSeriesRestoreCandidates ?? [:]
+        if let journal = seriesRestoreReplay.journal {
+            for record in try journal.records() where uids.contains(record.main) {
+                candidates[record.main] = Array(Set((candidates[record.main] ?? []) + record.frames.map(\.uid)))
+            }
+        }
+        var duties: [TrashedSeriesRestoreRecord] = []
+        do {
             _ = try await TrashedRelatedPhotos.restore(
-                uids, candidates: bridge.recentlyDeleted.trashedRelatedPhotos(of: uids),
+                uids, candidates: candidates,
                 readLinks: { linkIDs in
-                    let context = try await bridge.photosShareContextImpl()
-                    // A rate limit must not hold back the restore of the main photo; it comes back alone then.
-                    return try await bridge.driveSession.fetchLinkVisibility(
-                        shareID: context.shareID, linkIDs: linkIDs, retryOnRateLimit: false)
+                    let context = try await self.photosShareContextImpl()
+                    // A foreground rate limit fails Restore before the main changes.
+                    return try await TrashedRelatedPhotos.checkedVisibility(
+                        session: self.driveSession, shareID: context.shareID, ids: linkIDs, retryOnRateLimit: false)
                 },
                 rereadLinks: { linkIDs in
-                    let context = try await bridge.photosShareContextImpl()
-                    return try await bridge.driveSession.fetchLinkVisibility(shareID: context.shareID, linkIDs: linkIDs)
+                    let context = try await self.photosShareContextImpl()
+                    return try await TrashedRelatedPhotos.checkedVisibility(
+                        session: self.driveSession, shareID: context.shareID, ids: linkIDs, retryOnRateLimit: true)
                 },
                 restore: { photos in
-                    try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: photos.map(\.nodeID))
+                    try await self.driveSession.restore(volumeID: root.volumeID, linkIDs: photos.map(\.nodeID))
+                },
+                beforeMainRestore: { links, frames in
+                    guard let journal = self.seriesRestoreReplay.journal else {
+                        throw TrashedSeriesRestoreJournal.unavailable
+                    }
+                    duties = try uids.compactMap { main in
+                        let owned = frames.filter { links[$0.nodeID]?.mainPhotoLinkID == main.nodeID }
+                        guard !owned.isEmpty, let mainTrash = links[main.nodeID]?.trashTime else { return nil }
+                        return TrashedSeriesRestoreRecord(
+                            generation: UUID(), main: main, mainTrashTime: mainTrash,
+                            frames: try owned.map { uid in
+                                guard let trashTime = links[uid.nodeID]?.trashTime else {
+                                    throw TrashedSeriesRestoreJournal.unavailable
+                                }
+                                return .init(uid: uid, mainPhotoLinkID: main.nodeID, trashTime: trashTime)
+                            },
+                            retryAt: Date().addingTimeInterval(self.seriesRestoreReplay.retry.delay(afterAttempts: 1)))
+                    }
+                    let mainTrashTimes = Dictionary(
+                        uniqueKeysWithValues: uids.compactMap { uid in
+                            links[uid.nodeID]?.trashTime.map { (uid, $0) }
+                        })
+                    try journal.record(duties, mainTrashTimes: mainTrashTimes)
+                },
+                resumeFrames: { mains in
+                    await self.seriesRestoreReplay.resume(
+                        duties.filter { mains.contains($0.main) },
+                        read: { try await self.readSeriesRestoreStates($0) },
+                        restore: { try await self.restoreSeriesFrames($0) })
                 })
-            // A listing can drop these photos before the library lists them again; their thumbnails stay. Their related
-            // photos come back inside them and never showed in Recently Deleted.
-            bridge.recentlyDeleted.restored(uids)
-            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
-            await bridge.reportRecentlyDeleted()
+        } catch {
+            await startTrashedSeriesRestoreReplay()
+            throw error
+        }
+        recentlyDeleted.restored(uids)
+        recentlyDeletedStore.save(recentlyDeleted.persisted)
+        await reportRecentlyDeleted()
+        await startTrashedSeriesRestoreReplay()
+    }
+
+    /// A failed or rate-limited discovery fails Restore before any photo changes.
+    /// A cancelled URLSession request can throw URLError, so task cancellation remains authoritative.
+    func listTrashForRelatedPhotos(of mains: [PhotoUID]) async throws {
+        guard checkedSeriesRestoreCandidates == nil else { return }
+        do {
+            let root = try await resolvePhotosRoot()
+            let files = try await TrashedRelatedPhotos.checkedTrash(
+                session: driveSession, volumeID: root.volumeID, retryOnRateLimit: false)
+            try Task.checkCancellation()
+            checkedSeriesRestoreCandidates = TrashedRelatedPhotos.split(files, volumeID: root.volumeID).related
+        } catch {
+            try Task.checkCancellation()
+            throw error
         }
     }
 
     func emptyTrash() async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
-            _ = try await bridge.resolvePhotosRoot()
-            try await SDKCancellableOperation.run { [photosClient = bridge.photosClient] cancellationToken in
-                try await photosClient.emptyTrash(cancellationToken: cancellationToken)
-            } cancel: { [photosClient = bridge.photosClient] cancellationToken in
-                try? await photosClient.cancelEmptyTrash(cancellationToken: cancellationToken)
+            try await bridge.seriesRestoreReplay.exclusive {
+                try await bridge.emptySeriesTrashImpl()
             }
-            bridge.recentlyDeleted.emptied()
-            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
-            await bridge.reportRecentlyDeleted()
+        }
+    }
+
+    private func emptySeriesTrashImpl() async throws {
+        _ = try await resolvePhotosRoot()
+        try await SDKCancellableOperation.run { [photosClient = photosClient] cancellationToken in
+            try await photosClient.emptyTrash(cancellationToken: cancellationToken)
+        } cancel: { [photosClient = photosClient] cancellationToken in
+            try? await photosClient.cancelEmptyTrash(cancellationToken: cancellationToken)
+        }
+        checkedSeriesRestoreCandidates = [:]
+        recentlyDeleted.emptied()
+        recentlyDeletedStore.save(recentlyDeleted.persisted)
+        await reportRecentlyDeleted()
+        // A successful Empty Trash permanently deletes every unresolved trashed frame of these generations.
+        if let journal = seriesRestoreReplay.journal {
+            do {
+                for var record in try journal.records() {
+                    record.frames = []
+                    try journal.update(record)
+                }
+            } catch { DebugLog.log("restore: Empty Trash settlement deferred") }
         }
     }
 
@@ -1998,14 +2292,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     /// Lists the volume trash, stores the listing, and registers its photos for their thumbnails.
-    private func listTrash() async throws -> [PhotoItem] {
+    private func listTrash(retryOnRateLimit: Bool = true) async throws -> [PhotoItem] {
         guard !isShutDown else { throw CancellationError() }
         let ticket = recentlyDeleted.beginListing()
         let root = try await resolvePhotosRoot()
-        let files = try await driveSession.listTrash(volumeID: root.volumeID)
+        let files = try await driveSession.listTrash(volumeID: root.volumeID, retryOnRateLimit: retryOnRateLimit)
             .filter { $0.type != 1 && $0.type != 3 }  // drop folders + albums; keep files/unknown
         // Hide related photos (Live Photo videos, series frames), like the timeline; a restore of the main takes them.
-        let (links, related) = TrashedRelatedPhotos.split(files, volumeID: root.volumeID)
+        let links = TrashedRelatedPhotos.split(files, volumeID: root.volumeID).shown
         let photos =
             links
             .compactMap { l -> PhotoItem? in
@@ -2023,7 +2317,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let stored = recentlyDeleted.persisted
         switch recentlyDeleted.received(photos, ticket: ticket) {
         case .applied:
-            recentlyDeleted.listedRelatedPhotos(related)
+            checkedSeriesRestoreCandidates = nil
         case .overtakenByChange:
             // Photos that left the library meanwhile may still lack a listing. A background listing follows; when
             // this is the background listing itself, the next library refresh starts it.
@@ -2157,8 +2451,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         ]
     }
 
-    // MARK: - PhotoMetadataProvider
-
     // MARK: - EditedPhotoOriginalProviding
 
     func editedOriginal(of item: PhotoItem) async throws -> PhotoItem? {
@@ -2178,7 +2470,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func metadataImpl(for uid: PhotoUID) async throws -> PhotoMetadata {
-        let read = try await SDKPhotoMetadataReader.read(for: uid, client: photosClient)
+        let read = try await SDKPhotoMetadataReader.read(
+            for: uid, client: photosClient, sharing: presentationNodeReads, workMeasurements: workMeasurements)
         let metadata = read.metadata
         if let timelineOrderStore,
             !timelineOrderStore.recordResolvedMetadata(
@@ -2256,11 +2549,29 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             return Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
         }
         burstFrameVerdicts.merge(checked.verdicts)
-        let memberIDs = checked.frames
-        guard memberIDs.count > 1 else { return [] }
+        return Self.seriesAnswer(
+            frames: checked.frames, containing: uid.nodeID, entriesByID: entriesByID, burstEntries: burstEntries,
+            volumeID: root.volumeID)
+    }
+
+    /// The read answer for the frames of a series, as `BurstGroupProvider` states it: every frame when two or more
+    /// are left, the photo alone with only itself as a member when it is the one frame left, otherwise nothing.
+    static func seriesAnswer(
+        frames memberIDs: [String],
+        containing nodeID: String,
+        entriesByID: [String: PhotosListEntry],
+        burstEntries: [PhotosListEntry],
+        volumeID: String
+    ) -> [PhotoItem] {
+        guard memberIDs.count > 1 else {
+            // The other related files are no frames, so the photo is its own series. An empty answer would
+            // read as a burst that could not be loaded.
+            guard memberIDs == [nodeID], let entry = entriesByID[nodeID] else { return [] }
+            return [Self.photoItem(from: entry, volumeID: volumeID, burstMemberIDs: memberIDs)]
+        }
 
         let anchorEntry =
-            entriesByID[uid.nodeID]
+            entriesByID[nodeID]
             ?? burstEntries.first { entry in
                 memberIDs.contains(entry.linkID)
             }
@@ -2268,11 +2579,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
         return memberIDs.enumerated().map { offset, id in
             if let entry = entriesByID[id] {
-                return Self.photoItem(from: entry, volumeID: root.volumeID, burstMemberIDs: memberIDs)
+                return Self.photoItem(from: entry, volumeID: volumeID, burstMemberIDs: memberIDs)
             }
             return Self.syntheticBurstMember(
                 id: id,
-                volumeID: root.volumeID,
+                volumeID: volumeID,
                 memberIDs: memberIDs,
                 anchorTime: anchorTime,
                 offset: offset
@@ -2289,30 +2600,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func makeStreamingAssetImpl(for uid: PhotoUID) async throws -> StreamingVideoAsset {
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        let source: PhotoVideoStreamSource
-        do {
-            source = try await ProtonRequestContext.$priority.withValue(.immediate) {
-                try await fileSource()
-            }
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
-        }
+        try await withViewerPriorityScope { try await prepareStreamingAsset(for: uid) }
+    }
 
+    private func prepareStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
+        let source = try await ProtonRequestContext.$priority.withValue(.immediate) {
+            try await fileSource()
+        }
         // Throws `.notAVideo` cheaply for images, so the viewer falls back to its image path.
-        let prepared: PreparedVideo
-        do {
-            prepared = try await ProtonRequestContext.$priority.withValue(.immediate) {
-                try await source.prepare(uid: uid)
-            }
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
+        let prepared = try await ProtonRequestContext.$priority.withValue(.immediate) {
+            try await source.prepare(uid: uid)
         }
         let loader = ProtonVideoResourceLoader(
             prepared: prepared,
@@ -2329,26 +2626,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // Fetch and decrypt the first blocks while AVFoundation still inspects the asset, so its own
         // start-of-playback decision can already count on served bytes.
         loader.primePlaybackStart()
-        await requestGovernor.endPriorityScope(priorityScope)
         return StreamingVideoAsset(asset: asset, retaining: loader)
     }
 
     func prefetchEncrypted(for uid: PhotoUID) async throws {
         try await withOpenSession(cause: .viewer) { bridge in
-            let priorityScope = await bridge.requestGovernor.beginPriorityScope(
-                .immediate,
-                promoting: [.api, .storageDownload],
-                suspending: [.storageUpload]
-            )
-            do {
+            try await bridge.withViewerPriorityScope {
                 try await ProtonRequestContext.$priority.withValue(.immediate) {
                     let source = try await bridge.fileSource()
                     try await source.prefetchEncrypted(uid: uid)
                 }
-                await bridge.requestGovernor.endPriorityScope(priorityScope)
-            } catch {
-                await bridge.requestGovernor.endPriorityScope(priorityScope)
-                throw error
             }
         }
     }
@@ -2473,18 +2760,6 @@ private extension ThumbnailPriority {
     }
 }
 
-// MARK: - PhotoDimensionRecording (learned w/h into the library metadata DB)
-
-extension DriveSDKBridge: PhotoDimensionRecording {
-    /// Batched by `PhotoDimensionCoalescer`; the store fills only rows without dimensions
-    /// (first-seen-wins), so repeated decodes and future true-dimension writers can coexist.
-    func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {
-        _ = try? await withOpenSession(cause: .local) { bridge in
-            bridge.timelineStore?.updateDimensions(batch)
-        }
-    }
-}
-
 // MARK: - PhotoUploading (UploadFeature seam)
 
 /// Library upload via the SDK's `EncryptedMemoriesClient`. The SDK resolves the photos root itself, encrypts
@@ -2580,14 +2855,24 @@ extension DriveSDKBridge: PhotoUploading {
                 identityStore: nil,
                 contentIndex: nil,
                 replacementJournal: nil,
+                fingerprintCache: nil,
                 close: {}
             )
         }
         // Nil when the journal file cannot be read: edits then keep their earlier uploads.
         let replacementJournal = EditReplacementJournalFileStore.shared(
             accountDataDirectory: uploadManifestURL.deletingLastPathComponent())
+        let accountDirectory = uploadManifestURL.deletingLastPathComponent()
+        // One cache for the whole account: the duplicate service invalidates it per link, the finder reads it.
+        // Nil when the store cannot open: the ranking then reads every node as before.
+        let fingerprintCache = ExactDuplicateFingerprintCache.open(
+            accountDirectory: accountDirectory, policy: uploadManifestPolicy)
+        if fingerprintCache == nil {
+            DebugLog.log("[Dedupe] fingerprint store unavailable; rankings read every node")
+        }
         let lineageStore = UploadRemoteLineageIndexStore(
-            url: uploadManifestURL.deletingLastPathComponent()
+            url:
+                accountDirectory
                 .appendingPathComponent(UploadRemoteLineageIndexStore.databaseFileName),
             policy: uploadManifestPolicy)
         if lineageStore == nil {
@@ -2596,10 +2881,13 @@ extension DriveSDKBridge: PhotoUploading {
         let service = ProtonUploadDedupeService(
             session: driveSession,
             crypto: crypto,
+            rootMaterialResolver: rootMaterialResolver,
             photosClient: photosClient,
             contentIndexStore: store,
             lineageIndexStore: lineageStore,
-            firstBuildGate: firstIndexBuildGate
+            firstBuildGate: firstIndexBuildGate,
+            workMeasurements: workMeasurements,
+            fingerprintCache: fingerprintCache
         ) { [self] in
             try await photosShareContext()
         }
@@ -2617,8 +2905,10 @@ extension DriveSDKBridge: PhotoUploading {
             identityStore: store,
             contentIndex: store,
             replacementJournal: replacementJournal,
+            fingerprintCache: fingerprintCache,
             close: {
                 lineageStore?.close()
+                fingerprintCache?.close()
                 store.close()
             }
         )
@@ -2630,6 +2920,7 @@ extension DriveSDKBridge: PhotoUploading {
         ProtonAlbumWriteService(
             session: driveSession,
             crypto: crypto,
+            rootMaterialResolver: rootMaterialResolver,
             admission: shutdownGate,
             requestCause: requestCause(.albums)
         ) { [self] in
@@ -2684,7 +2975,7 @@ extension DriveSDKBridge: PhotoUploading {
                 name: request.name,
                 fileURL: request.fileURL,
                 fileSize: request.fileSize,
-                modificationDate: request.modificationDate,
+                modificationTime: try SDKModificationTime.string(from: request.modificationDate),
                 captureTime: request.captureTime,
                 mainPhotoUid: mainPhotoUid,
                 mediaType: request.mediaType,
@@ -2733,7 +3024,7 @@ extension DriveSDKBridge: PhotoUploading {
                 throw error
             }
             await operation.releaseResources()
-            uploadedBytes += max(0, request.fileSize)
+            recordCompletedUpload(bytes: request.fileSize)
             logging.completed(nodeID: ids.nodeUid.nodeID, filename: request.name)
             let uid = PhotoUID(volumeID: ids.nodeUid.volumeID, nodeID: ids.nodeUid.nodeID)
             if mainPhotoUid == nil {
@@ -2868,6 +3159,17 @@ extension DriveSDKBridge: PhotoTagAdding {
 
 extension DriveSDKBridge: EditReplacementRemote {}
 
+extension DriveSDKBridge: EditedOriginalRevertRemote {
+    /// The hidden original is read like a series member: the same node read supplies the metadata that the restored
+    /// copy keeps, and the copy drops the sections that describe the edited photo.
+    func originalSource(for uid: PhotoUID) async throws -> EditedOriginalSource {
+        try await withOpenSession(cause: .carryOver) { bridge in
+            EditedOriginalSource(
+                try await SDKPhotoMetadataReader.seriesMemberSource(for: uid, client: bridge.photosClient))
+        }
+    }
+}
+
 extension DriveSDKBridge: ExactDuplicateRemote {
     func downloadRelatedFile(
         _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
@@ -2946,12 +3248,17 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
         }
     }
 
+    /// The roles of the series members. "Keep only favorites" names the members that stay in the library
+    /// without a reported role in its completion notice, so this read must not stand on a cut-short answer:
+    /// the server can hide a photo behind its trashed main photo, and the notice would promise grid
+    /// visibility the photo does not have. A cut-short answer therefore throws before anything is trashed,
+    /// like the dedupe reads that protect backups. Nil for a member means the server no longer knows it.
     func memberRoles(of uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
         guard !uids.isEmpty else { return [:] }
         return try await withOpenSession(cause: .series) { bridge in
             let context = try await bridge.photosShareContext()
             let links = try await bridge.driveSession.fetchLinkVisibility(
-                shareID: context.shareID, linkIDs: uids.map(\.nodeID))
+                shareID: context.shareID, linkIDs: uids.map(\.nodeID), requiresCompleteResponse: true)
             return Dictionary(
                 uids.compactMap { uid in links[uid.nodeID].map { (uid, $0) } }, uniquingKeysWith: { first, _ in first })
         }
@@ -2959,7 +3266,9 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
 
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         guard !uids.isEmpty else { return [] }
-        // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.
+        // One tag listing per operation. It lists the main photos that carry the favorites tag; the listing hides
+        // related photos. A per-node tag read exists (`fetchAlbumPhotoMetadata` reads `Photo.Tags`), but it is not
+        // shown to answer the same as the listing for every photo asked here, so this path keeps the listing.
         let favorites = try await requestGovernor.causes.run(.carryOver) { try await favoriteUIDs() }
         return Set(uids.filter(favorites.contains))
     }
@@ -3000,6 +3309,38 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
             tempDirectory: accountDataDirectory.appendingPathComponent("series-dissolution-temp", isDirectory: true),
             currentClientUID: uploadClientUID
         )
+    }
+
+    /// The revert to original of this account's edited photos. It shares the duplicate service with uploads, like the
+    /// series dissolution. Nil when the upload manifest is unavailable, as uploads are then disabled.
+    nonisolated func makeEditedOriginalRevert(
+        duplicateChecker: (any UploadDuplicateChecking)?,
+        albums: any SeriesAlbumCarryOver
+    ) -> EditedOriginalRevert? {
+        guard let duplicateChecker else { return nil }
+        let accountDataDirectory = uploadManifestURL.deletingLastPathComponent()
+        return EditedOriginalRevert(
+            remote: self,
+            albums: albums,
+            copier: RelatedPhotoCopier(
+                uploader: self,
+                duplicateChecker: duplicateChecker,
+                provider: self,
+                tempDirectory: accountDataDirectory.appendingPathComponent("edited-revert-temp", isDirectory: true),
+                currentClientUID: uploadClientUID),
+            relations: duplicateChecker,
+            journalStore: EditedOriginalRevertJournalFileStore(accountDataDirectory: accountDataDirectory),
+            // The shared account gate: bridge teardown cancels and joins a running revert before the sign-out purge
+            // removes the journal directory, and a call after teardown is refused.
+            admission: shutdownGate
+        )
+    }
+
+    /// The viewer's entry to the revert: it proves the pair with this bridge's own lookup and reads the names here.
+    nonisolated func makeEditedPhotoReverter(revert: EditedOriginalRevert) -> EditedPhotoRevertService {
+        EditedPhotoRevertService(
+            revert: revert, originals: self,
+            names: { [self] main, original in try await editedRevertNames(main: main, original: original) })
     }
 }
 

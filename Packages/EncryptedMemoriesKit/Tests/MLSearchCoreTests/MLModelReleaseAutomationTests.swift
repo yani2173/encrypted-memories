@@ -56,6 +56,9 @@ import Testing
         )
         #expect(syntax.status == 0, Comment(rawValue: syntax.error))
         let publisher = try String(contentsOf: fixture.output.appendingPathComponent("publish-r2.sh"), encoding: .utf8)
+        let signer = try String(
+            contentsOf: Self.repositoryRoot.appendingPathComponent("scripts/r2_request.py"), encoding: .utf8)
+        #expect(publisher.contains(signer), "the generated publisher embeds the shared R2 signer unchanged")
         #expect(publisher.contains("if-none-match"))
         #expect(publisher.contains("NoRedirect"))
         #expect(publisher.contains("data=file_chunks(file_path)"))
@@ -90,8 +93,12 @@ import Testing
         let endpointValidation = try #require(rollbackSource.range(of: "R2_ENDPOINT must be an HTTPS URL"))
         let historicalRead = try #require(rollbackSource.range(of: "rclone copyto"))
         #expect(endpointValidation.lowerBound < historicalRead.lowerBound)
+        // The rollback script runs the shared signer file instead of embedding it.
+        #expect(rollbackSource.contains("\"$script_dir/r2_request.py\""))
         let rollbackPython = fixture.root.appendingPathComponent("rollback-r2-request.py")
-        try Self.embeddedPython(in: rollbackSource).write(to: rollbackPython, atomically: true, encoding: .utf8)
+        try String(
+            contentsOf: Self.repositoryRoot.appendingPathComponent("scripts/r2_request.py"), encoding: .utf8
+        ).write(to: rollbackPython, atomically: true, encoding: .utf8)
         let rollbackPythonSyntax = try Self.run(
             executable: URL(fileURLWithPath: "/usr/bin/python3"),
             arguments: ["-m", "py_compile", rollbackPython.path]

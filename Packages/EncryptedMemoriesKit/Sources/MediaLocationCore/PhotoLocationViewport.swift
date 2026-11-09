@@ -92,8 +92,8 @@ public struct PhotoLocationVisibleCoordinatePolicy: Sendable, Equatable {
             minLongitude = -180
             maxLongitude = 180
         } else {
-            minLongitude = Self.normalizedLongitude(viewport.centerLongitude - longitudeRadius)
-            maxLongitude = Self.normalizedLongitude(viewport.centerLongitude + longitudeRadius)
+            minLongitude = PhotoCoordinate.normalizedLongitude(viewport.centerLongitude - longitudeRadius)
+            maxLongitude = PhotoCoordinate.normalizedLongitude(viewport.centerLongitude + longitudeRadius)
         }
         return GeoBoundingBox(
             minLatitude: max(-90, viewport.centerLatitude - latitudeRadius),
@@ -161,11 +161,6 @@ public struct PhotoLocationVisibleCoordinatePolicy: Sendable, Equatable {
             min(cellDivisor, max(1, viewportSize.heightPoints / minimumPinSpacingPoints)),
             min(cellDivisor, max(1, viewportSize.widthPoints / minimumPinSpacingPoints))
         )
-    }
-
-    private static func normalizedLongitude(_ longitude: Double) -> Double {
-        let shifted = (longitude + 180).truncatingRemainder(dividingBy: 360)
-        return (shifted >= 0 ? shifted : shifted + 360) - 180
     }
 }
 

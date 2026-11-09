@@ -30,7 +30,7 @@ final class MacLibraryRefreshController {
 
     @ObservationIgnored private var uploadTask: Task<Void, Never>?
     @ObservationIgnored private var uploadGeneration: UInt64 = 0
-    @ObservationIgnored private let backupRefreshCoordinator = TimelineUploadRefreshCoordinator()
+    @ObservationIgnored private let backupRefreshCoordinator = TimelineUploadRefreshCoordinator(policy: .backupUploads)
 
     // MARK: - Routes
 
@@ -46,20 +46,23 @@ final class MacLibraryRefreshController {
         }
     }
 
-    /// Refreshes after background backup uploaded new library items. Repeated signals coalesce in the shared
-    /// coordinator.
-    func scheduleBackupUploadRefresh(host: Host) {
-        banner.beginBackupUploadRefresh()
-        Task {
-            await backupRefreshCoordinator.request(
-                refresh: { attempt in
-                    await self.performBackupUploadRefreshAttempt(attempt: attempt, host: host)
-                },
-                observer: { state in
-                    await self.applyBackupUploadRefresh(state)
-                }
-            )
-        }
+    /// Refreshes after background backup uploaded new library items. While a pass runs, the shared coordinator spaces
+    /// the refresh cycles; `backupPassDidEnd()` publishes the one that waits.
+    func scheduleBackupUploadRefresh(host: Host, passIsRunning: Bool) {
+        backupRefreshCoordinator.submitBackupUpload(
+            passIsRunning: passIsRunning,
+            refresh: { attempt in
+                await self.performBackupUploadRefreshAttempt(attempt: attempt, host: host)
+            },
+            observer: { state in
+                await self.applyBackupUploadRefresh(state)
+            }
+        )
+    }
+
+    /// The backup pass ended: the refresh that the interval holds back runs now.
+    func backupPassDidEnd() {
+        backupRefreshCoordinator.submitBackupPassEnd()
     }
 
     /// Runs the menu refresh unless another refresh is already running.
@@ -104,12 +107,14 @@ final class MacLibraryRefreshController {
     // MARK: - Refresh passes
 
     private func performBackupUploadRefreshAttempt(attempt: Int, host: Host) async -> TimelineRefreshFailureReason? {
+        // The banner shows a refresh that runs, not a signal that waits for the interval.
+        if attempt == 0 { banner.beginBackupUploadRefresh() }
         let result = await host.timelineModel.refreshLibrary()
         if await recoverBackendAfterScopeAccessLoss(ifNeeded: result, host: host) { return .cancelled }
         OfflineLibraryManager.shared.liveAssetCount = host.timelineModel.allItems.count
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
         logUploadRefresh(uploadedNode: "backup", attempt: attempt, result: result)
-        return result.failureReason
+        return result.contentUnchanged ? .unchanged : result.failureReason
     }
 
     private func applyBackupUploadRefresh(_ state: TimelineUploadRefreshAttempt) {

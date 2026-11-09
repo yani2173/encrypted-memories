@@ -1,0 +1,14 @@
+{
+  "commit": "7ef71c53ed550ffcfe4408113cc19dac209e1a9c",
+  "store_sha256": "85efd1a799b101de5c12f1f0120d0cc54a5ba77a8d6ca8a217162915df28ba5a",
+  "adaptation": "One import UploadCore added to resolve public model types. Released store implementation body unchanged; current PhotosCore plumbing.",
+  "database_sha256": "12c53e8f5b0d3c2567c54725eb883306bcc812398a7977ea2ce964f9495aecb6",
+  "contents": "Synthetic source, evidence, handoff, favorite/album intents, saved photo and in-flight remoteTrash, written through the released PendingBackupManifestStore.",
+  "snapshot_files_sha256": {
+    "pending-backup-v1.sqlite": "12c53e8f5b0d3c2567c54725eb883306bcc812398a7977ea2ce964f9495aecb6",
+    "pending-backup-v1.sqlite-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "pending-backup-v1.sqlite-shm": "e87a9ed71d34d135ae3f750e682265cb2cd51aad9956c6293974d5c71221542c"
+  },
+  "archive_sha256": "b5936428f7b11d62c603c93f4c7075a0970ac141ca53a9f8b1724a333dddc383",
+  "snapshot": "Complete quiescent main/WAL/SHM file set directly after the released writer exits. No writable inspection before capture."
+}

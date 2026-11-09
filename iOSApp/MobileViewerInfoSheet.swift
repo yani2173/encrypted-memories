@@ -55,9 +55,9 @@ struct MobileViewerInfoSheet: View {
 
     private var captureSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(item.captureTime, format: .dateTime.weekday(.wide).day().month(.wide).year())
+            Text(item.captureTime, format: MobileViewerCaptureFormat.date)
                 .font(.headline)
-            Text(item.captureTime, format: .dateTime.hour().minute())
+            Text(item.captureTime, format: MobileViewerCaptureFormat.time)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 
@@ -245,5 +245,109 @@ struct MobileViewerInfoSheet: View {
     private func durationString(_ seconds: Double) -> String {
         let total = max(0, Int(seconds.rounded()))
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+/// The capture date and time formats of the viewer's details, shared by the inspector and the folded details.
+enum MobileViewerCaptureFormat {
+    static let date = Date.FormatStyle.dateTime.weekday(.wide).day().month(.wide).year()
+    static let time = Date.FormatStyle.dateTime.hour().minute()
+}
+
+/// The photo details in the lower part of the folded layout: the date and time as its title, the place, and the albums
+/// as chips. No map, no file information and no buttons; the Info inspector keeps those. The title bar then shows only
+/// the position, so each fact appears once.
+struct MobileViewerDetailsSummary: View {
+    let details: ViewerChromeLayoutProfile.Details
+    let item: PhotoItem
+    let placeName: String?
+    let albumTitles: [String]
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: details.groupSpacing) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: details.titleSpacing) {
+                    dateText
+                    timeText
+                }
+                VStack(alignment: .leading, spacing: details.stackedTitleSpacing) {
+                    dateText
+                    timeText
+                }
+            }
+            .accessibilityElement(children: .combine)
+            if let placeName {
+                Label(placeName, systemImage: "mappin.and.ellipse")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !albumTitles.isEmpty {
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: details.albumChipSpacing) { chips(singleLine: false) }
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: details.albumChipSpacing) { chips(singleLine: true) }
+                    }
+                    .scrollClipDisabled()
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var dateText: some View {
+        Text(item.captureTime, format: MobileViewerCaptureFormat.date)
+            .font(.title3.weight(.semibold))
+    }
+
+    private var timeText: some View {
+        Text(item.captureTime, format: MobileViewerCaptureFormat.time)
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+    }
+
+    private func chips(singleLine: Bool) -> some View {
+        ForEach(albumTitles, id: \.self) { title in
+            Label(title, systemImage: "rectangle.stack")
+                .font(.footnote.weight(.medium))
+                .lineLimit(singleLine ? 1 : nil)
+                .modifier(CappedWidth(maximum: singleLine ? details.albumChipMaxWidth : nil))
+                .padding(.horizontal, details.albumChipHorizontalPadding)
+                .padding(.vertical, details.albumChipVerticalPadding)
+                .background(.fill.secondary, in: Capsule())
+        }
+    }
+}
+
+/// Keeps a chip's label at its own width up to `maximum`, so a long album title truncates instead of widening the chip.
+/// A horizontal scroll view proposes no width, so a plain maximum-width frame alone cannot cap the label.
+struct CappedWidth: ViewModifier {
+    let maximum: CGFloat?
+
+    func body(content: Content) -> some View {
+        if let maximum {
+            CappedWidthLayout(maximum: maximum) { content }
+        } else {
+            content
+        }
+    }
+}
+
+private struct CappedWidthLayout: Layout {
+    let maximum: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let subview = subviews.first else { return .zero }
+        let width = min(subview.sizeThatFits(.unspecified).width, maximum, proposal.width ?? .infinity)
+        return subview.sizeThatFits(ProposedViewSize(width: width, height: proposal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(
+            at: bounds.origin, anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
     }
 }

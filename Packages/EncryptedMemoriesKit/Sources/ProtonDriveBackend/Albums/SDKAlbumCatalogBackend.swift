@@ -251,7 +251,41 @@ actor SDKSharedAlbumSnapshotCache {
     }
 }
 
-/// SDK 0.32.1 catalog/sharing/membership adapter. Enumerations publish only after their native
+/// Viewer reads of one node: the Info panel metadata and the album memberships of the same photo. Overlapping misses of
+/// one client share one SDK `getNode`; each caller keeps its own mapping. Reads for a write (current memberships, merge
+/// facts) never use it, because they need a read that starts after their own request.
+typealias SDKPresentationNodeReads = SharedInFlightOperations<SDKPresentationNodeReadKey, DriveNode?>
+
+struct SDKPresentationNodeReadKey: Hashable, Sendable {
+    let client: ObjectIdentifier
+    let volumeID: String
+    let nodeID: String
+}
+
+enum SDKNodeRead {
+    /// One cancellable `getNode`. With `sharing`, an overlapping read of the same client and node joins it.
+    static func node(
+        _ uid: SDKNodeUid, client: any SDKPhotoCatalogClient, sharing: SDKPresentationNodeReads? = nil,
+        measurement: SupportWorkMeasurementPass? = nil
+    ) async throws -> DriveNode? {
+        let read: @Sendable () async throws -> DriveNode? = {
+            try await SDKCancellableOperation.run { token in
+                measurement?.record(.nodeCallsStarted)
+                let value = try await client.getNode(nodeUid: uid, cancellationToken: token)
+                measurement?.record(.nodeCallsReturned)
+                return value
+            } cancel: { token in
+                try? await client.cancelGetNode(cancellationToken: token)
+            }
+        }
+        guard let sharing else { return try await read() }
+        let key = SDKPresentationNodeReadKey(
+            client: ObjectIdentifier(client), volumeID: uid.volumeID, nodeID: uid.nodeID)
+        return try await sharing.run(key, operation: read)
+    }
+}
+
+/// SDK 0.33.0 catalog/sharing/membership adapter. Enumerations publish only after their native
 /// callback stream completes, and node hydration uses a bounded task group so a large catalog
 /// cannot create one unbounded task per album.
 struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
@@ -259,20 +293,26 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     private let maximumConcurrentNodeLoads: Int
     private let admission: JoinedShutdownGate?
     private let sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache
+    private let presentationNodeReads: SDKPresentationNodeReads?
     private let requestCause: ProtonRequestCauseBinding?
+    private let workMeasurements: SupportWorkMeasurements?
 
     init(
         client: any SDKPhotoCatalogClient,
         maximumConcurrentNodeLoads: Int = 4,
         admission: JoinedShutdownGate? = nil,
         sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache(),
-        requestCause: ProtonRequestCauseBinding? = nil
+        presentationNodeReads: SDKPresentationNodeReads? = nil,
+        requestCause: ProtonRequestCauseBinding? = nil,
+        workMeasurements: SupportWorkMeasurements? = nil
     ) {
         self.client = client
         self.maximumConcurrentNodeLoads = max(1, maximumConcurrentNodeLoads)
         self.admission = admission
         self.sharedAlbumSnapshotCache = sharedAlbumSnapshotCache
+        self.presentationNodeReads = presentationNodeReads
         self.requestCause = requestCause
+        self.workMeasurements = workMeasurements
     }
 
     func listAlbums() async throws -> [AlbumSummary] {
@@ -364,22 +404,34 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
             try? await client.cancelLeaveSharedNode(cancellationToken: token)
         }
         await sharedAlbumSnapshotCache.invalidate(client: client)
+        // A viewer read that started before the leave must not answer a later caller.
+        await presentationNodeReads?.invalidate()
     }
 
+    /// May join a viewer read of the same photo that is already running.
     func albumMemberships(
         for photoUIDs: [PhotoUID]
     ) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
         try await withAdmission {
-            try await self.performAlbumMemberships(for: photoUIDs)
+            try await self.performAlbumMemberships(for: photoUIDs, sharing: self.presentationNodeReads)
+        }
+    }
+
+    /// Starts its own read for every photo, never a running viewer read: a write depends on the answer.
+    func currentAlbumMemberships(
+        for photoUIDs: [PhotoUID]
+    ) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
+        try await withAdmission {
+            try await self.performAlbumMemberships(for: photoUIDs, sharing: nil)
         }
     }
 
     private func performAlbumMemberships(
-        for photoUIDs: [PhotoUID]
+        for photoUIDs: [PhotoUID], sharing: SDKPresentationNodeReads?
     ) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
         let uniqueUIDs = Array(Set(photoUIDs))
         let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
-        let nodes = try await loadNodes(sdkUIDs)
+        let nodes = try await loadNodes(sdkUIDs, sharing: sharing)
         var result: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
         result.reserveCapacity(nodes.count)
         for (sdkUID, node) in nodes {
@@ -399,31 +451,39 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     /// each photo, `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
     func nodeFacts(of photoUIDs: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try await withAdmission {
-            let uniqueUIDs = Array(Set(photoUIDs))
-            let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
-            let nodes = try await self.loadNodes(sdkUIDs)
-            var facts: [PhotoUID: ExactDuplicateNodeFacts] = [:]
-            for (sdkUID, node) in nodes {
-                let fact: ExactDuplicateNodeFacts
-                switch node {
-                case .photo(let photo):
-                    fact = .init(
-                        isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize,
-                        albums: photo.albumUids.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) },
-                        fingerprint: SDKPhotoMetadataReader.fingerprint(
-                            captureTime: photo.captureTime, name: photo.name, mimeType: photo.mediaType,
-                            revision: photo.activeRevision))
-                case .file(let file):
-                    // A plain file has no capture time, so two files cannot prove the same metadata.
-                    fact = .init(
-                        isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize,
-                        fingerprint: .matchingOnly(PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)))
-                case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
-                case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
+            try await WorkMeasurementOperation.run(.nodeFactsBatch, collector: self.workMeasurements) { measurement in
+                measurement?.record(.nodesRequested, count: photoUIDs.count)
+                let uniqueUIDs = Array(Set(photoUIDs))
+                measurement?.record(.nodesUnique, count: uniqueUIDs.count)
+                let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
+                let nodes = try await self.loadNodes(sdkUIDs, measurement: measurement)
+                var facts: [PhotoUID: ExactDuplicateNodeFacts] = [:]
+                for (sdkUID, node) in nodes {
+                    let fact: ExactDuplicateNodeFacts
+                    switch node {
+                    case .photo(let photo):
+                        fact = .init(
+                            isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize,
+                            albums: photo.albumUids.map {
+                                SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID)
+                            },
+                            fingerprint: SDKPhotoMetadataReader.fingerprint(
+                                captureTime: photo.captureTime, name: photo.name, mimeType: photo.mediaType,
+                                revision: photo.activeRevision))
+                    case .file(let file):
+                        // A plain file has no capture time, so two files cannot prove the same metadata.
+                        fact = .init(
+                            isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize,
+                            fingerprint: .matchingOnly(PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)))
+                    case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
+                    case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
+                    }
+                    facts[PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)] = fact
                 }
-                facts[PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)] = fact
+                // Count the facts the caller receives: a batch that throws midway delivers no facts at all.
+                measurement?.record(.factsCreated, count: facts.count)
+                return facts
             }
-            return facts
         }
     }
 
@@ -491,15 +551,12 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         }
     }
 
-    private func loadNodes(_ uids: [SDKNodeUid]) async throws -> [(SDKNodeUid, DriveNode?)] {
+    private func loadNodes(
+        _ uids: [SDKNodeUid], sharing: SDKPresentationNodeReads? = nil, measurement: SupportWorkMeasurementPass? = nil
+    ) async throws -> [(SDKNodeUid, DriveNode?)] {
         let client = client
         return try await BoundedConcurrency.throwingMap(uids, limit: maximumConcurrentNodeLoads) { uid in
-            let node = try await SDKCancellableOperation.run { token in
-                try await client.getNode(nodeUid: uid, cancellationToken: token)
-            } cancel: { token in
-                try? await client.cancelGetNode(cancellationToken: token)
-            }
-            return (uid, node)
+            (uid, try await SDKNodeRead.node(uid, client: client, sharing: sharing, measurement: measurement))
         }
     }
 

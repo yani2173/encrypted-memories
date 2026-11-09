@@ -5,6 +5,14 @@ enum ProtonRequestScope: CaseIterable, Hashable, Sendable {
     case api
     case storageDownload
     case storageUpload
+
+    var measurementQueue: SupportMeasurementQueue {
+        switch self {
+        case .api: .api
+        case .storageDownload: .storageDownload
+        case .storageUpload: .storageUpload
+        }
+    }
 }
 
 enum ProtonRequestPriority: Int, CaseIterable, Sendable, Comparable {
@@ -78,6 +86,7 @@ actor ProtonRequestGovernor {
         fileprivate let scope: ProtonRequestScope
         fileprivate let label: ProtonRequestLabel?
         fileprivate let cause: String
+        fileprivate let startMilliseconds: Int64
     }
 
     struct PriorityScope: Sendable {
@@ -95,7 +104,6 @@ actor ProtonRequestGovernor {
         let storageUpload: Scope
         let successWindowForIncrease: Int
         let starvationPromotionInterval: TimeInterval
-        let priorityScopeLifetime: TimeInterval
         /// Without a new 429, each interval of this length halves the admission interval and adds one
         /// concurrent request, up to the initial concurrency. A quiet app sends too few requests to reach
         /// `successWindowForIncrease`, so success-based recovery alone kept a 2 s pacing for minutes.
@@ -106,8 +114,7 @@ actor ProtonRequestGovernor {
             storageDownload: Scope(initialConcurrency: 4, maximumConcurrency: 8),
             storageUpload: Scope(initialConcurrency: 2, maximumConcurrency: 4),
             successWindowForIncrease: 32,
-            starvationPromotionInterval: 10,
-            priorityScopeLifetime: 60
+            starvationPromotionInterval: 10
         )
 
         func scope(_ value: ProtonRequestScope) -> Scope {
@@ -125,6 +132,7 @@ actor ProtonRequestGovernor {
         let priorityHandle: PriorityHandle?
         let sequence: UInt64
         let enqueuedAt: Date
+        let measurementEnqueuedAt: Duration?
         let label: ProtonRequestLabel?
         let cause: String
         let continuation: CheckedContinuation<Permit, Error>
@@ -157,11 +165,15 @@ actor ProtonRequestGovernor {
         }
     }
 
+    nonisolated let workMeasurements: SupportWorkMeasurements
     private let configuration: Configuration
     private let now: @Sendable () -> Date
     /// Lock-based so a nonisolated caller can open and close a cause without an actor hop.
     nonisolated let causes = ProtonRequestCauseScopes()
     private var tally = ProtonRequestTally()
+    private var trace = ProtonRequestTrace()
+    private let traceNow: @Sendable () -> Int64
+    private let requestLog: @Sendable (RemoteRequestSupportSnapshot.Request) -> Void
     private let summaryLog: @Sendable ([String: String]) -> Void
     private var states: [ProtonRequestScope: ScopeState]
     private var sequence: UInt64 = 0
@@ -170,21 +182,25 @@ actor ProtonRequestGovernor {
         [UUID: (
             priority: ProtonRequestPriority,
             promotedScopes: Set<ProtonRequestScope>,
-            suspendedScopes: Set<ProtonRequestScope>,
-            expiresAt: Date?
+            suspendedScopes: Set<ProtonRequestScope>
         )] = [:]
-    private var priorityWakeTask: Task<Void, Never>?
 
     init(
         configuration: Configuration = .production,
         now: @escaping @Sendable () -> Date = { Date() },
+        workMeasurements: SupportWorkMeasurements = SupportWorkMeasurements(),
         summaryLog: @escaping @Sendable ([String: String]) -> Void = {
             PhotoDiagnostics.shared.emitDebug("ProtonRequests", $0)
-        }
+        },
+        traceNow: @escaping @Sendable () -> Int64 = { RequestTraceClock.milliseconds },
+        requestLog: @escaping @Sendable (RemoteRequestSupportSnapshot.Request) -> Void = { ProtonRequestTrace.log($0) }
     ) {
         self.configuration = configuration
+        self.workMeasurements = workMeasurements
         self.now = now
         self.summaryLog = summaryLog
+        self.traceNow = traceNow
+        self.requestLog = requestLog
         states = Dictionary(
             uniqueKeysWithValues: ProtonRequestScope.allCases.map {
                 ($0, ScopeState(configuration: configuration.scope($0)))
@@ -203,7 +219,6 @@ actor ProtonRequestGovernor {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 sequence &+= 1
-                prunePriorityScopes()
                 let requestedPriority = priority ?? ProtonRequestContext.priority
                 let scopedPriority = priorityScopes.values
                     .filter { $0.promotedScopes.contains(scope) }
@@ -222,6 +237,7 @@ actor ProtonRequestGovernor {
                         priorityHandle: priorityHandle,
                         sequence: sequence,
                         enqueuedAt: now(),
+                        measurementEnqueuedAt: workMeasurements.instant(),
                         label: label,
                         cause: cause,
                         continuation: continuation
@@ -249,41 +265,16 @@ actor ProtonRequestGovernor {
     func beginPriorityScope(
         _ priority: ProtonRequestPriority,
         promoting promotedScopes: Set<ProtonRequestScope> = Set(ProtonRequestScope.allCases),
-        suspending suspendedScopes: Set<ProtonRequestScope> = [],
-        expiresAfter: TimeInterval? = nil
-    ) -> PriorityScope {
-        let scope = PriorityScope(id: UUID())
-        priorityScopes[scope.id] = (
-            priority,
-            promotedScopes,
-            suspendedScopes,
-            expiresAfter.map { now().addingTimeInterval($0) }
-        )
-        schedulePriorityWake()
-        return scope
-    }
-
-    /// Starts a scope for an SDK callback path that might not report completion.
-    ///
-    /// Structured operations must use `beginPriorityScope` and end the returned lease explicitly.
-    /// This watchdog is limited to the unstructured callback boundary.
-    func beginUnstructuredPriorityScope(
-        _ priority: ProtonRequestPriority,
-        promoting promotedScopes: Set<ProtonRequestScope> = Set(ProtonRequestScope.allCases),
         suspending suspendedScopes: Set<ProtonRequestScope> = []
     ) -> PriorityScope {
-        beginPriorityScope(
-            priority,
-            promoting: promotedScopes,
-            suspending: suspendedScopes,
-            expiresAfter: configuration.priorityScopeLifetime
-        )
+        let scope = PriorityScope(id: UUID())
+        priorityScopes[scope.id] = (priority, promotedScopes, suspendedScopes)
+        return scope
     }
 
     func endPriorityScope(_ scope: PriorityScope) {
         priorityScopes.removeValue(forKey: scope.id)
         drainAllScopes()
-        schedulePriorityWake()
     }
 
     /// Runs one bounded request with targeted promotion and admission suspension.
@@ -312,6 +303,13 @@ actor ProtonRequestGovernor {
         guard var state = states[permit.scope], state.activePermitIDs.remove(permit.id) != nil else { return }
         state.inFlight = max(0, state.inFlight - 1)
         let timestamp = now()
+        let record = RemoteRequestSupportSnapshot.Request(
+            scope: permit.scope.supportName, method: permit.label?.method ?? "OTHER",
+            endpoint: ProtonRequestTrace.endpoint(permit.label), cause: permit.cause,
+            status: ProtonRequestStatusClass(statusCode: statusCode, cancelled: cancelled).rawValue,
+            startMilliseconds: permit.startMilliseconds, endMilliseconds: traceNow())
+        trace.append(record)
+        requestLog(record)
         let summary = tally.record(
             ProtonRequestTally.Key(
                 scope: permit.scope,
@@ -371,7 +369,6 @@ actor ProtonRequestGovernor {
     }
 
     func snapshot() -> ProtonRequestGovernorSnapshot {
-        prunePriorityScopes()
         let timestamp = now()
         return ProtonRequestGovernorSnapshot(
             api: snapshot(.api, now: timestamp),
@@ -437,7 +434,10 @@ actor ProtonRequestGovernor {
                 totalCooldownSeconds: totals.cooldownSeconds
             )
         }
-        return RemoteRequestSupportSnapshot(counts: counts, overflowRequests: tally.overflowRequests, scopes: scopes)
+        return RemoteRequestSupportSnapshot(
+            counts: counts, overflowRequests: tally.overflowRequests, scopes: scopes,
+            recentRequests: trace.snapshot, droppedRequestRecords: trace.dropped,
+            traceCapturedAtMilliseconds: traceNow())
     }
 
     private func cancel(id: UUID, scope: ProtonRequestScope) {
@@ -445,6 +445,7 @@ actor ProtonRequestGovernor {
             let index = state.waiters.firstIndex(where: { $0.id == id })
         else { return }
         let waiter = state.waiters.remove(at: index)
+        workMeasurements.recordQueueWait(scope.measurementQueue, since: waiter.measurementEnqueuedAt, cancelled: true)
         states[scope] = state
         waiter.continuation.resume(throwing: CancellationError())
         drain(scope)
@@ -490,13 +491,17 @@ actor ProtonRequestGovernor {
 
             let index = bestWaiterIndex(in: state.waiters, now: timestamp)
             let waiter = state.waiters.remove(at: index)
+            workMeasurements.recordQueueWait(
+                scope.measurementQueue, since: waiter.measurementEnqueuedAt, cancelled: false)
             state.inFlight += 1
             state.activePermitIDs.insert(waiter.id)
             state.admitted.append(timestamp)
             state.nextAdmission = timestamp.addingTimeInterval(state.admissionInterval)
             tally.recordInFlight(state.inFlight, scope: scope)
             waiter.continuation.resume(
-                returning: Permit(id: waiter.id, scope: scope, label: waiter.label, cause: waiter.cause))
+                returning: Permit(
+                    id: waiter.id, scope: scope, label: waiter.label, cause: waiter.cause,
+                    startMilliseconds: traceNow()))
 
             if state.admissionInterval > 0 {
                 states[scope] = state
@@ -543,18 +548,6 @@ actor ProtonRequestGovernor {
         drain(scope)
     }
 
-    private func prunePriorityScopes() {
-        let timestamp = now()
-        let before = priorityScopes.count
-        priorityScopes = priorityScopes.filter { entry in
-            guard let expiresAt = entry.value.expiresAt else { return true }
-            return expiresAt > timestamp
-        }
-        if before != priorityScopes.count {
-            drainAllScopes()
-        }
-    }
-
     private func isAdmissionSuspended(_ scope: ProtonRequestScope) -> Bool {
         return priorityScopes.values.contains { $0.suspendedScopes.contains(scope) }
     }
@@ -563,26 +556,6 @@ actor ProtonRequestGovernor {
         for scope in ProtonRequestScope.allCases {
             drain(scope)
         }
-    }
-
-    private func schedulePriorityWake() {
-        priorityWakeTask?.cancel()
-        guard let earliest = priorityScopes.values.compactMap({ $0.expiresAt }).min() else {
-            priorityWakeTask = nil
-            return
-        }
-        let delay = max(0, earliest.timeIntervalSince(now()))
-        priorityWakeTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled else { return }
-            await self?.priorityWake()
-        }
-    }
-
-    private func priorityWake() {
-        priorityWakeTask = nil
-        prunePriorityScopes()
-        schedulePriorityWake()
     }
 
     private static func prune(_ state: inout ScopeState, now: Date) {

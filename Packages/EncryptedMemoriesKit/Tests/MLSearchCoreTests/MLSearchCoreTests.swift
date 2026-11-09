@@ -445,10 +445,10 @@ import Testing
         #expect(report.skippedAlreadyIndexed == 1)
         #expect(store.count(for: descriptorV1) == 1)
         // The stored record is the first one (idempotent semantics: first write wins).
-        let stored = store.allRecords(for: descriptorV1)
+        let stored = store.vectorBlock(for: descriptorV1)
         #expect(stored.count == 1)
         // Guard the report/data agreement: the first-write-wins vector is retained, not r2's.
-        #expect(stored.first?.vector == ContiguousArray([1, 0, 0, 0]))
+        #expect(stored.vectors.first == ContiguousArray([1, 0, 0, 0]))
     }
 
     @Test func containsReflectsCompositeKey() {
@@ -482,7 +482,7 @@ import Testing
             record("a0", descriptorV1, [1, 0, 0, 0]),
             record("a1", descriptorV1, [0, 1, 0, 0]),
         ])
-        store.remove(uid: uid("a0"), descriptor: descriptorV1)
+        store.remove(uids: [uid("a0")], descriptor: descriptorV1)
         #expect(!store.contains(uid: uid("a0"), descriptor: descriptorV1))
         #expect(store.contains(uid: uid("a1"), descriptor: descriptorV1))
         #expect(store.count(for: descriptorV1) == 1)
@@ -496,7 +496,7 @@ import Testing
             record("a0", descriptorV1, [1, 0, 0, 0]),
             record("a1", descriptorV1, [0, 1, 0, 0]),
         ])
-        let allUIDs = store.allIndexedUIDs(for: descriptorV1)
+        let allUIDs = store.vectorBlock(for: descriptorV1).uids
         #expect(Set(allUIDs.map(\.nodeID)) == ["a0", "a1"])
         let membership = store.indexedUIDs(for: descriptorV1, from: [uid("a0"), uid("a2"), uid("a1")])
         #expect(membership == Set([uid("a0"), uid("a1")]))

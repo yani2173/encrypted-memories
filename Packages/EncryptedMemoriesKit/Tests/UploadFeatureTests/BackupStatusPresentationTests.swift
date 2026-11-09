@@ -175,7 +175,7 @@ final class BackupStatusPresentationTests: XCTestCase {
 
         XCTAssertEqual(s.phase, .completed)
         XCTAssertEqual(s.backedUp, 9)
-        XCTAssertEqual(s.notBackedUpCount, 1)
+        XCTAssertEqual(s.totalConsidered, 10)
         XCTAssertEqual(p.headlineKey, "backup.phase_completed_with_omissions")
         XCTAssertEqual(p.accessory, .notice)
         XCTAssertEqual(p.backedUp, 9)
@@ -219,7 +219,8 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertEqual(s.phase, .waiting)
         XCTAssertEqual(p.headlineKey, "backup.phase_waiting_proton")
         XCTAssertEqual(p.accessory, .waiting)
-        XCTAssertEqual(s.notBackedUpCount, 1_481, "the backlog remains truthfully unfinished")
+        XCTAssertEqual(s.totalConsidered, 1_481, "the backlog remains truthfully unfinished")
+        XCTAssertEqual(s.backedUp, 0)
         XCTAssertEqual(p.attentionCount, 0, "unfinished work must not be labeled as failed media")
         XCTAssertNil(p.localizedAttention)
         XCTAssertNotNil(p.localizedSystemIssue)

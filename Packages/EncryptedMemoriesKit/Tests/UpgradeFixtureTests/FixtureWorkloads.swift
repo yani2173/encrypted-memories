@@ -141,7 +141,9 @@ enum FixtureWorkloads {
             _ = try await sync.run(engine: engine)
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
         } else {
-            let summary = queue.summary()
+            guard let summary = queue.summary() else {
+                throw FixtureFailure(description: "Backup queue summary could not be read")
+            }
             try fixtureRequire(await runner.isQueueOperational(), "Backup queue failed during recovery")
             try fixtureRequire(
                 summary.waiting + summary.active + summary.failed + summary.blocked == 0, "Backup queue did not recover"

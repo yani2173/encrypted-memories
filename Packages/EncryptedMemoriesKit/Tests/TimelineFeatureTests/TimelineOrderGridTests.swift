@@ -72,6 +72,80 @@ final class TimelineOrderGridTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(host.currentScrollAnchor()).topOffset, before.topOffset, accuracy: 0.5)
     }
 
+    func testMonthMarkersAreBuiltOnlyWhenTheRevisionChanges() throws {
+        let (host, window, items, _) = try gridFixture()
+        defer {
+            host.removeFromSuperview()
+            window.contentView = nil
+        }
+        let coordinator = MetalProductionGridView.Coordinator()
+        coordinator.host = host
+        coordinator.allItems = items
+        coordinator.dataRevision = 1
+        var markerBuilds = 0
+        coordinator.receiveContent(
+            items: items, revision: 1, routeGeneration: 0, initialViewport: .newest,
+            markers: {
+                markerBuilds += 1
+                return []
+            }(),
+            makeSource: { OrderGridSource(items) })
+        XCTAssertEqual(markerBuilds, 0, "an update with the applied revision discards the markers; do not build them")
+
+        coordinator.receiveContent(
+            items: items, revision: 2, routeGeneration: 0, initialViewport: .newest,
+            markers: {
+                markerBuilds += 1
+                return []
+            }(),
+            makeSource: { OrderGridSource(items) })
+        XCTAssertEqual(markerBuilds, 1, "a new revision builds the markers once")
+        XCTAssertEqual(coordinator.dataRevision, 2)
+    }
+
+    func testMonthMarkersAreNotBuiltWithoutAHostOrForADeferredRevision() throws {
+        let (host, window, items, _) = try gridFixture()
+        defer {
+            host.removeFromSuperview()
+            window.contentView = nil
+        }
+        var markerBuilds = 0
+        let orphan = MetalProductionGridView.Coordinator()
+        orphan.receiveContent(
+            items: items, revision: 2, routeGeneration: 0, initialViewport: .newest,
+            markers: {
+                markerBuilds += 1
+                return []
+            }(),
+            makeSource: { OrderGridSource(items) })
+        XCTAssertEqual(markerBuilds, 0, "without a host nothing is applied, so the markers are not built")
+
+        let before = try XCTUnwrap(host.currentScrollAnchor())
+        let pair = try XCTUnwrap(host.coordinator.flatIndex(forUID: before.itemID)) / 2 * 2
+        var corrected = items
+        corrected[pair].timelineOrder = .init(exactCaptureTime: items[pair].captureTime.addingTimeInterval(0.8))
+        corrected[pair + 1].timelineOrder = .init(exactCaptureTime: items[pair + 1].captureTime.addingTimeInterval(0.1))
+        corrected.sort(by: TimelineOrder.areInIncreasingOrder)
+        let coordinator = MetalProductionGridView.Coordinator()
+        coordinator.host = host
+        coordinator.allItems = items
+        coordinator.dataRevision = 1
+        let receive = {
+            coordinator.receiveContent(
+                items: corrected, revision: 2, routeGeneration: 0, initialViewport: .newest,
+                markers: {
+                    markerBuilds += 1
+                    return []
+                }(),
+                makeSource: { OrderGridSource(corrected) })
+        }
+        receive()
+        XCTAssertEqual(coordinator.allItems, items, "the visible correction is deferred")
+        XCTAssertEqual(markerBuilds, 1, "the first delivery of the deferred revision builds its markers")
+        receive()
+        XCTAssertEqual(markerBuilds, 1, "the same deferred revision again is dropped before its markers are built")
+    }
+
     func testMetadataThatKeepsTheOrderAlsoKeepsTheVisibleFramesAndZoomPhase() throws {
         let (host, window, items, phase) = try gridFixture()
         defer {
@@ -147,7 +221,6 @@ final class TimelineOrderGridTests: XCTestCase {
 
 @MainActor
 private final class OrderGridSource: MetalGridDataSource {
-    let label = "order-test"
     let sectionCounts: [Int]
     let flatUIDs: [PhotoUID]
     var onImagesAvailable: (() -> Void)?

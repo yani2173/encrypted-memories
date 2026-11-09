@@ -66,7 +66,7 @@ public struct PendingReplacementHandoff: Sendable, Equatable {
 }
 
 /// How a pending source reached Proton.
-public enum PendingHandoffKind: String, Sendable, Codable {
+public enum PendingHandoffKind: String, Sendable, Codable, CaseIterable {
     /// This app committed the primary resource.
     case uploaded
     /// The duplicate check mapped the source to a photo that already exists in Proton.
@@ -132,7 +132,7 @@ public struct PendingPresentationMetadata: Sendable, Equatable {
     }
 }
 
-public enum PendingDesiredState: String, Sendable, Equatable {
+public enum PendingDesiredState: String, Sendable, Equatable, CaseIterable {
     case excluded
     case included
 }
@@ -172,6 +172,38 @@ public enum PendingHandoffRead: Sendable, Equatable {
     }
 }
 
+/// An exhaustive reverse lookup of handoffs. An unreadable request exposes no partial result.
+public enum PendingHandoffsRead: Sendable, Equatable {
+    case unreadable
+    case complete([PendingHandoff])
+}
+
+/// Enqueueing alone does not settle a restored compound. Unknown or omitted keys remain unreadable.
+public enum PendingBackupReturnOutcome: Sendable, Equatable {
+    case completed
+    case waiting(until: Date)
+    case unreadable
+    /// A fresh read proves that an earlier in-flight trash applied after the person's restore.
+    case remoteTrashed
+}
+
+public struct PendingBackupRestoreResult: Sendable, Equatable {
+    public var outcomes: [PendingSourceKey: PendingBackupReturnOutcome]
+    public var discoveryComplete: Bool
+
+    /// A pending recheck is readable; incomplete discovery or an unknown source needs an error in the host.
+    public var isReadable: Bool {
+        discoveryComplete && !outcomes.values.contains(.unreadable)
+    }
+
+    public init(
+        outcomes: [PendingSourceKey: PendingBackupReturnOutcome] = [:], discoveryComplete: Bool = true
+    ) {
+        self.outcomes = outcomes
+        self.discoveryComplete = discoveryComplete
+    }
+}
+
 /// The actions that decoded, and whether the read was complete. An incomplete read can leave out owed actions.
 public struct PendingActionsRead: Sendable, Equatable {
     public let actions: [PendingAction]
@@ -207,8 +239,6 @@ public struct PendingSourceState: Sendable, Equatable {
     public let attempts: Int
     public let nextAttemptAt: Date
     public let updatedAt: Date
-
-    public var hasDueEffect: Bool { needsQueueSync || needsRemoteTrash || needsRemoteRestore }
 
     public init(
         key: PendingSourceKey,
@@ -275,7 +305,7 @@ public struct PendingExclusionRequest: Sendable, Equatable {
 }
 
 /// The effect a reconciler finished for one source generation.
-public enum PendingSourceEffect: String, Sendable, Equatable {
+public enum PendingSourceEffect: String, Sendable, Equatable, CaseIterable {
     case queueSync
     case remoteTrash
     case remoteRestore

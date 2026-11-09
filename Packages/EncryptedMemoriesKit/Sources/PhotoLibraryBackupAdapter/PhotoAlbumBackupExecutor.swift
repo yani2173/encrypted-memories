@@ -19,6 +19,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
     private let databasePolicy: LibraryDatabasePolicy
     private let identityResolver: any UploadIdentityResolving
     private let uploader: any PhotoUploading
+    private let tagAdder: (any PhotoTagAdding)?
     private let injectedResourceResolver: (any BackupResourceResolving)?
     private let injectedProofCatalog: (any UploadBackupAssetCatalog)?
     private let stopFenceAcquired: (@Sendable () async -> Void)?
@@ -40,12 +41,14 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         accountDataDirectory: URL,
         databasePolicy: LibraryDatabasePolicy,
         identityResolver: any UploadIdentityResolving,
-        uploader: any PhotoUploading
+        uploader: any PhotoUploading,
+        tagAdder: (any PhotoTagAdding)? = nil
     ) {
         self.accountDataDirectory = accountDataDirectory
         self.databasePolicy = databasePolicy
         self.identityResolver = identityResolver
         self.uploader = uploader
+        self.tagAdder = tagAdder
         injectedResourceResolver = nil
         injectedProofCatalog = nil
         stopFenceAcquired = nil
@@ -59,6 +62,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         databasePolicy: LibraryDatabasePolicy,
         identityResolver: any UploadIdentityResolving,
         uploader: any PhotoUploading,
+        tagAdder: (any PhotoTagAdding)? = nil,
         resourceResolver: any BackupResourceResolving,
         proofCatalog: (any UploadBackupAssetCatalog)? = nil,
         stopFenceAcquired: (@Sendable () async -> Void)? = nil,
@@ -70,6 +74,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         self.databasePolicy = databasePolicy
         self.identityResolver = identityResolver
         self.uploader = uploader
+        self.tagAdder = tagAdder
         injectedResourceResolver = resourceResolver
         injectedProofCatalog = proofCatalog
         self.stopFenceAcquired = stopFenceAcquired
@@ -185,6 +190,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
             resolver: resourceResolver,
             identityResolver: identityResolver,
             uploader: uploader,
+            tagAdder: tagAdder,
             throttleInputs: runtimeSignals.current,
             runtimeChanges: runtimeSignals.updates,
             clock: clock
@@ -193,7 +199,8 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         defer { lock.withLock { activeRunner = nil } }
 
         await runner.setOnProgress { snapshot in onProgress(snapshot) }
-        _ = try await engine.scan(PhotoLibraryBackupCatalog(localIdentifiers: localIdentifiers))
+        let catalog = injectedProofCatalog ?? PhotoLibraryBackupCatalog(localIdentifiers: localIdentifiers)
+        _ = try await engine.scan(catalog)
         _ = await runner.runUntilDrained(workIntent: .userInitiated)
         try await runner.checkCancellation()
         try Task.checkCancellation()

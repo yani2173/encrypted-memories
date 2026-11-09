@@ -63,9 +63,57 @@ struct AppleKeychainStoreTests {
         #expect(security.storedData(for: second, dataProtection: true) == nil)
     }
 
-    @Test func secureRandomReturnsRequestedByteCount() throws {
-        #expect(try AppleSecureRandom.data(count: 32).count == 32)
-        #expect(try AppleSecureRandom.data(count: 0).isEmpty)
+    @Test func theClassOfAnItemIsReadFromItsAttributesOnly() throws {
+        let security = MemorySecurityItemClient()
+        let store = SystemAppleKeychainStore(security: security)
+        let item = uniqueItem("class")
+        #expect(try store.accessibility(for: item) == nil, "no item, no class")
+
+        security.seed(
+            Data("saved".utf8), item: item, dataProtection: true,
+            accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+        #expect(try store.accessibility(for: item) == .whenUnlockedThisDeviceOnly)
+        let query = try #require(security.lastReadQuery)
+        #expect(query[kSecReturnAttributes as String] as? Bool == true)
+        #expect(query[kSecReturnData as String] == nil, "the class read never asks for the data")
+    }
+
+    @Test func aSaveWithAnotherClassUpdatesTheItemInPlace() throws {
+        let security = MemorySecurityItemClient()
+        let store = SystemAppleKeychainStore(security: security)
+        let old = uniqueItem("move")
+        security.seed(
+            Data("saved".utf8), item: old, dataProtection: true,
+            accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+        let new = AppleKeychainItem(
+            service: old.service, account: old.account, accessibility: .afterFirstUnlockThisDeviceOnly)
+
+        try store.setData(Data("saved".utf8), for: new)
+
+        #expect(try store.accessibility(for: new) == .afterFirstUnlockThisDeviceOnly)
+        #expect(security.addCount == 0)
+        #expect(security.deleteCount == 0)
+    }
+
+    @Test(arguments: [AppleKeychainAccessibility.whenUnlockedThisDeviceOnly, .afterFirstUnlockThisDeviceOnly])
+    func signOutRemovesTheSessionWhateverClassItWasSavedWith(_ saved: AppleKeychainAccessibility) throws {
+        let security = MemorySecurityItemClient()
+        let store = SystemAppleKeychainStore(security: security)
+        let service = "at.oncloud.encryptedmemories.security-tests.signout.\(UUID().uuidString)"
+        let savedItem = AppleKeychainItem(service: service, account: "default", accessibility: saved)
+        try store.setData(Data("session".utf8), for: savedItem)
+        let other: AppleKeychainAccessibility =
+            saved == .whenUnlockedThisDeviceOnly ? .afterFirstUnlockThisDeviceOnly : .whenUnlockedThisDeviceOnly
+
+        // The store of the new app version removes an item of either class: the queries carry no class.
+        try store.removeData(for: AppleKeychainItem(service: service, account: "default", accessibility: other))
+        #expect(security.storedData(for: savedItem, dataProtection: true) == nil)
+        #expect(security.deleteQueries.allSatisfy { $0[kSecAttrAccessible as String] == nil })
+
+        try store.setData(Data("session".utf8), for: savedItem)
+        try store.removeAllData(service: service)
+        #expect(security.storedData(for: savedItem, dataProtection: true) == nil, "the sign-out purge removes it too")
+        #expect(security.deleteQueries.allSatisfy { $0[kSecAttrAccessible as String] == nil })
     }
 
     private func uniqueItem(_ purpose: String) -> AppleKeychainItem {
@@ -86,11 +134,14 @@ private final class MemorySecurityItemClient: SecurityItemCalling, @unchecked Se
 
     private let lock = NSLock()
     private var storage: [Key: Data] = [:]
+    private var classes: [Key: String] = [:]
     private var adds = 0
     private var deletes = 0
     private var readQuery: [String: Any]?
+    private var deletions: [[String: Any]] = []
 
     var lastReadQuery: [String: Any]? { lock.withLock { readQuery } }
+    var deleteQueries: [[String: Any]] { lock.withLock { deletions } }
 
     var addCount: Int { lock.withLock { adds } }
     var deleteCount: Int { lock.withLock { deletes } }
@@ -100,6 +151,9 @@ private final class MemorySecurityItemClient: SecurityItemCalling, @unchecked Se
             readQuery = query
             guard let key = key(from: query), let data = storage[key] else {
                 return SecurityItemCopyResult(status: errSecItemNotFound, data: nil)
+            }
+            if query[kSecReturnAttributes as String] as? Bool == true {
+                return SecurityItemCopyResult(status: errSecSuccess, data: nil, accessible: classes[key])
             }
             return SecurityItemCopyResult(status: errSecSuccess, data: data)
         }
@@ -112,6 +166,7 @@ private final class MemorySecurityItemClient: SecurityItemCalling, @unchecked Se
             }
             guard storage[key] == nil else { return errSecDuplicateItem }
             storage[key] = data
+            classes[key] = (attributes[kSecAttrAccessible as String] as! CFString) as String
             adds += 1
             return errSecSuccess
         }
@@ -122,12 +177,16 @@ private final class MemorySecurityItemClient: SecurityItemCalling, @unchecked Se
             guard let key = key(from: query), storage[key] != nil else { return errSecItemNotFound }
             guard let data = attributes[kSecValueData as String] as? Data else { return errSecParam }
             storage[key] = data
+            if let accessible = attributes[kSecAttrAccessible as String] {
+                classes[key] = (accessible as! CFString) as String
+            }
             return errSecSuccess
         }
     }
 
     func delete(_ query: [String: Any]) -> OSStatus {
         lock.withLock {
+            deletions.append(query)
             if let service = query[kSecAttrService as String] as? String,
                 query[kSecAttrAccount as String] == nil
             {
@@ -148,9 +207,11 @@ private final class MemorySecurityItemClient: SecurityItemCalling, @unchecked Se
         }
     }
 
-    func seed(_ data: Data, item: AppleKeychainItem, dataProtection: Bool) {
+    func seed(_ data: Data, item: AppleKeychainItem, dataProtection: Bool, accessible: CFString? = nil) {
         lock.withLock {
-            storage[Key(service: item.service, account: item.account, dataProtection: dataProtection)] = data
+            let key = Key(service: item.service, account: item.account, dataProtection: dataProtection)
+            storage[key] = data
+            if let accessible { classes[key] = accessible as String }
         }
     }
 

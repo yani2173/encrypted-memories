@@ -79,7 +79,7 @@ import Testing
         #expect(try roundTrip(classifications) == classifications)
     }
 
-    @Test func nativeRegionFeatureQualityAndMaskContractsRoundTrip() throws {
+    @Test func nativeRegionFeatureAndQualityContractsRoundTrip() throws {
         let bounds = try MLNormalizedRect(x: 0, y: 0, width: 1, height: 1)
         let landmark = try MLRegionLandmark(identifier: "leftEye", x: 0.25, y: 0.4)
         let region = try MLRegionDetectionArtifact(
@@ -101,18 +101,10 @@ import Testing
             aesthetics: 0.7,
             saliencyBounds: bounds
         )
-        let mask = try MLMaskDescriptor(
-            context: context(.foregroundInstanceMask),
-            format: .alpha8,
-            width: 32,
-            height: 32,
-            byteCount: 1024
-        )
 
         #expect(try roundTrip(region) == region)
         #expect(try roundTrip(feature) == feature)
         #expect(try roundTrip(quality) == quality)
-        #expect(try roundTrip(mask) == mask)
     }
 
     @Test func featurePrintRejectsByteCountMismatchAndWrongNativeKind() throws {

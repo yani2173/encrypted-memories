@@ -6,17 +6,49 @@ final class LibraryStoragePressureTests: XCTestCase {
     func testThresholdsAndHysteresis() {
         let gib: Int64 = 1 << 30
         let mib: Int64 = 1 << 20
+        let policy = DiskCacheBudgetPolicy(platform: .mobile)
 
-        XCTAssertEqual(LibraryStoragePressure.next(after: .normal, availableBytes: 2 * gib), .normal)
-        XCTAssertEqual(LibraryStoragePressure.next(after: .normal, availableBytes: 2 * gib - 1), .low)
-        XCTAssertEqual(LibraryStoragePressure.next(after: .normal, availableBytes: 512 * mib - 1), .critical)
-        XCTAssertEqual(LibraryStoragePressure.next(after: .low, availableBytes: 2 * gib + 256 * mib - 1), .low)
-        XCTAssertEqual(LibraryStoragePressure.next(after: .low, availableBytes: 2 * gib + 256 * mib), .normal)
-        XCTAssertEqual(
-            LibraryStoragePressure.next(after: .critical, availableBytes: 512 * mib + 256 * mib - 1), .critical)
-        XCTAssertEqual(LibraryStoragePressure.next(after: .critical, availableBytes: 512 * mib + 256 * mib), .low)
-        XCTAssertEqual(LibraryStoragePressure.next(after: .critical, availableBytes: 2 * gib + 256 * mib), .normal)
-        XCTAssertEqual(LibraryStoragePressure.next(after: .low, availableBytes: nil), .low)
+        func next(_ after: LibraryStoragePressure, _ bytes: Int64?) -> LibraryStoragePressure {
+            LibraryStoragePressure.next(after: after, availableBytes: bytes, policy: policy)
+        }
+
+        XCTAssertEqual(next(.normal, 2 * gib), .normal)
+        XCTAssertEqual(next(.normal, 2 * gib - 1), .low)
+        XCTAssertEqual(next(.normal, 512 * mib - 1), .critical)
+        XCTAssertEqual(next(.low, 2 * gib + 256 * mib - 1), .low)
+        XCTAssertEqual(next(.low, 2 * gib + 256 * mib), .normal)
+        XCTAssertEqual(next(.critical, 512 * mib + 256 * mib - 1), .critical)
+        XCTAssertEqual(next(.critical, 512 * mib + 256 * mib), .low)
+        XCTAssertEqual(next(.critical, 2 * gib + 256 * mib), .normal)
+        XCTAssertEqual(next(.low, nil), .low)
+    }
+
+    func testThresholdsFollowTheSharedDiskCacheBudgetPolicy() {
+        let gib: Int64 = 1 << 30
+        let mib: Int64 = 1 << 20
+        for platform: DiskCacheBudgetPolicy.Platform in [.mobile, .macOS] {
+            let policy = DiskCacheBudgetPolicy(platform: platform)
+            let low = policy.lowStorageThresholdBytes
+            let critical = policy.criticalStorageThresholdBytes
+            let margin = policy.storageRecoveryMarginBytes
+
+            func next(_ after: LibraryStoragePressure, _ bytes: Int64) -> LibraryStoragePressure {
+                LibraryStoragePressure.next(after: after, availableBytes: bytes, policy: policy)
+            }
+
+            XCTAssertEqual(next(.normal, low), .normal)
+            XCTAssertEqual(next(.normal, low - 1), .low)
+            XCTAssertEqual(next(.normal, critical - 1), .critical)
+            XCTAssertEqual(next(.low, low + margin - 1), .low)
+            XCTAssertEqual(next(.low, low + margin), .normal)
+            XCTAssertEqual(next(.critical, critical + margin - 1), .critical)
+            XCTAssertEqual(next(.critical, critical + margin), .low)
+
+            // The policy keeps the current effective thresholds: low 2 GiB, critical 512 MiB, margin 256 MiB.
+            XCTAssertEqual(low, 2 * gib)
+            XCTAssertEqual(critical, 512 * mib)
+            XCTAssertEqual(margin, 256 * mib)
+        }
     }
 
     func testCriticalPausesAutomaticWritingWorkOnly() {

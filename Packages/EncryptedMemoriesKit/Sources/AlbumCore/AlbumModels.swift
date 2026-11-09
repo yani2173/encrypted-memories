@@ -67,7 +67,7 @@ public struct AlbumNodeIdentifier: Hashable, Sendable, Codable {
     }
 }
 
-/// App-owned mirror of the SDK 0.32.1 `MemberRole`. Core never imports SDK types.
+/// App-owned mirror of the SDK 0.33.0 `MemberRole`. Core never imports SDK types.
 public enum SharedAlbumRole: Sendable, Equatable, CaseIterable {
     /// Access comes from an ancestor node. The node itself is not shared directly with the user,
     /// so the effective level is unknown here and the app treats it as read-only.
@@ -288,7 +288,7 @@ public struct AlbumCapabilities: Sendable, Equatable {
         canSetCover: false
     )
 
-    /// SDK reads plus the narrow direct-HTTP write surface that the Swift API of SDK 0.32.1 cannot replace.
+    /// SDK reads plus the narrow direct-HTTP write surface that the Swift API of SDK 0.33.0 cannot replace.
     /// The HTTP writes resolve the account's own Photos share, volume and root key, so they address
     /// only owned albums. `canWriteSharedAlbums` therefore stays false.
     public static let sdkCatalogWithHTTPWrites = AlbumCapabilities(
@@ -306,23 +306,110 @@ public struct AlbumCapabilities: Sendable, Equatable {
 
 // MARK: - Errors
 
+/// The typed reason for a failed album write. Unknown failures must not be treated as permanent.
+public struct AlbumWriteCause: Sendable, Equatable {
+    public enum Kind: Sendable, Equatable {
+        case cancelled
+        case network(code: Int)
+        case http(status: Int)
+        case unknown
+    }
+
+    public let kind: Kind
+    public let underlyingError: any Error
+
+    /// Only known transient causes receive this classification. Unknown causes stay unclassified.
+    public var isTransient: Bool {
+        switch kind {
+        case .network(let code):
+            [
+                URLError.notConnectedToInternet.rawValue, URLError.timedOut.rawValue,
+                URLError.networkConnectionLost.rawValue, URLError.cannotConnectToHost.rawValue,
+                URLError.cannotFindHost.rawValue, URLError.dnsLookupFailed.rawValue,
+                URLError.resourceUnavailable.rawValue, URLError.secureConnectionFailed.rawValue,
+                URLError.cannotLoadFromNetwork.rawValue, URLError.internationalRoamingOff.rawValue,
+                URLError.dataNotAllowed.rawValue, URLError.requestBodyStreamExhausted.rawValue,
+            ].contains(code)
+        case .http(let status): status == 408 || status == 429 || (500...599).contains(status)
+        case .cancelled, .unknown: false
+        }
+    }
+
+    public init(_ error: any Error, httpStatus: Int? = nil) {
+        underlyingError = error
+        if error is CancellationError {
+            kind = .cancelled
+        } else if let httpStatus {
+            kind = .http(status: httpStatus)
+        } else if let urlError = error as? URLError {
+            kind = .network(code: urlError.errorCode)
+        } else {
+            kind = .unknown
+        }
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.kind == rhs.kind && lhs.underlyingError.localizedDescription == rhs.underlyingError.localizedDescription
+    }
+}
+
+/// A failed item in an album write. A missing code is an unknown outcome, not a refusal.
+public struct AlbumWriteItemFailure: Sendable, Equatable {
+    public let linkID: String
+    public let code: Int?
+    public let message: String
+
+    public init(linkID: String, code: Int?, message: String) {
+        self.linkID = linkID
+        self.code = code
+        self.message = message
+    }
+}
+
 /// Surfaced when an album operation cannot be completed. `.unsupported` is the explicit,
 /// user-visible signal for "the wired backend cannot honestly perform this operation" - never a
 /// crash, never silently downgraded to a library-only upload.
-public enum AlbumError: LocalizedError, Equatable {
+public enum AlbumError: LocalizedError, Equatable, CustomNSError {
     /// The operation is not implemented by the wired backend. `operation`/`gap` are developer-facing
     /// diagnostics and are deliberately not surfaced in `errorDescription`.
     case unsupported(operation: String, gap: String)
     /// The album exists, but attaching the requested existing photos did not fully converge. The
     /// identifier is retained so UI can refresh the album list and offer a membership-only retry
     /// without creating a duplicate album.
-    case albumCreatedButPhotosNotAdded(albumID: AlbumID, albumName: String, message: String)
+    case albumCreatedButPhotosNotAdded(
+        albumID: AlbumID, albumName: String, message: String, cause: AlbumWriteCause? = nil)
     /// Proton accepted some membership writes and rejected others. Existing successful membership
     /// must never be hidden behind an all-or-nothing UI claim.
     case partialAdd(succeeded: Int, total: Int, message: String)
+    case partialAddWithCauses(succeeded: Int, total: Int, message: String, failures: [AlbumWriteItemFailure])
     /// A write targeted a shared album. It is rejected before any network request.
     case sharedAlbumReadOnly(SharedAlbumWriteRestriction)
     case backend(String)
+    case requestFailed(AlbumWriteCause)
+
+    public static var errorDomain: String { "AlbumError" }
+    public var errorUserInfo: [String: Any] {
+        var info: [String: Any] = [:]
+        if let description = errorDescription { info[NSLocalizedDescriptionKey] = description }
+        if let cause = underlyingCause { info[NSUnderlyingErrorKey] = cause }
+        return info
+    }
+
+    public var underlyingCause: (any Error)? {
+        switch self {
+        case .albumCreatedButPhotosNotAdded(_, _, _, let cause): cause?.underlyingError
+        case .requestFailed(let cause): cause.underlyingError
+        default: nil
+        }
+    }
+
+    public var writeCause: AlbumWriteCause? {
+        switch self {
+        case .albumCreatedButPhotosNotAdded(_, _, _, let cause): cause
+        case .requestFailed(let cause): cause
+        default: nil
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -330,11 +417,11 @@ public enum AlbumError: LocalizedError, Equatable {
             L10n.string("error.album_action_unavailable")
         case .sharedAlbumReadOnly(let restriction):
             restriction.localizedReason
-        case .albumCreatedButPhotosNotAdded(_, let albumName, _):
+        case .albumCreatedButPhotosNotAdded(_, let albumName, _, _):
             L10n.string("error.album_created_add_failed \(albumName)")
-        case .partialAdd(let succeeded, let total, _):
+        case .partialAdd(let succeeded, let total, _), .partialAddWithCauses(let succeeded, let total, _, _):
             L10n.string("error.album_partial_add \(succeeded) \(total)")
-        case .backend:
+        case .backend, .requestFailed:
             L10n.string("error.album_backend")
         }
     }
@@ -347,10 +434,13 @@ public enum AlbumError: LocalizedError, Equatable {
             "\(operation): \(gap)"
         case .sharedAlbumReadOnly(let restriction):
             "shared album write rejected: \(restriction)"
-        case .albumCreatedButPhotosNotAdded(_, _, let message),
+        case .albumCreatedButPhotosNotAdded(_, _, let message, _),
             .partialAdd(_, _, let message),
+            .partialAddWithCauses(_, _, let message, _),
             .backend(let message):
             message
+        case .requestFailed(let cause):
+            cause.underlyingError.localizedDescription
         }
     }
 }

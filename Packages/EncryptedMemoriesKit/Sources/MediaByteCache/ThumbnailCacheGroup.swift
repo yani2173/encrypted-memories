@@ -1,4 +1,30 @@
 import Foundation
+import PhotosCore
+
+/// An account-owned diagnostic source. Scans start only when the support exporter requests one.
+public final class ThumbnailCacheSupportGroup: ThumbnailCacheSupportSource, @unchecked Sendable {
+    private let caches: [ThumbnailCache]
+
+    public init(_ caches: [ThumbnailCache]) { self.caches = caches }
+
+    public func thumbnailCacheSupportSnapshot(deadline: ContinuousClock.Instant) async -> ThumbnailCacheSupportSnapshot
+    {
+        guard !caches.isEmpty else { return .unavailable }
+        var entries: [ThumbnailCacheSupportSnapshot.Cache] = []
+        var status = ThumbnailCacheSupportSnapshot.Availability.complete
+        for cache in caches {
+            let snapshot = await cache.thumbnailCacheSupportSnapshot(deadline: deadline)
+            if snapshot.availability == .unavailable { return .unavailable }
+            if snapshot.availability == .partial { status = .partial }
+            for entry in snapshot.caches {
+                guard !entries.contains(where: { $0.kind == entry.kind }) else { return .unavailable }
+                entries.append(entry)
+            }
+            if status == .partial { break }
+        }
+        return ThumbnailCacheSupportSnapshot(availability: status, caches: entries)
+    }
+}
 
 /// The caches whose encrypted disk size one Settings display shows. Two groups are equal only when they hold the
 /// same cache instances, so a display that restarts its observation when the group changes follows a cache that

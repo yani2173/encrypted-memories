@@ -133,3 +133,21 @@ import Testing
         range.map { PhotoUID(volumeID: "v", nodeID: "\(prefix)\($0)") }
     }
 }
+
+extension MLSearchConceptDiscovery {
+    /// Evaluates the curated concepts. `sensitiveUIDs` must come from a successful `sensitiveUIDs(search:)`;
+    /// those items never count towards a concept. A failed concept query skips only that concept.
+    fileprivate static func evaluate(
+        concepts: [MLSearchConcept] = MLSearchConceptCatalog.curated,
+        coveredAssetCount: Int,
+        sensitiveUIDs: Set<PhotoUID>,
+        limit: Int = 400,
+        maximumOverlap: Double = 0.8,
+        search: MLSearchConceptDiscovery.Search
+    ) async -> [MLSearchConceptEvidence] {
+        await evaluateWithCompletion(
+            concepts: concepts, coveredAssetCount: coveredAssetCount, sensitiveUIDs: sensitiveUIDs,
+            limit: limit, maximumOverlap: maximumOverlap, search: search
+        ).evidence
+    }
+}

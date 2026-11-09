@@ -117,7 +117,9 @@ import Testing
             slots: [slot(0, y: 0)], flatUIDs: [visible], cache: cache,
             displayMode: .squareFillCrop, cornerRadius: 11, decorations: nil, now: startedAt
         )
-        #expect(start.groups[0].quads[0].alpha == 0)
+        let startImage = try #require(start.groups.flatMap(\.quads).first { $0.mode == .textured })
+        #expect(startImage.alpha == 0)
+        #expect(start.groups.flatMap(\.quads).contains { $0.mode == .thumbnailPlaceholder })
         #expect(cache.hasActiveThumbnailReveal(in: [visible], now: startedAt))
 
         let halfwayAt = startedAt + GridThumbnailRevealPolicy.duration * 0.5
@@ -125,7 +127,7 @@ import Testing
             slots: [slot(0, y: 0)], flatUIDs: [visible], cache: cache,
             displayMode: .squareFillCrop, cornerRadius: 11, decorations: nil, now: halfwayAt
         )
-        let halfwayAlpha = halfway.groups[0].quads[0].alpha
+        let halfwayAlpha = try #require(halfway.groups.flatMap(\.quads).first { $0.mode == .textured }).alpha
         #expect(halfwayAlpha > 0.5 && halfwayAlpha < 1)
 
         let settledAt = startedAt + GridThumbnailRevealPolicy.duration
@@ -385,6 +387,69 @@ import Testing
         #expect(out.groups[3].quads.count == 8)
         #expect(out.groups[4].quads.count == 1)
         #expect(out.groups[4].quads[0].mode == .textured)
+    }
+
+    /// A selection mark that an active fold covers moves to the nearest free corner; the duration label keeps its
+    /// place, and an inactive fold changes nothing.
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func selectionMarkLeavesACornerThatAnActiveFoldCovers() throws {
+        let cache = try #require(makeCache())
+        let image = try #require(makeImage())
+        let photo = uid("fold-photo")
+        cache.beginFrame(pinned: [photo])
+        cache.uploadVisible(wanted: [photo]) { _ in image }
+        let viewport = CGRect(x: 0, y: 0, width: 400, height: 400)
+
+        func compose(_ regions: ReservedRegionLayout) -> (mark: CGRect?, labels: [CGRect]) {
+            let out = MetalGridFrameComposer.buildGroups(
+                slots: [slot(0, y: 0)], flatUIDs: [photo], cache: cache,
+                displayMode: .squareFillCrop, cornerRadius: 11,
+                decorations: MetalGridDecorations(
+                    accent: SIMD4(0, 0, 1, 1), accentGlyphColor: .white, selectionMode: true,
+                    selected: [], favorites: [],
+                    overlay: { _ in GridThumbnailOverlay(durationText: "0:12") },
+                    reservedRegions: regions
+                )
+            )
+            // The image, the duration pill, its glyphs, then the empty selection circle.
+            let solid = out.groups.flatMap(\.quads).filter { $0.mode == .solid }.map(\.rect)
+            return (out.groups.last?.quads.first?.rect, solid)
+        }
+
+        // In book pose the fold crosses the tile's trailing edge.
+        let fold = CGRect(x: 80, y: 0, width: 40, height: 400)
+        let flat = compose(.none)
+        let folded = compose(
+            ReservedRegionLayout(areas: [ReservedRegionArea(frame: fold, isActive: true)], bounds: viewport))
+        let open = compose(
+            ReservedRegionLayout(areas: [ReservedRegionArea(frame: fold, isActive: false)], bounds: viewport))
+
+        let flatMark = try #require(flat.mark)
+        let foldedMark = try #require(folded.mark)
+        #expect(flatMark.midX > 50 && flatMark.midY > 50)
+        #expect(foldedMark.maxX <= fold.minX && foldedMark.midY > 50, "The mark moves leading, in the bottom row")
+        #expect(!foldedMark.intersects(fold))
+        #expect(folded.labels.allSatisfy { !$0.intersects(foldedMark) }, "The mark leaves the duration label free")
+        #expect(folded.labels == flat.labels, "The duration label keeps its place")
+        #expect(open.mark == flat.mark)
+        #expect(open.labels == flat.labels)
+
+        // When the regions leave room only on the duration label (bottom-trailing, beside the mark's home), the mark
+        // covers the label and draws above it.
+        let pill = try #require(flat.labels.first)
+        try #require(pill.width > flatMark.width + 1, "A mark fits on the pill")
+        let crowded = compose(
+            ReservedRegionLayout(
+                areas: [
+                    CGRect(x: pill.maxX + 0.5, y: 0, width: 400, height: 400),
+                    CGRect(x: 0, y: 0, width: pill.minX - 0.5, height: 400),
+                    CGRect(x: 0, y: 0, width: 400, height: pill.minY - flatMark.height + 1),
+                ].map { ReservedRegionArea(frame: $0, isActive: true) },
+                bounds: viewport))
+        let crowdedMark = try #require(crowded.mark)
+        #expect(crowdedMark != flatMark)
+        #expect(crowdedMark.intersects(pill), "Selection comes first")
+        #expect(crowded.labels == flat.labels, "The duration label keeps its place")
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))

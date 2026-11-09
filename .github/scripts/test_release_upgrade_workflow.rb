@@ -41,22 +41,24 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
   def test_the_jobs_of_the_upgrade_gate_are_generated_from_the_point_list_and_the_sources
     journey = File.expand_path("../../scripts/upgrade-test/run_journey.py", __dir__)
     points = IO.popen(["python3", journey, "--list-points"], &:read).split
-    assert_equal 12, points.length
+    refute_empty points
     assert_equal points.uniq, points
     matrix = @jobs.fetch("upgrade").dig("strategy", "matrix")
     assert_equal "${{ fromJSON(needs.prepare.outputs.upgrade_matrix) }}", matrix
     assert_equal "${{ steps.upgrade-plan.outputs.upgrade_matrix }}", @jobs.fetch("prepare").fetch("outputs").fetch("upgrade_matrix")
     plan = @jobs.fetch("prepare").fetch("steps").find { |step| step["id"] == "upgrade-plan" }
     refute_nil plan
-    generated = IO.popen(["python3", "-c", "import json, sys; sys.path.insert(0, sys.argv[1]); " \
-      "import release_upgrade as r; print(json.dumps(r.upgrade_matrix(['a', 'b', 'c'], sys.argv[2].split())))",
-                          File.expand_path(__dir__), points.join(" ")], &:read)
-    shards = JSON.parse(generated).fetch("include")
-    shards.group_by { |shard| shard.fetch("platform") }.each do |platform, group|
-      covered = group.flat_map { |shard| shard.fetch("points").split }
-      assert_equal points.sort, covered.sort, "#{platform} shards must cover every point exactly once"
+    [points, points + (1..5).map { |index| "extra.#{index}" }].each do |listed|
+      generated = IO.popen(["python3", "-c", "import json, sys; sys.path.insert(0, sys.argv[1]); " \
+        "import release_upgrade as r; print(json.dumps(r.upgrade_matrix(['a', 'b', 'c'], sys.argv[2].split())))",
+                            File.expand_path(__dir__), listed.join(" ")], &:read)
+      shards = JSON.parse(generated).fetch("include")
+      shards.group_by { |shard| shard.fetch("platform") }.each do |platform, group|
+        covered = group.flat_map { |shard| shard.fetch("points").split }
+        assert_equal listed.sort, covered.sort, "#{platform} shards must cover every point exactly once"
+      end
+      assert_equal shards.length, shards.map { |shard| [shard.fetch("platform"), shard.fetch("shard")] }.uniq.length
     end
-    assert_equal shards.length, shards.map { |shard| [shard.fetch("platform"), shard.fetch("shard")] }.uniq.length
     run = @jobs.fetch("upgrade").fetch("steps").find { |step| step["name"] == "Test installed upgrades" }
     assert_equal "${{ matrix.points }}", run.fetch("env").fetch("UPGRADE_POINTS")
     assert_includes run.fetch("run"), '--points "${points[@]}"'

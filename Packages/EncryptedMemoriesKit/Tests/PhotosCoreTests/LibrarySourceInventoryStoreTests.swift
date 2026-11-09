@@ -430,8 +430,8 @@ final class LibrarySourceInventoryStoreTests: XCTestCase {
         XCTAssertGreaterThan(firstResult.changedRows, 0)
         XCTAssertEqual(secondResult.changedRows, 0)
         var persisted = Data()
-        for name in LibrarySourceInventoryStore.databaseFileNames() {
-            let url = directory.appendingPathComponent(name)
+        for suffix in ["", "-wal", "-shm"] {
+            let url = directory.appendingPathComponent(LibrarySourceInventoryStore.databaseFileName + suffix)
             if let data = try? Data(contentsOf: url) {
                 persisted.append(data)
             }

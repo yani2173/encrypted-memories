@@ -31,6 +31,17 @@ if [[ -n "${IOS_TEST_PARALLEL_WORKERS:-}" && ! "$IOS_TEST_PARALLEL_WORKERS" =~ ^
   echo "[ios-tests] IOS_TEST_PARALLEL_WORKERS must be a positive integer." >&2
   exit 64
 fi
+# Extra xcodebuild arguments for the test run, for example the retry options of the Duo job. The caller owns the
+# spelling of each argument; this script only splits the value on whitespace. A build takes no test run options, so a
+# value together with build-for-testing is an error instead of a silent drop.
+IOS_TEST_EXTRA_ARGS=()
+if [[ -n "${IOS_TEST_EXTRA_XCODEBUILD_ARGS:-}" && -n "${IOS_TEST_EXTRA_XCODEBUILD_ARGS//[[:space:]]/}" ]]; then
+  if [[ "$ACTION" == "build-for-testing" ]]; then
+    echo "[ios-tests] IOS_TEST_EXTRA_XCODEBUILD_ARGS is set, but build-for-testing takes no test run option." >&2
+    exit 64
+  fi
+  read -r -a IOS_TEST_EXTRA_ARGS <<< "$IOS_TEST_EXTRA_XCODEBUILD_ARGS"
+fi
 # The runner image decides which iPhone simulators exist, and Apple renames the lineup every year. A
 # pinned device name therefore fails as "Unable to find a device matching the provided destination
 # specifier" on a new image. Resolve an installed iPhone instead; IOS_TEST_DESTINATION still overrides it.
@@ -162,8 +173,8 @@ else
 fi
 export DEVELOPER_DIR
 
-# CI starts the simulator at the beginning of the job, while the dependencies and the test bundles build, so the
-# boot is done when the tests start. The wait below still covers a boot that has not finished.
+# CI starts the simulator after the prepare step, while the test bundles build, so the boot is done when the
+# tests start. The wait below still covers a boot that has not finished.
 if [[ "$ACTION" == "boot-simulator" ]]; then
   if [[ -z "$SIMULATOR_UDID" ]]; then
     echo "[ios-tests] no simulator to start."
@@ -248,6 +259,9 @@ if [[ -n "$XCTESTRUN" ]]; then
     -destination "$DESTINATION" \
     -derivedDataPath "$DERIVED_DATA"
 else
+  # An unsigned test host has no Keychain entitlement, so sign-out claim purging fails with
+  # errSecMissingEntitlement. Ad-hoc signing gives the hosted app its entitlement locally, as
+  # scripts/upgrade-test/build_apps.py already does for upgrade builds.
   set -- xcrun xcodebuild \
     -project "$ROOT/EncryptedMemories.xcodeproj" \
     -scheme "$SCHEME" \
@@ -257,7 +271,8 @@ else
     -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
     -disableAutomaticPackageResolution \
     -skipPackagePluginValidation \
-    CODE_SIGNING_ALLOWED=NO
+    CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGN_IDENTITY=-
 fi
 if [[ "$ACTION" != "build-for-testing" && "$SCHEME" == "EncryptedMemoriesMobileCI" ]]; then
   set -- "$@" "-only-testing:$TEST_TARGET"
@@ -274,6 +289,9 @@ fi
 # drops the simulator sysdiagnose from the result bundle of a failed run. The test results stay.
 if [[ "$ACTION" != "build-for-testing" ]]; then
   set -- "$@" -collect-test-diagnostics never
+fi
+if [[ ${#IOS_TEST_EXTRA_ARGS[@]} -gt 0 ]]; then
+  set -- "$@" "${IOS_TEST_EXTRA_ARGS[@]}"
 fi
 TEST_STATUS=0
 if [[ "$TEST_TARGET" == "EncryptedMemoriesMobileUITests" && -n "${IOS_TEST_DIAGNOSTICS_PATH:-}" ]]; then

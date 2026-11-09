@@ -54,6 +54,9 @@ public protocol ExactDuplicateMerging: Sendable {
     ) async throws -> Bool
     /// The members of each group in an order that needs no request.
     func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]]
+    /// The metadata that earlier rankings read for the members of `groups`, kept for as long as the content index
+    /// stands at the same cursor. It only splits groups on the screen; a merge reads the server state again.
+    func storedFingerprints(of groups: [ExactDuplicateGroup]) async -> [PhotoUID: ExactDuplicateFingerprint]
     /// The capture dates of `members` that the device already knows, without a request. Unknown photos are left out.
     func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date]
     /// Ranks the members of each group, page by page. A group whose facts cannot be read is not in its page.
@@ -83,14 +86,13 @@ extension ExactDuplicateMerging {
     /// Without a local timeline, no date is known.
     public func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] { [:] }
 
+    /// Without saved metadata, every group waits for the ranking.
+    public func storedFingerprints(of groups: [ExactDuplicateGroup]) async -> [PhotoUID: ExactDuplicateFingerprint] {
+        [:]
+    }
+
     /// Mergers without a merge journal leave no merge open.
     public func resolvePendingMerges() async {}
-
-    /// Mergers without a merge journal leave no merge open.
-    public func confirmNoPendingMerges() async -> Bool { true }
-
-    /// Mergers without a merge journal leave no trashed copy to an open merge.
-    public func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
 
     /// Mergers without shared listings merge each batch on its own.
     public func merge(
@@ -162,6 +164,8 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
     case keptPhotoUnreadable
     /// A merge failed, for example without a connection.
     case failed
+    /// Some groups failed during Merge All.
+    case partialFailure(failed: Int, total: Int, canRetry: Bool)
     /// Merge All stopped, because the person stopped it or a whole batch failed. `merged` of `total` groups merged.
     case stopped(merged: Int, total: Int)
 
@@ -169,6 +173,7 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
         switch self {
         case .keptDuplicates(let count, _): L10n.string("duplicates.kept_title \(count)")
         case .keptPhotoUnreadable: L10n.string("duplicates.not_merged_title")
+        case .partialFailure: L10n.string("duplicates.partial_failure_title")
         case .failed: L10n.string("duplicates.merge_failed_title")
         case .stopped(let merged, let total):
             L10n.string("duplicates.merge_stopped \(merged.formatted()) \(total.formatted())")
@@ -189,6 +194,9 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
         case .keptDuplicates(_, .unreadable): L10n.string("duplicates.kept_reason_unreadable")
         case .keptDuplicates(_, .differentDetails): L10n.string("duplicates.kept_reason_different_details")
         case .keptPhotoUnreadable: L10n.string("duplicates.kept_photo_unreadable")
+        case .partialFailure(let failed, let total, let canRetry):
+            L10n.string("duplicates.partial_failure_message \(failed) \(total)")
+                + (canRetry ? "" : "\n" + L10n.string("duplicates.merge_unavailable_reason"))
         case .failed: L10n.string("duplicates.merge_failed_message")
         case .stopped: ""
         }
@@ -416,8 +424,10 @@ public final class ExactDuplicatesModel {
     }
     /// The screen waits for its scan and metadata check.
     public private(set) var isCheckingGroups = false
+    /// The metadata check, else the running library check, for example while a reopened screen reads its groups.
     public var checkingGroupsLine: ProgressLine {
-        rankingLine ?? ProgressLine(title: L10n.string("duplicates.ranking_title"), detail: nil, fraction: nil)
+        rankingLine ?? checkLine
+            ?? ProgressLine(title: L10n.string("duplicates.ranking_title"), detail: nil, fraction: nil)
     }
     /// How much of the library the content index covered at the last scan.
     public private(set) var coverage = ExactDuplicateCoverage.complete
@@ -430,6 +440,37 @@ public final class ExactDuplicatesModel {
     public private(set) var rankingProgress: ExactDuplicateScanProgress?
     /// The message of the last merge, until the person dismisses it.
     public private(set) var notice: ExactDuplicateMergeNotice?
+    /// Only groups with a known temporary failure are offered again. A later merge rechecks them through the finder.
+    @ObservationIgnored private var retryMergeGroupIDs: Set<String> = []
+    @ObservationIgnored private var nonRetryableMergeGroupIDs: Set<String> = []
+    @ObservationIgnored private var retryMergeTotal = 0
+
+    public var canRetryFailedMerges: Bool {
+        guard case .partialFailure(_, _, true) = notice else { return false }
+        return canMerge && !retryMergeGroupIDs.isEmpty
+    }
+
+    public func retryFailedMerges() async {
+        guard canMerge, !retryMergeGroupIDs.isEmpty else { return }
+        let requested = groups.filter { retryMergeGroupIDs.contains($0.id) }
+        guard !requested.isEmpty else { return }
+        let previousFailures = nonRetryableMergeGroupIDs
+        let total = retryMergeTotal
+        await merge(requested, all: true, onlyRequestedIDs: true)
+        guard !isRetired, !Task.isCancelled else { return }
+        let remaining = groups.filter { previousFailures.contains($0.id) }.count
+        guard remaining > 0 else { return }
+        // A successful retry of temporary failures does not hide the groups that still need another decision.
+        switch notice {
+        case nil, .keptDuplicates, .keptPhotoUnreadable:
+            notice = .partialFailure(failed: remaining, total: total, canRetry: false)
+        case .partialFailure(let failed, _, let canRetry):
+            notice = .partialFailure(failed: remaining + failed, total: total, canRetry: canRetry)
+        default: return
+        }
+        nonRetryableMergeGroupIDs.formUnion(previousFailures)
+        retryMergeTotal = total
+    }
     /// The groups that Merge All handled in its batches, of all groups that it merges. Nil outside Merge All and while
     /// Merge All still ranks.
     public private(set) var mergeAllProgress: ExactDuplicateScanProgress?
@@ -450,7 +491,7 @@ public final class ExactDuplicatesModel {
     @ObservationIgnored private var mergeRun: ExactDuplicateMergeRun?
     /// A batch of a merge is with the finder.
     @ObservationIgnored private var isMergeBatchRunning = false
-    /// Merge All paused while its batch was with the finder. A suspended app can end a request of that batch.
+    /// The app went to the background while the current batch of Merge All ran.
     @ObservationIgnored private var batchOverlappedPause = false
     /// They wait until the running batch finished.
     @ObservationIgnored private var batchWaiters: [CheckedContinuation<Void, Never>] = []
@@ -493,6 +534,9 @@ public final class ExactDuplicatesModel {
     /// The metadata of each copy that a ranking read. A screen that opens again splits its groups at once by them.
     /// A merge that finds other metadata drops those of its group.
     @ObservationIgnored private var knownFingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
+    /// The candidates of the last scan that a ranking already read and found to be no duplicates. They leave the list,
+    /// but the check of a reopened screen counts them as done.
+    @ObservationIgnored private var checkedNonDuplicates = 0
     /// The groups that the ranking of this load has read or queued. A failed group waits for the next load or a merge.
     @ObservationIgnored private var rankingRequested: Set<String> = []
     /// The groups that the screen showed since the last pause, until the pause after them ranks their pages.
@@ -886,15 +930,21 @@ public final class ExactDuplicatesModel {
             let scan = try await finder.duplicateGroups(progress: report)
             let fallback = await finder.fallbackMembers(of: scan.groups)
             let dates = await finder.captureDates(of: scan.groups.flatMap(\.members))
+            let stored = await finder.storedFingerprints(of: scan.groups)
             guard generation == loadGeneration, !isMerging else { return false }
+            // What this session read is newer than what an earlier launch saved.
+            let known = stored.merging(knownFingerprints) { _, read in read }
             let earlier = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             let earlierByHash = Dictionary(grouping: groups, by: \.scanGroup.contentHash)
             var shown: [Group] = []
             shown.reserveCapacity(scan.groups.count)
             var usedIDs: Set<String> = []
+            var nonDuplicates = 0
             for scanned in scan.groups {
                 let order = fallback[scanned.id] ?? scanned.members
-                for part in knownParts(of: scanned, earlier: earlier, avoiding: usedIDs) {
+                let parts = knownParts(of: scanned, known: known, earlier: earlier, avoiding: usedIDs)
+                if parts.isEmpty { nonDuplicates += 1 }
+                for part in parts {
                     let groupDates = Dictionary(
                         part.members.compactMap { member in dates[member].map { (member, $0) } },
                         uniquingKeysWith: { first, _ in first })
@@ -929,6 +979,7 @@ public final class ExactDuplicatesModel {
                 }
             }
             groups = shown
+            checkedNonDuplicates = nonDuplicates
             // A hash whose members changed needs another verdict, even if it was checked before this rescan.
             rankingRequested.formIntersection(Set(rankingQueue).union(shown.filter(\.isRanked).map(\.id)))
             hasInvalidatedGroups = false
@@ -949,12 +1000,13 @@ public final class ExactDuplicatesModel {
     /// The parts of a scanned group by the metadata that a ranking read already, so a screen that opens again reads
     /// nothing for them. The whole group while the metadata of a member are unknown.
     private func knownParts(
-        of scanned: ExactDuplicateGroup, earlier: [String: Group], avoiding used: Set<String>
+        of scanned: ExactDuplicateGroup, known: [PhotoUID: ExactDuplicateFingerprint], earlier: [String: Group],
+        avoiding used: Set<String>
     ) -> [ExactDuplicateGroup] {
-        guard !knownFingerprints.isEmpty, scanned.members.allSatisfy({ knownFingerprints[$0] != nil }) else {
+        guard !known.isEmpty, scanned.members.allSatisfy({ known[$0] != nil }) else {
             return [scanned]
         }
-        return scanned.split(by: knownFingerprints, keepingIDWith: earlier[scanned.id]?.kept, avoiding: used)
+        return scanned.split(by: known, keepingIDWith: earlier[scanned.id]?.kept, avoiding: used)
     }
 
     /// `group` under `preferred`, else under its own ID, else under an ID from its first member, whichever no group in
@@ -1027,7 +1079,7 @@ public final class ExactDuplicatesModel {
             rankingToken = token
             // Freeze the workload before splitting or dropping groups. Each attempted candidate counts once,
             // including unreadable candidates; disappearing groups cannot move progress backwards.
-            let checked = checksAllGroups ? groups.filter(\.isRanked).count : 0
+            let checked = checksAllGroups ? groups.filter(\.isRanked).count + checkedNonDuplicates : 0
             rankingFraction = 0
             rankingProgress = ExactDuplicateScanProgress(completed: checked, total: checked + wanted.count)
         }
@@ -1243,8 +1295,6 @@ public final class ExactDuplicatesModel {
     /// Merges every group shown, batch by batch, with progress. The screen shows the outcome of each batch before the
     /// next one starts. Stop cancels owned copies and lets the rest of the batch finish. The run also ends after a batch in which no
     /// group merged, for example without a connection. A run does not survive the app: it never resumes after a quit.
-    /// A group whose request failed with a connection error after a pause during its batch merges once more when the
-    /// run continues.
     public func mergeAll() async {
         guard canMerge else { return }
         await merge(groups, all: true)
@@ -1325,41 +1375,6 @@ public final class ExactDuplicatesModel {
         }
     }
 
-    /// Merges `batch` with the finder. `runningMergeWorkEnded()` waits until it returns.
-    private func mergeBatch(
-        _ batch: [Group], in run: ExactDuplicateMergeRun
-    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
-        isMergeBatchRunning = true
-        let results = await finder.merge(
-            batch.map {
-                ExactDuplicateMergeRequest(group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen)
-            }, in: run)
-        isMergeBatchRunning = false
-        let waiters = batchWaiters
-        batchWaiters = []
-        waiters.forEach { $0.resume() }
-        return results
-    }
-
-    /// `results` of `batch`, after the groups that failed with a connection error merged once more. A suspended app
-    /// ends a request that was still running with a timeout or a lost connection when it returns, although the
-    /// connection works. The groups wait until Merge All continues; a second failure stays a failure.
-    private func retryingGroupsInterruptedByPause(
-        of batch: [Group], results: [Result<ExactDuplicateMergeOutcome, any Error>], in run: ExactDuplicateMergeRun
-    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
-        let interrupted = results.indices.filter { index in
-            guard case .failure(let error) = results[index] else { return false }
-            return BackupSyncRunner.isTransientNetwork(error)
-        }
-        guard !interrupted.isEmpty else { return results }
-        await waitWhileMergePaused()
-        guard !isStoppingMergeAll, !isRetired, !Task.isCancelled else { return results }
-        let retried = await mergeBatch(interrupted.map { batch[$0] }, in: run)
-        var updated = results
-        for (index, result) in zip(interrupted, retried) { updated[index] = result }
-        return updated
-    }
-
     public func dismissNotice() {
         notice = nil
     }
@@ -1369,10 +1384,13 @@ public final class ExactDuplicatesModel {
     /// its kept photo meanwhile stays, so the person sees it first. A group whose metadata could not be read stays,
     /// and the merge reports a failure. A group that was not ranked and whose photo the person did not choose follows
     /// its ranking. With `all`, the groups merge in batches with progress, and the run can stop.
-    private func merge(_ requested: [Group], all: Bool) async {
+    private func merge(_ requested: [Group], all: Bool, onlyRequestedIDs: Bool = false) async {
         isMerging = true
         isMergingAll = all
         notice = nil
+        retryMergeGroupIDs = []
+        nonRetryableMergeGroupIDs = []
+        retryMergeTotal = 0
         // The groups that nobody scrolled to rank page by page, with progress. The merge keeps the copy that the rule
         // ranks first in such a group, as every device does: the person saw no preselection there, only the order
         // that needs no request. A photo that the person chose stays.
@@ -1389,7 +1407,11 @@ public final class ExactDuplicatesModel {
         let requestedHashes = Set(requested.map(\.scanGroup.contentHash))
         let requestedByID = Dictionary(requested.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let candidates = groups.filter { group in
-            if all { return requestedHashes.contains(group.scanGroup.contentHash) }
+            if all {
+                // A selective retry never expands into a permanent-failure part of the same content hash.
+                return onlyRequestedIDs
+                    ? requestedByID[group.id] != nil : requestedHashes.contains(group.scanGroup.contentHash)
+            }
             guard let request = requestedByID[group.id] else { return false }
             let followsRanking = !request.isRanked && !request.isKeptChosen
             return Set(request.members) == Set(group.members) && (followsRanking || request.kept == group.kept)
@@ -1400,6 +1422,9 @@ public final class ExactDuplicatesModel {
         var kept: [PhotoUID: ExactDuplicateKeepReason] = [:]
         var keptPhotoUnreadable = false
         var failed = selected.count < candidates.count
+        var failedGroupCount = candidates.count - selected.count
+        var retryableGroups: Set<String> = []
+        var nonRetryableGroups = Set(candidates.map(\.id)).subtracting(selected.map(\.id))
         var stale = false
         var stopped = false
         var mergedGroups = 0
@@ -1426,10 +1451,12 @@ public final class ExactDuplicatesModel {
             handled += batch.count
             batchOverlappedPause = false
             var results = await mergeBatch(Array(batch), in: run)
-            if batchOverlappedPause {
-                results = await retryingGroupsInterruptedByPause(of: Array(batch), results: results, in: run)
+            if all, batchOverlappedPause {
+                results = await retryInterruptedGroups(of: Array(batch), results: results, in: run)
             }
             // The outcome of every group of the batch is one change of the screen.
+            let failedBeforeBatch = failedGroupCount
+            var batchHasRetryableFailure = false
             var updated = groups
             var trashed: [PhotoUID] = []
             for (group, result) in zip(batch, results) {
@@ -1464,10 +1491,17 @@ public final class ExactDuplicatesModel {
                         forgetFingerprints(of: group)
                         stale = true
                     }
-                } catch is CancellationError {
+                } catch  where error is CancellationError || (all && UploadError.isCancellation(error)) {
                     break
                 } catch {
                     failed = true
+                    failedGroupCount += 1
+                    if Self.canRetryMerge(after: error) {
+                        batchHasRetryableFailure = true
+                        retryableGroups.insert(group.id)
+                    } else {
+                        nonRetryableGroups.insert(group.id)
+                    }
                 }
             }
             if updated != groups { groups = updated }
@@ -1476,12 +1510,22 @@ public final class ExactDuplicatesModel {
             mergeAllProgress = ExactDuplicateScanProgress(completed: handled, total: selected.count)
             // No group of the batch merged, for example without a connection: the next batch would fail, too.
             if !results.isEmpty, !results.contains(where: { (try? $0.get()) != nil }), handled < selected.count {
+                // The unattempted groups stay in the library, too. A temporary failure can try them with the failed batch.
+                if failedGroupCount > failedBeforeBatch {
+                    failedGroupCount += selected.count - handled
+                    if batchHasRetryableFailure {
+                        retryableGroups.formUnion(selected[handled...].map(\.id))
+                    } else {
+                        nonRetryableGroups.formUnion(selected[handled...].map(\.id))
+                    }
+                }
                 stopped = true
                 break
             }
         }
         // A stop before the ranking reported a page leaves no group to merge, and the run still ends as stopped.
         if all, isStoppingMergeAll || Task.isCancelled, mergedGroups < candidates.count { stopped = true }
+        let userStopped = isStoppingMergeAll || Task.isCancelled || isRetired
         mergingGroupIDs = []
         isMerging = false
         isMergingAll = false
@@ -1489,10 +1533,18 @@ public final class ExactDuplicatesModel {
         isMergePaused = false
         mergeAllProgress = nil
         wakeMergeResumers()
-        notice =
-            stopped
-            ? .stopped(merged: mergedGroups, total: candidates.count)
-            : Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
+        if all, failedGroupCount > 0, !userStopped {
+            retryMergeGroupIDs = retryableGroups
+            nonRetryableMergeGroupIDs = nonRetryableGroups
+            retryMergeTotal = candidates.count
+            notice = .partialFailure(
+                failed: failedGroupCount, total: candidates.count, canRetry: !retryableGroups.isEmpty)
+        } else {
+            notice =
+                stopped
+                ? .stopped(merged: mergedGroups, total: candidates.count)
+                : Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
+        }
         guard !isRetired else { return }
         if stale {
             await load()
@@ -1508,6 +1560,45 @@ public final class ExactDuplicatesModel {
             checkInterrupted = false
             Task { await self.buildAndRescan(generation: generation) }
         }
+    }
+
+    /// Runs one batch through the finder and wakes the platform that waits for its end.
+    private func mergeBatch(
+        _ batch: [Group], in run: ExactDuplicateMergeRun
+    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        isMergeBatchRunning = true
+        let results = await finder.merge(
+            batch.map {
+                ExactDuplicateMergeRequest(group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen)
+            }, in: run)
+        isMergeBatchRunning = false
+        let waiters = batchWaiters
+        batchWaiters = []
+        waiters.forEach { $0.resume() }
+        return results
+    }
+
+    /// The app went to the background while `batch` ran. A request that was still open when the system suspended the
+    /// app fails when the app returns, although the connection works. Its error does not always tell: a read through
+    /// the SDK fails with an SDK error. So after the pause, every failed group of the batch merges once more, through
+    /// the same finder merge: it checks the open merges of the journal first and reads the server state of each group
+    /// again, so a group that the first try merged after all skips, and no trash repeats blindly. A second failure
+    /// counts. A cancelled group, a stop, or the end of the account tries nothing again.
+    private func retryInterruptedGroups(
+        of batch: [Group], results: [Result<ExactDuplicateMergeOutcome, any Error>], in run: ExactDuplicateMergeRun
+    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        let interrupted = zip(batch.indices, results).compactMap { index, result -> Int? in
+            guard case .failure(let error) = result, !(error is CancellationError) else { return nil }
+            return index
+        }
+        guard !interrupted.isEmpty else { return results }
+        await waitWhileMergePaused()
+        // The end of the account stops Merge All, too.
+        guard !isStoppingMergeAll, !Task.isCancelled else { return results }
+        let retried = await mergeBatch(interrupted.map { batch[$0] }, in: run)
+        var updated = results
+        for (index, result) in zip(interrupted, retried) { updated[index] = result }
+        return updated
     }
 
     /// Ranks `unranked` for a merge. A pause cancels the ranking; after the pause, the groups that it did not rank
@@ -1549,6 +1640,12 @@ public final class ExactDuplicatesModel {
         rankingPublication.revoke(rankingWorkerToken)
         hasInvalidatedGroups = true
         for member in group.scanGroup.members { knownFingerprints[member] = nil }
+    }
+
+    /// Unknown failures and permanent rejections need a new decision, not a blanket retry.
+    private static func canRetryMerge(after error: any Error) -> Bool {
+        if case UploadError.retryableBackend = error { return true }
+        return BackupSyncRunner.isTransientNetwork(error)
     }
 
     /// One reason only: a failure first, then the unreadable photo to keep, then the kept duplicates.

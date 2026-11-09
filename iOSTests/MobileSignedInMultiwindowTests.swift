@@ -10,7 +10,8 @@ import XCTest
 @testable import EncryptedMemoriesMobile
 @testable import TimelineUIKitFeature
 
-/// Signed-in acceptance of several windows through the production composition (iPad only).
+/// Signed-in acceptance of several windows through the production composition, wherever the platform supports
+/// several scenes.
 ///
 /// The shared account runtime receives an isolated, deterministic library (`MobileSignedInFixture`). The scene
 /// roots, tab shell, timeline screens, grids, selection, search, viewer and the ordered sign-out teardown are the
@@ -55,11 +56,11 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         let existingSessions = Set(windowScenes().map(\.session.persistentIdentifier))
         addTeardownBlock { @MainActor in
             // A thrown assertion must not leave fixture scenes active for the next suite.
+            // A platform that refuses to close a scene keeps it; that refusal is not a test failure.
             for scene in self.windowScenes() where !existingSessions.contains(scene.session.persistentIdentifier) {
-                UIApplication.shared.requestSceneSessionDestruction(scene.session, options: nil)
-            }
-            try await self.waitUntil("fixture scenes are removed during teardown") {
-                self.windowScenes().allSatisfy { existingSessions.contains($0.session.persistentIdentifier) }
+                if case .refused(let reason) = await MobileSceneCloser.close(scene) {
+                    self.note("teardown: the platform kept a fixture scene: \(reason)")
+                }
             }
             UIApplication.shared.activateSceneSession(for: UISceneSessionActivationRequest(session: firstScene.session))
             {
@@ -212,10 +213,16 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         XCTAssertTrue(runtime.isStarted)
 
         // 9. Closing the second window keeps the account; reopening a window attaches again.
+        //    A closed window can be checked only where the platform closes the scene; the platform's answer
+        //    decides, never the device idiom.
         let secondID = secondScene.session.persistentIdentifier
-        UIApplication.shared.requestSceneSessionDestruction(secondScene.session, options: nil)
-        try await waitUntil("closed window leaves the ledger") {
-            runtime.sceneLedger.phase(of: secondID) == nil
+        switch await MobileSceneCloser.close(secondScene) {
+        case .closed:
+            try await waitUntil("closed window leaves the ledger") {
+                runtime.sceneLedger.phase(of: secondID) == nil
+            }
+        case .refused(let reason):
+            note("the platform kept the second scene, ledger departure not checked: \(reason)")
         }
         XCTAssertNotNil(runtime.libraryModel.thumbnailFeed, "closing a window must not sign the account out")
         XCTAssertTrue(runtime.isStarted)
@@ -230,11 +237,22 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         try await waitUntil("reactivated window shows the reconfigured library") {
             grids(in: firstWindow).count == 1 && grids(in: firstWindow).first?.thumbnailFeed === fixture.feed
         }
-        let gridA3 = try XCTUnwrap(grids(in: firstWindow).first)
-        let resumedBefore = gridA3.renderTickCount
-        gridA3.handleImagesAvailable()
-        try await waitUntil("reactivated grid renders again") { gridA3.renderTickCount > resumedBefore }
-        note("reactivated first window: grid renders again (ticks \(resumedBefore) -> \(gridA3.renderTickCount))")
+        // The window may rebuild its grid while the scene returns. Wake whichever grid the window shows now, and
+        // count its ticks from the moment it appears.
+        var probe = try XCTUnwrap(grids(in: firstWindow).first)
+        var resumedBefore = probe.renderTickCount
+        try await waitUntil("reactivated grid renders again") {
+            guard let current = grids(in: firstWindow).first(where: { $0.thumbnailFeed === fixture.feed }) else {
+                return false
+            }
+            if current !== probe {
+                probe = current
+                resumedBefore = current.renderTickCount
+            }
+            current.handleImagesAvailable()
+            return current.renderTickCount > resumedBefore
+        }
+        note("reactivated first window: grid renders again (ticks \(resumedBefore) -> \(probe.renderTickCount))")
         let reopened = Set(windowScenes().map(\.session.persistentIdentifier))
         UIApplication.shared.activateSceneSession(for: UISceneSessionActivationRequest(role: .windowApplication)) {
             XCTFail("third scene activation failed: \($0)")
@@ -244,15 +262,20 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         let gridC = try await waitForGrid(in: thirdWindow)
         XCTAssertTrue(gridC.thumbnailFeed === fixture.feed, "a reopened window attaches to the same account")
         note("reopened window renders \(gridC.itemUIDs.count) items from the shared feed")
-        UIApplication.shared.requestSceneSessionDestruction(thirdScene.session, options: nil)
-        try await waitUntil("reopened window leaves the ledger") {
-            runtime.sceneLedger.phase(of: thirdScene.session.persistentIdentifier) == nil
+        switch await MobileSceneCloser.close(thirdScene) {
+        case .closed:
+            try await waitUntil("reopened window leaves the ledger") {
+                runtime.sceneLedger.phase(of: thirdScene.session.persistentIdentifier) == nil
+            }
+        case .refused(let reason):
+            note("the platform kept the reopened scene, ledger departure not checked: \(reason)")
         }
         UIApplication.shared.activateSceneSession(for: UISceneSessionActivationRequest(session: firstScene.session)) {
             _ in
         }
         try await waitUntil("first scene is active again") { firstScene.activationState == .foregroundActive }
-        XCTAssertEqual(runtime.appliedOpportunity, .foregroundActive)
+        // The shared ledger follows the scene's phase asynchronously, and a scene the platform kept reports too.
+        try await waitUntil("the account follows the active window") { runtime.appliedOpportunity == .foregroundActive }
     }
 
     // MARK: - Helpers

@@ -2,7 +2,7 @@ import CoreGraphics
 
 // MARK: - Zoom anchor mode / trigger
 
-/// Where a zoom is anchored. A trackpad pinch anchors at the cursor; toolbar/keyboard +/- anchor at the
+/// Where a zoom is anchored. A trackpad pinch anchors at the cursor; toolbar +/- anchors at the
 /// center of the grid viewport, never at a toolbar button location, stale hover point, or viewport top.
 public enum GridZoomAnchorMode: String, Sendable {
     case cursor
@@ -13,15 +13,9 @@ public enum GridZoomTrigger: String, Sendable {
     case pinch
     case toolbarPlus
     case toolbarMinus
-    case keyboardPlus
-    case keyboardMinus
 
     public var anchorMode: GridZoomAnchorMode {
         self == .pinch ? .cursor : .viewportCenter
-    }
-
-    public var isPlusMinus: Bool {
-        self != .pinch
     }
 }
 
@@ -193,10 +187,6 @@ public struct GridZoomCommitDelta: Equatable, Sendable {
     public let focusRowOverlap: Double
     /// Visible intersection over visible union across the whole local neighborhood.
     public let neighborhoodOverlap: Double
-
-    public var anchorDeltaDistance: CGFloat {
-        (anchorDelta.width * anchorDelta.width + anchorDelta.height * anchorDelta.height).squareRoot()
-    }
 
     /// Horizontal shift in whole columns, rounded; this is the dominant component of the phase seam.
     public func anchorColumnShift(pitch: CGFloat) -> Int {

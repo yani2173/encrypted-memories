@@ -533,11 +533,36 @@ final class UploadDraftContentLookupTests: XCTestCase {
         XCTAssertEqual(retried.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
     }
 
+    func testReplacementContentProofIsReusedBeforeAdoption() async throws {
+        let harness = try EditScenarioHarness()
+        defer { try? harness.cleanup() }
+        let source = try XCTUnwrap(harness.library.snapshot.first).source
+        let descriptor = UploadResourceDescriptor(
+            source: source, fileURL: URL(fileURLWithPath: "/fixture/current.heic"), filename: "current.heic",
+            fileSize: 20, modificationDate: harness.clock.now, precomputedSHA1Digest: Data(repeating: 1, count: 20))
+        let retired = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
+        try harness.journal.addSuperseded(retired, for: source)
+        try harness.journal.settle([retired.nodeID], related: [], trashed: true, for: source)
+        harness.server.setVisibility(.init(isActive: false, mainPhotoLinkID: nil), for: retired.nodeID)
+        let active = harness.server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let pipeline = UploadDedupePipeline(
+            store: harness.identities, checker: harness.server, currentClientUID: "this-uploader",
+            replacementJournal: harness.journal)
+        let before = harness.server.readCounts.visibility
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
+        XCTAssertEqual(harness.identities.record(for: source)?.remoteLinkID, active.nodeID)
+        // One name-pass read of the retired target, then one content-pass proof. Adoption reuses that proof.
+        XCTAssertEqual(harness.server.readCounts.visibility, before + 2)
+    }
+
     func testFirstBatchVisibilityFailureKeepsTheDraftInsteadOfAdoptingTheSecondBatch() async throws {
         try await assertBatchedVisibilityFailure(blocked: true)
     }
 
-    func testNormalContentPassKeepsItsFailOpenVisibilityBehaviorAcrossBatches() async throws {
+    func testNormalContentPassFailsClosedOnAFailedCandidateRead() async throws {
         try await assertBatchedVisibilityFailure(blocked: false)
     }
 
@@ -559,15 +584,20 @@ final class UploadDraftContentLookupTests: XCTestCase {
         server.setVisibilityError(
             UploadError.backend("First batch visibility failed"), whenAskingFor: related[0].nodeID)
 
-        let result = try await pipeline.resolve(descriptor)
-
-        XCTAssertEqual(
-            result.decision,
-            blocked
-                ? .skip(.draftExists, remoteLinkID: draft?.nodeID)
-                : .skip(.activeDuplicate, remoteLinkID: related[0].nodeID))
-        XCTAssertEqual(store.record(for: descriptor.source)?.remoteLinkID, blocked ? nil : related[0].nodeID)
-        XCTAssertEqual(store.record(for: descriptor.source)?.outcome, blocked ? nil : "duplicateActive")
+        if blocked {
+            let result = try await pipeline.resolve(descriptor)
+            XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft?.nodeID))
+        } else {
+            // #553 reverses fail-open adoption: a failed read cannot prove this candidate is still active.
+            do {
+                _ = try await pipeline.resolve(descriptor)
+                XCTFail("A failed visibility read must not adopt the candidate")
+            } catch {
+                XCTAssertEqual(error as? UploadError, .backend("First batch visibility failed"))
+            }
+        }
+        XCTAssertNil(store.record(for: descriptor.source)?.remoteLinkID)
+        XCTAssertNil(store.record(for: descriptor.source)?.outcome)
         XCTAssertEqual(server.contentLookupCount, 1)
         XCTAssertEqual(server.uploadRequestCount, 0)
         if let draft { XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft) }
@@ -636,6 +666,42 @@ final class UploadDraftContentLookupTests: XCTestCase {
         XCTAssertEqual(harness.server.uploadRequestCount, 0)
         try harness.relaunch()
         XCTAssertEqual(harness.journal.entry(for: source), journal)
+    }
+
+    func testARelatedStateInThisCheckKeepsTheDraftDespiteAnEarlierMainState() async throws {
+        try await assertEarlierMainStateKeepsTheDraft(
+            now: RemoteLinkVisibility(isActive: true, mainPhotoLinkID: "link-other"))
+    }
+
+    func testAStateWithoutAPhotoRoleInThisCheckKeepsTheDraftDespiteAnEarlierMainState() async throws {
+        try await assertEarlierMainStateKeepsTheDraft(
+            now: RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: false))
+    }
+
+    /// An earlier read of this view named the copy an active main photo; the read of this check does not.
+    private func assertEarlierMainStateKeepsTheDraft(
+        now: RemoteLinkVisibility, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let server = EditScenarioServer()
+        let store = FakeIdentityStore()
+        let (_, descriptor, draft) = fixture(server: server)
+        let pipeline = UploadDedupePipeline(store: store, checker: server, currentClientUID: "this-uploader")
+        let copy = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let url = URL(fileURLWithPath: "/fixture/\(copy.nodeID)")
+        await pipeline.prime([
+            UploadResourceDescriptor(
+                source: .file(url), fileURL: url, filename: copy.nodeID, fileSize: 20,
+                modificationDate: descriptor.modificationDate,
+                precomputedSHA1Digest: descriptor.precomputedSHA1Digest)
+        ])
+        server.setVisibility(now, for: copy.nodeID)
+        let before = server.readCounts.visibility
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID), file: file, line: line)
+        XCTAssertNil(store.record(for: descriptor.source)?.remoteLinkID, file: file, line: line)
+        XCTAssertEqual(server.readCounts.visibility, before + 1, file: file, line: line)
     }
 
     private func resolveBeforeTimeout(

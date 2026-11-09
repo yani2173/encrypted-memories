@@ -2,6 +2,42 @@ import Foundation
 import OSLog
 import SQLite3
 
+/// The schema version of a store that keeps it in the `schema` row of an info table. `verify` and `stamp` are the
+/// version checks that `SQLiteStoreSchemaGate.openCurrentStore` takes.
+public struct SQLiteInfoTableVersion: Sendable {
+    public let table: String
+    public let version: Int
+    /// True: `stamp` replaces an existing `schema` row. False: `stamp` is a plain INSERT and fails on an existing row,
+    /// so an open that finds a row written by another connection fails closed. Each store keeps the form it always had.
+    public let stampReplacesExistingRow: Bool
+
+    public init(table: String, version: Int, stampReplacesExistingRow: Bool) {
+        self.table = table
+        self.version = version
+        self.stampReplacesExistingRow = stampReplacesExistingRow
+    }
+
+    /// True when the `schema` row holds `version`. The read uses `sqlite3_column_int`.
+    public func verify(_ db: OpaquePointer?) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM \(table) WHERE key='schema';", -1, &stmt, nil) == SQLITE_OK
+        else { return false }
+        var onDisk: Int?
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
+        sqlite3_finalize(stmt)
+        return result == SQLITE_ROW && onDisk == version
+    }
+
+    /// Writes `version` into the `schema` row.
+    public func stamp(_ db: OpaquePointer?) -> Bool {
+        let conflict = stampReplacesExistingRow ? " ON CONFLICT(key) DO UPDATE SET value=excluded.value" : ""
+        return sqlite3_exec(
+            db, "INSERT INTO \(table)(key, value) VALUES('schema', \(version))\(conflict);", nil, nil, nil
+        ) == SQLITE_OK
+    }
+}
+
 /// Classifies an opened SQLite connection before a store applies persistent pragmas or schema DDL.
 public enum SQLiteStoreSchemaState: Sendable, Equatable {
     case empty
@@ -44,6 +80,14 @@ public enum SQLiteRebuildableStoreOutcome {
 /// columns, constraints, and indexes produced by this build's schema SQL. This keeps schema changes explicit
 /// and prevents markerless or future files from being modified while an older build tries to open them.
 public enum SQLiteStoreSchemaGate {
+    typealias ReadWriteOpen = (String, UnsafeMutablePointer<OpaquePointer?>, Int32) -> Int32
+    static func liveReadWriteOpen(
+        _ path: String, _ handle: UnsafeMutablePointer<OpaquePointer?>, _ flags: Int32
+    )
+        -> Int32
+    {
+        sqlite3_open_v2(path, handle, flags, nil)
+    }
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "SQLiteStore")
     /// `SQLITE_TRANSIENT`: SQLite copies bound text and blobs before the bind call returns.
     public static var transientDestructor: sqlite3_destructor_type {
@@ -59,6 +103,7 @@ public enum SQLiteStoreSchemaGate {
         schemaSQL: String,
         policy: LibraryDatabasePolicy,
         includeMemoryTuning: Bool = true,
+        strictEmptySchema: Bool = false,
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool
     ) -> OpaquePointer? {
@@ -68,6 +113,7 @@ public enum SQLiteStoreSchemaGate {
                 schemaSQL: schemaSQL,
                 policy: policy,
                 includeMemoryTuning: includeMemoryTuning,
+                strictEmptySchema: strictEmptySchema,
                 verifyVersion: verifyVersion,
                 stampVersion: stampVersion
             )
@@ -107,6 +153,19 @@ public enum SQLiteStoreSchemaGate {
         createDirectory: ((URL) throws -> Void)? = nil,
         probe: SQLiteFailureProbe = .live
     ) -> SQLiteRebuildableStoreOutcome {
+        openRebuildableStoreOutcome(
+            at: url, schemaSQL: schemaSQL, policy: policy, enforceForeignKeys: enforceForeignKeys,
+            verifyVersion: verifyVersion, stampVersion: stampVersion, copyItem: copyItem,
+            createDirectory: createDirectory, probe: probe, openReadWrite: liveReadWriteOpen)
+    }
+
+    static func openRebuildableStoreOutcome(
+        at url: URL, schemaSQL: String, policy: LibraryDatabasePolicy, enforceForeignKeys: Bool = false,
+        verifyVersion: (OpaquePointer?) -> Bool, stampVersion: (OpaquePointer?) -> Bool,
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil, probe: SQLiteFailureProbe = .live,
+        openReadWrite: ReadWriteOpen
+    ) -> SQLiteRebuildableStoreOutcome {
         func open() -> SQLiteStoreOpenResult {
             openStore(
                 at: url,
@@ -117,7 +176,8 @@ public enum SQLiteStoreSchemaGate {
                 stampVersion: stampVersion,
                 copyItem: copyItem,
                 createDirectory: createDirectory,
-                probe: probe
+                probe: probe,
+                openReadWrite: openReadWrite
             )
         }
         switch open() {
@@ -156,16 +216,19 @@ public enum SQLiteStoreSchemaGate {
         policy: LibraryDatabasePolicy,
         includeMemoryTuning: Bool = true,
         enforceForeignKeys: Bool = false,
+        strictEmptySchema: Bool = false,
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool,
         copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
         createDirectory: ((URL) throws -> Void)? = nil,
-        probe: SQLiteFailureProbe = .live
+        probe: SQLiteFailureProbe = .live,
+        openReadWrite: ReadWriteOpen = liveReadWriteOpen
     ) -> SQLiteStoreOpenResult {
         let compatibility = compatibility(
             at: url,
             schemaSQL: schemaSQL,
             busyTimeoutMs: policy.busyTimeoutMs,
+            strictEmptySchema: strictEmptySchema,
             versionIsCurrent: verifyVersion,
             copyItem: copyItem,
             createDirectory: createDirectory,
@@ -178,9 +241,8 @@ public enum SQLiteStoreSchemaGate {
         let flags =
             SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
             | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
-        guard sqlite3_open_v2(url.path, &opened, flags, nil) == SQLITE_OK, let handle = opened else {
-            sqlite3_close(opened)
-            return .failed
+        guard openReadWrite(url.path, &opened, flags) == SQLITE_OK, let handle = opened else {
+            return probe.keepsFileAfterFailedOpen(closing: opened) ? .retryLater : .failed
         }
         // The verification below waits as long as the busy timeout and tells a lock from another schema.
         let busy = SQLiteBusyRecorder(timeoutMs: policy.busyTimeoutMs)
@@ -195,6 +257,7 @@ public enum SQLiteStoreSchemaGate {
                 initializeCurrentSchema(
                     handle,
                     schemaSQL: schemaSQL,
+                    strictEmptySchema: strictEmptySchema,
                     stamp: { stampVersion(handle) }
                 )
             else {
@@ -228,6 +291,7 @@ public enum SQLiteStoreSchemaGate {
         at url: URL,
         schemaSQL: String,
         busyTimeoutMs: Int = 5_000,
+        strictEmptySchema: Bool = false,
         versionIsCurrent: (OpaquePointer?) -> Bool,
         copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
         createDirectory: ((URL) throws -> Void)? = nil,
@@ -252,7 +316,7 @@ public enum SQLiteStoreSchemaGate {
         // A failure that says nothing about the file, such as a full disk, ends the inspection the same way. SQLite
         // keeps the failure only until the next call, so each check below reads it right after the failed read.
         func keepsFile() -> Bool { busy.gaveUp || probe.keepsFile(after: inspection, step: .inspection) }
-        switch state(of: inspection) {
+        switch state(of: inspection, strictEmptySchema: strictEmptySchema) {
         case .empty:
             guard let version = userVersion(of: inspection) else { return busy.gaveUp ? .retryLater : .unavailable }
             if busy.gaveUp { return .retryLater }
@@ -447,8 +511,12 @@ public enum SQLiteStoreSchemaGate {
         return String(cString: value)
     }
 
-    public static func state(of db: OpaquePointer?) -> SQLiteStoreSchemaState {
-        guard let objects = schemaObjects(in: db) else { return .unavailable }
+    /// With strictEmptySchema, every row in sqlite_schema counts, including SQLite-owned objects.
+    /// The default preserves existing callers' application-schema classification.
+    public static func state(of db: OpaquePointer?, strictEmptySchema: Bool = false) -> SQLiteStoreSchemaState {
+        guard let objects = schemaObjects(in: db, includeInternalObjects: strictEmptySchema) else {
+            return .unavailable
+        }
         return objects.isEmpty ? .empty : .populated
     }
 
@@ -491,9 +559,10 @@ public enum SQLiteStoreSchemaGate {
     public static func initializeCurrentSchema(
         _ db: OpaquePointer?,
         schemaSQL: String,
+        strictEmptySchema: Bool = false,
         stamp: () -> Bool
     ) -> Bool {
-        guard state(of: db) == .empty,
+        guard state(of: db, strictEmptySchema: strictEmptySchema) == .empty,
             sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
         else { return false }
 
@@ -569,14 +638,16 @@ public enum SQLiteStoreSchemaGate {
         let match: String
     }
 
-    private static func schemaObjects(in db: OpaquePointer?) -> [SchemaObject]? {
+    private static func schemaObjects(in db: OpaquePointer?, includeInternalObjects: Bool = false) -> [SchemaObject]? {
+        let filter =
+            includeInternalObjects
+            ? "" : "WHERE type IN ('table','index','view','trigger') AND name NOT LIKE 'sqlite_%' "
         var statement: OpaquePointer?
         guard
             sqlite3_prepare_v2(
                 db,
                 "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-                    + "WHERE type IN ('table','index','view','trigger') AND name NOT LIKE 'sqlite_%' "
-                    + "ORDER BY type, name, tbl_name;",
+                    + filter + "ORDER BY type, name, tbl_name;",
                 -1,
                 &statement,
                 nil
@@ -667,24 +738,30 @@ public enum SQLiteStoreSchemaGate {
         guard sqlite3_prepare_v2(db, "PRAGMA index_list(\(literal(table)));", -1, &statement, nil) == SQLITE_OK
         else { return nil }
         defer { sqlite3_finalize(statement) }
-        var indexes: [Index] = []
+        var listed: [(name: String, isUnique: Bool, origin: String, isPartial: Bool)] = []
         var result = sqlite3_step(statement)
         while result == SQLITE_ROW {
-            guard let name = text(statement, 1),
-                let origin = text(statement, 3),
-                let columns = indexColumns(in: db, index: name)
-            else { return nil }
-            indexes.append(
-                Index(
-                    name: name,
-                    isUnique: sqlite3_column_int(statement, 2) != 0,
-                    origin: origin,
-                    isPartial: sqlite3_column_int(statement, 4) != 0,
-                    columns: columns
+            guard let name = text(statement, 1), let origin = text(statement, 3) else { return nil }
+            listed.append(
+                (
+                    name: name, isUnique: sqlite3_column_int(statement, 2) != 0, origin: origin,
+                    isPartial: sqlite3_column_int(statement, 4) != 0
                 ))
             result = sqlite3_step(statement)
         }
         guard result == SQLITE_DONE else { return nil }
+        // The columns come after the list statement is finalized. The finalize of a healthy statement resets the
+        // error code of the connection, so a failure of the column query inside the open list would be lost.
+        sqlite3_finalize(statement)
+        statement = nil
+        var indexes: [Index] = []
+        for entry in listed {
+            guard let columns = indexColumns(in: db, index: entry.name) else { return nil }
+            indexes.append(
+                Index(
+                    name: entry.name, isUnique: entry.isUnique, origin: entry.origin, isPartial: entry.isPartial,
+                    columns: columns))
+        }
         return indexes.sorted { $0.name < $1.name }
     }
 

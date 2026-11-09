@@ -64,7 +64,6 @@
         func restore(_ uids: [PhotoUID]) async throws { throw URLError(.unsupportedURL) }
         func emptyTrash() async throws { throw URLError(.unsupportedURL) }
         func metadataRowCount() async -> Int { 8 }
-        func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {}
         func addTags(_ tags: [Int], to uid: PhotoUID) async throws {}
 
         struct Link: Codable {

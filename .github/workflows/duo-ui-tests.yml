@@ -1,0 +1,174 @@
+name: iPhone Duo UI tests
+
+# Runs the iOS UI tests on the iPhone Duo simulator of a hosted runner for a pull request that changes the iOS app,
+# its UI tests, the project or the UI test scripts. It is advice, not a gate: the job is not a required check, has no
+# merge_group trigger and gives the merge queue no result. A failed test shows as a red job check on the pull request;
+# with continue-on-error the workflow run stays green, and the required checks and the merge queue do not change.
+# The job prints the runtimes, the device types and the free disk first, so that a runner image without the iPhone Duo
+# runtime ends with a summary instead of a failure.
+on:
+  pull_request:
+    paths:
+      - "iOSApp/**"
+      - "iOSUITests/**"
+      - "project.yml"
+      - "scripts/verify-ios-app-tests.sh"
+      - "scripts/build-paths.sh"
+      - ".github/scripts/run_ui_tests_with_retry.sh"
+      - ".github/workflows/duo-ui-tests.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duo-ui-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+
+jobs:
+  duo-ui:
+    name: iPhone Duo UI tests
+    runs-on: xcode-27
+    # A run takes about 40 to 60 minutes; the limit is 75 minutes.
+    timeout-minutes: 75
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Print the toolchain, the runtimes, the device types and the disk
+        run: |
+          set -uo pipefail
+          xcodebuild -version
+          xcodebuild -showsdks
+          xcrun simctl list runtimes
+          xcrun simctl list devicetypes
+          xcrun simctl list devices
+          df -h /
+
+      - name: Record the runner state at the start
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh start
+
+      - name: Find the iPhone Duo runtime and create the simulator
+        id: duo
+        run: |
+          set -euo pipefail
+          udid="$(python3 - <<'PY'
+          import json, subprocess, sys
+
+          def simctl(*args):
+              return json.loads(subprocess.run(["xcrun", "simctl", *args, "-j"], check=True, capture_output=True, text=True).stdout)
+
+          # The runtime that belongs to the pinned Xcode 27.1; a newer runtime comes with a new Xcode pin.
+          types = [t for t in simctl("list", "devicetypes")["devicetypes"] if t["name"] == "iPhone Duo"]
+          runtimes = [
+              r for r in simctl("list", "runtimes")["runtimes"]
+              if r.get("isAvailable") and r.get("platform") == "iOS" and r["version"].startswith("27.1")
+              and any(t["name"] == "iPhone Duo" for t in r.get("supportedDeviceTypes", []))
+          ]
+          if not types or not runtimes:
+              sys.exit(0)
+          runtime = max(runtimes, key=lambda r: r["buildversion"])
+          sys.stderr.write("runtime " + runtime["identifier"] + " build " + runtime["buildversion"] + "\n")
+          created = subprocess.run(
+              ["xcrun", "simctl", "create", "iPhone Duo UI tests", types[0]["identifier"], runtime["identifier"]],
+              check=True, capture_output=True, text=True).stdout.strip()
+          print(created)
+          PY
+          )"
+          if [[ -z "$udid" ]]; then
+            {
+              echo "### iPhone Duo UI tests: no iPhone Duo runtime"
+              echo "This runner image has no iOS 27.1 runtime with the iPhone Duo device type. The runtimes, the device types and the free disk are in the log of the first step. Nothing was tested and nothing failed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "udid=$udid" >> "$GITHUB_OUTPUT"
+            echo "Duo simulator $udid"
+          fi
+
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        if: ${{ steps.duo.outputs.found == 'true' }}
+        with:
+          build-profile: app
+          save-cache: "false"
+
+      - name: Build the app and both simulator test bundles once
+        id: test-build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: build-for-testing
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_DESTINATION: platform=iOS Simulator,id=${{ steps.duo.outputs.udid }}
+        run: bash ./scripts/verify-ios-app-tests.sh
+
+      - name: Run all UI tests without building on the iPhone Duo
+        id: ui
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: test-without-building
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_DESTINATION: platform=iOS Simulator,id=${{ steps.duo.outputs.udid }}
+          IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui-duo.xcresult
+          # The hosted runner sometimes fails to launch the app under load; xcodebuild repeats only a test case that
+          # failed, up to two iterations. A test that fails both iterations still fails the job.
+          IOS_TEST_EXTRA_XCODEBUILD_ARGS: -retry-tests-on-failure -test-iterations 2
+        run: bash .github/scripts/run_ui_tests_with_retry.sh bash ./scripts/verify-ios-app-tests.sh ui
+
+      - name: Report the test counts and the free disk
+        if: ${{ always() && steps.duo.outputs.found == 'true' }}
+        continue-on-error: true
+        env:
+          RESULT: ${{ runner.temp }}/ios-ui-duo.xcresult
+          PREPARE: ${{ steps.prepare.outcome }}
+          BUILD: ${{ steps.test-build.outcome }}
+        run: |
+          set -uo pipefail
+          {
+            echo "### iPhone Duo UI tests"
+            if [[ -d "$RESULT" ]]; then
+              xcrun xcresulttool get test-results summary --path "$RESULT" |
+                python3 -c 'import json,sys; r=json.load(sys.stdin); print("UI tests on iPhone Duo:", {k:r[k] for k in ["totalTestCount", "passedTests", "failedTests", "skippedTests"]})'
+              # A test that failed once and then passed on its retry appears in the result tree as a passed test case
+              # with a failed repetition below it. The raw log shows the iterations; this collects them in the summary.
+              xcrun xcresulttool get test-results tests --path "$RESULT" 2>/dev/null |
+                python3 .github/scripts/list_retried_tests.py || echo "The retried tests could not be read from the result bundle."
+            else
+              echo "No test result: the tests did not start (preparation: ${PREPARE:-not run}, build: ${BUILD:-not run})."
+            fi
+            echo '```'
+            df -h /
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain the UI test result
+        if: ${{ always() && steps.test-build.outcome != 'skipped' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-ui-duo-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          # The attempt-1 log always exists; only the attempt-1 result bundle needs a retry of a runner that failed to start.
+          path: |
+            ${{ runner.temp }}/ios-ui-duo.xcresult
+            ${{ runner.temp }}/ios-ui-duo-attempt1.xcresult
+            ${{ runner.temp }}/ios-ui-attempt1.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Record the runner state at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh end

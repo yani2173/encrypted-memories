@@ -36,9 +36,9 @@ UNKNOWN = "UNKNOWN"
 # so an absent entry alone proves nothing in the first minutes of a run.
 MINIMUM_RUN_AGE_SECONDS = 600
 POLL_INTERVAL_SECONDS = 60
-# The loop ends before the job limit, which stays below the 180 minute check timeout of the queue,
+# The loop ends before the job limit, which stays below the 360 minute check timeout of the queue,
 # exactly like the failure watchdog of the workflow.
-LOOP_DEADLINE_SECONDS = 9900
+LOOP_DEADLINE_SECONDS = 14100
 # A gh command that hangs must end the call, so that the job can end at its time limit.
 GH_CALL_TIMEOUT_SECONDS = 60
 QUEUE_BRANCH = "main"

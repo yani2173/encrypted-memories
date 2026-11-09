@@ -1,6 +1,57 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "albums.cover_failed_generic": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The album cover could not be changed."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Das Albumcover konnte nicht geändert werden."
+          }
+        }
+      }
+    },
+    "export.failed_generic": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The export could not be completed."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Der Export konnte nicht abgeschlossen werden."
+          }
+        }
+      }
+    },
+    "export.burst_load_failed": {
+      "comment": "Shown in the export-failure alert when reading a burst group failed; nothing was exported.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The photos of this burst could not be loaded, so nothing was exported."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Fotos dieser Serie konnten nicht geladen werden. Deshalb wurde nichts exportiert."
+          }
+        }
+      }
+    },
     "%@ / %@": {
       "comment": "Used and total Proton storage.",
       "extractionState": "manual",
@@ -87,24 +138,24 @@
       "extractionState": "manual",
       "comment": "Shown when a registered backup folder cannot be read. %@ is the affected name.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Backup stopped because %@ could not be read. Check its permissions and try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung wurde beendet, weil %@ nicht gelesen werden konnte. Prüfe die Berechtigungen und versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Encrypted Memories cannot read “%@”; allow access and select the folder again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Encrypted Memories kann „%@“ nicht lesen; erlaube den Zugriff und wähle den Ordner erneut aus." } }
       }
     },
     "settings.backup_folder_error_missing %@": {
       "extractionState": "manual",
       "comment": "Shown when a registered backup folder or child disappears. %@ is the affected name.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Backup stopped because %@ is no longer available. Select the folder again and retry." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung wurde beendet, weil %@ nicht mehr verfügbar ist. Wähle den Ordner erneut aus und versuche es noch einmal." } }
+        "en": { "stringUnit": { "state": "translated", "value": "“%@” is no longer available." } },
+        "de": { "stringUnit": { "state": "translated", "value": "„%@“ ist nicht mehr verfügbar." } }
       }
     },
     "settings.backup_folder_error_transient %@": {
       "extractionState": "manual",
       "comment": "Shown for another file-system error during folder backup. %@ is the affected name.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Backup could not finish reading %@. Try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung konnte %@ nicht vollständig lesen. Versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "“%@” could not be read completely." } },
+        "de": { "stringUnit": { "state": "translated", "value": "„%@“ konnte nicht vollständig gelesen werden." } }
       }
     },
     "settings.backup_status_section": {
@@ -118,8 +169,8 @@
       "extractionState": "manual",
       "comment": "Shown when the duplicate-protection store could not be opened; backup is disabled rather than risking double uploads.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Backup is unavailable because duplicate protection could not be initialized." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Backup ist nicht verfügbar, weil der Duplikatschutz nicht initialisiert werden konnte." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Backup is unavailable on this device." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Backup ist auf diesem Gerät nicht verfügbar." } }
       }
     },
     "settings.backup_sync_now": {
@@ -237,13 +288,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The photos couldn't be moved to Recently Deleted. They are still in your library."
+            "value": "Moving to Trash did not finish."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die Fotos konnten nicht in „Zuletzt gelöscht“ verschoben werden. Sie sind weiterhin in deiner Mediathek."
+            "value": "Das Verschieben in den Papierkorb wurde nicht abgeschlossen."
           }
         }
       }
@@ -254,13 +305,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The photos couldn't be restored. They are still in Recently Deleted."
+            "value": "Restoring did not finish."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die Fotos konnten nicht wiederhergestellt werden. Sie sind weiterhin in „Zuletzt gelöscht“."
+            "value": "Die Wiederherstellung wurde nicht abgeschlossen."
           }
         }
       }
@@ -725,13 +776,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Upload completed, but the library hasn’t indexed it yet. Use Refresh Library."
+            "value": "Uploaded items are not visible yet; use Refresh Library."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Upload abgeschlossen, aber die Mediathek hat ihn noch nicht indexiert. Verwende „Mediathek aktualisieren“."
+            "value": "Hochgeladene Objekte sind noch nicht sichtbar; verwende „Mediathek aktualisieren“."
           }
         }
       }

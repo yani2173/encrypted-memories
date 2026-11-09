@@ -8,13 +8,22 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 
 import release_upgrade
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/upgrade-test"))
+from journey import run_cases
 from release_upgrade import (
     UpgradeError, JOB_BUDGET_MINUTES, PLATFORMS, job_minutes, journey_points, select_sources, select_plan,
     upgrade_matrix, plan_matrix, unbudgeted_matrix, validate_override, MAX_MATRIX_JOBS, MIN_IOS_JOBS, shard_count,
 )
 
+REQUIRED_POINTS = {
+    "backup.claimed", "backup.remoteReceipt", "backup.localRecord",
+    "model.partial", "model.installRecord", "model.promoted",
+    "index.embed", "index.beforeCommit", "index.afterCommit",
+    "thumbnail.beforeLoad", "thumbnail.afterLoad", "thumbnail.stored",
+}
 
 def release(tag, published="2026-10-01T12:00:00Z", **changes):
     result = {
@@ -28,6 +37,43 @@ def release(tag, published="2026-10-01T12:00:00Z", **changes):
 
 
 class ReleaseUpgradeTests(unittest.TestCase):
+    def test_five_new_points_are_accepted_by_the_journey_list_contract(self):
+        journey = Path(__file__).resolve().parents[2] / "scripts/upgrade-test/run_journey.py"
+        points = journey_points(journey) + [f"extra.{index}" for index in range(5)]
+        case = type(self)("test_the_journey_lists_its_points_once_for_the_matrix")
+        result = unittest.TestResult()
+        with patch(__name__ + ".journey_points", return_value=points):
+            case.run(result)
+        self.assertTrue(result.wasSuccessful(), result.failures or result.errors)
+
+        sources = ["v1.0.5", "v1.1.0", "v1.2.0"]
+        jobs = upgrade_matrix(sources, points)["include"]
+        for platform in PLATFORMS:
+            calls = []
+            for job in jobs:
+                if job["platform"] == platform:
+                    run_cases(sources, job["points"].split(), lambda source, point: calls.append((source, point)))
+            expected = Counter((source, point) for source in sources for point in points)
+            self.assertEqual(Counter(calls), expected, platform)
+            self.assertNotEqual(Counter(calls[:-1]), expected, "an omitted case must fail coverage")
+            self.assertNotEqual(Counter(calls + [calls[0]]), expected, "a repeated case must fail coverage")
+
+    def test_journey_contract_rejects_a_missing_or_duplicated_required_point(self):
+        journey = Path(__file__).resolve().parents[2] / "scripts/upgrade-test/run_journey.py"
+        points = journey_points(journey)
+        for broken in ([point for point in points if point != required] for required in REQUIRED_POINTS):
+            case = type(self)("test_the_journey_lists_its_points_once_for_the_matrix")
+            result = unittest.TestResult()
+            with patch(__name__ + ".journey_points", return_value=broken):
+                case.run(result)
+            self.assertFalse(result.wasSuccessful())
+        for broken in (points + [point] for point in points):
+            case = type(self)("test_the_journey_lists_its_points_once_for_the_matrix")
+            result = unittest.TestResult()
+            with patch(__name__ + ".journey_points", return_value=broken):
+                case.run(result)
+            self.assertFalse(result.wasSuccessful())
+
     def test_stable_checks_every_supported_published_stable_predecessor(self):
         target = release("v1.1.0", "2026-10-08T12:00:00Z")
         history = [release("v1.0.5"), release("v1.0.3"), release("v1.0.4"), target]
@@ -133,7 +179,7 @@ class ReleaseUpgradeTests(unittest.TestCase):
     def test_the_journey_lists_its_points_once_for_the_matrix(self):
         journey = Path(__file__).resolve().parents[2] / "scripts/upgrade-test/run_journey.py"
         points = journey_points(journey)
-        self.assertEqual(len(points), 12)
+        self.assertTrue(REQUIRED_POINTS.issubset(points), REQUIRED_POINTS.difference(points))
         self.assertEqual(len(set(points)), len(points))
         self.assertEqual(points[0], "backup.claimed")
 

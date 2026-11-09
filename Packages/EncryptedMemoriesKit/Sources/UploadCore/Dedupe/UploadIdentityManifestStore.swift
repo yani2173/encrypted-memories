@@ -32,6 +32,8 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     private let connection: SQLiteStoreConnection
     private var db: OpaquePointer? { connection.database }
     private static let schemaVersion = 8
+    private static let schemaVersionRow = SQLiteInfoTableVersion(
+        table: "manifest_info", version: schemaVersion, stampReplacesExistingRow: false)
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
@@ -152,31 +154,9 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             at: url,
             schemaSQL: schema,
             policy: policy,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
+            verifyVersion: schemaVersionRow.verify,
+            stampVersion: schemaVersionRow.stamp
         )
-    }
-
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
-        var stmt: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(handle, "SELECT value FROM manifest_info WHERE key='schema';", -1, &stmt, nil)
-                == SQLITE_OK
-        else {
-            return false
-        }
-        let result = sqlite3_step(stmt)
-        let onDisk = result == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : nil
-        sqlite3_finalize(stmt)
-        return result == SQLITE_ROW && onDisk == schemaVersion
-    }
-
-    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
-        sqlite3_exec(
-            handle,
-            "INSERT INTO manifest_info(key, value) VALUES('schema', \(schemaVersion));",
-            nil, nil, nil
-        ) == SQLITE_OK
     }
 
     // MARK: UploadIdentityStore
@@ -196,9 +176,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 ) == SQLITE_OK
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, source.kind.rawValue)
-            bindText(stmt, 2, source.identifier)
-            bindText(stmt, 3, source.resource.rawValue)
+            do {
+                try connection.bindText(stmt, 1, source.kind.rawValue)
+                try connection.bindText(stmt, 2, source.identifier)
+                try connection.bindText(stmt, 3, source.resource.rawValue)
+            } catch {
+                return nil
+            }
             guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
             return UploadIdentityRecord(
                 source: source,
@@ -237,8 +221,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 ) == SQLITE_OK
             else { return [] }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, contentHash)
-            bindText(stmt, 2, hashKeyEpoch)
+            do {
+                try connection.bindText(stmt, 1, contentHash)
+                try connection.bindText(stmt, 2, hashKeyEpoch)
+            } catch {
+                return []
+            }
             sqlite3_bind_int64(stmt, 3, Int64(max(0, limit)))
             var records: [UploadIdentityRecord] = []
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -332,9 +320,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             for linkID in unique.sorted() {
                 sqlite3_reset(stmt)
                 sqlite3_clear_bindings(stmt)
-                bindText(stmt, 1, linkID)
-                bindText(stmt, 2, source.kind.rawValue)
-                bindText(stmt, 3, source.identifier)
+                do {
+                    try connection.bindText(stmt, 1, linkID)
+                    try connection.bindText(stmt, 2, source.kind.rawValue)
+                    try connection.bindText(stmt, 3, source.identifier)
+                } catch {
+                    return false
+                }
                 guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
             }
             return true
@@ -381,23 +373,27 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 ) == SQLITE_OK
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, record.source.kind.rawValue)
-            bindText(stmt, 2, record.source.identifier)
-            bindText(stmt, 3, record.source.resource.rawValue)
-            bindText(stmt, 4, record.filename)
-            bindText(stmt, 5, record.correctedName)
-            sqlite3_bind_int64(stmt, 6, record.fileSize)
-            sqlite3_bind_double(stmt, 7, record.modificationDate.timeIntervalSince1970)
-            bindText(stmt, 8, record.sha1Hex)
-            bindText(stmt, 9, record.nameHash)
-            bindText(stmt, 10, record.contentHash)
-            bindText(stmt, 11, record.hashKeyEpoch)
-            bindOptionalText(stmt, 12, record.remoteVolumeID)
-            bindOptionalText(stmt, 13, record.remoteLinkID)
-            bindOptionalText(stmt, 14, record.outcome)
-            sqlite3_bind_double(stmt, 15, record.updatedAt.timeIntervalSince1970)
-            sqlite3_bind_int(stmt, 16, onlyIfUnchanged ? 1 : 0)
-            bindOptionalText(stmt, 17, readLinkID)
+            do {
+                try connection.bindText(stmt, 1, record.source.kind.rawValue)
+                try connection.bindText(stmt, 2, record.source.identifier)
+                try connection.bindText(stmt, 3, record.source.resource.rawValue)
+                try connection.bindText(stmt, 4, record.filename)
+                try connection.bindText(stmt, 5, record.correctedName)
+                sqlite3_bind_int64(stmt, 6, record.fileSize)
+                sqlite3_bind_double(stmt, 7, record.modificationDate.timeIntervalSince1970)
+                try connection.bindText(stmt, 8, record.sha1Hex)
+                try connection.bindText(stmt, 9, record.nameHash)
+                try connection.bindText(stmt, 10, record.contentHash)
+                try connection.bindText(stmt, 11, record.hashKeyEpoch)
+                try connection.bindText(stmt, 12, record.remoteVolumeID)
+                try connection.bindText(stmt, 13, record.remoteLinkID)
+                try connection.bindText(stmt, 14, record.outcome)
+                sqlite3_bind_double(stmt, 15, record.updatedAt.timeIntervalSince1970)
+                sqlite3_bind_int(stmt, 16, onlyIfUnchanged ? 1 : 0)
+                try connection.bindText(stmt, 17, readLinkID)
+            } catch {
+                return false
+            }
             return sqlite3_step(stmt) == SQLITE_DONE
         }
     }
@@ -424,11 +420,16 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             for move in valid where didWrite {
                 sqlite3_reset(stmt)
                 sqlite3_clear_bindings(stmt)
-                bindText(stmt, 1, move.to)
-                sqlite3_bind_double(stmt, 2, now)
-                bindText(stmt, 3, move.from)
-                bindText(stmt, 4, move.contentHash)
-                bindText(stmt, 5, hashKeyEpoch)
+                do {
+                    try connection.bindText(stmt, 1, move.to)
+                    sqlite3_bind_double(stmt, 2, now)
+                    try connection.bindText(stmt, 3, move.from)
+                    try connection.bindText(stmt, 4, move.contentHash)
+                    try connection.bindText(stmt, 5, hashKeyEpoch)
+                } catch {
+                    didWrite = false
+                    break
+                }
                 didWrite = sqlite3_step(stmt) == SQLITE_DONE
             }
             sqlite3_finalize(stmt)
@@ -457,8 +458,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 ) == SQLITE_OK
             else { return [] }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, hashKeyEpoch)
-            bindText(stmt, 2, contentHash)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+                try connection.bindText(stmt, 2, contentHash)
+            } catch {
+                return []
+            }
             sqlite3_bind_int64(stmt, 3, Int64(max(0, limit)))
             var records: [UploadRemoteContentIndexRecord] = []
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -491,7 +496,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 ) == SQLITE_OK
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, hashKeyEpoch)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+            } catch {
+                return false
+            }
             return sqlite3_step(stmt) == SQLITE_ROW
         }
     }
@@ -536,8 +545,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             for identity in Set(identities) {
                 sqlite3_reset(recordStmt)
                 sqlite3_clear_bindings(recordStmt)
-                bindText(recordStmt, 1, hashKeyEpoch)
-                bindText(recordStmt, 2, identity.identifier)
+                do {
+                    try connection.bindText(recordStmt, 1, hashKeyEpoch)
+                    try connection.bindText(recordStmt, 2, identity.identifier)
+                } catch {
+                    return [:]
+                }
                 sqlite3_bind_int64(recordStmt, 3, identity.revision.rawValue)
                 guard sqlite3_step(recordStmt) == SQLITE_ROW else { continue }
                 let resourceCount = Int(sqlite3_column_int(recordStmt, 0))
@@ -545,8 +558,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
                 sqlite3_reset(linksStmt)
                 sqlite3_clear_bindings(linksStmt)
-                bindText(linksStmt, 1, hashKeyEpoch)
-                bindText(linksStmt, 2, identity.identifier)
+                do {
+                    try connection.bindText(linksStmt, 1, hashKeyEpoch)
+                    try connection.bindText(linksStmt, 2, identity.identifier)
+                } catch {
+                    return [:]
+                }
                 sqlite3_bind_int64(linksStmt, 3, identity.revision.rawValue)
                 var links: [String] = []
                 while sqlite3_step(linksStmt) == SQLITE_ROW {
@@ -581,8 +598,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 ) == SQLITE_OK
             else { return .unavailable }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, hashKeyEpoch)
-            bindText(stmt, 2, hashKeyEpoch)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+                try connection.bindText(stmt, 2, hashKeyEpoch)
+            } catch {
+                return .unavailable
+            }
             guard sqlite3_step(stmt) == SQLITE_ROW else { return .unavailable }
             let indexed = Int(sqlite3_column_int64(stmt, 0))
             let unresolved = Int(sqlite3_column_int64(stmt, 1))
@@ -638,10 +659,16 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return nil
             }
-            bindText(stmt, 1, hashKeyEpoch)
-            bindText(stmt, 2, buildID)
-            bindText(stmt, 3, eventID)
-            bindText(stmt, 4, sourceFingerprint)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+                try connection.bindText(stmt, 2, buildID)
+                try connection.bindText(stmt, 3, eventID)
+                try connection.bindText(stmt, 4, sourceFingerprint)
+            } catch {
+                sqlite3_finalize(stmt)
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return nil
+            }
             sqlite3_bind_int64(stmt, 5, Int64(total))
             sqlite3_bind_double(stmt, 6, updatedAt.timeIntervalSince1970)
             let wrote = sqlite3_step(stmt) == SQLITE_DONE
@@ -723,7 +750,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 return [:]
             }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, hashKeyEpoch)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+            } catch {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return [:]
+            }
             var result: [String: UploadBackupExternalIdentity] = [:]
             while sqlite3_step(stmt) == SQLITE_ROW {
                 guard let link = columnText(stmt, 0), let identifier = columnText(stmt, 1) else { continue }
@@ -766,8 +798,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 var stmt: OpaquePointer?
                 ok = sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK
                 if ok {
-                    bindText(stmt, 1, hashKeyEpoch)
-                    ok = sqlite3_step(stmt) == SQLITE_DONE
+                    do {
+                        try connection.bindText(stmt, 1, hashKeyEpoch)
+                        ok = sqlite3_step(stmt) == SQLITE_DONE
+                    } catch {
+                        ok = false
+                    }
                 }
                 sqlite3_finalize(stmt)
             }
@@ -839,7 +875,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
             }
-            bindText(deleteStmt, 1, hashKeyEpoch)
+            do {
+                try connection.bindText(deleteStmt, 1, hashKeyEpoch)
+            } catch {
+                sqlite3_finalize(deleteStmt)
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
+            }
             let didDelete = sqlite3_step(deleteStmt) == SQLITE_DONE
             sqlite3_finalize(deleteStmt)
 
@@ -854,7 +896,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
             }
-            bindText(deleteUnresolved, 1, hashKeyEpoch)
+            do {
+                try connection.bindText(deleteUnresolved, 1, hashKeyEpoch)
+            } catch {
+                sqlite3_finalize(deleteUnresolved)
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
+            }
             let didDeleteUnresolved = sqlite3_step(deleteUnresolved) == SQLITE_DONE
             sqlite3_finalize(deleteUnresolved)
 
@@ -976,7 +1024,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 ) == SQLITE_OK
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, hashKeyEpoch)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+            } catch {
+                return nil
+            }
             var groups: [String: [String]] = [:]
             while true {
                 switch sqlite3_step(stmt) {
@@ -1017,7 +1069,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 ) == SQLITE_OK
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, hashKeyEpoch)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+            } catch {
+                return nil
+            }
             var sizes: [String: Int64] = [:]
             while true {
                 switch sqlite3_step(stmt) {
@@ -1030,18 +1086,6 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                     return nil
                 }
             }
-        }
-    }
-
-    /// Row count - surfaced for tests and a future cache-status UI.
-    public func count() -> Int {
-        connection.withLock {
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM upload_identity;", -1, &stmt, nil) == SQLITE_OK else {
-                return 0
-            }
-            defer { sqlite3_finalize(stmt) }
-            return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
         }
     }
 
@@ -1062,9 +1106,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             }
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
-            bindText(stmt, 1, record.hashKeyEpoch)
-            bindText(stmt, 2, record.contentHash)
-            bindText(stmt, 3, record.remoteLinkID)
+            do {
+                try connection.bindText(stmt, 1, record.hashKeyEpoch)
+                try connection.bindText(stmt, 2, record.contentHash)
+                try connection.bindText(stmt, 3, record.remoteLinkID)
+            } catch {
+                return false
+            }
             guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
         }
         return true
@@ -1080,7 +1128,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                     -1, &stmt, nil
                 ) == SQLITE_OK
             else { return false }
-            bindText(stmt, 1, hashKeyEpoch)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+            } catch {
+                sqlite3_finalize(stmt)
+                return false
+            }
             let succeeded = sqlite3_step(stmt) == SQLITE_DONE
             sqlite3_finalize(stmt)
             guard succeeded else { return false }
@@ -1140,27 +1193,39 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
             sqlite3_reset(deleteLinksStmt)
             sqlite3_clear_bindings(deleteLinksStmt)
-            bindText(deleteLinksStmt, 1, record.hashKeyEpoch)
-            bindText(deleteLinksStmt, 2, record.externalIdentity.identifier)
+            do {
+                try connection.bindText(deleteLinksStmt, 1, record.hashKeyEpoch)
+                try connection.bindText(deleteLinksStmt, 2, record.externalIdentity.identifier)
+            } catch {
+                return false
+            }
             sqlite3_bind_int64(deleteLinksStmt, 3, record.externalIdentity.revision.rawValue)
             guard sqlite3_step(deleteLinksStmt) == SQLITE_DONE else { return false }
 
             sqlite3_reset(recordStmt)
             sqlite3_clear_bindings(recordStmt)
-            bindText(recordStmt, 1, record.hashKeyEpoch)
-            bindText(recordStmt, 2, record.externalIdentity.identifier)
-            sqlite3_bind_int64(recordStmt, 3, record.externalIdentity.revision.rawValue)
-            sqlite3_bind_int(recordStmt, 4, Int32(record.resourceCount))
-            bindText(recordStmt, 5, primaryLink)
+            do {
+                try connection.bindText(recordStmt, 1, record.hashKeyEpoch)
+                try connection.bindText(recordStmt, 2, record.externalIdentity.identifier)
+                sqlite3_bind_int64(recordStmt, 3, record.externalIdentity.revision.rawValue)
+                sqlite3_bind_int(recordStmt, 4, Int32(record.resourceCount))
+                try connection.bindText(recordStmt, 5, primaryLink)
+            } catch {
+                return false
+            }
             guard sqlite3_step(recordStmt) == SQLITE_DONE else { return false }
 
             for link in links {
                 sqlite3_reset(linkStmt)
                 sqlite3_clear_bindings(linkStmt)
-                bindText(linkStmt, 1, record.hashKeyEpoch)
-                bindText(linkStmt, 2, record.externalIdentity.identifier)
-                sqlite3_bind_int64(linkStmt, 3, record.externalIdentity.revision.rawValue)
-                bindText(linkStmt, 4, link)
+                do {
+                    try connection.bindText(linkStmt, 1, record.hashKeyEpoch)
+                    try connection.bindText(linkStmt, 2, record.externalIdentity.identifier)
+                    sqlite3_bind_int64(linkStmt, 3, record.externalIdentity.revision.rawValue)
+                    try connection.bindText(linkStmt, 4, link)
+                } catch {
+                    return false
+                }
                 guard sqlite3_step(linkStmt) == SQLITE_DONE else { return false }
             }
         }
@@ -1194,8 +1259,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         for linkID in unique {
             sqlite3_reset(deleteProofStmt)
             sqlite3_clear_bindings(deleteProofStmt)
-            bindText(deleteProofStmt, 1, hashKeyEpoch)
-            bindText(deleteProofStmt, 2, linkID)
+            do {
+                try connection.bindText(deleteProofStmt, 1, hashKeyEpoch)
+                try connection.bindText(deleteProofStmt, 2, linkID)
+            } catch {
+                return false
+            }
             guard sqlite3_step(deleteProofStmt) == SQLITE_DONE else { return false }
         }
 
@@ -1216,7 +1285,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             ) == SQLITE_OK
         else { return false }
         defer { sqlite3_finalize(deleteOrphansStmt) }
-        bindText(deleteOrphansStmt, 1, hashKeyEpoch)
+        do {
+            try connection.bindText(deleteOrphansStmt, 1, hashKeyEpoch)
+        } catch {
+            return false
+        }
         return sqlite3_step(deleteOrphansStmt) == SQLITE_DONE
     }
 
@@ -1235,8 +1308,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         for linkID in unique {
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
-            bindText(stmt, 1, hashKeyEpoch)
-            bindText(stmt, 2, linkID)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+                try connection.bindText(stmt, 2, linkID)
+            } catch {
+                return false
+            }
             guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
         }
         return deleteUnresolvedRemoteLinksLocked(Array(unique), hashKeyEpoch: hashKeyEpoch)
@@ -1273,9 +1350,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             guard !issue.remoteLinkID.isEmpty, !issue.indexGeneration.isEmpty else { return false }
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
-            bindText(stmt, 1, hashKeyEpoch)
-            bindText(stmt, 2, issue.remoteLinkID)
-            bindText(stmt, 3, issue.reason.rawValue)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+                try connection.bindText(stmt, 2, issue.remoteLinkID)
+                try connection.bindText(stmt, 3, issue.reason.rawValue)
+            } catch {
+                return false
+            }
             sqlite3_bind_double(stmt, 4, issue.firstObservedAt.timeIntervalSince1970)
             sqlite3_bind_double(stmt, 5, issue.lastObservedAt.timeIntervalSince1970)
             if let attempted = issue.lastRepairAttemptAt {
@@ -1283,7 +1364,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             } else {
                 sqlite3_bind_null(stmt, 6)
             }
-            bindText(stmt, 7, issue.indexGeneration)
+            do {
+                try connection.bindText(stmt, 7, issue.indexGeneration)
+            } catch {
+                return false
+            }
             guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
         }
         return true
@@ -1307,8 +1392,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         for linkID in unique {
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
-            bindText(stmt, 1, hashKeyEpoch)
-            bindText(stmt, 2, linkID)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+                try connection.bindText(stmt, 2, linkID)
+            } catch {
+                return false
+            }
             guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
         }
         return true
@@ -1326,7 +1415,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             ) == SQLITE_OK
         else { return nil }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, hashKeyEpoch)
+        do {
+            try connection.bindText(stmt, 1, hashKeyEpoch)
+        } catch {
+            return nil
+        }
         guard sqlite3_step(stmt) == SQLITE_ROW,
             let buildID = columnText(stmt, 0),
             let eventID = columnText(stmt, 1),
@@ -1354,7 +1447,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             ) == SQLITE_OK
         else { return nil }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, hashKeyEpoch)
+        do {
+            try connection.bindText(stmt, 1, hashKeyEpoch)
+        } catch {
+            return nil
+        }
         guard sqlite3_step(stmt) == SQLITE_ROW, let eventID = columnText(stmt, 0) else { return nil }
         return UploadRemoteContentIndexCheckpoint(
             eventID: eventID,
@@ -1380,7 +1477,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, value)
+        do {
+            try connection.bindText(stmt, 1, value)
+        } catch {
+            return false
+        }
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
@@ -1397,9 +1498,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         for record in records {
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
-            bindText(stmt, 1, record.hashKeyEpoch)
-            bindText(stmt, 2, record.contentHash)
-            bindText(stmt, 3, record.remoteLinkID)
+            do {
+                try connection.bindText(stmt, 1, record.hashKeyEpoch)
+                try connection.bindText(stmt, 2, record.contentHash)
+                try connection.bindText(stmt, 3, record.remoteLinkID)
+            } catch {
+                return false
+            }
             guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
         }
         return true
@@ -1435,9 +1540,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             guard !issue.remoteLinkID.isEmpty, !issue.indexGeneration.isEmpty else { return false }
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
-            bindText(stmt, 1, hashKeyEpoch)
-            bindText(stmt, 2, issue.remoteLinkID)
-            bindText(stmt, 3, issue.reason.rawValue)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+                try connection.bindText(stmt, 2, issue.remoteLinkID)
+                try connection.bindText(stmt, 3, issue.reason.rawValue)
+            } catch {
+                return false
+            }
             sqlite3_bind_double(stmt, 4, issue.firstObservedAt.timeIntervalSince1970)
             sqlite3_bind_double(stmt, 5, issue.lastObservedAt.timeIntervalSince1970)
             if let attempted = issue.lastRepairAttemptAt {
@@ -1445,7 +1554,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             } else {
                 sqlite3_bind_null(stmt, 6)
             }
-            bindText(stmt, 7, issue.indexGeneration)
+            do {
+                try connection.bindText(stmt, 7, issue.indexGeneration)
+            } catch {
+                return false
+            }
             guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
         }
         return true
@@ -1468,7 +1581,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             ) == SQLITE_OK
         else { return nil }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, hashKeyEpoch)
+        do {
+            try connection.bindText(stmt, 1, hashKeyEpoch)
+        } catch {
+            return nil
+        }
         var issues: [UploadRemoteContentIndexIssue] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let linkID = columnText(stmt, 0),
@@ -1511,7 +1628,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             ) == SQLITE_OK
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, hashKeyEpoch)
+        do {
+            try connection.bindText(stmt, 1, hashKeyEpoch)
+        } catch {
+            return false
+        }
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
@@ -1532,9 +1653,13 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             guard !record.remoteLinkID.isEmpty, !record.externalIdentity.identifier.isEmpty else { return false }
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
-            bindText(stmt, 1, hashKeyEpoch)
-            bindText(stmt, 2, record.remoteLinkID)
-            bindText(stmt, 3, record.externalIdentity.identifier)
+            do {
+                try connection.bindText(stmt, 1, hashKeyEpoch)
+                try connection.bindText(stmt, 2, record.remoteLinkID)
+                try connection.bindText(stmt, 3, record.externalIdentity.identifier)
+            } catch {
+                return false
+            }
             sqlite3_bind_int64(stmt, 4, record.externalIdentity.revision.rawValue)
             guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
         }
@@ -1558,8 +1683,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, Int64(nextCursor))
         sqlite3_bind_double(stmt, 2, updatedAt.timeIntervalSince1970)
-        bindText(stmt, 3, hashKeyEpoch)
-        bindText(stmt, 4, buildID)
+        do {
+            try connection.bindText(stmt, 3, hashKeyEpoch)
+            try connection.bindText(stmt, 4, buildID)
+        } catch {
+            return false
+        }
         return sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1
     }
 
@@ -1581,8 +1710,12 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             ) == SQLITE_OK
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, hashKeyEpoch)
-        bindText(stmt, 2, checkpoint.eventID)
+        do {
+            try connection.bindText(stmt, 1, hashKeyEpoch)
+            try connection.bindText(stmt, 2, checkpoint.eventID)
+        } catch {
+            return false
+        }
         sqlite3_bind_double(stmt, 3, checkpoint.refreshedAt.timeIntervalSince1970)
         return sqlite3_step(stmt) == SQLITE_DONE
     }
@@ -1605,27 +1738,17 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             ) == SQLITE_OK
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, hashKeyEpoch)
-        bindText(stmt, 2, checkpoint.eventID)
+        do {
+            try connection.bindText(stmt, 1, hashKeyEpoch)
+            try connection.bindText(stmt, 2, checkpoint.eventID)
+        } catch {
+            return false
+        }
         sqlite3_bind_double(stmt, 3, checkpoint.refreshedAt.timeIntervalSince1970)
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
-    // MARK: Column/bind helpers
-
-    private let transient = SQLiteStoreSchemaGate.transientDestructor  // SQLITE_TRANSIENT
-
-    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
-        sqlite3_bind_text(stmt, index, value, -1, transient)
-    }
-
-    private func bindOptionalText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) {
-        if let value {
-            sqlite3_bind_text(stmt, index, value, -1, transient)
-        } else {
-            sqlite3_bind_null(stmt, index)
-        }
-    }
+    // MARK: Column helpers
 
     private func columnText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {
         guard let text = sqlite3_column_text(stmt, index) else { return nil }

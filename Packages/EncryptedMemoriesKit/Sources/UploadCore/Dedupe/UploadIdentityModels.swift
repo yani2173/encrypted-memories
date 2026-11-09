@@ -7,7 +7,7 @@ import PhotosCore
 /// All upload paths use this vocabulary so the dedupe pipeline stays cross-platform.
 public struct UploadSourceIdentity: Sendable, Hashable, Codable {
     /// Which adapter produced the resource - the namespace of `identifier`.
-    public enum Kind: String, Sendable, Codable {
+    public enum Kind: String, Sendable, Codable, CaseIterable {
         /// A file on disk; `identifier` is the absolute file-system path.
         case fileURL
         /// A photo-library asset resource. Prefer a stable provider identifier when available.
@@ -63,6 +63,26 @@ public struct UploadSourceIdentity: Sendable, Hashable, Codable {
 
 // MARK: - Resource descriptor
 
+/// A durable pending decision supplies this account-local recheck authority; it never grants an upload by itself.
+public struct UploadRestoredCompoundContext: Sendable, Equatable {
+    public let source: UploadSourceIdentity
+    public let revision: UploadBackupRevision
+    public let generation: Int64
+    public let confirmedRemote: PhotoUID
+    public let requiredMembers: [UploadSourceIdentity.Resource]
+
+    public init(
+        source: UploadSourceIdentity, revision: UploadBackupRevision, generation: Int64, confirmedRemote: PhotoUID,
+        requiredMembers: [UploadSourceIdentity.Resource] = []
+    ) {
+        self.source = source
+        self.revision = revision
+        self.generation = generation
+        self.confirmedRemote = confirmedRemote
+        self.requiredMembers = requiredMembers
+    }
+}
+
 /// Everything a source adapter must state about one resource before any bytes are read - the input
 /// to hashing, cache validity, and the duplicate check. Platform adapters only construct these;
 /// they never make dedupe decisions themselves.
@@ -81,9 +101,6 @@ public struct UploadResourceDescriptor: Sendable {
     public let precomputedSHA1Digest: Data?
     /// Admission intent for local hashing only. It is never persisted or sent to the server.
     public let workIntent: LibraryWorkIntent
-    /// The primary resource of this compound when `source.resource` is secondary - lets a future
-    /// Live Photo path upload only the missing paired video via `mainPhotoUid`.
-    public let mainResource: UploadSourceIdentity?
     /// The remote main photo that a burst member becomes a related photo of. The dedupe rule for burst members
     /// reads the relation from it. It is never persisted.
     public let mainRemoteLinkID: String?
@@ -110,7 +127,6 @@ public struct UploadResourceDescriptor: Sendable {
         modificationDate: Date,
         precomputedSHA1Digest: Data? = nil,
         workIntent: LibraryWorkIntent = .userInitiated,
-        mainResource: UploadSourceIdentity? = nil,
         mainRemoteLinkID: String? = nil,
         requiresRelatedMatch: Bool = false,
         externalIdentifier: String? = nil,
@@ -128,7 +144,6 @@ public struct UploadResourceDescriptor: Sendable {
         self.modificationDate = modificationDate
         self.precomputedSHA1Digest = precomputedSHA1Digest
         self.workIntent = workIntent
-        self.mainResource = mainResource
         self.mainRemoteLinkID = mainRemoteLinkID
         self.requiresRelatedMatch = requiresRelatedMatch
         self.externalIdentifier = externalIdentifier
@@ -189,7 +204,6 @@ public struct UploadResourceDescriptor: Sendable {
             modificationDate: modificationDate,
             precomputedSHA1Digest: precomputedSHA1Digest,
             workIntent: workIntent ?? self.workIntent,
-            mainResource: mainResource,
             mainRemoteLinkID: mainRemoteLinkID ?? self.mainRemoteLinkID,
             requiresRelatedMatch: requiresRelatedMatch ?? self.requiresRelatedMatch,
             externalIdentifier: externalIdentifier ?? self.externalIdentifier,
@@ -504,11 +518,6 @@ extension UploadIdentityStore {
     public func isNeededElsewhere(_ linkIDs: Set<String>, by source: UploadSourceIdentity) -> Bool {
         isNeededElsewhere(linkIDs) { row, _ in row.kind == source.kind && row.identifier == source.identifier }
     }
-
-    /// One row of `trustedRecords`.
-    public func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
-        trustedRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
-    }
 }
 
 /// One active remote photo identity retained by the local content index. The hash is already keyed
@@ -768,13 +777,6 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     func remoteContentDuplicateSizes(hashKeyEpoch: String) -> [String: Int64]?
 }
 
-extension UploadRemoteContentIndexStore {
-    /// One record of `remoteContentRecords`.
-    public func remoteContentRecord(contentHash: String, hashKeyEpoch: String) -> UploadRemoteContentIndexRecord? {
-        remoteContentRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
-    }
-}
-
 /// Local content hashing with streaming SHA-1.
 /// The protocol lets tests and platform adapters provide hashing without changing the pipeline.
 /// Hashing runs asynchronously so concurrent items do not block the queue.
@@ -862,7 +864,15 @@ public protocol UploadDuplicateChecking: Sendable {
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String>
     /// The current state and main photo of each link. A link that the server no longer knows is absent. The edit
     /// replacement reads it, because only the state of a photo proves that the person deleted it.
+    /// On the Proton backend this read fails closed: an answer that is not complete throws, because an omitted link
+    /// and a deleted link look the same there. The Exact Duplicates reads ask for the lenient read below.
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility]
+    /// `linkVisibility(of:)` that accepts an incomplete answer when `requiresCompleteResponse` is false: a link that
+    /// the answer omits is absent. The Exact Duplicates reads use it and keep their behavior on such an answer.
+    /// The default ignores the flag, for backends without a completeness signal.
+    func linkVisibility(
+        of linkIDs: [String], requiresCompleteResponse: Bool
+    ) async throws -> [String: RemoteLinkVisibility]
     /// Fresh raw states and response completeness, without the legacy visibility defaults.
     func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot
     /// Active main photos carrying this iCloud identifier. Incomplete results cannot prove absence.
@@ -877,8 +887,6 @@ public protocol UploadDuplicateChecking: Sendable {
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool)
     /// Identity of an active main. A missing identifier is unknown, not evidence of another asset.
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool)
-    /// Live encrypted iOS.photos modification time. Missing or unreadable metadata is unknown.
-    func modificationDate(ofMainLink linkID: String) async throws -> Date?
     /// Live complete compound metadata. Missing or unreadable evidence returns nil.
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound?
     /// Earlier links named by an active main's lineage. Uses the same completeness boundary as the head reads.
@@ -917,8 +925,14 @@ extension RemoteLinkVisibility {
 }
 
 public extension UploadDuplicateChecking {
-    /// `linkVisibility(of:)` in requests of at most `batchSize` links, the limit of Proton's metadata endpoint. A
-    /// failed request fails the whole read.
+    func linkVisibility(
+        of linkIDs: [String], requiresCompleteResponse: Bool
+    ) async throws -> [String: RemoteLinkVisibility] {
+        try await linkVisibility(of: linkIDs)
+    }
+
+    /// `linkVisibility(of:requiresCompleteResponse: false)` in requests of at most `batchSize` links, the limit of
+    /// Proton's metadata endpoint. A failed request fails the whole read. The Exact Duplicates reads use it.
     func linkVisibility(
         batching linkIDs: [String], batchSize: Int = UploadDedupePipeline.protonDuplicateBatchSize
     ) async throws -> [String: RemoteLinkVisibility] {
@@ -927,12 +941,11 @@ public extension UploadDuplicateChecking {
         for start in stride(from: 0, to: linkIDs.count, by: size) {
             try Task.checkCancellation()
             let chunk = Array(linkIDs[start..<min(start + size, linkIDs.count)])
-            visibility.merge(try await linkVisibility(of: chunk)) { _, new in new }
+            visibility.merge(try await linkVisibility(of: chunk, requiresCompleteResponse: false)) { _, new in new }
         }
         return visibility
     }
 
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? { nil }
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? { nil }
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
@@ -1006,6 +1019,11 @@ public struct DedupeUnavailableIdentityResolver: UploadIdentityResolving {
 /// The pipeline seam `UploadManager` uses to resolve a descriptor into identity and decision.
 /// `UploadDedupePipeline` serves every platform.
 public protocol UploadIdentityResolving: Sendable {
+    func prepareRestoredCompound(
+        _ context: UploadRestoredCompoundContext, isCurrent: @escaping @Sendable () -> Bool
+    ) async throws
+    func restoredPhotoOutcome(_ context: UploadRestoredCompoundContext) async throws -> PendingBackupReturnOutcome
+    func endRestoredCompound(_ context: UploadRestoredCompoundContext) async
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult
     /// Re-checks a still-valid local upload proof against current remote state without ever
     /// returning a fresh-upload decision. Backup uses this only when an unfinished secondary is
@@ -1051,6 +1069,15 @@ public protocol UploadIdentityResolving: Sendable {
 }
 
 public extension UploadIdentityResolving {
+    func prepareRestoredCompound(
+        _ context: UploadRestoredCompoundContext, isCurrent: @escaping @Sendable () -> Bool
+    ) async throws {
+        throw UploadError.backend("Restored compound checking is unavailable")
+    }
+    func restoredPhotoOutcome(_ context: UploadRestoredCompoundContext) async throws -> PendingBackupReturnOutcome {
+        .unreadable
+    }
+    func endRestoredCompound(_ context: UploadRestoredCompoundContext) async {}
     func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord? { nil }
     func revalidateKnownRemote(_ descriptor: UploadResourceDescriptor) async throws -> UploadDuplicateDecision? { nil }
     func remoteAssetProofs(

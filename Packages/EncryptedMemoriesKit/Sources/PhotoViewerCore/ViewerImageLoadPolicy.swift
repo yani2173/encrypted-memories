@@ -41,8 +41,7 @@ public enum ViewerImageLoadPolicy {
     public static let maxZoomedPixelSize = 6144
 
     /// How many pages either side of the current one may load their display image. `0` = current only (the tightest
-    /// bound: no fetch/decode fan-out to swipe-preview neighbours). Kept as a knob so a future preload of ±1 is a
-    /// one-line change, not a rewrite.
+    /// bound: no fetch/decode fan-out to swipe-preview neighbours).
     public static let loadNeighborRadius = 0
 
     /// Whether a page at `distanceFromCurrent` (|pageIndex − currentIndex|) may load its display image now.

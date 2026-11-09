@@ -176,8 +176,8 @@ final class EditScenarioTests: XCTestCase {
         XCTAssertEqual(harness.state(of: on), .completed)
         XCTAssertEqual(harness.server.links.first { $0.uid == still.main.uid }?.state, .trashed)
         let liveAgain = try compound(of: try harness.liveMain())
-        XCTAssertEqual(liveAgain.main.tags, liveTag)
-        XCTAssertEqual(liveAgain.video.tags, liveTag)
+        XCTAssertEqual(liveAgain.main.tags, liveTag, "the still receives tag 3 after settlement")
+        XCTAssertEqual(liveAgain.video.tags, [], "the paired video never carries the Live Photo tag")
         harness.assertCurrentManifest()
     }
 
@@ -964,7 +964,7 @@ final class EditScenarioTests: XCTestCase {
         await harness.pass()
         harness.assertSafety()
         XCTAssertEqual(harness.state(of: restored), .completed)
-        XCTAssertNil(harness.queue.entry(for: next.source, revision: next.revision))
+        XCTAssertNil(try harness.queue.entry(for: next.source, revision: next.revision))
         XCTAssertNil(harness.journal.entry(for: entry.source).keptDeleted)
         XCTAssertNil(harness.journal.entry(for: entry.source).deletionCheckStartedAt)
     }
@@ -984,7 +984,7 @@ final class EditScenarioTests: XCTestCase {
         harness.clock.advance(by: 5)
         await harness.pass()
         XCTAssertEqual(harness.state(of: later), .completed)
-        XCTAssertNil(harness.queue.entry(for: parked.source, revision: parked.revision), "nothing asks about it")
+        XCTAssertNil(try harness.queue.entry(for: parked.source, revision: parked.revision), "nothing asks about it")
     }
 
     func testRestoreDuringDeletionWaitSettlesWithoutParking() async throws {

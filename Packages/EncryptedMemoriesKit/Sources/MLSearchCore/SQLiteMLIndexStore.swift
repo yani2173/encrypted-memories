@@ -171,10 +171,6 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
         )
     }
 
-    public func remove(uid: PhotoUID, descriptor: MLModelDescriptor) {
-        remove(uids: [uid], descriptor: descriptor)
-    }
-
     public func remove(uids: [PhotoUID], descriptor: MLModelDescriptor) {
         guard !uids.isEmpty else { return }
         lock.withLock { _ = removeTrackedUIDsLocked(uids, descriptor: descriptor) }
@@ -232,34 +228,6 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
 
     // MARK: - Membership / coverage
 
-    public func contains(uid: PhotoUID, descriptor: MLModelDescriptor) throws -> Bool {
-        try lock.withLock {
-            guard db != nil else { throw MLIndexStoreReadError.storageUnavailable }
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    SELECT 1 FROM ml_embeddings
-                    WHERE model_identifier=? AND model_version=?
-                      AND embedding_dimension=? AND embedding_precision=?
-                      AND volume_id=? AND node_id=? LIMIT 1;
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else { throw MLIndexStoreReadError.storageUnavailable }
-            defer { sqlite3_finalize(stmt) }
-            bindEpochRead(stmt, descriptor)
-            bindText(stmt, 5, uid.volumeID)
-            bindText(stmt, 6, uid.nodeID)
-            switch sqlite3_step(stmt) {
-            case SQLITE_ROW: return true
-            case SQLITE_DONE: return false
-            default: throw MLIndexStoreReadError.storageUnavailable
-            }
-        }
-    }
-
     public func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) throws -> Set<PhotoUID> {
         guard !uids.isEmpty else { return [] }
         var found: Set<PhotoUID> = []
@@ -311,35 +279,6 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
             }
         }
         return found
-    }
-
-    public func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] {
-        lock.withLock {
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    SELECT volume_id, node_id FROM ml_embeddings
-                    WHERE model_identifier=? AND model_version=?
-                      AND embedding_dimension=? AND embedding_precision=?
-                    ORDER BY volume_id, node_id;
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else { return [] }
-            defer { sqlite3_finalize(stmt) }
-            bindEpochRead(stmt, descriptor)
-            var uids: [PhotoUID] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                uids.append(PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1)))
-            }
-            return uids
-        }
-    }
-
-    public func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] {
-        lock.withLock { allTrackedUIDsLocked(for: descriptor) ?? [] }
     }
 
     @discardableResult
@@ -507,123 +446,6 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     }
 
     // MARK: - Reads
-
-    public func allRecords(for descriptor: MLModelDescriptor) -> [MLEmbeddingRecord] {
-        lock.withLock {
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    SELECT volume_id, node_id, vector, indexed_at, capture_time FROM ml_embeddings
-                    WHERE model_identifier=? AND model_version=? AND embedding_dimension=? AND embedding_precision=?
-                    ORDER BY volume_id, node_id;
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else { return [] }
-            bindEpochRead(stmt, descriptor)
-
-            var records: [MLEmbeddingRecord] = []
-            var invalidUIDs: Set<PhotoUID> = []
-            let expectedBytes = descriptor.embeddingDimension * MLFloat16Codec.bytesPerElement
-            let expectedSealedBytes = cipher.sealedByteCount(forPlaintextByteCount: expectedBytes)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let uid = PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1))
-                let encryptedBytes = Int(sqlite3_column_bytes(stmt, 2))
-                guard encryptedBytes > 0, let blob = sqlite3_column_blob(stmt, 2) else {
-                    invalidUIDs.insert(uid)
-                    continue
-                }
-                // Byte-count validation before any decryption: a truncated/corrupt blob is
-                // skipped for the cost of a length compare, never a crypto operation.
-                if let expectedSealedBytes, encryptedBytes != expectedSealedBytes {
-                    invalidUIDs.insert(uid)
-                    continue
-                }
-                let ciphertext = Data(bytes: blob, count: encryptedBytes)
-                let context = MLVectorCipherContext(uid: uid, descriptor: descriptor)
-                guard let plaintext = try? cipher.open(ciphertext, context: context),
-                    let vector = plaintext.withUnsafeBytes({
-                        MLFloat16Codec.decodeLittleEndian($0, dimension: descriptor.embeddingDimension)
-                    })
-                else {
-                    invalidUIDs.insert(uid)
-                    continue
-                }
-                let captureTime: Date? =
-                    sqlite3_column_type(stmt, 4) == SQLITE_NULL
-                    ? nil
-                    : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
-                records.append(
-                    MLEmbeddingRecord(
-                        uid: context.uid,
-                        descriptor: descriptor,
-                        vector: vector,
-                        timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3)),
-                        captureTime: captureTime
-                    ))
-            }
-            sqlite3_finalize(stmt)
-            deleteInvalidRowsLocked(invalidUIDs, descriptor: descriptor)
-            return records
-        }
-    }
-
-    /// Streams rows straight from disk into one packed buffer; no per-record arrays, no
-    /// intermediate `MLEmbeddingRecord`s. This is the query-path load for large epochs.
-    public func vectorBlock(for descriptor: MLModelDescriptor) -> MLVectorBlock {
-        lock.withLock {
-            var block = MLVectorBlock(descriptor: descriptor)
-            block.reserveCapacity(countLocked(for: descriptor))
-
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    SELECT volume_id, node_id, vector FROM ml_embeddings
-                    WHERE model_identifier=? AND model_version=? AND embedding_dimension=? AND embedding_precision=?
-                    ORDER BY volume_id, node_id;
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else { return block }
-            bindEpochRead(stmt, descriptor)
-
-            var invalidUIDs: Set<PhotoUID> = []
-            let expectedBytes = descriptor.embeddingDimension * MLFloat16Codec.bytesPerElement
-            let expectedSealedBytes = cipher.sealedByteCount(forPlaintextByteCount: expectedBytes)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let uid = PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1))
-                let encryptedBytes = Int(sqlite3_column_bytes(stmt, 2))
-                guard encryptedBytes > 0, let blob = sqlite3_column_blob(stmt, 2) else {
-                    invalidUIDs.insert(uid)
-                    continue
-                }
-                // Length check before decryption; corrupt rows never cost a crypto pass.
-                if let expectedSealedBytes, encryptedBytes != expectedSealedBytes {
-                    invalidUIDs.insert(uid)
-                    continue
-                }
-                let ciphertext = Data(bytes: blob, count: encryptedBytes)
-                let context = MLVectorCipherContext(uid: uid, descriptor: descriptor)
-                guard let plaintext = try? cipher.open(ciphertext, context: context),
-                    plaintext.count == expectedBytes
-                else {
-                    invalidUIDs.insert(uid)
-                    continue
-                }
-                // Widen binary16 to Float32 directly in the packed scoring buffer.
-                _ = plaintext.withUnsafeBytes { raw in
-                    block.append(uid: uid, rawLittleEndianFloat16: raw)
-                }
-            }
-            sqlite3_finalize(stmt)
-            deleteInvalidRowsLocked(invalidUIDs, descriptor: descriptor)
-            return block
-        }
-    }
 
     /// Streams a deterministic keyset page into a bounded Float32 block.
     ///

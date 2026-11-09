@@ -98,18 +98,18 @@ final class MissingSourceReconciliationTests: XCTestCase {
         try await sync.reconcileMissingSources(engine: engine(proof: proof))
         XCTAssertEqual(queue.count(), 3)
         for candidate in [missing, pending] {
-            XCTAssertNotNil(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+            XCTAssertNotNil(try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         }
         for candidate in [complete, excluded, deleted, removed] {
-            XCTAssertNil(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+            XCTAssertNil(try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         }
-        XCTAssertEqual(queue.entry(for: parked.snapshot.source, revision: parked.snapshot.revision), parkedRow)
+        XCTAssertEqual(try queue.entry(for: parked.snapshot.source, revision: parked.snapshot.revision), parkedRow)
         XCTAssertEqual(proof.calls, 0)
         XCTAssertEqual(catalog.reconciledMissingSourceGeneration(), 0)
         // The upgrade sweep runs once: an ordinary removal does not invent another sweep.
         XCTAssertTrue(queue.remove(source: missing.snapshot.source, revision: missing.snapshot.revision))
         try await sync.reconcileMissingSources(engine: engine(proof: proof))
-        XCTAssertNil(queue.entry(for: missing.snapshot.source, revision: missing.snapshot.revision))
+        XCTAssertNil(try queue.entry(for: missing.snapshot.source, revision: missing.snapshot.revision))
     }
 
     func testPermanentlyMissingPhotoStaysRecordedWithoutAnotherSweepOrAttemptAfterRelaunch() async throws {
@@ -136,7 +136,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         try await sync.reconcileMissingSources(engine: engine())
         XCTAssertEqual(tracked.pages, 2, "The final missing report must not start another catalog sweep")
         XCTAssertEqual(queue.count(), 1)
-        XCTAssertEqual(queue.entry(for: terminal.source, revision: terminal.revision), terminal)
+        XCTAssertEqual(try queue.entry(for: terminal.source, revision: terminal.revision), terminal)
 
         closeStores()
         try openStores()
@@ -148,7 +148,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(retries, 0, "Back Up Now must not reset the missing-source checks")
         _ = await relaunched.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(resolver.resolveCount(for: "permanent"), 4)
-        XCTAssertEqual(queue.entry(for: terminal.source, revision: terminal.revision), terminal)
+        XCTAssertEqual(try queue.entry(for: terminal.source, revision: terminal.revision), terminal)
 
         // A sweep owed for another source also leaves the terminal row untouched.
         let dropped = try self.candidate("older-drop")
@@ -156,8 +156,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertTrue(queue.removeMissingSource(source: dropped.snapshot.source, revision: dropped.snapshot.revision))
         try await PhotoLibraryCatalogSync(store: relaunchedCatalog).reconcileMissingSources(engine: engine())
         XCTAssertEqual(queue.count(), 2)
-        XCTAssertEqual(queue.entry(for: terminal.source, revision: terminal.revision), terminal)
-        XCTAssertNotNil(queue.entry(for: dropped.snapshot.source, revision: dropped.snapshot.revision))
+        XCTAssertEqual(try queue.entry(for: terminal.source, revision: terminal.revision), terminal)
+        XCTAssertNotNil(try queue.entry(for: dropped.snapshot.source, revision: dropped.snapshot.revision))
     }
 
     // MARK: - Issue 445: a photo that cannot be read must not return on every pass
@@ -180,7 +180,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         for _ in 1...3 {
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
             try await sync.reconcileMissingSources(engine: engine(clock: clock))
-            totals.append(queue.summary().total)
+            totals.append(queue.summary()!.total)
             clock.advance(by: 3600)
         }
 
@@ -188,8 +188,9 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: "gone"), 1, "Photos is asked once")
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 1)
         XCTAssertEqual(tracked.pages - pagesBefore, 1, "one catalog walk for the one drop, not one per pass")
-        XCTAssertTrue(catalog.presentEntries(for: ["gone"]).isEmpty, "the catalog no longer lists the photo")
-        XCTAssertEqual(queue.summary().sourceMissing, 0, "nothing is shown as a problem")
+        XCTAssertTrue(
+            try XCTUnwrap(catalog.presentEntries(for: ["gone"])).isEmpty, "the catalog no longer lists the photo")
+        XCTAssertEqual(try XCTUnwrap(queue.summary()).sourceMissing, 0, "nothing is shown as a problem")
 
         // When Photos lists the photo again, it backs up as usual.
         let listed = PhotoLibraryCatalogSync(store: catalog, enumerator: ChangedEnumerator(info: info))
@@ -197,7 +198,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             engine: engine(clock: clock),
             changes: .init(changedIdentifiers: ["gone"], deletedIdentifiers: [], requiresFullRescan: false),
             commitChanges: {})
-        XCTAssertFalse(catalog.presentEntries(for: ["gone"]).isEmpty)
+        XCTAssertFalse(try XCTUnwrap(catalog.presentEntries(for: ["gone"])).isEmpty)
         resolver.set(.standard, for: "gone")
         let progress = await runner.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(progress.uploaded, 1)
@@ -216,10 +217,11 @@ final class MissingSourceReconciliationTests: XCTestCase {
 
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
 
-        XCTAssertFalse(catalog.presentEntries(for: ["vanished-file"]).isEmpty, "the photo stays in the catalog")
+        XCTAssertFalse(
+            try XCTUnwrap(catalog.presentEntries(for: ["vanished-file"])).isEmpty, "the photo stays in the catalog")
         try await PhotoLibraryCatalogSync(store: catalog).reconcileMissingSources(engine: engine(clock: clock))
         XCTAssertNotNil(
-            queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision),
+            try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision),
             "recovery queues the photo again")
     }
 
@@ -245,7 +247,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
             for wait in [3600.0, 7200, 14_400] {
                 _ = await runner.runUntilDrained(mode: .eligibleOnly)
                 try await sync.reconcileMissingSources(engine: engine(clock: clock))
-                queued.append(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision) != nil)
+                queued.append(
+                    try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision) != nil)
                 clock.advance(by: wait)
             }
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
@@ -253,12 +256,13 @@ final class MissingSourceReconciliationTests: XCTestCase {
 
             XCTAssertEqual(queued, [true, true, true], "\(code): the row stays while Photos is asked again")
             let terminal = try XCTUnwrap(
-                queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision), "\(code)")
+                try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision), "\(code)")
             XCTAssertEqual(terminal.state, .sourceMissing, "\(code): shown once as missing after the last check")
             XCTAssertEqual(resolver.resolveCount(for: id), 4, "\(code): one attempt and three checks")
             XCTAssertEqual(queue.missingSourceDiscardGeneration(), generationBefore, "\(code)")
             XCTAssertEqual(tracked.pages, pagesBefore, "\(code): no catalog walk")
-            XCTAssertFalse(catalog.presentEntries(for: [id]).isEmpty, "\(code): the photo is still in the library")
+            XCTAssertFalse(
+                try XCTUnwrap(catalog.presentEntries(for: [id])).isEmpty, "\(code): the photo is still in the library")
         }
     }
 
@@ -276,14 +280,14 @@ final class MissingSourceReconciliationTests: XCTestCase {
             let progress = try await sync.run(engine: engine(), identifiers: [id])
             XCTAssertEqual(progress.changed, 1)
             XCTAssertEqual(
-                queue.entry(for: changed.snapshot.source, revision: changed.snapshot.revision)?.state, .discovered)
+                try queue.entry(for: changed.snapshot.source, revision: changed.snapshot.revision)?.state, .discovered)
             let clock = BackupTestClock(start: Date())
             let resolver = ScriptedBackupResolver(defaultModified: try XCTUnwrap(info.modificationDate))
             let uploaded = await runner(clock: clock, resolver: resolver).runUntilDrained(mode: .eligibleOnly)
             XCTAssertEqual(uploaded.uploaded, newRevision ? 2 : 1)
             XCTAssertEqual(
-                queue.entry(for: changed.snapshot.source, revision: changed.snapshot.revision)?.state, .completed)
-            XCTAssertEqual(queue.summary().sourceMissing, 0)
+                try queue.entry(for: changed.snapshot.source, revision: changed.snapshot.revision)?.state, .completed)
+            XCTAssertEqual(queue.summary()!.sourceMissing, 0)
         }
     }
 
@@ -295,7 +299,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let sync = PhotoLibraryCatalogSync(store: catalog, enumerator: ChangedEnumerator(info: info))
         _ = try await sync.run(engine: engine())
         XCTAssertEqual(
-            queue.entry(for: terminal.source, revision: terminal.revision), terminal,
+            try queue.entry(for: terminal.source, revision: terminal.revision), terminal,
             "An unchanged full scan must keep the terminal missing record")
         try await sync.runPass(
             engine: engine(),
@@ -303,13 +307,13 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 changedIdentifiers: [info.localIdentifier], deletedIdentifiers: [], requiresFullRescan: false),
             commitChanges: {})
         XCTAssertEqual(
-            queue.entry(for: terminal.source, revision: terminal.revision)?.state, .discovered,
+            try queue.entry(for: terminal.source, revision: terminal.revision)?.state, .discovered,
             "A Photos change must retry the file even when dates and listed resources stay the same")
         let clock = BackupTestClock(start: Date())
         let resolver = ScriptedBackupResolver(defaultModified: Date(timeIntervalSince1970: 200))
         let progress = await runner(clock: clock, resolver: resolver).runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(progress.uploaded, 1)
-        XCTAssertEqual(queue.summary().sourceMissing, 0)
+        XCTAssertEqual(queue.summary()!.sourceMissing, 0)
     }
 
     func testRepeatedPhotosChangesForABrokenFileNeverStartAnotherMissingSourceSweep() async throws {
@@ -336,7 +340,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             for wait in [3600.0, 7200, 14_400] {
                 _ = await runner.runUntilDrained(mode: .eligibleOnly)
                 let waiting = try XCTUnwrap(
-                    queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+                    try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
                 XCTAssertEqual(waiting.state, .discovered)
                 // Another signal during a planned check must not reset its count or due date.
                 try await sync.runPass(
@@ -344,12 +348,12 @@ final class MissingSourceReconciliationTests: XCTestCase {
                     changes: .init(
                         changedIdentifiers: [info.localIdentifier], deletedIdentifiers: [], requiresFullRescan: false),
                     commitChanges: {})
-                XCTAssertEqual(queue.entry(for: waiting.source, revision: waiting.revision), waiting)
+                XCTAssertEqual(try queue.entry(for: waiting.source, revision: waiting.revision), waiting)
                 clock.advance(by: wait)
             }
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
             XCTAssertEqual(
-                queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state,
+                try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state,
                 .sourceMissing)
             XCTAssertEqual(
                 resolver.resolveCount(for: info.localIdentifier), round * 4,
@@ -378,7 +382,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let clock = BackupTestClock()
         try dismiss(candidate, issue: .init(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail))
         let dismissed = try XCTUnwrap(
-            queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+            try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         let live = UploadBackupAssetCandidate(
             snapshot: .init(
                 source: offered.snapshot.source, revision: offered.snapshot.revision,
@@ -391,7 +395,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let sync = PhotoLibraryCatalogSync(store: catalog, enumerator: ChangedEnumerator(info: info))
         if !metadataChanged {
             _ = try await sync.run(engine: engine)
-            XCTAssertEqual(queue.entry(for: dismissed.source, revision: dismissed.revision), dismissed)
+            XCTAssertEqual(try queue.entry(for: dismissed.source, revision: dismissed.revision), dismissed)
             XCTAssertEqual(availability.calls, 0)
         }
         try await sync.runPass(
@@ -399,7 +403,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             changes: .init(
                 changedIdentifiers: [info.localIdentifier], deletedIdentifiers: [], requiresFullRescan: false),
             commitChanges: {})
-        XCTAssertEqual(queue.entry(for: dismissed.source, revision: dismissed.revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: dismissed.source, revision: dismissed.revision)?.state, .discovered)
         XCTAssertEqual(availability.calls, 0)
         let progress = await availabilityRunner(clock: clock, resolver: availability).runUntilDrained(
             mode: .eligibleOnly)
@@ -407,7 +411,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(availability.cleanups, 1)
         XCTAssertEqual(progress.uploaded, 1)
         XCTAssertEqual(progress.needsAttention, 0)
-        XCTAssertEqual(queue.entry(for: dismissed.source, revision: dismissed.revision)?.state, .completed)
+        XCTAssertEqual(try queue.entry(for: dismissed.source, revision: dismissed.revision)?.state, .completed)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
 
@@ -434,7 +438,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         for round in 1...3 {
             if metadataChanged { info.resources[0].originalFilename = "still-missing-\(round).jpg" }
             let dismissed = try XCTUnwrap(
-                queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+                try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
             let sync = PhotoLibraryCatalogSync(store: tracked, enumerator: ChangedEnumerator(info: info))
             try await sync.runPass(
                 engine: engine,
@@ -448,7 +452,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
             let progress = await availabilityRunner(clock: clock, resolver: availability).runUntilDrained(
                 mode: .eligibleOnly)
             XCTAssertEqual(availability.calls, round)
-            XCTAssertEqual(queue.entry(for: dismissed.source, revision: dismissed.revision)?.state, .dismissedFailure)
+            XCTAssertEqual(
+                try queue.entry(for: dismissed.source, revision: dismissed.revision)?.state, .dismissedFailure)
             XCTAssertEqual(progress.needsAttention, 0)
             XCTAssertEqual(progress.dismissedFailures, 1)
             clock.advance(by: 7 * 3600)
@@ -481,7 +486,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 for: try XCTUnwrap(catalog.entry(for: candidate.snapshot.source.identifier)))
             try dismiss(candidate, issue: reason)
             let dismissed = try XCTUnwrap(
-                queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+                try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
             let availability = AvailabilityResolver(candidate: candidate)
             for metadataChanged in [false, true] {
                 if metadataChanged { info.resources[0].originalFilename = "changed.jpg" }
@@ -491,7 +496,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
                     changes: .init(
                         changedIdentifiers: [info.localIdentifier], deletedIdentifiers: [], requiresFullRescan: false),
                     commitChanges: {})
-                XCTAssertEqual(queue.entry(for: dismissed.source, revision: dismissed.revision), dismissed)
+                XCTAssertEqual(try queue.entry(for: dismissed.source, revision: dismissed.revision), dismissed)
                 XCTAssertEqual(availability.calls, 0)
             }
         }
@@ -509,7 +514,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             try dismiss(
                 offered, issue: .init(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail))
             let dismissed = try XCTUnwrap(
-                queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
+                try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
             let snapshot = offered.snapshot
             let resolved = UploadBackupAssetCandidate(
                 snapshot: .init(
@@ -581,7 +586,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             try dismiss(
                 offered, issue: .init(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail))
             let dismissed = try XCTUnwrap(
-                queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
+                try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
             let clock = BackupTestClock()
             let availability = AvailabilityResolver(candidate: offered, failure: failure)
             try await engine(clock: clock).enqueueChangedMissingSources([offered])
@@ -628,11 +633,11 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let availability = AvailabilityResolver(candidate: offered)
         try await engine(clock: clock).enqueueChangedMissingSources([offered])
         XCTAssertEqual(
-            queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .discovered)
+            try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .discovered)
         XCTAssertEqual(availability.calls, 0)
         _ = await availabilityRunner(clock: clock, resolver: availability).runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(
-            queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
+            try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
         XCTAssertEqual(availability.calls, 1)
         XCTAssertEqual(availability.cleanups, 1)
     }
@@ -660,7 +665,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         closeStores()
         try sql(url(UploadBackupSyncQueueManifestStore.databaseFileName), "DROP TRIGGER deny_reopen;")
         try openStores()
-        XCTAssertEqual(queue.entry(for: dismissed.source, revision: dismissed.revision), dismissed)
+        XCTAssertEqual(try queue.entry(for: dismissed.source, revision: dismissed.revision), dismissed)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
 
@@ -690,7 +695,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             replacement.originalFilename = "metadata-change.jpg"
             replacement.updatedAt = pending.updatedAt.addingTimeInterval(100)
             XCTAssertTrue(queue.upsertBatch([replacement]))
-            XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+            XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         }
         XCTAssertEqual(queue.count(), 1)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
@@ -713,7 +718,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             _ = try await engine.enqueueBatch([offered])
             try await engine.enqueueChangedMissingSources([offered])
         }
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         XCTAssertEqual(tracked.pages, pages)
         XCTAssertEqual(proof.calls, 0)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
@@ -734,10 +739,12 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(projection.progress.dismissedFailures, 1)
         XCTAssertEqual(projection.progress.outstanding.count, 1, "The scheduler still owes a check")
         XCTAssertEqual(projection.status.needsAttentionCount, 0)
-        XCTAssertEqual(projection.status.notBackedUpCount, 1)
-        XCTAssertTrue(queue.unsettledRows().isEmpty)
+        XCTAssertEqual(projection.status.totalConsidered, 1)
+        XCTAssertEqual(projection.status.backedUp, 0)
+        XCTAssertTrue((try queue.decisionUnsettledRows()).isEmpty)
         XCTAssertEqual(
-            queue.rows(kind: .photoLibraryAsset, identifiers: [offered.snapshot.source.identifier]).map(\.state),
+            try queue.decisionRows(kind: .photoLibraryAsset, identifiers: [offered.snapshot.source.identifier]).map(
+                \.state),
             [.dismissedFailure])
         await projector.stop()
     }
@@ -748,9 +755,9 @@ final class MissingSourceReconciliationTests: XCTestCase {
         pending.lastError = BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue
         XCTAssertTrue(queue.upsert(pending))
         let date = pending.updatedAt.addingTimeInterval(10)
-        let claimed = try XCTUnwrap(queue.claimRunnable(limit: 1, claimedAt: date).first)
+        let claimed = try XCTUnwrap(queue.claimRunnable(limit: 1, claimedAt: date)?.first)
         XCTAssertEqual(claimed.lastError, pending.lastError)
-        XCTAssertTrue(queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try queue.decisionUnsettledRows()).isEmpty)
         closeStores()
         try openStores()
         XCTAssertEqual(queue.requeueStaleActive(before: date.addingTimeInterval(1), updatedAt: date), 1)
@@ -758,8 +765,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let restored = try XCTUnwrap(queue.entry(for: pending.source, revision: pending.revision))
         XCTAssertEqual(restored.state, .discovered)
         XCTAssertEqual(restored.lastError, pending.lastError)
-        XCTAssertEqual(queue.summary().dismissedFailures, 1)
-        XCTAssertEqual(queue.summary().waiting, 0)
+        XCTAssertEqual(queue.summary()!.dismissedFailures, 1)
+        XCTAssertEqual(queue.summary()!.waiting, 0)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
 
@@ -774,7 +781,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             .runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(availability.calls, 1)
         XCTAssertTrue(proof.primedSources.isEmpty)
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision)?.state, .dismissedFailure)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision)?.state, .dismissedFailure)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
 
@@ -795,7 +802,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             try await engine.enqueueChangedMissingSources([offered])
             _ = try await engine.enqueueBatch([offered])
         }
-        XCTAssertEqual(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision), pending)
+        XCTAssertEqual(try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision), pending)
         let waiting = await availabilityRunner(clock: clock, resolver: availability, network: network).runUntilDrained(
             mode: .eligibleOnly)
         XCTAssertTrue(waiting.isWaitingForWiFi)
@@ -809,11 +816,13 @@ final class MissingSourceReconciliationTests: XCTestCase {
             return true
         }
         XCTAssertTrue(problems.isEmpty)
-        XCTAssertTrue(queue.unsettledRows().isEmpty, "Pending upload reconciliation must not restore a dismissed photo")
+        XCTAssertTrue(
+            (try queue.decisionUnsettledRows()).isEmpty,
+            "Pending upload reconciliation must not restore a dismissed photo")
         if relaunch {
             closeStores()
             try openStores()
-            XCTAssertEqual(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision), pending)
+            XCTAssertEqual(try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision), pending)
         }
         network.set(.init(usesMobileData: false))
         let completed = await availabilityRunner(clock: clock, resolver: availability, network: network)
@@ -823,7 +832,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(completed.uploaded, missing ? 0 : 1)
         XCTAssertEqual(completed.dismissedFailures, missing ? 1 : 0)
         XCTAssertEqual(
-            queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state,
+            try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state,
             missing ? .dismissedFailure : .completed)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
         let tracked = PageCatalog(inner: catalog)
@@ -847,7 +856,9 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let network = BackupNetworkBox(.unconstrained)
         let queue = try XCTUnwrap(self.queue)
         queue.setChangeObserver { _ in
-            if queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state == .checking {
+            if queueEntryForTesting(in: queue, source: offered.snapshot.source, revision: offered.snapshot.revision)?
+                .state == .checking
+            {
                 network.set(.init(isNetworkExpensive: true, usesMobileData: false))
             }
         }
@@ -867,7 +878,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             mode: .eligibleOnly)
         XCTAssertEqual(availability.calls, 1)
         XCTAssertEqual(
-            queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
+            try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
     }
 
     func testDismissedSourceRecheckKeepsTheIncompleteDuplicateIndexWarningWhileThePassRuns() async throws {
@@ -878,7 +889,9 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let network = BackupNetworkBox(.unconstrained)
         let queue = try XCTUnwrap(self.queue)
         queue.setChangeObserver { _ in
-            if queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state == .checking {
+            if queueEntryForTesting(in: queue, source: offered.snapshot.source, revision: offered.snapshot.revision)?
+                .state == .checking
+            {
                 network.set(.init(isNetworkExpensive: true, usesMobileData: false))
             }
         }
@@ -944,7 +957,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
             mode: .eligibleOnly)
         XCTAssertEqual(missing.calls, 1)
         XCTAssertEqual(
-            queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .dismissedFailure)
+            try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .dismissedFailure
+        )
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
 
@@ -959,7 +973,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 failure: nilResult ? nil : UploadError.fileMissing("missing fixture"))
             _ = await availabilityRunner(clock: clock, resolver: availability).runUntilDrained(mode: .eligibleOnly)
             XCTAssertEqual(
-                queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .dismissedFailure
+                try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state,
+                .dismissedFailure
             )
             XCTAssertEqual(availability.calls, 1)
             clock.advance(by: 7 * 3600)
@@ -994,7 +1009,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 queue.updateDismissedSourceRecheck(
                     released, matchingState: expectedState, matchingLastError: expectedReason), false)
             XCTAssertEqual(
-                queue.entry(for: pending.source, revision: pending.revision), scenario == "removed" ? nil : pending)
+                try queue.entry(for: pending.source, revision: pending.revision), scenario == "removed" ? nil : pending)
             XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
         }
     }
@@ -1013,7 +1028,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let progress = await availabilityRunner(clock: clock, resolver: availability).runUntilDrained(
             mode: .eligibleOnly)
         XCTAssertEqual(progress.uploaded, 0)
-        XCTAssertNil(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
+        XCTAssertNil(try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
         XCTAssertEqual(availability.cleanups, 1)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
@@ -1033,15 +1048,15 @@ final class MissingSourceReconciliationTests: XCTestCase {
             XCTAssertEqual(queue.makeRetryableWorkEligible(updatedAt: clock.now), 0)
             let defaults = SpyQueueStore(inner: queue, log: BackupEventLog())
             XCTAssertEqual(defaults.makeRetryableWorkEligible(updatedAt: clock.now), 0)
-            XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+            XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         }
         closeStores()
         try openStores()
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         let premature = AvailabilityResolver(candidate: offered)
         _ = await availabilityRunner(clock: clock, resolver: premature).runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(premature.calls, 0)
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         try await assertDeferredDismissalPresentation(clock: clock, due: due)
     }
 
@@ -1068,16 +1083,16 @@ final class MissingSourceReconciliationTests: XCTestCase {
         }
         XCTAssertEqual(queue.makeRetryableWorkEligible(updatedAt: clock.now), expected.count)
         for entry in expected {
-            XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision), entry)
+            XCTAssertEqual(try queue.entry(for: entry.source, revision: entry.revision), entry)
         }
         let defaults = SpyQueueStore(inner: queue, log: BackupEventLog())
         clock.advance(by: 2)
         XCTAssertEqual(defaults.makeRetryableWorkEligible(updatedAt: clock.now), expected.count)
         for var entry in expected {
             entry.updatedAt = clock.now
-            XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision), entry)
+            XCTAssertEqual(try queue.entry(for: entry.source, revision: entry.revision), entry)
         }
-        let claimed = queue.claimRunnable(limit: expected.count, claimedAt: clock.now)
+        let claimed = try XCTUnwrap(queue.claimRunnable(limit: expected.count, claimedAt: clock.now))
         XCTAssertEqual(Set(claimed.map(\.source)), Set(expected.map(\.source)))
         XCTAssertEqual(claimed.count, expected.count)
     }
@@ -1098,7 +1113,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             resourceCoordinator: .init(runtimeState: LibraryRuntimeState()))
         let oldRun = Task { await oldRunner.runUntilDrained(mode: .eligibleOnly) }
         await started.arriveAndWait()
-        XCTAssertEqual(queue.entry(for: old.snapshot.source, revision: old.snapshot.revision)?.state, .checking)
+        XCTAssertEqual(try queue.entry(for: old.snapshot.source, revision: old.snapshot.revision)?.state, .checking)
         let newer = UploadBackupAssetCandidate(
             snapshot: .init(
                 source: old.snapshot.source,
@@ -1113,19 +1128,19 @@ final class MissingSourceReconciliationTests: XCTestCase {
             clock: clock, resolver: returned, resourceCoordinator: .init(runtimeState: LibraryRuntimeState())
         ).runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(completed.uploaded, 1)
-        XCTAssertEqual(queue.entry(for: next.source, revision: next.revision)?.state, .completed)
-        XCTAssertNil(queue.entry(for: old.snapshot.source, revision: old.snapshot.revision))
-        XCTAssertEqual(queue.summary().pendingSourceRechecks, 0)
+        XCTAssertEqual(try queue.entry(for: next.source, revision: next.revision)?.state, .completed)
+        XCTAssertNil(try queue.entry(for: old.snapshot.source, revision: old.snapshot.revision))
+        XCTAssertEqual(queue.summary()!.pendingSourceRechecks, 0)
         await release.arriveAndWait()
         let late = await oldRun.value
         XCTAssertEqual(oldUploader.uploaded.count, 0)
         XCTAssertEqual(late.uploaded, 1, "Progress includes the newer successful row in the shared queue")
         XCTAssertEqual(oldAvailability.calls, 1)
         XCTAssertEqual(oldAvailability.cleanups, 1)
-        XCTAssertNil(queue.entry(for: old.snapshot.source, revision: old.snapshot.revision))
+        XCTAssertNil(try queue.entry(for: old.snapshot.source, revision: old.snapshot.revision))
         XCTAssertEqual(queue.count(), 1)
-        XCTAssertEqual(queue.summary().dismissedFailures, 0)
-        XCTAssertEqual(queue.summary().pendingSourceRechecks, 0)
+        XCTAssertEqual(queue.summary()!.dismissedFailures, 0)
+        XCTAssertEqual(queue.summary()!.pendingSourceRechecks, 0)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
 
@@ -1182,10 +1197,10 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertTrue(
             queue.removeUnsavedEarlierRevisions(
                 of: offered.snapshot.source, through: keptRevision, except: keptRevision))
-        XCTAssertNil(queue.entry(for: obsolete.source, revision: obsolete.revision))
-        XCTAssertEqual(queue.entry(for: success.source, revision: success.revision), success)
+        XCTAssertNil(try queue.entry(for: obsolete.source, revision: obsolete.revision))
+        XCTAssertEqual(try queue.entry(for: success.source, revision: success.revision), success)
         for entry in protected {
-            XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision), entry)
+            XCTAssertEqual(try queue.entry(for: entry.source, revision: entry.revision), entry)
         }
         XCTAssertEqual(queue.count(), protected.count + 1)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
@@ -1204,18 +1219,14 @@ final class MissingSourceReconciliationTests: XCTestCase {
     }
 
     func testSourceRecheckNetworkFallbackRechecksAdmissionAfterItsLocalReadFails() async throws {
-        try await verifySourceRecheckNetworkFallback(permissionCloses: true, composite: false)
-    }
-
-    func testCompositeSourceRecheckRetainsAdmissionAtTheNetworkFallback() async throws {
-        try await verifySourceRecheckNetworkFallback(permissionCloses: true, composite: true)
+        try await verifySourceRecheckNetworkFallback(permissionCloses: true)
     }
 
     func testSourceRecheckNetworkFallbackStillReadsWithPermission() async throws {
-        try await verifySourceRecheckNetworkFallback(permissionCloses: false, composite: false)
+        try await verifySourceRecheckNetworkFallback(permissionCloses: false)
     }
 
-    private func verifySourceRecheckNetworkFallback(permissionCloses: Bool, composite: Bool) async throws {
+    private func verifySourceRecheckNetworkFallback(permissionCloses: Bool) async throws {
         let offered = try candidate("gated-network-recheck")
         let clock = BackupTestClock()
         let queue = try XCTUnwrap(self.queue)
@@ -1225,15 +1236,13 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let allowFallback = UploadTestBarrier(participantCount: 2)
         let fallback = NetworkFallbackAvailabilityResolver(
             inner: AvailabilityResolver(candidate: offered), locallyRead: locallyRead, allowFallback: allowFallback)
-        let resolver: any BackupResourceResolving =
-            composite
-            ? CompositeBackupResourceResolver([.photoLibraryAsset: fallback]) : fallback
         let network = BackupNetworkBox(.unconstrained)
-        let runner = availabilityRunner(clock: clock, resolver: resolver, network: network)
+        let runner = availabilityRunner(clock: clock, resolver: fallback, network: network)
         let run = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
         await locallyRead.arriveAndWait()
         XCTAssertEqual(fallback.requests, [false])
-        XCTAssertEqual(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .checking)
+        XCTAssertEqual(
+            try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .checking)
         if permissionCloses { network.set(.init(isNetworkExpensive: true, usesMobileData: false)) }
         await allowFallback.arriveAndWait()
         let progress = await run.value
@@ -1248,7 +1257,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             XCTAssertEqual(progress.dismissedFailures, 1)
         } else {
             XCTAssertEqual(
-                queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
+                try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
             XCTAssertEqual(progress.dismissedFailures, 0)
         }
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
@@ -1338,18 +1347,18 @@ final class MissingSourceReconciliationTests: XCTestCase {
             snapshot: offered.snapshot, originalFilename: "changed-readiness.jpg", byteCount: 300)
         _ = try await engine(clock: clock).enqueueBatch([metadata])
         try await engine(clock: clock).enqueueChangedMissingSources([offered])
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         closeStores()
         try openStores()
         _ = try await engine(clock: clock).enqueueBatch([metadata])
         try await engine(clock: clock).enqueueChangedMissingSources([offered])
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         try await assertDeferredDismissalPresentation(clock: clock, due: due)
         clock.advance(by: due.timeIntervalSince(clock.now) - 0.25)
         let premature = AvailabilityResolver(candidate: offered)
         _ = await availabilityRunner(clock: clock, resolver: premature).runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(premature.calls, 0, "Neither Photos readiness nor persisted backoff permits an earlier read")
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         clock.advance(by: 0.25)
         let returned = AvailabilityResolver(candidate: offered)
         let completed = await availabilityRunner(clock: clock, resolver: returned).runUntilDrained(mode: .eligibleOnly)
@@ -1358,7 +1367,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(completed.uploaded, 1)
         XCTAssertEqual(completed.needsAttention, 0)
         XCTAssertEqual(completed.dismissedFailures, 0)
-        XCTAssertEqual(queue.summary().pendingSourceRechecks, 0)
+        XCTAssertEqual(queue.summary()!.pendingSourceRechecks, 0)
         XCTAssertEqual(queue.count(), 1)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
         let settled = try XCTUnwrap(queue.entry(for: pending.source, revision: pending.revision))
@@ -1404,18 +1413,18 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 _ = try await engine(clock: clock).enqueueBatch([changedMetadata])
                 try await engine(clock: clock).enqueueChangedMissingSources([offered])
             }
-            XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+            XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
             if attempt == 2 || attempt == 12 {
                 closeStores()
                 try openStores()
-                XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+                XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
                 try await assertDeferredDismissalPresentation(clock: clock, due: due)
             }
             clock.advance(by: due.timeIntervalSince(clock.now) - 0.25)
             let premature = AvailabilityResolver(candidate: offered)
             _ = await availabilityRunner(clock: clock, resolver: premature).runUntilDrained(mode: .eligibleOnly)
             XCTAssertEqual(premature.calls, 0, "No Photos read may run before the persisted due date")
-            XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+            XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
             clock.advance(by: 0.25)
         }
         let returned = AvailabilityResolver(candidate: offered)
@@ -1430,7 +1439,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertNil(settled.lastError)
         XCTAssertEqual(queue.count(), 1)
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
-        XCTAssertEqual(queue.summary().pendingSourceRechecks, 0)
+        XCTAssertEqual(queue.summary()!.pendingSourceRechecks, 0)
     }
 
     func testDismissedSourceRecheckBackoffCountsOnlyAdmittedFailedReadsAndCapsItsOrdinal() async throws {
@@ -1449,11 +1458,11 @@ final class MissingSourceReconciliationTests: XCTestCase {
         _ = await availabilityRunner(clock: clock, resolver: unread, network: network).runUntilDrained(
             mode: .eligibleOnly)
         XCTAssertEqual(unread.calls, 0)
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         network.set(.unconstrained)
         let queue = try XCTUnwrap(self.queue)
         queue.setChangeObserver { [pending] _ in
-            if queue.entry(for: pending.source, revision: pending.revision)?.state == .checking {
+            if queueEntryForTesting(in: queue, source: pending.source, revision: pending.revision)?.state == .checking {
                 network.set(.init(isNetworkAvailable: false))
             }
         }
@@ -1498,7 +1507,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(projection.progress.outstanding.count, 1)
         XCTAssertEqual(projection.progress.outstanding.nextAttemptAt, due)
         XCTAssertEqual(projection.status.needsAttentionCount, 0)
-        XCTAssertEqual(projection.status.notBackedUpCount, 1)
+        XCTAssertEqual(projection.status.totalConsidered, 1)
+        XCTAssertEqual(projection.status.backedUp, 0)
         XCTAssertEqual(
             BackupAutomaticRetryPlanner.nextAttempt(
                 outstandingCount: projection.progress.outstanding.count,
@@ -1510,7 +1520,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             return true
         }
         XCTAssertTrue(problems.isEmpty)
-        XCTAssertTrue(queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try queue.decisionUnsettledRows()).isEmpty)
     }
 
     private func availabilityRunner(
@@ -1589,6 +1599,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let candidate = try candidate("absent")
         XCTAssertFalse(
             queue.removeMissingSource(source: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertTrue(queue.isOperational(), "An absent discard does not record a storage failure")
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
         XCTAssertTrue(queue.upsert(row(candidate)))
         XCTAssertTrue(
@@ -1657,7 +1668,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertNil(catalog.missingSourceSweepProgress())
         try await sync.reconcileMissingSources(engine: resumed)
         XCTAssertEqual(resumed.firstIdentifiers, ["B", "C", "A", "B", "C"])
-        XCTAssertNotNil(queue.entry(for: a.snapshot.source, revision: a.snapshot.revision))
+        XCTAssertNotNil(try queue.entry(for: a.snapshot.source, revision: a.snapshot.revision))
         XCTAssertEqual(catalog.reconciledMissingSourceGeneration(), 1)
         XCTAssertEqual(queue.count(), 3)
     }
@@ -1680,7 +1691,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         try sql(url(UploadBackupSyncQueueManifestStore.databaseFileName), "DROP TRIGGER deny_insert;")
         try openStores()
         try await PhotoLibraryCatalogSync(store: catalog).reconcileMissingSources(engine: engine())
-        XCTAssertNotNil(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertNotNil(try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
     }
 
     func testUnreadableExclusionsOrStateKeepTheSweepPending() async throws {
@@ -1711,8 +1722,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertTrue(queue.upsert(newer))
         XCTAssertTrue(queue.insertMissingSources([row(candidate)]))
         XCTAssertEqual(queue.count(), 1)
-        XCTAssertEqual(queue.entry(for: newer.source, revision: newer.revision), newer)
-        XCTAssertNil(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertEqual(try queue.entry(for: newer.source, revision: newer.revision), newer)
+        XCTAssertNil(try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
     }
 
     func testFailedDiscardGenerationWriteRollsBackTheRemoval() throws {
@@ -1732,7 +1743,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         try sql(url(UploadBackupSyncQueueManifestStore.databaseFileName), "DROP TRIGGER deny_generation;")
         queue = try XCTUnwrap(
             UploadBackupSyncQueueManifestStore(url: url(UploadBackupSyncQueueManifestStore.databaseFileName)))
-        XCTAssertNotNil(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertNotNil(try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
 
@@ -1775,7 +1786,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertFalse(tracked.usedMainThread)
         XCTAssertEqual(enqueuer.firstIdentifiers.count, 500)
         XCTAssertEqual(queue.count(), 2)
-        XCTAssertEqual(queue.nextRunnable(limit: 2).map(\.source.identifier).sorted(), ["000000", "099999"])
+        XCTAssertEqual(queue.runnableEntries().map(\.source.identifier).sorted(), ["000000", "099999"])
     }
 
     private func sql(_ url: URL, _ statement: String) throws {
@@ -1845,11 +1856,11 @@ final class MissingSourceReconciliationTests: XCTestCase {
         var maximumPageSize: Int { lock.withLock { metrics.maximum } }
         var usedMainThread: Bool { lock.withLock { metrics.main } }
         init(inner: PhotoLibraryCatalogManifestStore) { self.inner = inner }
-        func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry] {
+        func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage? {
             let page = inner.presentEntries(afterLocalIdentifier: afterLocalIdentifier, limit: limit)
             lock.withLock {
                 metrics.pages += 1
-                metrics.maximum = max(metrics.maximum, page.count)
+                if let page { metrics.maximum = max(metrics.maximum, page.entries.count) }
                 metrics.main = metrics.main || Thread.isMainThread
             }
             return page
@@ -1865,9 +1876,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         func completeMissingSourceSweep(generation: Int64) -> Bool {
             inner.completeMissingSourceSweep(generation: generation)
         }
-        func entry(for id: String) -> PhotoLibraryCatalogEntry? { inner.entry(for: id) }
-        func classify(_ e: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange { inner.classify(e) }
-        func upsert(_ e: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange { inner.upsert(e) }
+        func entry(for id: String) throws -> PhotoLibraryCatalogEntry? { try inner.entry(for: id) }
+        func classifyBatch(_ e: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] { inner.classifyBatch(e) }
         func upsertBatch(_ e: [PhotoLibraryCatalogEntry]) -> Bool { inner.upsertBatch(e) }
         func markRemoved(_ ids: [String], removedAt: Date) -> PhotoLibraryCatalogMutationResult {
             inner.markRemoved(ids, removedAt: removedAt)
@@ -1875,12 +1885,12 @@ final class MissingSourceReconciliationTests: XCTestCase {
         func sweepRemoved(notSeenAfter: Date, removedAt: Date) -> PhotoLibraryCatalogMutationResult {
             inner.sweepRemoved(notSeenAfter: notSeenAfter, removedAt: removedAt)
         }
-        func snapshot() -> PhotoLibraryCatalogSnapshot { inner.snapshot() }
-        func count() -> Int { inner.count() }
+        func snapshot() -> PhotoLibraryCatalogSnapshot? { inner.snapshot() }
+        func count() -> Int? { inner.count() }
         func hasCompletedFullScan() -> Bool { inner.hasCompletedFullScan() }
         func markFullScanOwed() -> Bool { inner.markFullScanOwed() }
         func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
-        func fullScanProgress() -> PhotoLibraryFullScanProgress? { inner.fullScanProgress() }
+        func fullScanProgress() throws -> PhotoLibraryFullScanProgress? { try inner.fullScanProgress() }
         func recordFullScanProgress(_ p: PhotoLibraryFullScanProgress) -> Bool { inner.recordFullScanProgress(p) }
         func completeFullScan() -> Bool { inner.completeFullScan() }
         func clearFullScanResumePoint() -> Bool { inner.clearFullScanResumePoint() }
@@ -1891,9 +1901,9 @@ final class MissingSourceReconciliationTests: XCTestCase {
         func beginFullScanSnapshot(epochStart: Date) -> Bool { inner.beginFullScanSnapshot(epochStart: epochStart) }
         func appendFullScanSnapshotIdentifiers(_ ids: [String]) -> Bool { inner.appendFullScanSnapshotIdentifiers(ids) }
         func finishFullScanSnapshot() -> Bool { inner.finishFullScanSnapshot() }
-        func fullScanSnapshotIdentifiers(startingAt: Int, limit: Int) -> [String] {
+        func fullScanSnapshotIdentifiers(startingAt: Int, limit: Int) -> [String]? {
             inner.fullScanSnapshotIdentifiers(startingAt: startingAt, limit: limit)
         }
-        func fullScanSnapshotCount() -> Int { inner.fullScanSnapshotCount() }
+        func fullScanSnapshotCount() -> Int? { inner.fullScanSnapshotCount() }
     }
 }

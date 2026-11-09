@@ -1,6 +1,6 @@
 import Foundation
 
-/// Derives the Apple-Photos-style two-line center title for the viewer top bar.
+/// Derives the two-line center title for the viewer top bar.
 ///
 /// Line one prefers location, then capture date/time, then filename, and finally a localized fallback.
 /// Line two shows date/time with location when available; otherwise it shows the position.
@@ -26,6 +26,7 @@ public enum ViewerTitleFormatter {
     ///   - locationName: reverse-geocoded POI/location name, if already available (never blocks on it). A name of
     ///     whitespace alone counts as no name.
     ///   - filename: original filename, used only as a date-less fallback.
+    ///   - detailsShowDateAndPlace: the viewer's details show the date, the time and the place (the folded layout).
     ///   - locale: user/app locale - drives date wording ("um") and the "von"/"of" connector.
     public static func make(
         captureDate: Date?,
@@ -34,9 +35,13 @@ public enum ViewerTitleFormatter {
         locationName: String? = nil,
         locationIsResolving: Bool = false,
         filename: String? = nil,
+        detailsShowDateAndPlace: Bool = false,
         locale: Locale = .current
     ) -> ViewerTitle {
         let position = positionString(index: index, total: total, locale: locale)
+        // The folded layout's details lead with the date, the time and the place; the title then names each fact
+        // only once and keeps the position.
+        if detailsShowDateAndPlace { return ViewerTitle(line1: position, line2: "") }
         let dateTime = captureDate.map { dateTimeString($0, locale: locale) }
 
         if let locationName = PlaceNameText.displayable(locationName) {

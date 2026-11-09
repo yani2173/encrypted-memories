@@ -220,7 +220,7 @@ public struct PhotoLocationAggregation {
         )
         let longitudeIndex = min(
             longitudeGrid.cellCount - 1,
-            max(0, Int(Foundation.floor((normalizedLongitude(longitude) + 180) / longitudeGrid.step)))
+            max(0, Int(Foundation.floor((PhotoCoordinate.normalizedLongitude(longitude) + 180) / longitudeGrid.step)))
         )
         return PhotoLocationCellID(
             latitudeStepExponent: resolution.latitudeStepExponent,
@@ -228,11 +228,6 @@ public struct PhotoLocationAggregation {
             latitudeIndex: latitudeIndex,
             longitudeIndex: longitudeIndex
         )
-    }
-
-    private static func normalizedLongitude(_ longitude: Double) -> Double {
-        let shifted = (longitude + 180).truncatingRemainder(dividingBy: 360)
-        return (shifted >= 0 ? shifted : shifted + 360) - 180
     }
 
     private static func latitudeGrid(exponent: Int) -> AxisGrid {

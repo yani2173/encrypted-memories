@@ -1,8 +1,8 @@
 import CoreGraphics
 import Foundation
 
-/// Width limits for the resizable left sidebar. The drag handle and persisted width both clamp through
-/// `clamp(_:)` so the sidebar cannot become unusably narrow or crowd the grid.
+/// Width limits for the left sidebar. A stored width is read through `clamp(_:)` so the sidebar cannot
+/// become unusably narrow or crowd the grid.
 public enum SidebarMetrics {
     public static let minWidth: CGFloat = 180
     public static let maxWidth: CGFloat = 360
@@ -17,19 +17,11 @@ public enum SidebarMetrics {
     public static func resolved(stored: CGFloat) -> CGFloat {
         stored <= 0 ? defaultWidth : clamp(stored)
     }
-
-    public static func effectiveWidth(visible: Bool, width: CGFloat) -> CGFloat {
-        visible ? clamp(width) : 0
-    }
 }
 
 public enum SidebarPersistence {
     public static func resolvedWidth(defaults: UserDefaults = .standard) -> CGFloat {
         SidebarMetrics.resolved(stored: CGFloat(defaults.double(forKey: AppSettingsKey.sidebarWidth)))
-    }
-
-    public static func saveWidth(_ width: CGFloat, defaults: UserDefaults = .standard) {
-        defaults.set(Double(SidebarMetrics.clamp(width)), forKey: AppSettingsKey.sidebarWidth)
     }
 
     public static func resolvedVisible(defaults: UserDefaults = .standard) -> Bool {

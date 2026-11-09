@@ -35,8 +35,8 @@ public struct MediaLoadingSpinner: View {
 
     /// The fraction to show while media downloads: only after the first and before the last percent, so a download
     /// that has not started or has nearly finished shows the calm spinner instead of a ring that jumps.
-    public nonisolated static func visibleFraction(_ progress: Double, isDownloading: Bool) -> Double? {
-        isDownloading && progress > 0.001 && progress < 0.995 ? progress : nil
+    public nonisolated static func visibleFraction(_ progress: Double) -> Double? {
+        progress > 0.001 && progress < 0.995 ? progress : nil
     }
 
     nonisolated static var accessibilityName: String { L10n.string("loading.content") }

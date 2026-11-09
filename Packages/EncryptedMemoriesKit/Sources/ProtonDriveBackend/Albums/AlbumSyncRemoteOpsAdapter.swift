@@ -1,6 +1,7 @@
 import AlbumCore
 import AlbumSyncCore
 import Foundation
+import PhotosCore
 import UploadCore
 
 /// `AlbumSyncCore.AlbumSyncRemoteAlbumOps` over the album write service + the bridge's decrypted
@@ -14,6 +15,67 @@ struct ProtonAlbumSyncRemoteOps: AlbumSyncRemoteAlbumOps {
     var duplicateChecker: (any UploadDuplicateChecking)?
     /// Copies of one photo per lookup; more copies of the same bytes are rare.
     static let sameContentLimit = 16
+    var recoveryVolumeProvider: (@Sendable () async throws -> String)?
+    var recoveryRestore: (@Sendable (PhotoUID) async throws -> Void)?
+    var recoverySessionID = UUID()
+
+    /// Composition uses the existing trash route, including related photos and session shutdown admission.
+    static func withRecovery(
+        service: ProtonAlbumWriteService,
+        listProvider: @escaping @Sendable () async throws -> [AlbumSummary],
+        duplicateChecker: (any UploadDuplicateChecking)?, bridge: DriveSDKBridge
+    ) -> Self {
+        Self(
+            service: service, listProvider: listProvider, duplicateChecker: duplicateChecker,
+            recoveryVolumeProvider: { try await bridge.photosShareContext().volumeID },
+            recoveryRestore: { uid in try await bridge.restore([uid]) })
+    }
+
+    func photoRecoveryContext() async throws -> AlbumSyncPhotoRecovery.Context? {
+        guard let duplicateChecker, let recoveryVolumeProvider, recoveryRestore != nil else { return nil }
+        let volume = try await recoveryVolumeProvider()
+        let epoch = try await duplicateChecker.hashKeyEpoch()
+        try Task.checkCancellation()
+        guard !volume.isEmpty, !epoch.isEmpty else { return nil }
+        return .init(sessionID: recoverySessionID, volumeID: volume, hashKeyEpoch: epoch)
+    }
+
+    func photoRecoveryState(for record: UploadIdentityRecord) async throws -> AlbumSyncPhotoRecovery.RemoteState {
+        guard let duplicateChecker, let linkID = record.remoteLinkID, !linkID.isEmpty,
+            !record.nameHash.isEmpty, !record.contentHash.isEmpty,
+            try await duplicateChecker.hashKeyEpoch() == record.hashKeyEpoch
+        else { return .unavailable }
+        try Task.checkCancellation()
+        let rows = try await duplicateChecker.findDuplicates(nameHashes: [record.nameHash])
+        try Task.checkCancellation()
+        let exact = rows.filter {
+            $0.linkID == linkID && $0.nameHash == record.nameHash && $0.contentHash == record.contentHash
+        }
+        guard let state = exact.first?.linkState, state == .trashed || state == .active,
+            exact.allSatisfy({ $0.linkState == state })
+        else { return .unavailable }
+        let role = try await duplicateChecker.linkVisibility(of: [linkID])[linkID]
+        try Task.checkCancellation()
+        guard let role, role.hasExplicitPhotoState, role.mainPhotoLinkID == nil,
+            role.isActive == (state == .active)
+        else { return .unavailable }
+        let metadata = try await duplicateChecker.linkStateSnapshot(of: [linkID])
+        try Task.checkCancellation()
+        guard metadata.complete, metadata.states[linkID] == state.rawValue else { return .unavailable }
+        return state == .trashed ? .trashed : .active
+    }
+
+    func restorePhoto(
+        _ uid: PhotoUID, context: AlbumSyncPhotoRecovery.Context,
+        validate: @Sendable () async throws -> Void
+    ) async throws {
+        guard let recoveryRestore, uid.volumeID == context.volumeID, !uid.nodeID.isEmpty,
+            try await photoRecoveryContext() == context
+        else { throw AlbumSyncPhotoRecovery.Error.unavailable }
+        try await validate()
+        try Task.checkCancellation()
+        try await recoveryRestore(uid)
+    }
 
     func listAlbums() async throws -> [AlbumSyncRemoteAlbum] {
         try await listProvider().map { AlbumSyncRemoteAlbum(id: $0.id, title: $0.title) }

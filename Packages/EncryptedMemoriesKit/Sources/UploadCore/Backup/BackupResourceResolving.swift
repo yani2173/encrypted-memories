@@ -256,54 +256,6 @@ public extension BackupResourceResolving {
     }
 }
 
-/// Routes each queue entry to the resolver for its source kind, so one runner can drain a
-/// queue containing mixed sources (folder files + photo-library assets) without semantic forks.
-public struct CompositeBackupResourceResolver: BackupResourceResolving {
-    private let resolvers: [UploadSourceIdentity.Kind: any BackupResourceResolving]
-
-    public init(_ resolvers: [UploadSourceIdentity.Kind: any BackupResourceResolving]) {
-        self.resolvers = resolvers
-    }
-
-    public func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
-        try await resolver(for: entry).resolve(entry)
-    }
-
-    public func resolve(
-        _ entry: UploadBackupSyncQueueEntry,
-        onPreparationProgress: @escaping BackupResourcePreparationHandler
-    ) async throws -> BackupResolvedResource? {
-        try await resolver(for: entry).resolve(entry, onPreparationProgress: onPreparationProgress)
-    }
-
-    public func resolve(
-        _ entry: UploadBackupSyncQueueEntry,
-        onPreparationProgress: @escaping BackupResourcePreparationHandler,
-        readAdmission: @escaping BackupResourceReadAdmission
-    ) async throws -> BackupResolvedResource? {
-        try await resolver(for: entry).resolve(
-            entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission)
-    }
-
-    public func resolve(
-        _ entry: UploadBackupSyncQueueEntry,
-        onPreparationProgress: @escaping BackupResourcePreparationHandler,
-        readAdmission: @escaping BackupResourceReadAdmission,
-        omittingMissingPairedVideo: Bool
-    ) async throws -> BackupResolvedResource? {
-        try await resolver(for: entry).resolve(
-            entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission,
-            omittingMissingPairedVideo: omittingMissingPairedVideo)
-    }
-
-    private func resolver(for entry: UploadBackupSyncQueueEntry) throws -> any BackupResourceResolving {
-        guard let resolver = resolvers[entry.source.kind] else {
-            throw UploadError.backend("no backup resolver registered for source kind \(entry.source.kind.rawValue)")
-        }
-        return resolver
-    }
-}
-
 /// The file-URL resolver shared by every platform's folder/file backup path. Reads current
 /// attributes so a file edited after the scan is backed up as it exists now. Security-scoped
 /// access (macOS sandbox bookmarks) is session-scoped by the platform layer around the whole

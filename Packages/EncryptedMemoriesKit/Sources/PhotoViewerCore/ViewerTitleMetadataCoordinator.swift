@@ -122,8 +122,7 @@ public final class ViewerTitleMetadataCoordinator {
                 return .init(metadata: nil, placeName: nil, metadataLoadFailed: !Task.isCancelled)
             }
             guard !Task.isCancelled else { return .init(metadata: nil, placeName: nil) }
-            guard !Task.isCancelled,
-                metadata.hasLocation,
+            guard metadata.hasLocation,
                 let latitude = metadata.latitude,
                 let longitude = metadata.longitude,
                 let placeNameResolver

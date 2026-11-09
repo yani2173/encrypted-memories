@@ -11,9 +11,15 @@ public struct ProtonPendingRemoteEffects: PendingRemoteEffects {
     private let albums: AlbumsRepository
 
     public init(facade: ProtonClientFacade) {
-        trashProvider = facade.backend as? any TrashProvider
-        favorites = facade.backend as? any FavoritesProvider
-        albums = facade.albums
+        self.init(
+            trashProvider: facade.backend as? any TrashProvider, favorites: facade.backend as? any FavoritesProvider,
+            albums: facade.albums)
+    }
+
+    init(trashProvider: (any TrashProvider)?, favorites: (any FavoritesProvider)?, albums: AlbumsRepository) {
+        self.trashProvider = trashProvider
+        self.favorites = favorites
+        self.albums = albums
     }
 
     public func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {

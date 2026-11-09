@@ -5,6 +5,14 @@ import UniformTypeIdentifiers
 /// The only place PhotoKit types become `PhotoBackupAssetInfo`. Reads local metadata only -
 /// `PHAssetResource.assetResources(for:)` is synchronous and never triggers downloads.
 enum PhotoKitAssetMapper {
+    /// The whole library, newest first, or only `identifiers` in PhotoKit's order.
+    static func fetchAssets(identifiers: [String]? = nil) -> PHFetchResult<PHAsset> {
+        if let identifiers { return PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil) }
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        return PHAsset.fetchAssets(with: options)
+    }
+
     /// The asset as backup sees it. A photo of a burst (series) also carries its series role, so that only
     /// the series' main photo becomes a backup candidate and its members travel in that compound.
     static func info(for asset: PHAsset, cloudIdentifier: String? = nil) -> PhotoBackupAssetInfo {

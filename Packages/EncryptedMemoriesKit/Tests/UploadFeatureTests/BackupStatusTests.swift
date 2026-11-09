@@ -126,7 +126,7 @@ final class BackupStatusTests: XCTestCase {
         XCTAssertEqual(first.backedUp, 2)
     }
 
-    func testNotBackedUpCountIncludesFailuresAndBlockedDrafts() {
+    func testFailuresAndBlockedDraftsKeepTheBackupUnfinished() {
         let status = BackupStatus(
             progress: progress(
                 total: 20, uploaded: 8, alreadyBackedUp: 9,
@@ -136,7 +136,8 @@ final class BackupStatusTests: XCTestCase {
 
         XCTAssertEqual(status.phase, .needsAttention)
         XCTAssertEqual(status.needsAttentionCount, 1)
-        XCTAssertEqual(status.notBackedUpCount, 3)
+        XCTAssertEqual(status.totalConsidered, 20)
+        XCTAssertEqual(status.backedUp, 17)
     }
 
     func testCompletedAndIdle() {
@@ -181,9 +182,8 @@ final class BackupStatusTests: XCTestCase {
         summary.include(.skippedRemoteDeletion)
 
         XCTAssertEqual(summary.resolved, 2)
-        XCTAssertEqual(summary.settledSuccessfully, 3)
-        XCTAssertEqual(summary.progressFraction, 1)
-        XCTAssertFalse(summary.hasWork)
+        XCTAssertEqual(summary.skippedRemoteDeletions, 1)
+        XCTAssertEqual(summary.total, 3)
         XCTAssertTrue(UploadBackupSyncQueueState.skippedRemoteDeletion.isTerminalSuccess)
     }
 
@@ -247,7 +247,6 @@ final class BackupStatusTests: XCTestCase {
         running.total = 10
         running.waiting = 4
         running.checking = 2
-        running.checked = 3
         running.skippedDuplicates = 1
         let checking = BackupStatus(manualUploadCheck: running)
         XCTAssertEqual(
@@ -262,13 +261,11 @@ final class BackupStatusTests: XCTestCase {
 
         var failed = UploadPreparationStatus()
         failed.total = 2
-        failed.checked = 1
         failed.failed = 1
         XCTAssertEqual(BackupStatus(manualUploadCheck: failed).phase, .needsAttention)
 
         var done = UploadPreparationStatus()
         done.total = 2
-        done.checked = 1
         done.skippedDuplicates = 1
         XCTAssertEqual(BackupStatus(manualUploadCheck: done).phase, .completed)
     }

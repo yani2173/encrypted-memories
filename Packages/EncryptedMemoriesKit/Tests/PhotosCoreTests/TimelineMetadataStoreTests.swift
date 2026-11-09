@@ -733,102 +733,61 @@ final class TimelineMetadataStoreTests: XCTestCase {
         store.close()
     }
 
-    private func dims(_ w: Int, _ h: Int) throws -> PhotoPixelDimensions {
-        try XCTUnwrap(PhotoPixelDimensions(width: w, height: h))
-    }
-
-    func testDimensionsRoundTripAndSurviveReopen() throws {
+    func testTimelineRefreshKeepsStoredDimensionColumns() throws {
         let dir = try makeTempDir()
         let (store, url) = try makeStore(in: dir)
         let a = makeItem(node: "a", t: 100)
         let b = makeItem(node: "b", t: 200)
         store.save([a, b])
+        // An earlier build stored these values; this build neither reads nor writes the columns.
+        rawExec(url, "UPDATE photos SET w=320, h=240 WHERE node='a';")
 
-        let size = try dims(320, 240)
-        let result = store.updateDimensions([a.uid: size])
-        XCTAssertTrue(result.succeeded)
-        XCTAssertEqual(result.updatedRows, 1)
-
-        // On disk as real columns; undimensioned rows stay null (absent from the bulk load).
-        XCTAssertEqual(rawRows(url, "SELECT w, h FROM photos WHERE node='a';"), [["320", "240"]])
-        XCTAssertEqual(rawRows(url, "SELECT w, h FROM photos WHERE node='b';"), [["NULL", "NULL"]])
-        XCTAssertEqual(store.loadDimensions(), [a.uid: size])
-
-        store.close()
-        let reopened = try XCTUnwrap(TimelineMetadataStore(url: url))
-        XCTAssertEqual(reopened.loadDimensions(), [a.uid: size], "dimensions must survive reopen")
-        reopened.close()
-    }
-
-    func testTimelineRefreshDoesNotClobberLearnedDimensions() throws {
-        let dir = try makeTempDir()
-        let (store, _) = try makeStore(in: dir)
-        let a = makeItem(node: "a", t: 100)
-        let b = makeItem(node: "b", t: 200)
-        store.save([a, b])
-        store.updateDimensions([a.uid: try dims(320, 240)])
-
-        // A changed refresh writes only changed/new rows and never references w/h - learned
-        // dimensions on unchanged rows must survive.
+        // A changed refresh writes only changed/new rows and never references w/h - the values on
+        // unchanged rows must survive.
         let changed = store.save([a, b, makeItem(node: "c", t: 300)])
         XCTAssertFalse(changed.skippedUnchanged)
-        XCTAssertEqual(store.loadDimensions(), [a.uid: try dims(320, 240)])
+        // Only row a holds values; the other rows, including the new row c, stay NULL.
+        XCTAssertEqual(
+            rawRows(url, "SELECT node, w, h FROM photos ORDER BY node;"),
+            [["a", "320", "240"], ["b", "NULL", "NULL"], ["c", "NULL", "NULL"]])
 
-        // An unchanged refresh short-circuits - dimensions are not part of the timeline digest,
-        // so recording them must not break the no-op skip.
-        store.updateDimensions([b.uid: try dims(100, 100)])
+        // An unchanged refresh short-circuits - w/h are not part of the timeline digest.
+        rawExec(url, "UPDATE photos SET w=100, h=100 WHERE node='b';")
         let skipped = store.save([a, b, makeItem(node: "c", t: 300)])
-        XCTAssertTrue(skipped.skippedUnchanged, "dimension updates must not invalidate the save digest")
-        XCTAssertEqual(store.loadDimensions().count, 2)
+        XCTAssertTrue(skipped.skippedUnchanged, "stored dimensions must not invalidate the save digest")
+        XCTAssertEqual(
+            rawRows(url, "SELECT node, w, h FROM photos ORDER BY node;"),
+            [["a", "320", "240"], ["b", "100", "100"], ["c", "NULL", "NULL"]])
         store.close()
     }
 
-    func testDimensionUpdateIsNoOpWhenUnchangedOrAlreadyLearned() throws {
+    /// The stored digest decides whether a refresh writes anything, so its byte stream is part of the
+    /// persisted format: an unchanged digest keeps an existing database from a forced full rewrite. The value
+    /// was computed once from the original implementation.
+    func testTimelineDigestBytesAreStable() throws {
         let dir = try makeTempDir()
         let (store, url) = try makeStore(in: dir)
-        let a = makeItem(node: "a", t: 100)
-        store.save([a])
+        let items = [
+            makeItem(node: "a", t: 0),
+            makeItem(
+                node: "\u{e9}-\u{65E5}\u{672C}-\u{1F642}", t: 1.5, mime: "image/heic", live: true,
+                relvid: "motion-\u{fc}", dur: 12.25, tags: [.livePhotos, .favorites, .bursts],
+                burst: ["b1", "b2,x"]),
+            makeItem(vol: "vol2", node: "c", t: -3.75, mime: "video/quicktime", dur: 0, tags: [.videos]),
+            makeItem(node: "d", t: 1_000_000_000.125, dur: -0.0, tags: [.raw, .selfies]),
+            makeItem(node: "e", t: 1_000_000_000.125, relvid: "", burst: [""]),
+            // Identifiers longer than 15 UTF-8 bytes are stored on the heap, like production identifiers.
+            makeItem(
+                vol: "volume-with-a-long-identifier", node: "node-0123456789abcdefghijklmnopqrstuvwxyz", t: 7,
+                mime: "video/quicktime", live: true, relvid: "related-video-0123456789abcdef", dur: 3.5,
+                tags: [.panoramas, .portraits],
+                burst: ["burst-member-0123456789abcdef", "second-member-0123456789abcdef"]),
+        ]
+        store.save(items)
 
-        XCTAssertEqual(store.updateDimensions([a.uid: try dims(320, 240)]).updatedRows, 1)
-        // Repeating the same values produces zero writes.
-        XCTAssertEqual(store.updateDimensions([a.uid: try dims(320, 240)]).updatedRows, 0)
-        // different values in default fill mode still produce zero writes; first-seen-wins protects
-        // dimensions already stored by an earlier decode.
-        XCTAssertEqual(store.updateDimensions([a.uid: try dims(999, 111)]).updatedRows, 0)
-        XCTAssertEqual(rawRows(url, "SELECT w, h FROM photos WHERE node='a';"), [["320", "240"]])
-        store.close()
-    }
-
-    func testOverwriteModeReplacesOnlyChangedValues() throws {
-        let dir = try makeTempDir()
-        let (store, _) = try makeStore(in: dir)
-        let a = makeItem(node: "a", t: 100)
-        let b = makeItem(node: "b", t: 200)
-        store.save([a, b])
-        store.updateDimensions([a.uid: try dims(320, 240), b.uid: try dims(100, 100)])
-
-        // Future true-dimension writer: upgrades a (differs), skips b (identical values).
-        let result = store.updateDimensions(
-            [a.uid: try dims(4032, 3024), b.uid: try dims(100, 100)],
-            overwrite: true
-        )
-        XCTAssertTrue(result.succeeded)
-        XCTAssertEqual(result.updatedRows, 1)
-        XCTAssertEqual(store.loadDimensions(), [a.uid: try dims(4032, 3024), b.uid: try dims(100, 100)])
-        store.close()
-    }
-
-    func testDimensionUpdateIgnoresUnknownRows() throws {
-        let dir = try makeTempDir()
-        let (store, _) = try makeStore(in: dir)
-        store.save([makeItem(node: "a", t: 100)])
-
-        let unknown = PhotoUID(volumeID: "vol1", nodeID: "never-enumerated")
-        let result = store.updateDimensions([unknown: try dims(320, 240)])
-        XCTAssertTrue(result.succeeded)
-        XCTAssertEqual(result.updatedRows, 0, "dimension updates must never invent photo rows")
-        XCTAssertEqual(store.count(), 1)
-        XCTAssertTrue(store.loadDimensions().isEmpty)
+        XCTAssertEqual(
+            rawRows(url, "SELECT value FROM store_meta WHERE key='timeline.digest';"),
+            [["b4f9f7213241013e9dff3b38ed59fd3e8f84e751dbe34e6491760f6beafaa086"]])
         store.close()
     }
 

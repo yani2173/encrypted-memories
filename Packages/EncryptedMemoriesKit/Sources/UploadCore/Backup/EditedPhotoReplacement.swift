@@ -141,7 +141,7 @@ public struct EditedPhotoReplacement: Sendable {
         }
         let volumeID = try await remote.ownPhotosVolumeID()
         func resolved(_ uid: PhotoUID) -> PhotoUID {
-            uid.volumeID.isEmpty ? PhotoUID(volumeID: volumeID, nodeID: uid.nodeID) : uid
+            uid.inVolume(volumeID)
         }
         let replacement = resolved(primary)
         // The earlier photos may hold the only copy of the original. They wait for an upload that holds it.

@@ -1,5 +1,11 @@
 import Foundation
 
+/// An error type of a backend that knows which playback failure it stands for. `VideoPlaybackError.classify` asks it
+/// before it falls back to the NSError heuristics, so a failure with a typed cause does not depend on message text.
+public protocol VideoPlaybackClassifiable: Error {
+    var videoPlaybackError: VideoPlaybackError? { get }
+}
+
 /// Every way the native video path can fail, mapped to a stable case so the UI can show a readable
 /// reason (never an infinite spinner) and diagnostics can log a consistent token. Mirrors the
 /// failure surface Proton Drive Web reports for its streaming preview (broken-video / SW-timeout /
@@ -12,12 +18,15 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
     case metadataUnavailable
     /// AVFoundation reached `.failed` with a codec/format it cannot decode.
     case unsupportedCodec
-    /// Backend exposes no stream URL and no range path.
+    /// The host has no way to stream this video (no stream provider). Only a missing capability of the host sets it.
     case streamURLUnavailable
-    /// The backend cannot serve byte ranges, so progressive streaming is impossible.
+    /// The server answered a byte range with 416. No code path confirms that ranges are missing for good.
     case rangeNotSupported
-    /// A block failed to decrypt (wrong key / corrupt packet).
+    /// A typed crypto failure of the backend: a key ring, a message or a key packet that does not decrypt.
     case decryptionFailed
+    /// The stored description of the video contradicts itself in a way that no new attempt changes, for example a
+    /// negative block size.
+    case malformedContent
     /// No network / transport error while fetching bytes.
     case networkUnavailable
     /// Auth expired and could not be refreshed.
@@ -42,6 +51,7 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
         case .streamURLUnavailable: return L10n.string("error.video.stream_unavailable")
         case .rangeNotSupported: return L10n.string("error.video.range_not_supported")
         case .decryptionFailed: return L10n.string("error.video.decryption_failed")
+        case .malformedContent: return L10n.string("error.video.malformed_content")
         case .networkUnavailable: return L10n.string("error.video.network_unavailable")
         case .authExpired: return L10n.string("error.video.auth_expired")
         case .quotaOrRateLimited: return L10n.string("error.video.quota_rate_limited")
@@ -61,6 +71,7 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
         case .streamURLUnavailable: return "streamURLUnavailable"
         case .rangeNotSupported: return "rangeNotSupported"
         case .decryptionFailed: return "decryptionFailed"
+        case .malformedContent: return "malformedContent"
         case .networkUnavailable: return "networkUnavailable"
         case .authExpired: return "authExpired"
         case .quotaOrRateLimited: return "quotaOrRateLimited"
@@ -71,11 +82,28 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
         }
     }
 
-    /// Whether it's worth offering a "Retry" affordance (transient failures) vs. a hard "no" (codec).
+    /// Whether a "Retry" can work. Only a cause that is confirmed permanent hides it: a codec the player cannot decode,
+    /// a file that is not a video, a host without a stream provider, a typed crypto failure, a self-contradicting
+    /// description of the video and an unauthorized answer (401), which asks the person to sign in again. An HTTP
+    /// answer such as 404, 410 or 416 does not prove that a new attempt fails (an expired stream reference is
+    /// renewed), so it keeps Retry.
     public var isRetryable: Bool {
         switch self {
-        case .unsupportedCodec, .notVideo: return false
+        case .unsupportedCodec, .notVideo, .streamURLUnavailable, .decryptionFailed, .malformedContent, .authExpired:
+            return false
         default: return true
+        }
+    }
+
+    /// The waits before the silent retries of a rate limit while the viewer prepares the video.
+    public static let rateLimitSilentRetryDelays: [Duration] = [.seconds(3), .seconds(8), .seconds(20)]
+
+    /// The waits before the silent retries of a failure that goes away by itself. The viewer keeps its loading
+    /// indicator during these waits and shows the failure only when the last retry fails too.
+    public var silentRetryDelays: [Duration] {
+        switch self {
+        case .quotaOrRateLimited: return Self.rateLimitSilentRetryDelays
+        default: return []
         }
     }
 }
@@ -85,6 +113,7 @@ public extension VideoPlaybackError {
     /// error. Kept pure (string/NSError based) so it's unit-testable without AVFoundation. The
     /// network/HTTP heuristics match the codes the app's `DriveSession` raises.
     static func classify(_ error: Error) -> VideoPlaybackError {
+        if let typed = (error as? any VideoPlaybackClassifiable)?.videoPlaybackError { return typed }
         let ns = error as NSError
 
         // URLSession transport failures.
@@ -100,8 +129,10 @@ public extension VideoPlaybackError {
 
         // AVFoundation media errors.
         if ns.domain == "AVFoundationErrorDomain" {
-            // -11828 mediaFormatNotRecognized, -11833 unsupported, -11839 cannotDecode, etc.
-            let unsupported: Set<Int> = [-11828, -11829, -11833, -11839, -11850]
+            // -11828 fileFormatNotRecognized, -11829 fileFailedToParse, -11833 decoderNotFound,
+            // -11850 serverIncorrectlyConfigured. -11839 decoderTemporarilyUnavailable is a state of the moment: it
+            // stays a player failure, which keeps Retry.
+            let unsupported: Set<Int> = [-11828, -11829, -11833, -11850]
             if unsupported.contains(ns.code) { return .unsupportedCodec }
             return .playerItemFailed(detail: "AV\(ns.code)")
         }
@@ -118,12 +149,11 @@ public extension VideoPlaybackError {
             case 401: return .authExpired
             case 429: return .quotaOrRateLimited
             case 416: return .rangeNotSupported
-            case 404, 410: return .streamURLUnavailable
+            case 404, 410: return .metadataUnavailable
             default: break
             }
         }
         let lower = text.lowercased()
-        if lower.contains("decrypt") { return .decryptionFailed }
         if lower.contains("not a video") || lower.contains("notavideo") { return .notVideo }
         return .unknown(detail: text)
     }

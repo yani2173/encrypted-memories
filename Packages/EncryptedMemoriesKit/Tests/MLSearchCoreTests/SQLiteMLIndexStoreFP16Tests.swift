@@ -57,14 +57,9 @@ import Testing
         var blockLoadCount: Int { lock.withLock { blockLoads } }
 
         func upsert(_ records: [MLEmbeddingRecord]) -> MLIndexBatchReport { backing.upsert(records) }
-        func contains(uid: PhotoUID, descriptor: MLModelDescriptor) throws -> Bool {
-            try backing.contains(uid: uid, descriptor: descriptor)
-        }
         func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) throws -> Set<PhotoUID> {
             try backing.indexedUIDs(for: descriptor, from: uids)
         }
-        func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allIndexedUIDs(for: descriptor) }
-        func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allTrackedUIDs(for: descriptor) }
         func reconcileTrackedUIDs(
             currentAuthoritativeUIDs: [PhotoUID],
             previousAuthoritativeUIDs: [PhotoUID]?,
@@ -76,13 +71,6 @@ import Testing
                 descriptor: descriptor
             )
         }
-        func allRecords(for descriptor: MLModelDescriptor) -> [MLEmbeddingRecord] {
-            backing.allRecords(for: descriptor)
-        }
-        func vectorBlock(for descriptor: MLModelDescriptor) -> MLVectorBlock {
-            lock.withLock { blockLoads += 1 }
-            return backing.vectorBlock(for: descriptor)
-        }
         func forEachVectorBlock(
             for descriptor: MLModelDescriptor,
             maximumRows: Int,
@@ -93,7 +81,6 @@ import Testing
                 try body(block)
             }
         }
-        func remove(uid: PhotoUID, descriptor: MLModelDescriptor) { backing.remove(uid: uid, descriptor: descriptor) }
         func remove(uids: [PhotoUID], descriptor: MLModelDescriptor) {
             backing.remove(uids: uids, descriptor: descriptor)
         }
@@ -309,7 +296,7 @@ import Testing
         #expect(block.count == 3)
         #expect(!block.uids.contains(uid("a1")))
         #expect(cipher.openCount - opensBefore == 3)
-        #expect(store.allRecords(for: descriptor).count == 3)
+        #expect(store.vectorBlock(for: descriptor).count == 3)
 
         // The read purges the invalid derived row. Normal membership now schedules it again.
         #expect(try store.contains(uid: uid("a1"), descriptor: descriptor) == false)

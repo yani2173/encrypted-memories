@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import Testing
 
 @testable import ProtonAuth
@@ -21,7 +22,48 @@ struct ProtonAuthControllerTests {
         let store = FakeSessionStore(loadError: FakeStoreError.unavailable)
         let controller = ProtonAuthController(store: store, authenticator: FakeAuthenticator())
 
-        #expect(controller.bootstrap() == .signedOut(error: "session store unavailable"))
+        #expect(controller.bootstrap() == .signedOut(error: L10n.string("auth.saved_sign_in_unreadable")))
+    }
+
+    @MainActor
+    @Test func aSignOutTellsTheBackgroundWindowsThatNoAccountIsSignedIn() {
+        let session = ProtonSession(uid: "uid-signed-out", accessToken: "at", refreshToken: "rt", keyPassword: "kp")
+        let reads = BackgroundAccountReadiness(grace: {})
+        let controller = ProtonAuthController(
+            store: FakeSessionStore(initial: session), authenticator: FakeAuthenticator(), sessionReads: reads)
+        controller.bootstrap()
+        #expect(reads.lastRead == .readable)
+        controller.signOut()
+        #expect(reads.lastRead == .absent)
+    }
+
+    @MainActor
+    @Test func aSignOutWhoseRemovalFailedStillTellsTheBackgroundWindowsThatNoAccountIsSignedIn() {
+        let session = ProtonSession(uid: "uid-signed-out", accessToken: "at", refreshToken: "rt", keyPassword: "kp")
+        let reads = BackgroundAccountReadiness(grace: {})
+        let controller = ProtonAuthController(
+            store: FakeSessionStore(initial: session, clearError: FakeStoreError.unavailable),
+            authenticator: FakeAuthenticator(), sessionReads: reads)
+        controller.bootstrap()
+        guard case .signedOut(let error) = controller.signOut() else {
+            Issue.record("the sign-out ends the account")
+            return
+        }
+        #expect(error != nil)
+        #expect(reads.lastRead == .absent)
+    }
+
+    @MainActor
+    @Test func aSignInTellsTheBackgroundWindowsThatTheSignInIsReadable() async {
+        let session = ProtonSession(uid: "uid-new", accessToken: "at", refreshToken: "rt", keyPassword: "kp")
+        let reads = BackgroundAccountReadiness(grace: {})
+        let controller = ProtonAuthController(
+            store: FakeSessionStore(), authenticator: FakeAuthenticator(session: session), sessionReads: reads)
+        controller.bootstrap()
+        #expect(reads.lastRead == .absent)
+        controller.signIn(openURL: { _ in })
+        #expect(await waitUntil { controller.state == .signedIn(session) })
+        #expect(reads.lastRead == .readable)
     }
 
     @MainActor
@@ -70,8 +112,7 @@ struct ProtonAuthControllerTests {
 
         #expect(
             await waitUntil {
-                if case .signedOut(error: "offline") = controller.state { return true }
-                return false
+                controller.state == .signedOut(error: L10n.string("auth.sign_in_incomplete"))
             })
         #expect(store.savedSessions().isEmpty)
     }
@@ -86,7 +127,7 @@ struct ProtonAuthControllerTests {
 
         #expect(
             await waitUntil {
-                controller.state == .signedOut(error: "session store unavailable")
+                controller.state == .signedOut(error: L10n.string("auth.sign_in_not_saved"))
             })
         #expect(controller.currentSession == nil)
     }

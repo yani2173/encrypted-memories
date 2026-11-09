@@ -73,7 +73,7 @@ struct PhotoLibraryLiveChangeBuffer {
 /// Incremental change tracking across launches (persistent change history) plus a live in-session
 /// observer. The persistent token is PhotoKit-specific state, so it lives here in the adapter,
 /// persisted as a secure-coded archive next to the account's backup stores.
-public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObserver, @unchecked Sendable {
+public final class PhotoLibraryChangeMonitor: @unchecked Sendable {
     private final class ObservedAssetsBox: @unchecked Sendable {
         let fetchResult: PHFetchResult<PHAsset>
 
@@ -119,11 +119,7 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
     }
 
     struct Operations: Sendable {
-        var fetch: @Sendable () -> PHFetchResult<PHAsset> = {
-            let options = PHFetchOptions()
-            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-            return PHAsset.fetchAssets(with: options)
-        }
+        var fetch: @Sendable () -> PHFetchResult<PHAsset> = { PhotoKitAssetMapper.fetchAssets() }
         var register: @Sendable (any PHPhotoLibraryChangeObserver) -> Void = { PHPhotoLibrary.shared().register($0) }
         var unregister: @Sendable (any PHPhotoLibraryChangeObserver) -> Void = {
             PHPhotoLibrary.shared().unregisterChangeObserver($0)
@@ -179,7 +175,6 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         }
     }
 
-    private let legacyID = UUID()
     private var callbacks: [UUID: Callback] = [:]
     private var registration: Registration?
     private var observedAssets: PHFetchResult<PHAsset>?
@@ -204,19 +199,11 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
     init(tokenURL: URL, operations: Operations) {
         self.tokenURL = tokenURL
         self.operations = operations
-        super.init()
     }
 
     deinit {
         if let registration { operations.unregister(registration) }
     }
-
-    /// Starts or replaces the legacy subscription. Its stop never cancels another consumer.
-    public func startObserving(_ handler: @Sendable @escaping () -> Void) {
-        addSubscriber(id: legacyID, handler: handler)
-    }
-
-    public func stopObserving() { removeSubscriber(id: legacyID) }
 
     public func subscribe(_ handler: @Sendable @escaping () -> Void) -> Subscription {
         let id = UUID()
@@ -230,12 +217,14 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         #endif
         let (generation, replaced): (UInt64?, Callback?) = lock.withLock {
             let replaced = callbacks.updateValue(Callback(handler), forKey: id)
+            // Each subscription has a fresh id, so nothing is replaced. A replaced callback still leaves the lock first.
+            assert(replaced == nil, "a subscription id was reused")
             guard !isObserving, !isStarting else { return (nil, replaced) }
             isStarting = true
             observationGeneration &+= 1
             return (observationGeneration, replaced)
         }
-        // Releasing a client closure can destroy another subscription and re-enter cancellation.
+        // Releasing a client closure can destroy another subscription and re-enter cancellation (#778).
         withExtendedLifetime(replaced) {}
         guard let generation else { return }
 
@@ -283,10 +272,6 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
             isObserving && generation == observationGeneration && registration === admitted
         }
         if !registrationIsCurrent { operations.unregister(admitted) }
-    }
-
-    public func photoLibraryDidChange(_ changeInstance: PHChange) {
-        receive(changeInstance, generation: lock.withLock { observationGeneration })
     }
 
     private func receive(_ changeInstance: PHChange, generation: UInt64) {

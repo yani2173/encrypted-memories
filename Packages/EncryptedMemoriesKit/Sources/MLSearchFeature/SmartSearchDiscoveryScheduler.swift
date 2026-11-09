@@ -231,9 +231,15 @@ public final class SmartSearchDiscoveryScheduler {
                     locationsChanged: locationEvidence == nil && previous.coordinates != coordinates)
             }
         }
+        let runtime = runtimeState.snapshot()
         eligible =
             libraryIsSettled && cacheContentIsSettled && Self.permitsAutomaticGeneration(snapshot)
-            && Self.permitsRefresh(runtimeState.snapshot())
+            && Self.permitsRefresh(runtime)
+        if !eligible {
+            Self.recordBlocked(
+                libraryIsSettled: libraryIsSettled, cacheContentIsSettled: cacheContentIsSettled,
+                generationAllowed: Self.permitsAutomaticGeneration(snapshot), runtime: runtime)
+        }
         PhotoDiagnostics.shared.emitDebug(
             "SearchSuggestions",
             [
@@ -348,6 +354,24 @@ public final class SmartSearchDiscoveryScheduler {
             && snapshot.activeSearchCount == 0
     }
 
+    /// One line, at most every 10 seconds per distinct state, that names which gate keeps the refresh from
+    /// starting. Fixed scalars only.
+    private static func recordBlocked(
+        libraryIsSettled: Bool, cacheContentIsSettled: Bool, generationAllowed: Bool,
+        runtime: LibraryRuntimeSnapshot
+    ) {
+        PhotoDiagnostics.shared.emit(
+            "SearchSuggestions",
+            [
+                "event": "refreshBlocked", "eligible": "false", "librarySettled": "\(libraryIsSettled)",
+                "cacheContentSettled": "\(cacheContentIsSettled)", "generationAllowed": "\(generationAllowed)",
+                "lowPower": "\(runtime.isLowPowerMode)", "thermal": "\(runtime.thermalLevel)",
+                "memory": "\(runtime.memoryPressure)",
+                "foreground": "\(runtime.executionOpportunity == .foregroundActive)",
+                "searchCount": "\(runtime.activeSearchCount)", "transferCount": "\(runtime.activeUserTransferCount)",
+            ], throttleSeconds: 10)
+    }
+
     private func conditionsChanged(_ snapshot: LibraryRuntimeSnapshot) {
         let wasEligible = eligible
         if snapshot.memoryPressure != .normal || snapshot.memoryHeadroom >= .constrained {
@@ -367,6 +391,12 @@ public final class SmartSearchDiscoveryScheduler {
             && Self.permitsRefresh(snapshot)
         if !eligible {
             task?.cancel()
+            if input != nil {
+                Self.recordBlocked(
+                    libraryIsSettled: input?.libraryIsSettled == true,
+                    cacheContentIsSettled: input?.cacheContentIsSettled == true,
+                    generationAllowed: Self.permitsAutomaticGeneration(input?.snapshot), runtime: snapshot)
+            }
         } else if !wasEligible {
             failedKey = nil
             retryCount = 0
@@ -398,6 +428,10 @@ public final class SmartSearchDiscoveryScheduler {
         let snapshot: SmartSearchDiscoveryModel.PersistedSnapshot?
         let exact: Bool
         let reusesEvidence: Bool
+        /// What the saved payload failed, for the restore outcome line. All true without a payload to judge.
+        var versionMatches = true
+        var modelMatches = true
+        var evidenceComplete = true
     }
 
     /// Hydrate saved rows even while Search is active. This performs no inference or geocoding.
@@ -424,28 +458,19 @@ public final class SmartSearchDiscoveryScheduler {
                 Result { () throws -> PreparedCache in
                     try Task.checkCancellation()
                     var saved: SmartSearchDiscoveryPersistence?
+                    var versionMatches = true
+                    var modelMatches = true
+                    var evidenceComplete = true
                     if let data {
                         do {
                             let decoded = try PropertyListDecoder().decode(
                                 SmartSearchDiscoveryPersistence.self, from: data)
-                            let evidenceComplete = decoded.hasCompleteEvidence(
+                            evidenceComplete = decoded.hasCompleteEvidence(
                                 requiresVisualEvidence: SmartSearchDiscoveryModel.visualConceptsAvailable(
                                     input.snapshot))
-                            if decoded.version == SmartSearchDiscoveryPersistence.version, decoded.modelKey == modelKey,
-                                evidenceComplete
-                            {
-                                saved = decoded
-                            } else {
-                                PhotoDiagnostics.shared.emitDebug(
-                                    "SearchSuggestions",
-                                    [
-                                        "cache": "payloadRejected",
-                                        "versionMatches":
-                                            "\(decoded.version == SmartSearchDiscoveryPersistence.version)",
-                                        "modelMatches": "\(decoded.modelKey == modelKey)",
-                                        "evidenceComplete": "\(evidenceComplete)",
-                                    ])
-                            }
+                            versionMatches = decoded.version == SmartSearchDiscoveryPersistence.version
+                            modelMatches = decoded.modelKey == modelKey
+                            if versionMatches, modelMatches, evidenceComplete { saved = decoded }
                         } catch {
                             PhotoDiagnostics.shared.increment("ml.suggestions.snapshotDecodeFailed")
                         }
@@ -453,16 +478,26 @@ public final class SmartSearchDiscoveryScheduler {
                     guard let saved else {
                         return PreparedCache(
                             fingerprint: nil, assetFingerprint: nil, saved: nil, snapshot: nil, exact: false,
-                            reusesEvidence: false)
+                            reusesEvidence: false, versionMatches: versionMatches, modelMatches: modelMatches,
+                            evidenceComplete: evidenceComplete)
                     }
                     let fingerprints = try SmartSearchDiscoveryPersistence.fingerprints(
                         sections: input.sections, favorites: input.favorites, coordinates: input.coordinates)
                     try Task.checkCancellation()
                     let exact = saved.fingerprint == fingerprints.content
+                    // Changed content (a running backup adds photos) still shows what was computed before, as
+                    // provisional rows that the next refresh replaces.
+                    let snapshot =
+                        exact
+                        ? saved.snapshot
+                        : saved.snapshot.provisional(
+                            library: Set(input.sections.lazy.flatMap(\.items).map(\.uid)), favorites: input.favorites)
                     return PreparedCache(
                         fingerprint: fingerprints.content, assetFingerprint: fingerprints.assets, saved: saved,
-                        snapshot: exact ? saved.snapshot : nil, exact: exact,
-                        reusesEvidence: exact || saved.assetFingerprint == fingerprints.assets)
+                        snapshot: snapshot, exact: exact,
+                        reusesEvidence: exact || saved.assetFingerprint == fingerprints.assets,
+                        versionMatches: versionMatches, modelMatches: modelMatches,
+                        evidenceComplete: evidenceComplete)
                 }
             }
             if let lease = access, !(await lease.isCurrent()) {
@@ -493,19 +528,35 @@ public final class SmartSearchDiscoveryScheduler {
                     ? "unavailable"
                     : access?.data == nil
                         ? "missing"
-                        : prepared.saved == nil ? "incompatible" : prepared.exact ? "restored" : "contentChanged"
+                        : prepared.saved == nil
+                            ? "incompatible"
+                            : prepared.exact
+                                ? "restored"
+                                : prepared.snapshot == nil
+                                    ? "contentChanged" : self.discovery.hasComputed ? "skipped" : "provisional"
                 Self.recordPersistence(action: "restore", result: outcome, started: started)
+                PhotoDiagnostics.shared.emit(
+                    "SearchSuggestions",
+                    [
+                        "event": "restoreOutcome", "outcome": outcome, "versionMatches": "\(prepared.versionMatches)",
+                        "modelMatches": "\(prepared.modelMatches)", "evidenceComplete": "\(prepared.evidenceComplete)",
+                        "exactContent": "\(prepared.exact)",
+                    ])
                 self.contentFingerprint = prepared.fingerprint
                 self.assetFingerprint = prepared.assetFingerprint
                 PhotoDiagnostics.shared.emitDebug(
                     "SearchSuggestions",
                     [
                         "cache": "prepared", "lease": "\(access != nil)", "payload": "\(prepared.saved != nil)",
-                        "exactContent": "\(prepared.exact)",
+                        "exactContent": "\(prepared.exact)", "versionMatches": "\(prepared.versionMatches)",
+                        "modelMatches": "\(prepared.modelMatches)", "evidenceComplete": "\(prepared.evidenceComplete)",
                     ])
                 if let saved = prepared.saved {
                     self.discovery.restorePlaceNames(from: saved.snapshot)
-                    if let snapshot = prepared.snapshot {
+                    // Provisional rows only fill an empty screen. A model that already shows rows keeps them: a
+                    // library change during the session must not replace valid rows, places included, by a filtered
+                    // older copy.
+                    if let snapshot = prepared.snapshot, prepared.exact || !self.discovery.hasComputed {
                         self.discovery.restore(
                             snapshot,
                             content: SmartSearchContentIdentity(

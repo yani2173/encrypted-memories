@@ -1,3 +1,4 @@
+import CoreGraphics
 import XCTest
 
 final class MobileFailedBackupUITests: XCTestCase {
@@ -10,12 +11,13 @@ final class MobileFailedBackupUITests: XCTestCase {
 
     override func tearDown() { app.terminate() }
 
-    private func openSheet(mode: String? = nil, language: String = "en") {
+    private func openSheet(mode: String? = nil, language: String = "en", missingPreview: Bool = false) {
         app.launchArguments = [
             "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesFailedBackupFixture",
             "-AppleLanguages", "(\(language))", "-AppleLocale", language == "de" ? "de_DE" : "en_US",
         ]
         if let mode { app.launchArguments.append(mode) }
+        if missingPreview { app.launchArguments.append("-EncryptedMemoriesMissingProblemPreview") }
         app.launch()
         let settings = app.buttons[language == "de" ? "Proton-Konto und Einstellungen" : "Proton Account and Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 60))
@@ -80,6 +82,63 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertFalse(
             app.staticTexts.containing(NSPredicate(format: "label CONTAINS 'Fixture technical detail'"))
                 .firstMatch.exists)
+    }
+
+    func testProblemRowShowsItsLocalPreviewWithoutChangingItsAccessibleText() throws {
+        openSheet(mode: "-EncryptedMemoriesAccountStorageOnlyBackupFixture")
+        let photo = row("accountStorage fixture.heic")
+        XCTAssertTrue(photo.waitForExistence(timeout: 10))
+        let drawn = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in Self.previewPixels(in: photo.screenshot().image.cgImage) > 200 },
+            object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [drawn], timeout: 10), .completed, "the row has no rendered local preview")
+        assertProblemRowLabel(photo)
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "Backup problem with local preview"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testProblemPlaceholderDoesNotChangeTheAccessibleText() {
+        openSheet(mode: "-EncryptedMemoriesAccountStorageOnlyBackupFixture", missingPreview: true)
+        let photo = row("accountStorage fixture.heic")
+        XCTAssertTrue(photo.waitForExistence(timeout: 10))
+        XCTAssertEqual(Self.previewPixels(in: photo.screenshot().image.cgImage), 0)
+        assertProblemRowLabel(photo)
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "Backup problem with local placeholder"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func assertProblemRowLabel(_ photo: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(
+            photo.label,
+            "accountStorage fixture.heic, Your Proton storage is full. Free up space or upgrade your plan.", file: file,
+            line: line)
+        XCTAssertFalse(
+            photo.label.localizedCaseInsensitiveContains("photo"),
+            "the decorative preview must add no VoiceOver label", file: file, line: line)
+    }
+
+    private static func previewPixels(in image: CGImage?) -> Int {
+        guard let image else { return 0 }
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard
+                let context = CGContext(
+                    data: buffer.baseAddress, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+                )
+            else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
+        }
+        guard drawn else { return 0 }
+        return stride(from: 0, to: pixels.count, by: 4).filter {
+            pixels[$0] > 200 && pixels[$0 + 1] < 60 && pixels[$0 + 2] > 200
+        }.count
     }
 
     func testGermanSectionsAndReasons() {

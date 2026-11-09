@@ -6,7 +6,7 @@ import XCTest
 
 final class MobileSearchLandingLayoutTests: XCTestCase {
     @MainActor func testSearchClearanceFollowsSizeClassWithoutGrowingWithDynamicType() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let model = MobileLibraryModel()
         let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let window = UIWindow(windowScene: scene)

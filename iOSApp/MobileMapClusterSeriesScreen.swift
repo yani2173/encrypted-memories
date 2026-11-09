@@ -51,36 +51,23 @@ struct MobileMapClusterSeriesScreen: View {
     }
 
     @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
-        if pager.pageCount > 1 {
-            ToolbarItem(placement: .topBarLeading) {
-                Button {
-                    selection.finish()
-                    pageIndex -= 1
-                } label: {
-                    Image(systemName: "chevron.left")
-                }
-                .disabled(currentPage?.hasPrevious != true || selectionBusy)
+        MobileMapClusterPageToolbarItems(
+            pageIndex: pageIndex, pageCount: pager.pageCount, currentPage: currentPage, isBusy: selectionBusy,
+            previous: {
+                selection.finish()
+                pageIndex -= 1
+            },
+            next: {
+                selection.finish()
+                pageIndex += 1
             }
-            .mobileVisibilityPriority(.high)
-            ToolbarItem(placement: .principal) {
-                Text("\(pageIndex + 1)/\(pager.pageCount)")
-                    .monospacedDigit()
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    selection.finish()
-                    pageIndex += 1
-                } label: {
-                    Image(systemName: "chevron.right")
-                }
-                .disabled(currentPage?.hasNext != true || selectionBusy)
-            }
-            .mobileVisibilityPriority(.high)
-        }
+        )
         if !clusterItems.isEmpty {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button(selection.isSelecting ? L10n.string("action.done") : L10n.string("action.select")) {
+            ProminentToolbarItem(placement: .topBarTrailing, isProminent: selection.isSelecting) {
+                Button {
                     selection.toggleMode()
+                } label: {
+                    MobileSelectionModeLabel(isSelecting: selection.isSelecting)
                 }
             }
             .mobileVisibilityPriority(.high)
@@ -91,11 +78,12 @@ struct MobileMapClusterSeriesScreen: View {
             showAlbumPicker: $showAlbumPicker,
             onShare: startShare,
             onTrash: { selection.showTrashConfirm = true },
-            albumPicker: {
+            albumPicker: { regularPresentation in
                 if let coordinator = model.albumActions {
                     AlbumDestinationPicker(
                         coordinator: coordinator,
                         photoUIDs: model.selectedUIDs(selection.selected),
+                        regularPresentation: regularPresentation,
                         onAlbumsChanged: { model.noteAlbumsChanged() },
                         onCompleted: { _ in
                             showAlbumPicker = false
@@ -167,5 +155,43 @@ struct MobileMapClusterSeriesScreen: View {
             longitude: coordinate.longitude
         )
         placeName = name
+    }
+}
+
+/// The native cluster pager toolbar, independent of photo loading and reverse geocoding.
+struct MobileMapClusterPageToolbarItems: ToolbarContent {
+    @Environment(\.verticalBarEdge) private var edge
+    let pageIndex: Int
+    let pageCount: Int
+    let currentPage: PhotoLocationClusterPage?
+    let isBusy: Bool
+    let previous: () -> Void
+    let next: () -> Void
+
+    var body: some ToolbarContent {
+        if pageCount > 1 {
+            ToolbarItem(placement: .topBarLeading) {
+                Button(action: previous) { pageLabel("map.previous_page", symbol: "chevron.left") }
+                    .disabled(currentPage?.hasPrevious != true || isBusy)
+            }
+            .mobileVisibilityPriority(.high)
+            ToolbarItem(placement: .principal) {
+                Text("\(pageIndex + 1)/\(pageCount)")
+                    .monospacedDigit()
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: next) { pageLabel("map.next_page", symbol: "chevron.right") }
+                    .disabled(currentPage?.hasNext != true || isBusy)
+            }
+            .mobileVisibilityPriority(.high)
+        }
+    }
+
+    @ViewBuilder private func pageLabel(_ key: String.LocalizationValue, symbol: String) -> some View {
+        if edge == nil {
+            Image(systemName: symbol)
+        } else {
+            Label(L10n.string(key), systemImage: symbol)
+        }
     }
 }

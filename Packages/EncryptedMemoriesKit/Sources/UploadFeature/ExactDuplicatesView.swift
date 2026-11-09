@@ -53,6 +53,12 @@ public struct ExactDuplicatesView<Cover: View>: View {
                 model.notice?.title ?? "",
                 isPresented: Binding(get: { model.notice != nil }, set: { if !$0 { model.dismissNotice() } })
             ) {
+                if model.canRetryFailedMerges {
+                    Button(L10n.string("duplicates.retry_merge")) {
+                        Task { await model.retryFailedMerges() }
+                    }
+                    .accessibilityIdentifier("duplicates.retryMerge")
+                }
                 Button(L10n.string("action.ok"), role: .cancel) { model.dismissNotice() }
             } message: {
                 if let message = model.notice?.message, !message.isEmpty { Text(message) }

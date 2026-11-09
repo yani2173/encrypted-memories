@@ -42,9 +42,18 @@ struct MobilePhotoViewer: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var index: Int
     @State private var chromeVisible = true
+    /// Whether the system put the media and the lower part side by side: the folded layout of a partly open device.
+    @State private var arrangementSideBySide = false
+    @State private var videoTransport: ViewerVideoTransport
+    #if DEBUG
+        @Environment(\.mobileViewerIsDividedForTesting) private var dividedArrangementForTesting
+        @Environment(\.mobileViewerTransportChromeForTesting) private var transportChromeForTesting
+        @Environment(\.mobileViewerShareProbeForTesting) private var shareProbeForTesting
+    #endif
     @State private var burstSelection = BurstSelectionModel()
     @State private var editedOriginal = EditedPhotoOriginalState()
     @State private var editedOriginalLookup = EditedPhotoOriginalLookup()
+    @State private var revert = EditedPhotoRevertController()
     @State private var selection = MobileGridSelectionController()
     @State private var isRestoring = false
     @State private var showRestoreError = false
@@ -73,6 +82,9 @@ struct MobilePhotoViewer: View {
     @State private var titleMetadataCoordinator: ViewerTitleMetadataCoordinator
     /// Ties the loaded series to its library page so an index change can never show the previous page's series.
     @State private var burstBaseUID: PhotoUID?
+    /// The burst read that a Share tap starts after a failed or unconfirmed read. A page change or the
+    /// closed viewer cancels it, so its share never reaches another page or a closed viewer.
+    @State private var shareReread: Task<Void, Never>?
     /// The presented "Select Favorites" mode of the current series.
     @State private var seriesModel: MobileSeriesFavoritesModel?
     /// Bounded, shared image loader for the pages (thumbnail to screen-bounded preview, off-main and cached).
@@ -90,8 +102,10 @@ struct MobilePhotoViewer: View {
         viewerRouter: MobileViewerRouter,
         showsInfoInitially: Bool = false,
         followsLibraryReplacements: Bool = false,
-        duplicateGroup: MobileDuplicateViewerGroup? = nil
+        duplicateGroup: MobileDuplicateViewerGroup? = nil,
+        videoTransport: ViewerVideoTransport? = nil
     ) {
+        _videoTransport = State(initialValue: videoTransport ?? ViewerVideoTransport())
         _showInfo = State(initialValue: showsInfoInitially)
         _items = State(initialValue: items)
         self.startIndex = startIndex
@@ -161,7 +175,8 @@ struct MobilePhotoViewer: View {
                     MobileViewerPage(
                         item: item,
                         isCurrent: isCurrent,
-                        showsChrome: chromeVisible,
+                        videoTransport: videoTransport,
+                        transportPlacement: videoTransportPlacement,
                         resolvedMediaKind: resolvedMediaKinds[item.uid],
                         libraryModel: libraryModel,
                         imageStore: imageStore,
@@ -207,12 +222,19 @@ struct MobilePhotoViewer: View {
                 }
             }
             // The filmstrip is bottom safe-area content, the Photos-app contract: the media refits when the chrome
-            // toggles, and the native bottom bar stacks below the strip.
-            .safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }
-            .overlay {
+            // toggles, and the native bottom bar stacks below the strip. In the folded layout the system puts the
+            // filmstrip and the details on the other part of the display.
+            .viewerArrangement(
+                showsLowerPart: chromeVisible,
+                stackedLowerPartHeight: chromeLayoutProfile.stackedLowerPartHeight,
+                isSideBySide: $arrangementSideBySide
+            ) {
+                viewerBottomAccessory
+            } notice: {
                 UndoNoticeOverlay(
                     notice: Binding(get: { libraryModel.undoNotice }, set: { libraryModel.undoNotice = $0 }))
             }
+            .background { Color.black.ignoresSafeArea() }
             // The principal item draws both lines. A blank title string would render as quotation marks while
             // a known location resolves, so the reserved line is hidden by opacity instead, as on the Mac.
             .navigationTitle(viewerTitle.reservesLocationLine ? viewerTitle.line2 : viewerTitle.line1)
@@ -239,6 +261,7 @@ struct MobilePhotoViewer: View {
             }
         }
         .task(id: currentBaseItem?.uid) {
+            shareReread?.cancel()
             guard let currentBaseItem else { return }
             await loadBurst(for: currentBaseItem)
         }
@@ -288,6 +311,23 @@ struct MobilePhotoViewer: View {
         } message: {
             Text(String(localized: "viewer.favorite_failed_message"))
         }
+        // Only the buttons end the confirmation: the controller, not the binding, decides what a tap does, so a
+        // dismissal that SwiftUI reports before the button action can never cancel the confirmed revert.
+        .alert(
+            L10n.string("viewer.revert_original_title"),
+            isPresented: Binding(get: { revert.isConfirming }, set: { _ in })
+        ) {
+            Button(L10n.string("viewer.revert_original_confirm")) { confirmRevertToOriginal() }
+            Button(L10n.string("action.cancel"), role: .cancel) { revert.cancel() }
+        } message: {
+            Text(L10n.string("viewer.revert_original_message"))
+        }
+        .alert(
+            L10n.string("viewer.revert_original_failed"),
+            isPresented: Binding(get: { revert.showsFailure }, set: { _ in })
+        ) {
+            Button(L10n.string("action.ok"), role: .cancel) { revert.dismissFailure() }
+        }
         .alert(
             saveToLibraryMessage ?? "",
             isPresented: Binding(
@@ -303,6 +343,7 @@ struct MobilePhotoViewer: View {
             liveTextHighlighted = false
             visibleThumbnail?.select(uid)
             editedOriginal.pageChanged(to: uid)
+            revert.pageChanged()
             lookUpEditedOriginal()
         }
         // The library may still load when the viewer opens; the photo on screen then asks as soon as it is ready.
@@ -313,10 +354,13 @@ struct MobilePhotoViewer: View {
         .onAppear { visibleThumbnail?.reopen(currentBaseItem?.uid) }
         .onAppear { lookUpEditedOriginal() }
         .onDisappear {
+            shareReread?.cancel()
             cancelViewerMutationPresentation()
             titleMetadataCoordinator.cancelAll()
             visibleThumbnail?.end()
             editedOriginalLookup.cancel()
+            // The viewer closed: a revert that ends later must not close or dismiss anything.
+            revert.detach()
         }
         .animation(
             MobileViewerMotionPolicy.animation(.smooth(duration: 0.24), reduceMotion: reduceMotion),
@@ -330,26 +374,71 @@ struct MobilePhotoViewer: View {
     @ViewBuilder private var viewerBottomAccessory: some View {
         if chromeVisible {
             let profile = chromeLayoutProfile
-            MobileViewerFilmstrip(
-                items: items,
-                selectedUID: currentBaseItem?.uid,
-                feed: libraryModel.thumbnailFeed,
-                itemSide: min(46, profile.filmstripHeight),
-                allowsVisibleDuplicateThumbnails: duplicateGroup != nil,
-                onSelect: selectPage
-            )
-            .frame(height: profile.filmstripHeight)
-            .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
-            .padding(.top, profile.rowSpacing)
-            .padding(.bottom, profile.bottomPadding)
+            VStack(spacing: 0) {
+                if videoTransportPlacement == .lowerPart {
+                    MobileViewerTransportRow(transport: videoTransport)
+                }
+                MobileViewerFilmstrip(
+                    items: items,
+                    selectedUID: currentBaseItem?.uid,
+                    feed: libraryModel.thumbnailFeed,
+                    itemSide: profile.filmstripItemSide,
+                    allowsVisibleDuplicateThumbnails: duplicateGroup != nil,
+                    onSelect: selectPage
+                )
+                .frame(height: profile.filmstripHeight)
+                .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
+                .padding(.top, profile.rowSpacing)
+                .padding(.bottom, profile.bottomPadding)
+                // The details fill the rest of the lower part and scroll when many albums or a large text size need
+                // more room, so nothing reaches the fold.
+                if let details = profile.details, let item = currentBaseItem {
+                    ScrollView {
+                        MobileViewerDetailsSummary(
+                            details: details,
+                            item: item,
+                            placeName: ViewerInfoLocation(
+                                metadata: metadataLoadState.metadata,
+                                placeName: titleMetadataState.resolution?.placeName,
+                                mapAndPlacesEnabled: mapAndPlacesEnabled
+                            ).placeName,
+                            albumTitles: albumTitles
+                        )
+                        .padding(.horizontal, details.horizontalPadding)
+                        .padding(.vertical, details.verticalPadding)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .environment(\.colorScheme, .dark)
+                }
+            }
             .frame(maxWidth: .infinity)
             .transition(.opacity)
         }
     }
 
+    private var isDivided: Bool {
+        #if DEBUG
+            if let dividedArrangementForTesting { return dividedArrangementForTesting }
+        #endif
+        return arrangementSideBySide
+    }
+
+    private var transportChromeVisible: Bool {
+        #if DEBUG
+            if let transportChromeForTesting { return transportChromeForTesting }
+        #endif
+        return chromeVisible
+    }
+
+    private var videoTransportPlacement: ViewerArrangement.VideoTransportPlacement {
+        let available = videoTransport.isAttached(to: currentBaseItem.map { editedOriginal.displayed($0).uid })
+        return ViewerArrangement.videoTransportPlacement(
+            isDivided: isDivided, showsChrome: transportChromeVisible, isAvailable: available)
+    }
+
     private var isCompactLandscape: Bool { verticalSizeClass == .compact }
     private var chromeLayoutProfile: ViewerChromeLayoutProfile {
-        MobileViewerBottomLayout.profile(compactLandscape: isCompactLandscape)
+        MobileViewerBottomLayout.profile(compactLandscape: isCompactLandscape, sideBySide: isDivided)
     }
 
     /// Native bar content. Close leads the navigation bar and the more-actions menu trails it; the per-photo
@@ -417,7 +506,7 @@ struct MobilePhotoViewer: View {
 
     /// Close is the primary navigation control: it stays at the top of a vertical bar and never overflows.
     private var viewerCloseItem: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
+        ToolbarItem(placement: .cancellationAction) {
             Button {
                 dismiss()
             } label: {
@@ -459,9 +548,11 @@ struct MobilePhotoViewer: View {
             Text(verbatim: title.line1)
                 .font(.headline)
                 .opacity(title.reservesLocationLine ? 0 : 1)
-            Text(verbatim: title.line2)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+            if !title.line2.isEmpty {
+                Text(verbatim: title.line2)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
         }
         .lineLimit(1)
         .multilineTextAlignment(.center)
@@ -481,7 +572,8 @@ struct MobilePhotoViewer: View {
                 && titleMetadataState.shouldReservePlaceNameLine(
                     hasKnownLocation: libraryModel.locationIndex.hasKnownLocation(current.uid)
                 ),
-            filename: metadataLoadState.metadata?.filename
+            filename: metadataLoadState.metadata?.filename,
+            detailsShowDateAndPlace: chromeLayoutProfile.showsDetails
         )
     }
 
@@ -528,7 +620,7 @@ struct MobilePhotoViewer: View {
                 Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
             }
         }
-        .disabled(currentBaseItem == nil || selection.isBusy)
+        .disabled(currentBaseItem == nil || selection.isBusy || shareDecision == .burstLoading)
         .accessibilityLabel(String(localized: "viewer.share_action"))
     }
 
@@ -626,7 +718,7 @@ struct MobilePhotoViewer: View {
         } label: {
             Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
         }
-        .disabled(currentBaseItem == nil || selection.isBusy)
+        .disabled(currentBaseItem == nil || selection.isBusy || shareDecision == .burstLoading)
 
         if let base = currentBaseItem, editedOriginal.canShowOriginal(of: base.uid) {
             let showing = editedOriginal.isShowingOriginal(of: base.uid)
@@ -638,6 +730,15 @@ struct MobilePhotoViewer: View {
                     systemImage: showing ? "wand.and.rays" : "wand.and.rays.inverse"
                 )
             }
+        }
+
+        if offersRevertToOriginal {
+            Button {
+                revert.request()
+            } label: {
+                Label(L10n.string("viewer.revert_original"), systemImage: "arrow.counterclockwise")
+            }
+            .disabled(revert.phase != .idle)
         }
 
         if currentBaseItem?.uid != nil, liveTextUID == currentBaseItem?.uid {
@@ -750,15 +851,56 @@ struct MobilePhotoViewer: View {
         }
     }
 
-    /// Shares what the page shows: the original of an edited photo while it is shown.
+    /// What Share carries for the shown page, from the shared viewer rule: the original of an
+    /// edited photo while it is shown, the whole loaded series, or nothing yet.
+    private var shareDecision: BurstExportExpansion.Result? {
+        guard let base = currentBaseItem else { return nil }
+        return burstSelection.viewerExportDecision(
+            current: editedOriginal.displayed(base), page: base, belongsToPage: burstBelongsToCurrentPage)
+    }
+
     private func shareCurrentItem() {
-        guard let base = currentBaseItem, libraryModel.backend != nil else { return }
-        let item = editedOriginal.displayed(base)
-        let items = burstBelongsToCurrentPage ? burstSelection.exportItems(current: item) : [item]
-        selection.startShare(
-            items: items, backend: libraryModel.viewerMedia,
-            failureMessage: String(localized: "viewer.share_failed")
-        )
+        guard libraryModel.backend != nil, let page = currentBaseItem, let result = shareDecision else { return }
+        guard case .burstReadFailed = result else {
+            share(result)
+            return
+        }
+        // A tap after a failed or unconfirmed burst read reads the burst again. Share is dimmed while
+        // the read runs, and the share then follows the new read: the whole series, or the notice.
+        shareReread?.cancel()
+        shareReread = Task { @MainActor in
+            await loadBurst(for: page)
+            guard !Task.isCancelled, currentBaseItem?.uid == page.uid, let reread = shareDecision else { return }
+            share(reread)
+        }
+    }
+
+    private func share(_ result: BurstExportExpansion.Result) {
+        switch result {
+        case .success(let items, let expandedSingleSeries):
+            let failureMessage = MobileViewerShareFailureText.message(
+                for: items, expandedSingleSeries: expandedSingleSeries, resolvedKinds: resolvedMediaKinds)
+            #if DEBUG
+                shareProbeForTesting?.record(
+                    .shared(nodeIDs: items.map(\.uid.nodeID), failureMessage: failureMessage))
+            #endif
+            selection.startShare(items: items, backend: libraryModel.viewerMedia, failureMessage: failureMessage)
+        case .burstReadFailed:
+            // Nothing leaves the app for a burst the viewer could not read completely.
+            let message = String(localized: "viewer.share_burst_load_failed")
+            #if DEBUG
+                shareProbeForTesting?.record(.burstReadFailed(message: message))
+            #endif
+            selection.actionError = MobileSelectionError(message: message)
+        case .burstLoading:
+            // The filmstrip has not settled yet; the Share control is dimmed while this
+            // window lasts, so a share that still arrives is refused without an alert.
+            #if DEBUG
+                shareProbeForTesting?.record(.burstUnsettled)
+            #endif
+        case .cancelled:
+            break
+        }
     }
 
     private func requestViewerMutation() {
@@ -783,6 +925,31 @@ struct MobilePhotoViewer: View {
             isSavingToLibrary = false
             saveToLibraryMessage = result?.message ?? L10n.string("library.save_to_library_failed")
         }
+    }
+
+    /// The command shows for an edited photo with a proven original, in the own library, when a backend reverts.
+    private var offersRevertToOriginal: Bool {
+        guard let base = currentBaseItem else { return false }
+        return EditedPhotoRevertController.isAvailable(
+            canShowOriginal: editedOriginal.canShowOriginal(of: base.uid),
+            mutationAction: viewerMutationAction,
+            hasReverter: libraryModel.editedPhotoReverter != nil)
+    }
+
+    /// The person confirmed. The controller starts the revert once, whatever the number of taps.
+    private func confirmRevertToOriginal() {
+        guard let base = currentBaseItem, let original = editedOriginal.original(of: base.uid),
+            let reverter = libraryModel.editedPhotoReverter
+        else { return revert.cancel() }
+        let libraryModel = libraryModel
+        revert.confirm(
+            perform: {
+                try await libraryModel.revertEditedPhoto(main: base, original: original, using: reverter)
+                // The screen behind the viewer must hear of the revert although the viewer may be gone by then, so
+                // this belongs here and not in `onSuccess`, which only closes the viewer.
+                viewerRouter.noteCompletedMutation(uid: base.uid)
+            },
+            onSuccess: { dismiss() })
     }
 
     private func confirmMoveToTrash() {
@@ -1004,6 +1171,10 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
         pvc.dataSource = context.coordinator
         pvc.delegate = context.coordinator
         pvc.view.backgroundColor = .clear
+        for scrollView in pvc.view.subviews.compactMap({ $0 as? UIScrollView }) {
+            scrollView.leftEdgeEffect.isHidden = true
+            scrollView.rightEdgeEffect.isHidden = true
+        }
         pvc.setViewControllers([context.coordinator.pageController(at: index)], direction: .forward, animated: false)
         return pvc
     }
@@ -1118,7 +1289,8 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
 private struct MobileViewerPage: View {
     let item: PhotoItem
     let isCurrent: Bool
-    let showsChrome: Bool
+    let videoTransport: ViewerVideoTransport
+    let transportPlacement: ViewerArrangement.VideoTransportPlacement
     let resolvedMediaKind: MediaKind?
     let libraryModel: MobileLibraryModel
     let imageStore: UIKitViewerImageStore
@@ -1132,7 +1304,8 @@ private struct MobileViewerPage: View {
             MobileVideoPage(
                 item: item,
                 isCurrent: isCurrent,
-                showsChrome: showsChrome,
+                transport: videoTransport,
+                transportPlacement: transportPlacement,
                 libraryModel: libraryModel,
                 onToggleChrome: onToggleChrome,
                 onCloseRequested: onCloseRequested
@@ -1701,6 +1874,19 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
     }
 }
 
+private struct MobileViewerTransportRow: View {
+    let transport: ViewerVideoTransport
+
+    var body: some View {
+        let snapshot = transport.snapshot
+        MobileVideoPlaybackControls(
+            currentTime: snapshot.currentTime, duration: snapshot.duration, isPlaying: snapshot.isPlaying,
+            isLoading: snapshot.isLoading, onTogglePlayback: transport.togglePlayback,
+            onSeekTo: transport.seek(to:), fillsHeight: false
+        )
+    }
+}
+
 private struct MobileVideoPlaybackControls: View {
     let currentTime: Double
     let duration: Double
@@ -1708,6 +1894,7 @@ private struct MobileVideoPlaybackControls: View {
     let isLoading: Bool
     let onTogglePlayback: () -> Void
     let onSeekTo: (Double) -> Void
+    let fillsHeight: Bool
 
     @State private var scrubTime: Double?
     @Environment(\.verticalSizeClass) private var verticalSizeClass
@@ -1715,12 +1902,13 @@ private struct MobileVideoPlaybackControls: View {
     private var displayedTime: Double { scrubTime ?? currentTime }
     private var seekRange: ClosedRange<Double> { 0...max(duration, 0.1) }
     private var layoutProfile: ViewerChromeLayoutProfile {
-        MobileViewerBottomLayout.profile(compactLandscape: verticalSizeClass == .compact)
+        // Both placements keep the existing transport sizes and design.
+        MobileViewerBottomLayout.profile(compactLandscape: verticalSizeClass == .compact, sideBySide: false)
     }
 
     var body: some View {
         VStack {
-            Spacer()
+            if fillsHeight { Spacer() }
 
             HStack(spacing: 12) {
                 playbackButton(
@@ -1796,7 +1984,8 @@ private struct MobileVideoPlaybackControls: View {
 private struct MobileVideoPage: View {
     let item: PhotoItem
     let isCurrent: Bool
-    let showsChrome: Bool
+    let transport: ViewerVideoTransport
+    let transportPlacement: ViewerArrangement.VideoTransportPlacement
     let libraryModel: MobileLibraryModel
     let onToggleChrome: () -> Void
     let onCloseRequested: () -> Void
@@ -1806,7 +1995,10 @@ private struct MobileVideoPage: View {
     /// The streaming asset is the only strong owner of the range resource-loader, which AVFoundation holds
     /// weakly - it must live as long as the player, or every protonvideo:// range request goes unserved.
     @State private var streamingAsset: StreamingVideoAsset?
-    @State private var failed = false
+    /// The classified cause of the failure that the page shows; nil while nothing failed.
+    @State private var failure: VideoPlaybackError?
+    /// Changes when the person taps Retry, so the preparation task starts again.
+    @State private var retryCount = 0
     @State private var poster: UIImage?
     @State private var pinch = ViewerPinchState()
     @State private var drag = ViewerDragState()
@@ -1832,11 +2024,16 @@ private struct MobileVideoPage: View {
 
     var body: some View {
         ZStack {
-            if failed {
-                ContentUnavailableView(
-                    L10n.string("viewer.playback_failed"),
-                    systemImage: "exclamationmark.triangle"
-                )
+            if let failure {
+                ContentUnavailableView {
+                    Label(L10n.string("viewer.playback_failed"), systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(failure.userMessage)
+                } actions: {
+                    if failure.isRetryable {
+                        RetryButton(.prominent) { retryCount += 1 }
+                    }
+                }
                 .foregroundStyle(.white)
             } else if let player {
                 MobileNativeVideoPlayer(
@@ -1857,7 +2054,7 @@ private struct MobileVideoPage: View {
                     }
                 }
 
-                if showsChrome {
+                if transportPlacement == .media {
                     MobileVideoPlaybackControls(
                         currentTime: playbackTime,
                         duration: playbackDuration,
@@ -1867,7 +2064,7 @@ private struct MobileVideoPage: View {
                             isActivelyPlaying: playbackIsPlaying
                         ),
                         onTogglePlayback: togglePlayback,
-                        onSeekTo: seek(to:)
+                        onSeekTo: seek(to:), fillsHeight: true
                     )
                     .transition(.opacity)
                 }
@@ -1902,7 +2099,8 @@ private struct MobileVideoPage: View {
                 uid: item.uid,
                 current: isCurrent,
                 sourceRevision: libraryModel.scopePresentationRevision,
-                sourceIdentity: sourceIdentity
+                sourceIdentity: sourceIdentity,
+                retryCount: retryCount
             )
         ) { await prepare() }
         .task(id: playbackAttachment?.generation) {
@@ -1913,9 +2111,11 @@ private struct MobileVideoPage: View {
             if current {
                 playbackIntendsToPlay = true
                 player?.play()
+                attachTransport()
             } else {
                 playbackIntendsToPlay = false
                 player?.pause()
+                detachTransport()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime)) {
@@ -1947,6 +2147,7 @@ private struct MobileVideoPage: View {
         let current: Bool
         let sourceRevision: UInt64
         let sourceIdentity: ObjectIdentifier?
+        let retryCount: Int
     }
 
     @MainActor
@@ -1987,6 +2188,7 @@ private struct MobileVideoPage: View {
             @unknown default:
                 break
             }
+            publishTransport()
             try? await Task.sleep(for: .milliseconds(150))
         }
     }
@@ -2006,6 +2208,7 @@ private struct MobileVideoPage: View {
         }
         playbackIsPlaying = willPlay && player.timeControlStatus == .playing
         playbackIsBuffering = willPlay && player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        publishTransport()
     }
 
     private func seek(to seconds: Double) {
@@ -2014,6 +2217,33 @@ private struct MobileVideoPage: View {
         let target = min(max(0, seconds), upper)
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         playbackTime = target
+        publishTransport()
+    }
+
+    private var transportSnapshot: ViewerVideoTransport.Snapshot {
+        ViewerVideoTransport.Snapshot(
+            currentTime: playbackTime, duration: playbackDuration,
+            isPlaying: playbackIsPlaying || playbackIsBuffering,
+            isLoading: MobileVideoPlaybackIntent.showsLoadingIndicator(
+                intendsToPlay: playbackIntendsToPlay, isActivelyPlaying: playbackIsPlaying)
+        )
+    }
+
+    private func attachTransport() {
+        guard isCurrent, let playbackAttachment else { return }
+        transport.attach(
+            uid: item.uid, attachment: playbackAttachment, snapshot: transportSnapshot,
+            onTogglePlayback: togglePlayback, onSeekTo: seek(to:))
+    }
+
+    private func publishTransport() {
+        guard let playbackAttachment else { return }
+        transport.update(transportSnapshot, attachment: playbackAttachment)
+    }
+
+    private func detachTransport() {
+        guard let playbackAttachment else { return }
+        transport.detach(attachment: playbackAttachment)
     }
 
     private var placeholderDismissDrag: some Gesture {
@@ -2105,7 +2335,7 @@ private struct MobileVideoPage: View {
         guard isCurrent, player == nil, let backend = libraryModel.backend else { return }
         playbackGeneration &+= 1
         let generation = playbackGeneration
-        failed = false
+        failure = nil
         let activity = LibraryRuntimeState.shared.beginActivity(.videoPlayback)
         defer {
             if playbackActivity !== activity { activity.end() }
@@ -2115,10 +2345,11 @@ private struct MobileVideoPage: View {
                 "[ViewerPerf] video prepare start uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
         }
         do {
-            let streaming =
+            let streaming = try await VideoPreparationRetry.run {
                 item.uid.isLocalPending
-                ? try await libraryModel.viewerMedia.makeStreamingAsset(for: item.uid)
-                : try await backend.makeStreamingAsset(for: item.uid)
+                    ? try await libraryModel.viewerMedia.makeStreamingAsset(for: item.uid)
+                    : try await backend.makeStreamingAsset(for: item.uid)
+            }
             guard !Task.isCancelled, isCurrent,
                 generation == playbackGeneration,
                 requestedSourceIdentity == sourceIdentity,
@@ -2149,6 +2380,7 @@ private struct MobileVideoPage: View {
                 playbackIntendsToPlay = true
                 newPlayer.play()
             }
+            attachTransport()
         } catch is CancellationError {
             return
         } catch {
@@ -2157,11 +2389,12 @@ private struct MobileVideoPage: View {
                 requestedSourceIdentity == sourceIdentity,
                 requestedSourceRevision == libraryModel.scopePresentationRevision
             else { return }
-            failed = true
+            failure = VideoPlaybackError.classify(error)
         }
     }
 
     private func teardown() {
+        detachTransport()
         playbackGeneration &+= 1
         playbackAttachment = nil
         playbackSourceIdentity = nil
@@ -2222,16 +2455,18 @@ private struct MobileVideoPage: View {
         playbackIsPlaying = false
         playbackIntendsToPlay = false
         playbackIsBuffering = false
+        publishTransport()
     }
 
     private func failPlayback(
-        _: VideoPlaybackError,
+        _ error: VideoPlaybackError,
         generation: UInt64,
         player observedPlayer: AVPlayer,
         item observedItem: AVPlayerItem
     ) {
         guard isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem) else { return }
-        failed = true
+        failure = error
+        detachTransport()
         playbackGeneration &+= 1
         playbackAttachment = nil
         playbackSourceIdentity = nil
@@ -2324,6 +2559,8 @@ struct MobileZoomableImage: UIViewRepresentable {
         scrollView.bouncesZoom = true
         scrollView.showsVerticalScrollIndicator = false
         scrollView.showsHorizontalScrollIndicator = false
+        scrollView.leftEdgeEffect.isHidden = true
+        scrollView.rightEdgeEffect.isHidden = true
         scrollView.backgroundColor = .clear
         scrollView.contentInsetAdjustmentBehavior = .never
 

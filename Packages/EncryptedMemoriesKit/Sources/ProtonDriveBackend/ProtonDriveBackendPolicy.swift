@@ -17,35 +17,31 @@ public typealias PhotosBackend = PhotosRepository
     & PhotoLibrarySaving
     & TrashProvider
     & LibraryStatsProvider
-    & PhotoDimensionRecording
 
+/// The video-block cache budget is not part of this policy. `DiskCacheBudgetPolicy.videoBudget` is the
+/// single source, and `VideoByteRangeCache` applies it.
 public struct ProtonDriveBackendPolicy: Sendable, Equatable {
     public let sdkCacheDirectory: URL
     public let libraryDatabaseBaseDirectory: URL
     public let libraryDatabasePolicy: LibraryDatabasePolicy
-    public let videoCacheBudgetBytes: Int
 
     public init(
         sdkCacheDirectory: URL,
         libraryDatabaseBaseDirectory: URL = LibraryDatabaseLocation.defaultBaseDirectory(),
-        libraryDatabasePolicy: LibraryDatabasePolicy = .conservative,
-        videoCacheBudgetBytes: Int = 512 * 1024 * 1024
+        libraryDatabasePolicy: LibraryDatabasePolicy = .conservative
     ) {
         self.sdkCacheDirectory = sdkCacheDirectory
         self.libraryDatabaseBaseDirectory = libraryDatabaseBaseDirectory
         self.libraryDatabasePolicy = libraryDatabasePolicy
-        self.videoCacheBudgetBytes = videoCacheBudgetBytes
     }
 
     public static func standard(
-        libraryDatabasePolicy: LibraryDatabasePolicy = .conservative,
-        videoCacheBudgetBytes: Int = 512 * 1024 * 1024
+        libraryDatabasePolicy: LibraryDatabasePolicy = .conservative
     ) -> Self {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return Self(
             sdkCacheDirectory: caches.appendingPathComponent("EncryptedMemories/sdk", isDirectory: true),
-            libraryDatabasePolicy: libraryDatabasePolicy,
-            videoCacheBudgetBytes: videoCacheBudgetBytes
+            libraryDatabasePolicy: libraryDatabasePolicy
         )
     }
 
@@ -79,6 +75,7 @@ public enum ProtonDriveBackendFactory {
             }
         #endif
         let bridge = try await DriveSDKBridge(session: session, store: store, policy: policy)
+        await bridge.startTrashedSeriesRestoreReplay()
         let accountDataDirectory = bridge.uploadManifestURL.deletingLastPathComponent()
         let sourceInventoryStore = LibrarySourceInventoryStore(
             directory: accountDataDirectory,
@@ -127,5 +124,18 @@ public enum ProtonDriveBackendFactory {
         UserDefaults.standard.removeObject(forKey: AppSettingsKey.libraryMapViewportSize)
         DriveSDKBridge.purgeMetadata(uid: uid, policy: policy)
         VideoByteRangeCache.shared.clearAll()
+    }
+}
+
+/// Classifies a library-open failure that no Retry with the same session can clear.
+public enum LibraryOpenFailurePermanence {
+    /// True only for a confirmed permanent cause: the account has no photos share, the drive scope is terminally
+    /// lost, or the server rejected the session. Account fetches report an unsuccessful refresh separately
+    /// when rejection is unproved. Network failures, rate limits and unclear answers keep Retry.
+    public static func isPermanent(_ error: Error) -> Bool {
+        if error is DriveBridgeError { return true }
+        if error is any LibraryChangeTerminalError { return true }
+        if case ProtonAuthError.apiError(let code, _) = error { return code == 401 }
+        return false
     }
 }

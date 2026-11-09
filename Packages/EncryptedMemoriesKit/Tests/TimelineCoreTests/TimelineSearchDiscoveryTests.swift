@@ -14,24 +14,15 @@ import Testing
         #expect(history.queries == ["baum", "Pizza"])
     }
 
-    @Test func recentDateSuggestionsAreNewestFirstLocalizedAndLexicallySearchable() {
+    @Test func isoDayQueryMatchesTheCaptureDayOfAnItemInANeutralSection() {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let first = item("first", date: date(2026, 3, 23, calendar: calendar))
         let second = item("second", date: date(2025, 12, 1, calendar: calendar))
-        let suggestions = TimelineSearchDiscovery.recentDateSuggestions(
-            sections: [TimelineSection(id: "all", date: second.captureTime, title: "", items: [second, first])],
-            calendar: calendar,
-            locale: Locale(identifier: "de_AT")
-        )
-
-        #expect(suggestions.map(\.query) == ["2026-03-23", "2025-12-01"])
-        #expect(suggestions.first?.title.contains("2026") == true)
-        #expect(suggestions.first?.representativeUID == first.uid)
 
         let filtered = TimelineSearch.filter(
             [TimelineSection(id: "all", date: second.captureTime, title: "", items: [second, first])],
-            query: suggestions[0].query
+            query: "2026-03-23"
         )
         #expect(filtered.flatMap(\.items).map(\.uid) == [first.uid])
     }

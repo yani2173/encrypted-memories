@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import XCTest
 
 @testable import UploadCore
@@ -94,4 +95,132 @@ final class FolderBackupCatalogTests: XCTestCase {
             XCTAssertEqual(error.url.lastPathComponent, "z-later")
         }
     }
+
+    private static let skipCounterKeys = [
+        "folderScan.unreadableEntrySkips.missing",
+        "folderScan.unreadableEntrySkips.permissionDenied",
+        "folderScan.unreadableEntrySkips.transient",
+    ]
+
+    private func skipCounters() -> [Int] {
+        Self.skipCounterKeys.map { PhotoDiagnostics.shared.counter($0) }
+    }
+
+    private func writeFiles(_ names: [String]) throws {
+        for name in names {
+            try Data("x".utf8).write(to: tempDir.appendingPathComponent(name))
+        }
+    }
+
+    private func restoreAccess() {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tempDir.path)
+    }
+
+    func testCandidatesSkipAnEntryWhoseAttributesCannotBeReadAndContinue() async throws {
+        try writeFiles(["a.jpg", "b.jpg", "z.jpg"])
+        // The listing reads every resource value, so only the attribute read of b.jpg fails.
+        let failedReads = ReadCounter()
+        let catalog = FolderBackupCatalog(folder: tempDir, includeHidden: false) { path in
+            guard (path as NSString).lastPathComponent == "b.jpg" else {
+                return try FileManager.default.attributesOfItem(atPath: path)
+            }
+            failedReads.increment()
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)
+        }
+
+        let skippedPermission = PhotoDiagnostics.shared.counter("folderScan.unreadableEntrySkips.permissionDenied")
+        let candidates = try await collect(catalog)
+
+        XCTAssertEqual(failedReads.value, 1, "the skip must happen at the attribute read")
+        XCTAssertEqual(
+            candidates.map(\.originalFilename), ["a.jpg", "z.jpg"],
+            "one unreadable entry must be skipped and never end the scan")
+        XCTAssertEqual(
+            PhotoDiagnostics.shared.counter("folderScan.unreadableEntrySkips.permissionDenied"),
+            skippedPermission + 1,
+            "a skip must leave a class-only hint on the internal diagnostics surface, without names or paths")
+        let exported = PhotoDiagnostics.shared.supportSnapshot()
+            .counters["folderScan.unreadableEntrySkips.permissionDenied"]
+        XCTAssertEqual(
+            exported, skippedPermission + 1,
+            "the skip hint must be part of the existing support diagnostics export")
+    }
+
+    func testFolderThatCannotBeSearchedFailsInsteadOfAnEmptyScan() async throws {
+        try writeFiles(["a.jpg", "b.jpg"])
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: tempDir.path)
+        defer { restoreAccess() }
+
+        let before = skipCounters()
+        do {
+            _ = try await collect(FolderBackupCatalog(folder: tempDir))
+            XCTFail("a folder without search permission must not look like an empty successful scan")
+        } catch let error as FolderEnumerationError {
+            XCTAssertEqual(error.operation, .readDirectory)
+            XCTAssertEqual(error.failureClass, .permissionDenied)
+            XCTAssertTrue(error.requiresRootAccessRenewal(for: tempDir))
+        }
+        XCTAssertEqual(skipCounters(), before, "a folder failure must not count as skipped entries")
+    }
+
+    func testFolderThatLosesSearchPermissionDuringTheScanFailsInsteadOfSkippingEveryEntry() async throws {
+        try writeFiles(["a.jpg", "b.jpg", "z.jpg"])
+        defer { restoreAccess() }
+
+        let before = skipCounters()
+        var iterator = FolderBackupCatalog(folder: tempDir).candidates().makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertEqual(first?.originalFilename, "a.jpg")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: tempDir.path)
+        do {
+            while try await iterator.next() != nil {}
+            XCTFail("a folder that lost access must not end as a successful scan")
+        } catch let error as FolderEnumerationError {
+            XCTAssertEqual(error.operation, .readDirectory)
+            XCTAssertEqual(error.failureClass, .permissionDenied)
+            XCTAssertEqual(error.url, tempDir)
+            XCTAssertTrue(error.requiresRootAccessRenewal(for: tempDir))
+        }
+        XCTAssertEqual(skipCounters(), before, "a folder failure must not count as skipped entries")
+    }
+
+    #if os(macOS)
+        func testCandidatesSkipAFileWhosePermissionsDenyReadingItsDetails() async throws {
+            try writeFiles(["a.jpg", "b.jpg", "z.jpg"])
+            let denied = tempDir.appendingPathComponent("b.jpg")
+            try runChmod(["+a", "everyone deny readattr,readextattr,readsecurity", denied.path])
+            defer { try? runChmod(["-N", denied.path]) }
+
+            let skippedPermission = PhotoDiagnostics.shared.counter(
+                "folderScan.unreadableEntrySkips.permissionDenied")
+            let candidates = try await collect(FolderBackupCatalog(folder: tempDir))
+
+            XCTAssertEqual(
+                candidates.map(\.originalFilename), ["a.jpg", "z.jpg"],
+                "a file whose own permissions deny reading its details must not stop the scan")
+            XCTAssertEqual(
+                PhotoDiagnostics.shared.counter("folderScan.unreadableEntrySkips.permissionDenied"),
+                skippedPermission + 1)
+        }
+
+        private func runChmod(_ arguments: [String]) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+            process.arguments = arguments
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, "chmod \(arguments.first ?? "")")
+        }
+    #endif
+}
+
+/// Counts reads across the scan's detached tasks.
+private final class ReadCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int { lock.withLock { count } }
+
+    func increment() { lock.withLock { count += 1 } }
 }

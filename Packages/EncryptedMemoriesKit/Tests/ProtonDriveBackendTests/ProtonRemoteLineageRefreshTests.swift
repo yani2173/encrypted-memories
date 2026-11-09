@@ -6,10 +6,10 @@ import ProtonCoreCryptoPatchedGoImplementation
 import ProtonDriveSDK
 import SQLite3
 import Testing
-import UploadCore
 
 @testable import PhotosCore
 @testable import ProtonDriveBackend
+@testable import UploadCore
 
 /// The gopenpgp implementation is process-global and injected once (the apps do the same at startup).
 private let lineageCryptoReady: Void = {
@@ -18,6 +18,124 @@ private let lineageCryptoReady: Void = {
 
 extension DriveSessionStubSuite {
     @Suite struct ProtonRemoteLineageRefreshTests {
+        @Test(.enabled(if: D1SupportOverheadProbe.enabled))
+        func benchmarkD1IndexRebuildCollectionOverhead() async throws {
+            let keys = try LineageKeys()
+            let ids = (0..<64).map { "benchmark-\($0)" }
+            let links = try ids.map {
+                try keys.activePhoto($0, attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+            }
+            let listed = ids.map {
+                ["LinkID": $0, "CaptureTime": 1, "Tags": [], "RelatedPhotos": []] as [String: Any]
+            }
+            let listing = try JSONSerialization.data(withJSONObject: ["Code": 1000, "Photos": listed])
+            let material = Self.material(rootKey: keys.root)
+            let hash = ProtonPhotoHMAC.hex(message: "abcd", key: material.hashKey)
+            try await D1SupportOverheadProbe.pairs(workload: "indexRebuild64") { enabled in
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let store = try #require(
+                    UploadIdentityManifestStore(url: directory.appendingPathComponent("index.sqlite")))
+                defer { store.close() }
+                let session = makeSession()
+                let collector = enabled ? SupportWorkMeasurements() : nil
+                StubURLProtocol.reset()
+                StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+                StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: String(decoding: listing, as: UTF8.self))
+                try routeMetadata(links)
+                let (_, elapsed) = try await D1SupportOverheadProbe.timed {
+                    try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                        material: material, session: session, crypto: keys.crypto,
+                        store: store, lineageStore: nil, progress: { _ in }, workMeasurements: collector)
+                }
+                #expect(store.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
+                #expect(
+                    Set(
+                        store.remoteContentRecords(contentHash: hash, hashKeyEpoch: "epoch", limit: 128).map(
+                            \.remoteLinkID)) == Set(ids))
+                #expect(try metadataRequestLinkIDs() == ids.sorted())
+                #expect(StubURLProtocol.requests().count == 4)
+                if let collector {
+                    let state = collector.workMeasurementSupportSnapshot().passes[
+                        SupportMeasurementKind.indexRebuild.rawValue]
+                    #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+                    #expect(state.counters[0] == 64 && state.counters[1] == 64)
+                    #expect(state.samples.last?.outcome == 0)
+                }
+                return elapsed
+            }
+        }
+
+        @Test func diagnosticsCountSuccessfulCryptoBeforeLaterFailures() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let keys = try LineageKeys()
+            var badKey = try keys.activePhoto("bad-key", attributes: "{}")
+            badKey.removeValue(forKey: "NodePassphrase")
+            var badPassphrase = try keys.activePhoto("bad-passphrase", attributes: "{}")
+            badPassphrase["NodePassphrase"] = "not-an-encrypted-passphrase"
+            var badDecrypt = try keys.activePhoto("bad-decrypt", attributes: "{}")
+            badDecrypt["XAttr"] = "not-an-encrypted-message"
+            let badJSON = try keys.activePhoto("bad-json", attributes: "not-json")
+            let good = try keys.activePhoto("good", attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+            StubURLProtocol.reset()
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+            let listed = ["good", "bad-key", "bad-passphrase", "bad-decrypt", "bad-json"].map {
+                ["LinkID": $0, "CaptureTime": 1, "Tags": [], "RelatedPhotos": []] as [String: Any]
+            }
+            let listing = try JSONSerialization.data(withJSONObject: ["Code": 1000, "Photos": listed])
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/photos", json: String(decoding: listing, as: UTF8.self))
+            try routeMetadata([good, badKey, badPassphrase, badDecrypt, badJSON])
+            let measurements = SupportWorkMeasurements()
+            try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                material: Self.material(rootKey: keys.root), session: makeSession(), crypto: keys.crypto,
+                store: content, lineageStore: nil, progress: { _ in }, workMeasurements: measurements)
+            let state = measurements.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.indexRebuild.rawValue]
+            #expect(state.started == 1 && state.completed == 1)
+            #expect(state.counters[SupportMeasurementCounter.unlockSucceeded.rawValue] == 3)
+            #expect(state.counters[SupportMeasurementCounter.decryptSucceeded.rawValue] == 2)
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
+            let exported = String(
+                decoding: try JSONEncoder().encode(measurements.workMeasurementSupportSnapshot()), as: UTF8.self)
+            #expect(!exported.contains("bad-decrypt") && !exported.contains("good"))
+        }
+
+        @Test func diagnosticsSeparateEventCryptoFromLineageRepairCrypto() async throws {
+            let fixture = try RepairFixture(unresolved: ["repair-photo"])
+            defer { fixture.close() }
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"event-photo","Type":2,"State":1}}]}"#
+            )
+            try routeMetadata([
+                try fixture.keys.activePhoto(
+                    "event-photo", attributes: #"{"iOS.photos":{"ICloudID":"private-cloud"}}"#),
+                try fixture.keys.activePhoto(
+                    "repair-photo", attributes: #"{"iOS.photos":{"ICloudID":"private-cloud"}}"#),
+            ])
+            let measurements = SupportWorkMeasurements()
+            try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                material: Self.material(rootKey: fixture.keys.root), session: makeSession(),
+                crypto: fixture.keys.crypto,
+                store: fixture.content, lineageStore: fixture.lineage, progress: { _ in },
+                workMeasurements: measurements)
+            let snapshot = measurements.workMeasurementSupportSnapshot()
+            let events = snapshot.passes[SupportMeasurementKind.eventUpdate.rawValue]
+            let repairs = snapshot.passes[SupportMeasurementKind.lineageRepair.rawValue]
+            #expect(events.completed == 1 && repairs.completed == 1)
+            #expect(events.counters[0] == 1 && events.counters[1] == 1)
+            #expect(repairs.counters[0] == 1 && repairs.counters[1] == 1)
+            #expect(snapshot.passes[SupportMeasurementKind.indexRebuild.rawValue].started == 0)
+        }
+
         @Test func missingBehindOrFailedLineageUsesTheContentEventPath() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -58,7 +176,9 @@ extension DriveSessionStubSuite {
                 routeEmptyEvents(from: "one", to: "two")
                 try await refresh(content: content, lineage: lineage)
                 #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
-                #expect(content.remoteContentRecord(contentHash: "hash", hashKeyEpoch: "epoch")?.remoteLinkID == "main")
+                #expect(
+                    content.remoteContentRecords(contentHash: "hash", hashKeyEpoch: "epoch", limit: 1).first?
+                        .remoteLinkID == "main")
                 #expect(StubURLProtocol.requests().map(\.path) == ["/drive/volumes/vol1/events/one"])
                 if let lineage {
                     #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("two")) == .incomplete)
@@ -605,7 +725,8 @@ extension DriveSessionStubSuite {
             let service = makeService(content: content, lineage: nil)
             await service.recordUploaded(contentHash: "early", remoteLinkID: "link-early")
             #expect(
-                content.remoteContentRecord(contentHash: "early", hashKeyEpoch: "epoch") != nil, "before the shutdown")
+                content.remoteContentRecords(contentHash: "early", hashKeyEpoch: "epoch", limit: 1).first != nil,
+                "before the shutdown")
             // A new record ends a staged build, so the build starts after it.
             #expect(
                 content.beginRemoteContentIndexBuild(
@@ -621,7 +742,7 @@ extension DriveSessionStubSuite {
                 content.remoteContentIndexBuildCheckpoint(hashKeyEpoch: "epoch") != nil,
                 "the invalidation after the shutdown leaves the staged build alone")
             #expect(
-                content.remoteContentRecord(contentHash: "late", hashKeyEpoch: "epoch") == nil,
+                content.remoteContentRecords(contentHash: "late", hashKeyEpoch: "epoch", limit: 1).first == nil,
                 "no write after the shutdown")
         }
 
@@ -867,12 +988,411 @@ extension DriveSessionStubSuite {
             routeEmptyEvents(from: "two", to: "three")
             try await refresh(content: content, lineage: lineage)
             #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "three")
-            #expect(content.remoteContentRecord(contentHash: "hash", hashKeyEpoch: "epoch")?.remoteLinkID == "main")
+            #expect(
+                content.remoteContentRecords(contentHash: "hash", hashKeyEpoch: "epoch", limit: 1).first?.remoteLinkID
+                    == "main")
             #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("three")) == .incomplete)
             #expect(
                 StubURLProtocol.requests().map(\.path) == [
                     "/drive/volumes/vol1/events/one", "/drive/volumes/vol1/events/two",
                 ])
+        }
+
+        @Test func lineageSaveFailureMarksTheEventUpdatePassAsPartial() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            var db: OpaquePointer?
+            #expect(
+                sqlite3_open(directory.appendingPathComponent("lineage.sqlite").path, &db) == SQLITE_OK)
+            defer { sqlite3_close(db) }
+            #expect(
+                sqlite3_exec(
+                    db,
+                    """
+                    CREATE TRIGGER reject_checkpoint BEFORE INSERT ON lineage_checkpoint
+                    BEGIN SELECT RAISE(ABORT, 'test write failure'); END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            let collector = SupportWorkMeasurements()
+            try await refresh(content: content, lineage: lineage, workMeasurements: collector)
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 1)
+        }
+
+        /// The store, the lineage store and the failing-checkpoint trigger that an early lineage save failure needs.
+        private func failingLineageSaveFixture() throws -> (
+            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore, directory: URL
+        ) {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            var db: OpaquePointer?
+            #expect(
+                sqlite3_open(directory.appendingPathComponent("lineage.sqlite").path, &db) == SQLITE_OK)
+            defer { sqlite3_close(db) }
+            #expect(
+                sqlite3_exec(
+                    db,
+                    """
+                    CREATE TRIGGER reject_checkpoint BEFORE INSERT ON lineage_checkpoint
+                    BEGIN SELECT RAISE(ABORT, 'test write failure'); END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            // Clear requests from earlier passes, including a control pass in the same test.
+            StubURLProtocol.reset()
+            return (content, lineage, directory)
+        }
+
+        /// The events of a first page whose lineage save fails, with one more page after it.
+        private func routeFirstPageWithFailedLineageSave() {
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/one",
+                json: #"{"Code":1000,"EventID":"two","More":1,"Refresh":0,"Events":[]}"#)
+        }
+
+        /// The requests that reached the held second events page, so a test can see when a pass reached it.
+        private func heldSecondPageReads() -> Int {
+            StubURLProtocol.requests().filter {
+                $0.path.hasPrefix("/drive/volumes/vol1/events/two")
+            }.count
+        }
+
+        @Test func laterPagesStillCountAfterAnEarlyLineageSaveFailure() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            let keys = try LineageKeys()
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/two",
+                json:
+                    #"{"Code":1000,"EventID":"three","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"event-photo","Type":2,"State":1}}]}"#
+            )
+            try routeMetadata([
+                try keys.activePhoto("event-photo", attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+            ])
+            let collector = SupportWorkMeasurements()
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: keys.root,
+                workMeasurements: collector)
+            #expect(
+                fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "three")
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.counters[SupportMeasurementCounter.unlockSucceeded.rawValue] == 1)
+            #expect(state.counters[SupportMeasurementCounter.decryptSucceeded.rawValue] == 1)
+            #expect(state.samples.last?.outcome == 1)
+        }
+
+        @Test func earlyLineageSaveFailureAndALaterPageFailureMarkThePassFailed() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            // The second events page stays unrouted: its fetch fails after the lineage save failed.
+            let collector = SupportWorkMeasurements()
+            await #expect(throws: (any Error).self) {
+                try await refresh(
+                    content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            }
+            #expect(
+                fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            // The trigger aborted the lineage save of the first page and disabled the store. The pass
+            // saw this failure before the second page's fetch failed: only that failed write sets
+            // writesDisabled while the store stays open.
+            #expect(!fixture.lineage.acceptsWrites)
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 2)
+        }
+
+        @Test func earlyLineageSaveFailureAndALaterPageCancellationMarkThePassCancelled() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            // The second page hangs instead of failing with a stubbed URLError.cancelled: only the
+            // caller's real task cancellation ends the pass, so the outcome proves the classification
+            // of the cancellation that URLSession reports for a cancelled request.
+            StubURLProtocol.hang("GET /drive/volumes/vol1/events/two")
+            let collector = SupportWorkMeasurements()
+            let refreshPass = Task {
+                try await refresh(
+                    content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            }
+            // Cancel and join before fixture cleanup on every path. The join reports a failure
+            // if the pass does not terminate within its safety limit.
+            do {
+                try await waitUntil { heldSecondPageReads() > 0 }
+                try #require(heldSecondPageReads() > 0, "the pass reached the held second page")
+                // The first page completed while the second one hangs: its content checkpoint moved, and
+                // the aborted lineage save of that page disabled the lineage store before the cancellation.
+                #expect(
+                    fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+                #expect(!fixture.lineage.acceptsWrites)
+                refreshPass.cancel()
+                try await join(refreshPass, "the cancelled pass ends instead of hanging on the held page")
+            } catch {
+                refreshPass.cancel()
+                // The join records its own failure and its wait never throws, so it cannot mask
+                // the original error that this block rethrows.
+                try? await join(refreshPass, "a failed step still ends the pass before the cleanup closes the stores")
+                throw error
+            }
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 3)
+        }
+
+        /// The duration class of an event update includes the time of its later pages: the injected clock
+        /// only crosses the highest bound while the second page hangs after the first page's lineage
+        /// save failed. A control pass through the same early-failure code, with both pages answered,
+        /// stays in class 0 when the clock never moves. No wall-clock time passes in either pass.
+        @Test func eventUpdateDurationIncludesTheTimeOfLaterPages() async throws {
+            let clock = ManualDurationClock()
+
+            // Control: the same first page whose lineage save fails, with the second page answered.
+            // The clock never moves, so the finished pass stays in duration class 0.
+            let controlFixture = try failingLineageSaveFixture()
+            defer {
+                controlFixture.content.close()
+                controlFixture.lineage.close()
+                try? FileManager.default.removeItem(at: controlFixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/two",
+                json: #"{"Code":1000,"EventID":"three","More":0,"Refresh":0,"Events":[]}"#)
+            let controlCollector = SupportWorkMeasurements(now: { clock.value })
+            try await refresh(
+                content: controlFixture.content, lineage: controlFixture.lineage,
+                workMeasurements: controlCollector)
+            #expect(!controlFixture.lineage.acceptsWrites, "the control reaches the same failed save")
+            let control = controlCollector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(control.started == 1 && control.completed == 1 && control.inProgress == 0)
+            #expect(control.samples.last?.outcome == 1)
+            #expect(control.samples.last?.totalClass == 0, "a clock that never moves stays in class 0")
+
+            // Held pass: the same fixture shape, with the second page held instead of answered.
+            let fixture = try failingLineageSaveFixture()
+            #expect(heldSecondPageReads() == 0, "the fixture clears the control pass requests")
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.hang("GET /drive/volumes/vol1/events/two")
+            let collector = SupportWorkMeasurements(now: { clock.value })
+            let refreshPass = Task {
+                try await refresh(
+                    content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            }
+            // Cancel and join before fixture cleanup on every path. The join reports a failure
+            // if the pass does not terminate within its safety limit.
+            do {
+                try await waitUntil { heldSecondPageReads() > 0 }
+                try #require(heldSecondPageReads() > 0, "the pass reached the held second page")
+                // The pass already finished the first page: its lineage save failed before the held page,
+                // and the measurement of the pass is still open instead of frozen at the first page.
+                #expect(!fixture.lineage.acceptsWrites)
+                #expect(
+                    fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two",
+                    "the first page completed before the clock moves")
+                // Only now, with the pass held on its second page, the measured time crosses the top
+                // duration bound. The total must include this page: a total that stopped at the first page
+                // would still read the class the control showed.
+                clock.advance(.seconds(121))
+                refreshPass.cancel()
+                try await join(refreshPass, "the cancelled pass ends instead of hanging on the held page")
+            } catch {
+                refreshPass.cancel()
+                // The join records its own failure and its wait never throws, so it cannot mask
+                // the original error that this block rethrows.
+                try? await join(refreshPass, "a failed step still ends the pass before the cleanup closes the stores")
+                throw error
+            }
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 3)
+            #expect(state.samples.last?.totalClass == 6)
+        }
+
+        /// A normally completing partial pass includes the time up to its second page.
+        /// The clock moves only once the stub records that page, without wall-clock sleeping.
+        @Test func aNormalPartialPassCountsTheElapsedClockTime() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/two",
+                json: #"{"Code":1000,"EventID":"three","More":0,"Refresh":0,"Events":[]}"#)
+            let collector = SupportWorkMeasurements(now: {
+                self.heldSecondPageReads() > 0 ? .seconds(121) : .zero
+            })
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            #expect(!fixture.lineage.acceptsWrites, "the pass reaches the same early failed save")
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 1)
+            #expect(state.samples.last?.totalClass == 6)
+        }
+
+        /// A cancellation that URLSession reports for a request of a later page classifies the pass as
+        /// cancelled. This is the transport-level counterpart of the caller-side task cancellation
+        /// above: it needs no hanging request, only the stubbed transport error.
+        @Test func laterPageURLErrorCancelledClassifiesThePassAsCancelled() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.fail("GET /drive/volumes/vol1/events/two")
+            let collector = SupportWorkMeasurements()
+            await #expect(throws: (any Error).self) {
+                try await refresh(
+                    content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            }
+            // The first page completed, and its lineage save failed before the transport cancelled.
+            #expect(
+                fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            #expect(!fixture.lineage.acceptsWrites)
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 3)
+        }
+
+        @Test func lineageFinishBuildFailureMarksTheIndexRebuildPassAsPartial() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            let keys = try LineageKeys()
+            let photo = try keys.activePhoto(
+                "main",
+                attributes: #"{"iOS.photos":{"ICloudID":"cloud"},"#
+                    + #""EncryptedMemories.lineage":{"V":1,"Reason":"edit","Replaces":["old"]}}"#)
+            var db: OpaquePointer?
+            #expect(sqlite3_open(directory.appendingPathComponent("lineage.sqlite").path, &db) == SQLITE_OK)
+            defer { sqlite3_close(db) }
+            #expect(
+                sqlite3_exec(
+                    db,
+                    """
+                    CREATE TRIGGER reject_remote_lineage BEFORE INSERT ON remote_lineage
+                    BEGIN SELECT RAISE(ABORT, 'test write failure'); END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+            let listing = try JSONSerialization.data(
+                withJSONObject: [
+                    "Code": 1000,
+                    "Photos": [["LinkID": "main", "CaptureTime": 1, "Tags": [], "RelatedPhotos": []]],
+                ]
+            )
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/photos", json: String(decoding: listing, as: UTF8.self))
+            try routeMetadata([photo])
+            let collector = SupportWorkMeasurements()
+            try await refresh(
+                content: content, lineage: lineage, rootKey: keys.root, workMeasurements: collector)
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
+            #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")) == .incomplete)
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.indexRebuild.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 1)
+        }
+
+        @Test func refreshRequiredEventEndsTheEventUpdatePassBeforeTheNestedRebuild() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            StubURLProtocol.reset()
+            // Refresh:1 starts a nested rebuild; its events/latest fetch stays unrouted and fails.
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/one",
+                json: #"{"Code":1000,"EventID":"two","More":0,"Refresh":1,"Events":[]}"#)
+            let collector = SupportWorkMeasurements()
+            await #expect(throws: (any Error).self) {
+                try await refresh(content: content, lineage: lineage, workMeasurements: collector)
+            }
+            let snapshot = collector.workMeasurementSupportSnapshot()
+            let events = snapshot.passes[SupportMeasurementKind.eventUpdate.rawValue]
+            let rebuild = snapshot.passes[SupportMeasurementKind.indexRebuild.rawValue]
+            #expect(events.started == 1 && events.completed == 1 && events.inProgress == 0)
+            #expect(events.samples.last?.outcome == 1)
+            #expect(rebuild.started == 1 && rebuild.completed == 1 && rebuild.inProgress == 0)
+            #expect(rebuild.samples.last?.outcome == 2)
         }
 
         @Test func missingLineageStagingDoesNotRestartAResumedContentBuild() async throws {
@@ -900,7 +1420,9 @@ extension DriveSessionStubSuite {
                 "GET /drive/volumes/vol1/photos",
                 json: #"{"Code":1000,"Photos":[{"LinkID":"main","CaptureTime":1,"Tags":[],"RelatedPhotos":[]}]}"#)
             try await refresh(content: content, lineage: lineage)
-            #expect(content.remoteContentRecord(contentHash: "hash", hashKeyEpoch: "epoch")?.remoteLinkID == "main")
+            #expect(
+                content.remoteContentRecords(contentHash: "hash", hashKeyEpoch: "epoch", limit: 1).first?.remoteLinkID
+                    == "main")
             #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")) == .incomplete)
             #expect(StubURLProtocol.requests().map(\.path).filter { $0.contains("fetch_metadata") }.isEmpty)
             #expect(StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count == 2)
@@ -999,6 +1521,105 @@ extension DriveSessionStubSuite {
             #expect(lineage.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch") == ["photo"])
             #expect(lineage.replacingMainLinkIDs(ofReplacedLink: "old", hashKeyEpoch: "epoch") == ["photo"])
             #expect(try metadataRequestLinkIDs().sorted() == ["photo", "trashed"])
+        }
+
+        /// The four lineage reads answer from the lineage store, and each reports whether the index is complete.
+        @Test func theLineageReadsAnswerFromTheStoreAndReportItsCompleteness() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [
+                        .init(hashKeyEpoch: "epoch", remoteLinkID: "photo", externalIdentifier: "cloud", isMain: true)
+                    ],
+                    lineage: [.init(hashKeyEpoch: "epoch", replacedLinkID: "old", replacingLinkID: "photo")],
+                    hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            let service = makeService(content: content, lineage: lineage)
+
+            let active = try await service.activeMainLinkIDs(forExternalIdentifier: "cloud")
+            let replacing = try await service.replacingMainLinkIDs(ofReplacedLink: "old")
+            let identifier = try await service.externalIdentifier(ofMainLink: "photo")
+            let replaced = try await service.replacedLinkIDs(ofReplacingMain: "photo")
+
+            #expect(active.links == ["photo"] && active.complete)
+            #expect(replacing.links == ["photo"] && replacing.complete)
+            #expect(identifier.identifier == "cloud" && identifier.complete)
+            #expect(replaced.links == ["old"] && replaced.complete)
+        }
+
+        /// Without a lineage store the lineage reads prove nothing: they answer empty and incomplete.
+        @Test func withoutALineageStoreEveryLineageReadIsEmptyAndIncomplete() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            let service = makeService(content: content, lineage: nil)
+
+            let active = try await service.activeMainLinkIDs(forExternalIdentifier: "cloud")
+            let replacing = try await service.replacingMainLinkIDs(ofReplacedLink: "old")
+            let identifier = try await service.externalIdentifier(ofMainLink: "photo")
+            let replaced = try await service.replacedLinkIDs(ofReplacingMain: "photo")
+
+            #expect(active.links.isEmpty && !active.complete)
+            #expect(replacing.links.isEmpty && !replacing.complete)
+            #expect(identifier.identifier == nil && !identifier.complete)
+            #expect(replaced.links.isEmpty && !replaced.complete)
+        }
+
+        /// A lineage store that is behind the content index proves nothing: every lineage read reports its answer
+        /// from the store, and none reports the index as complete.
+        @Test func aLineageStoreBehindTheContentIndexMakesEveryLineageReadIncomplete() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [
+                        .init(hashKeyEpoch: "epoch", remoteLinkID: "photo", externalIdentifier: "cloud", isMain: true)
+                    ],
+                    lineage: [.init(hashKeyEpoch: "epoch", replacedLinkID: "old", replacingLinkID: "photo")],
+                    hashKeyEpoch: "epoch", eventID: "zero", unresolvedRemoteLinkIDs: []))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            let service = makeService(content: content, lineage: lineage)
+
+            let active = try await service.activeMainLinkIDs(forExternalIdentifier: "cloud")
+            let replacing = try await service.replacingMainLinkIDs(ofReplacedLink: "old")
+            let identifier = try await service.externalIdentifier(ofMainLink: "photo")
+            let replaced = try await service.replacedLinkIDs(ofReplacingMain: "photo")
+
+            #expect(active.links == ["photo"] && !active.complete)
+            #expect(replacing.links == ["photo"] && !replacing.complete)
+            #expect(identifier.identifier == "cloud" && !identifier.complete)
+            #expect(replaced.links == ["old"] && !replaced.complete)
         }
 
         /// A link that fails again stays unresolved, and a later sweep reads it again.
@@ -1253,7 +1874,9 @@ extension DriveSessionStubSuite {
                 try await refresh(content: content, lineage: lineage)
             }
             #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
-            #expect(content.remoteContentRecord(contentHash: "hash", hashKeyEpoch: "epoch")?.remoteLinkID == "main")
+            #expect(
+                content.remoteContentRecords(contentHash: "hash", hashKeyEpoch: "epoch", limit: 1).first?.remoteLinkID
+                    == "main")
             #expect(lineage.hasCheckpoint(hashKeyEpoch: "epoch", eventID: "one"))
             #expect(lineage.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch") == ["main"])
             #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")) == .complete)
@@ -1554,10 +2177,12 @@ extension DriveSessionStubSuite {
             Self.material(rootKey: .init(armored: "", passphrase: ""))
         }
 
-        private static func material(rootKey: UnlockableKey) -> ProtonUploadDedupeService.Material {
+        private static func material(
+            rootKey: UnlockableKey, hashKeyEpoch: String = "epoch"
+        ) -> ProtonUploadDedupeService.Material {
             .init(
                 context: .init(volumeID: "vol1", shareID: "share1", rootLinkID: "root1"),
-                rootKey: rootKey, hashKey: Data(), epoch: "epoch")
+                rootKey: rootKey, hashKey: Data(), epoch: hashKeyEpoch)
         }
 
         private func makeSession() -> DriveSession { Self.makeSession() }
@@ -1572,6 +2197,187 @@ extension DriveSessionStubSuite {
 
         private func checkpoint(_ eventID: String) -> UploadRemoteContentIndexCheckpoint {
             .init(eventID: eventID, refreshedAt: Date())
+        }
+
+        /// A changed link never keeps its old fingerprint, because a duplicate merge reads these fingerprints to rank.
+        /// This run keeps the fingerprint of a link that the event page did not name.
+        @Test func anEventInvalidatesOnlyTheFingerprintOfTheLinkItNamed() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let cache = try seededFingerprintCache(fixture)
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":0,"Link":{"LinkID":"photo-a"}}]}"#
+            )
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache)
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.eventID == "two")
+            #expect(savedDetails("photo-a", in: cache, at: snapshot).isEmpty)
+            #expect(savedDetails("photo-b", in: cache, at: snapshot) == [photo("photo-b"): fingerprint("camera-b")])
+        }
+
+        /// An edited file loses its old fingerprint: an edit names the link as active, so the fingerprint of the
+        /// earlier revision must not serve the new revision.
+        @Test func anEditEventDropsTheFingerprintOfTheEditedLink() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let cache = try seededFingerprintCache(fixture)
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"photo-a","Type":2,"State":1}}]}"#
+            )
+            try routeMetadata([
+                fixture.keys.activePhoto("photo-a", attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+            ])
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache)
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.eventID == "two")
+            #expect(savedDetails("photo-a", in: cache, at: snapshot).isEmpty)
+            #expect(savedDetails("photo-b", in: cache, at: snapshot) == [photo("photo-b"): fingerprint("camera-b")])
+        }
+
+        /// A changed hash key starts a fresh index, so no fingerprint of the old key epoch survives it.
+        @Test func aKeyEpochChangeEmptiesEveryFingerprint() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let cache = try seededFingerprintCache(fixture)
+            #expect(fingerprintRowCount(fixture.directory) == 2)
+            // The new key epoch has no checkpoint, so the refresh rebuilds the index from scratch.
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache, hashKeyEpoch: "epoch-two")
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.scope.hashKeyEpoch == "epoch-two")
+            #expect(snapshot.eventID == "two")
+            // The rebuild discards every saved detail of the old key epoch.
+            #expect(fingerprintRowCount(fixture.directory) == 0)
+        }
+
+        /// A failed surgical advance falls back to the safe full reset. The store moved its cursor past the cache
+        /// (a lost write or another component advanced it), so the cache must not keep serving at the stale cursor.
+        @Test func aDesynchronizedStoreFallsBackToTheFullReset() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let cache = try seededFingerprintCache(fixture)
+            // Move the persisted context ahead without the cache, which a lost in-memory state can do.
+            _ = cache.store.prepare(
+                scope: .init(
+                    accountID: fixture.directory.lastPathComponent, volumeID: "vol1", hashKeyEpoch: "epoch"),
+                eventID: "later")
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":0,"Link":{"LinkID":"photo-a"}}]}"#
+            )
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache)
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.eventID == "two")
+            #expect(fingerprintRowCount(fixture.directory) == 0)
+            #expect(savedDetails("photo-a", in: cache, at: snapshot).isEmpty)
+            #expect(savedDetails("photo-b", in: cache, at: snapshot).isEmpty)
+        }
+
+        /// A launch without a fingerprint store (unreadable or absent) keeps the refresh working unchanged.
+        @Test func anEventRefreshWithoutAFingerprintCacheAdvancesTheIndex() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":0,"Link":{"LinkID":"photo-a"}}]}"#
+            )
+            try await refresh(content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root)
+            #expect(fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+        }
+
+        /// A new launch has no in-memory cursor, so the invalidation recovers the persisted snapshot at the cursor
+        /// the index left. The unnamed link keeps its detail; the named link loses it.
+        @Test func aRelaunchedCacheRecoversThePersistedCursorAndKeepsUnnamedLinks() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let seeding = try seededFingerprintCache(fixture)
+            seeding.close()
+            // A relaunch opens the store without the earlier in-memory cursor.
+            let cache = try #require(ExactDuplicateFingerprintCache.open(accountDirectory: fixture.directory))
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":0,"Link":{"LinkID":"photo-a"}}]}"#
+            )
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache)
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.eventID == "two")
+            #expect(savedDetails("photo-a", in: cache, at: snapshot).isEmpty)
+            #expect(savedDetails("photo-b", in: cache, at: snapshot) == [photo("photo-b"): fingerprint("camera-b")])
+        }
+
+        /// Counts the saved detail rows without touching the store, so an assertion cannot destroy its own evidence.
+        private func fingerprintRowCount(_ directory: URL) -> Int64 {
+            var db: OpaquePointer?
+            guard
+                sqlite3_open_v2(
+                    directory.appendingPathComponent(ExactDuplicateFingerprintStore.databaseFileName).path,
+                    &db, SQLITE_OPEN_READONLY, nil
+                ) == SQLITE_OK
+            else { return -1 }
+            defer { sqlite3_close(db) }
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM fingerprint;", -1, &statement, nil) == SQLITE_OK
+            else { return -1 }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW else { return -1 }
+            return sqlite3_column_int64(statement, 0)
+        }
+
+        /// One event page between two cursors, so a test names the link that the page changed. The page JSON names
+        /// the cursor it produces.
+        private func routeEventPage(from: String, json: String) {
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/\(from)", json: json)
+        }
+
+        private func photo(_ linkID: String) -> PhotoUID { PhotoUID(volumeID: "vol1", nodeID: linkID) }
+
+        /// The saved details of one link through the group read of the Duplicates screen. Empty when it has none.
+        private func savedDetails(
+            _ linkID: String, in cache: ExactDuplicateFingerprintCache,
+            at snapshot: ExactDuplicateFingerprintStore.Snapshot
+        ) -> [PhotoUID: ExactDuplicateFingerprint] {
+            let group = ExactDuplicateGroup(
+                contentHash: linkID, hashKeyEpoch: snapshot.scope.hashKeyEpoch, members: [photo(linkID)])
+            return cache.store.fingerprints(ofGroups: [group], in: snapshot)
+        }
+
+        private func fingerprint(_ device: String) -> ExactDuplicateFingerprint {
+            ExactDuplicateFingerprint(
+                captureTime: Date(timeIntervalSince1970: 1_700_000_000.125), latitude: 12.25, longitude: -34.5,
+                device: device, pixelWidth: 1920, pixelHeight: 1080, durationSeconds: 1.125, mimeType: "image/heic")
+        }
+
+        /// A cache with the details of two links at the checkpoint "one" that the fixture seeds.
+        private func seededFingerprintCache(_ fixture: RepairFixture) throws -> ExactDuplicateFingerprintCache {
+            let cache = try #require(ExactDuplicateFingerprintCache.open(accountDirectory: fixture.directory))
+            cache.begin(volumeID: "vol1", hashKeyEpoch: "epoch", eventID: "one")
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(
+                cache.store.store(
+                    [
+                        photo("photo-a"): fingerprint("camera-a"),
+                        photo("photo-b"): fingerprint("camera-b"),
+                    ], for: snapshot))
+            return cache
         }
 
         private func routeEmptyEvents(from: String, to: String) {
@@ -1720,25 +2526,40 @@ extension DriveSessionStubSuite {
         private func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
             rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: ""),
+            workMeasurements: SupportWorkMeasurements? = nil,
+            fingerprintCache: ExactDuplicateFingerprintCache? = nil, hashKeyEpoch: String = "epoch",
             progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { _ in }
         ) async throws {
             try await Self.refresh(
                 content: content, lineage: lineage, rebuildsMissingLineage: rebuildsMissingLineage, rootKey: rootKey,
+                workMeasurements: workMeasurements, fingerprintCache: fingerprintCache, hashKeyEpoch: hashKeyEpoch,
                 progress: progress)
         }
 
         fileprivate static func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
             rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: ""),
+            workMeasurements: SupportWorkMeasurements? = nil,
+            fingerprintCache: ExactDuplicateFingerprintCache? = nil, hashKeyEpoch: String = "epoch",
             progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { _ in }
         ) async throws {
             try await ProtonUploadDedupeService.refreshRemoteContentIndex(
-                material: material(rootKey: rootKey), session: makeSession(),
+                material: material(rootKey: rootKey, hashKeyEpoch: hashKeyEpoch), session: makeSession(),
                 crypto: DriveCrypto(addressKeys: [], signers: []),
-                store: content, lineageStore: lineage, rebuildsMissingLineage: rebuildsMissingLineage,
-                progress: progress)
+                store: content, lineageStore: lineage, fingerprintCache: fingerprintCache,
+                rebuildsMissingLineage: rebuildsMissingLineage,
+                progress: progress, workMeasurements: workMeasurements)
         }
     }
+}
+
+/// The injectable clock for SupportWorkMeasurements: the pass under test reads `value`, and only the
+/// test itself moves time with `advance`. Nothing reads a wall clock while a test holds a pass.
+private final class ManualDurationClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = Duration.zero
+    var value: Duration { lock.withLock { current } }
+    func advance(_ amount: Duration) { lock.withLock { current += amount } }
 }
 
 /// One outcome that a test reads while the code under test still runs: nil until it is set.

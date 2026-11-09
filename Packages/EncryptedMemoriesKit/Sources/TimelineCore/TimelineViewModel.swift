@@ -18,6 +18,8 @@ public struct TimelineRefreshResult: Sendable, Equatable {
     public let publishedLibraryChangeToken: String?
     /// False when the refresh loaded a filtered route, which can never confirm a whole-library revision.
     public let coversWholeLibrary: Bool
+    /// True when the refresh succeeded and the loaded content equals the content that was already shown.
+    public let contentUnchanged: Bool
 
     public var found: Bool { foundItem != nil }
 
@@ -32,7 +34,8 @@ public struct TimelineRefreshResult: Sendable, Equatable {
         failureReason: TimelineRefreshFailureReason? = nil,
         addedUIDs: [PhotoUID] = [],
         publishedLibraryChangeToken: String? = nil,
-        coversWholeLibrary: Bool = true
+        coversWholeLibrary: Bool = true,
+        contentUnchanged: Bool = false
     ) {
         self.uploadedUID = uploadedUID
         self.foundItem = foundItem
@@ -45,6 +48,7 @@ public struct TimelineRefreshResult: Sendable, Equatable {
         self.addedUIDs = addedUIDs
         self.publishedLibraryChangeToken = publishedLibraryChangeToken
         self.coversWholeLibrary = coversWholeLibrary
+        self.contentUnchanged = contentUnchanged
     }
 
     /// The change monitor's outcome for a refresh that succeeded.
@@ -60,10 +64,11 @@ public final class TimelineViewModel {
         case loading
         case empty
         case loaded([TimelineSection])
-        case failed(String)
+        /// `retryable` requests the retry affordance in the shell.
+        case failed(String, retryable: Bool)
     }
 
-    public private(set) var state: State = .loading {
+    public internal(set) var state: State = .loading {
         didSet { contentRevision &+= 1 }
     }
     /// Monotonic identity for the active route's canonical content. Search workers key results to it so a
@@ -80,6 +85,11 @@ public final class TimelineViewModel {
     /// backend. The host reads this after the coalesced initial load completes.
     public private(set) var initialLoadFailureReason: TimelineRefreshFailureReason?
     @ObservationIgnored private var initialAuthoritativeAddedUIDs: [PhotoUID] = []
+    private var provisionalProjection: TimelineContentProjection?
+    private var provisionalRevision: UInt64 = 0
+    @ObservationIgnored private var provisionalGeneration: UInt64 = 0
+
+    public var isProvisionalPresentation: Bool { filter == .all && provisionalProjection != nil }
     /// Flat, chronological items of the currently active route (whole library for `.all`, else the
     /// filtered tag/album/trash set) - backs selection and the upload-found lookup, not viewer paging.
     public private(set) var allItems: [PhotoItem] = [] {
@@ -111,6 +121,7 @@ public final class TimelineViewModel {
     /// timeline (4n) or a filtered route (4n + 1).
     public var gridSourceRevision: UInt64 {
         switch filter {
+        case .all where isProvisionalPresentation: provisionalRevision &* 4 &+ 3
         case .all where showsPendingPhotos: pendingPresentation.membershipRevision &* 4 &+ 2
         case .all: wholeLibraryRevision &* 4
         default: contentRevision &* 4 &+ 1
@@ -147,13 +158,16 @@ public final class TimelineViewModel {
     /// The route state the grid shows. A library without Proton photos still shows its pending photos, and an
     /// empty Proton trash still shows photos deleted before upload.
     public var gridState: State {
+        if isProvisionalPresentation, let provisionalProjection { return .loaded(provisionalProjection.sections) }
         if filter == .all, case .empty = state,
             !LibraryEmptyPolicy.isCompletelyEmpty(
                 knownItemCount: allRouteSnapshot == nil ? nil : wholeLibrarySnapshot.count,
                 authority: wholeLibraryInventoryAuthority
             )
         {
-            if let failure = initialLibraryLoadState.failure { return .failed(failure.message) }
+            if let failure = initialLibraryLoadState.failure {
+                return .failed(failure.message, retryable: failure.retryable)
+            }
             return .loading
         }
         guard showsPendingPhotos || showsPendingTrash else { return state }
@@ -165,11 +179,13 @@ public final class TimelineViewModel {
 
     /// Sections of the grid; see `gridState`.
     public var gridSections: [TimelineSection] {
-        showsPendingPhotos || showsPendingTrash ? pendingSections : currentSections
+        if isProvisionalPresentation, let provisionalProjection { return provisionalProjection.sections }
+        return showsPendingPhotos || showsPendingTrash ? pendingSections : currentSections
     }
 
     /// Grid and viewer items; see `gridState`.
     public var gridItems: [PhotoItem] {
+        if isProvisionalPresentation, let provisionalProjection { return provisionalProjection.snapshot.items }
         if showsPendingPhotos { return pendingPresentation.items }
         if showsPendingTrash { return pendingTrash.merged(intoNewestFirst: presentationItems) }
         return presentationItems
@@ -177,6 +193,7 @@ public final class TimelineViewModel {
 
     /// The grid items with these identities, pending photos included, for actions on a selection.
     public func gridItems(matching uids: Set<PhotoUID>) -> [PhotoItem] {
+        guard !isProvisionalPresentation else { return [] }
         switch filter {
         case .all:
             return showsPendingPhotos
@@ -383,7 +400,14 @@ public final class TimelineViewModel {
 
     /// Re-runs the selected filter for the error-state Retry action. It does not fall back to `.all`.
     public func retry() async {
-        if filter == .all { await loadAll(force: true) } else { await loadFiltered(filter) }
+        if filter == .all {
+            if allRouteSnapshot == nil, initialLibraryLoadState.failure != nil {
+                applyInitialLoad(.reset)
+            }
+            await loadAll(force: true)
+        } else {
+            await loadFiltered(filter)
+        }
     }
 
     /// Loads a tag/album/trash filter, showing the `.loading` animation while it fetches (so a route switch never
@@ -418,12 +442,21 @@ public final class TimelineViewModel {
         } catch {
             guard filter == f else { return }
             // Keep the cached view on a refresh error; surface failure only if we have nothing to show.
-            if case .loaded = state {} else { state = .failed(error.localizedDescription) }
+            if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
         }
     }
 
     #if DEBUG
         func cancelInitialLoadForTesting() { initialLoadTask?.cancel() }
+        /// Replays first-load events through the production reducer, then mirrors a resulting failure
+        /// into the grid state exactly like `loadAll` does. Isolates the non-retryable verdict, which no
+        /// production producer emits yet, for tests.
+        func applyIsolatedInitialLoadEventsForTesting(_ events: [LibraryLoadEvent]) {
+            for event in events { applyInitialLoad(event) }
+            if let failure = initialLibraryLoadState.failure {
+                surfaceLoadFailure(failure.message)
+            }
+        }
         /// Runs after a trash or restore projection computed its result and before it writes it.
         @ObservationIgnored var afterProjectionComputedForTesting: (@MainActor () async -> Void)?
     #endif
@@ -459,7 +492,7 @@ public final class TimelineViewModel {
     public func reportInitialContentFailure() {
         let message = L10n.string("error.load_library_title")
         applyInitialLoad(.contentLoadFailed(message: message))
-        if initialLibraryLoadState.failure != nil { state = .failed(message) }
+        if initialLibraryLoadState.failure != nil { surfaceLoadFailure(message) }
     }
 
     /// Shows a caller-provided, already-resolved item set in the existing timeline grid without asking the
@@ -538,7 +571,7 @@ public final class TimelineViewModel {
     /// Commits a trash that another feature already did on the server, such as the merge of duplicates. A photo that
     /// no listing has shown yet still stays hidden from every later listing; Recently Deleted gets the known ones.
     public func commitTrash(uids: Set<PhotoUID>) async {
-        await commitTrash(uids, knownItems: wholeLibraryItemsForViewer.filter { uids.contains($0.uid) })
+        await commitTrash(uids, knownItems: allLibraryItems(matching: uids))
     }
 
     private func commitTrash(_ uids: Set<PhotoUID>, knownItems items: [PhotoItem]) async {
@@ -742,8 +775,31 @@ public final class TimelineViewModel {
         }
 
         let publishedBeforeLoad = wholeLibraryPublication
+        provisionalGeneration &+= 1
+        let progressGeneration = provisionalGeneration
+        let access = hadInventoryBaseline ? nil : await feed.beginProvisionalThumbnailAccess()
+        await loadInitialInventorySnapshot(
+            hadInventoryBaseline: hadInventoryBaseline, progressGeneration: progressGeneration,
+            publishedBeforeLoad: publishedBeforeLoad, thumbnailAccess: access)
+        clearProvisionalTimeline(generation: progressGeneration)
+        if let access { await feed.endProvisionalThumbnailAccess(access) }
+    }
+
+    private func loadInitialInventorySnapshot(
+        hadInventoryBaseline: Bool, progressGeneration: UInt64, publishedBeforeLoad: [UInt64],
+        thumbnailAccess: UUID?
+    ) async {
         do {
-            let refreshed = try await repository.loadTimelineSnapshot()
+            let refreshed: TimelineLoadSnapshot
+            if hadInventoryBaseline {
+                refreshed = try await repository.loadTimelineSnapshot()
+            } else {
+                refreshed = try await repository.loadTimelineSnapshot { [weak self] page in
+                    await self?.applyProvisionalTimeline(
+                        page, generation: progressGeneration, publishedBeforeLoad: publishedBeforeLoad,
+                        thumbnailAccess: thumbnailAccess)
+                }
+            }
             let projection = await normalizeOffMain(refreshed.sections, for: .all)
             // A cancellation or a newer publication of the whole library during the read supersedes this older listing.
             // Another route's grid does not: it leaves the whole library unchanged.
@@ -772,15 +828,50 @@ public final class TimelineViewModel {
             // A cancelled owner cannot publish. A backend cancellation of an active read is a load failure.
             guard !Task.isCancelled, filter == .all else { return }
             initialLoadFailureReason = error is any LibraryChangeTerminalError ? .scopeAccessLost : .other
-            applyInitialLoad(.failed(message: error.localizedDescription, retryable: true))
+            applyInitialLoad(.failed(message: LibraryLoadFailureMessage.message(for: error), retryable: true))
             // Keep showing the cached timeline on a refresh error; surface failure only if we have
-            // nothing to show.
-            if case .loaded = state {} else { state = .failed(error.localizedDescription) }
+            // nothing to show. The reducer's verdict - not this site - decides the Retry affordance.
+            if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
         }
+    }
+
+    private func applyProvisionalTimeline(
+        _ page: ProvisionalTimelineSnapshot, generation: UInt64, publishedBeforeLoad: [UInt64], thumbnailAccess: UUID?
+    ) async {
+        guard !Task.isCancelled, filter == .all, allRouteSnapshot == nil,
+            generation == provisionalGeneration, publishedBeforeLoad == wholeLibraryPublication
+        else { return }
+        let projection = await normalizeOffMain(page.sections, for: .all)
+        guard !Task.isCancelled, filter == .all, allRouteSnapshot == nil,
+            generation == provisionalGeneration, publishedBeforeLoad == wholeLibraryPublication,
+            !projection.snapshot.items.isEmpty
+        else { return }
+        if let thumbnailAccess {
+            await feed.updateProvisionalThumbnailAccess(projection.uids, using: thumbnailAccess)
+            guard !Task.isCancelled, filter == .all, allRouteSnapshot == nil,
+                generation == provisionalGeneration, publishedBeforeLoad == wholeLibraryPublication
+            else { return }
+        }
+        provisionalProjection = projection
+        provisionalRevision &+= 1
+        applyInitialLoad(.provisionalInventoryResolved(count: projection.snapshot.count))
+    }
+
+    private func clearProvisionalTimeline(generation: UInt64) {
+        guard generation == provisionalGeneration else { return }
+        provisionalProjection = nil
+        if Task.isCancelled, case .provisionalContent = initialLibraryLoadState { applyInitialLoad(.reset) }
     }
 
     private func applyInitialLoad(_ event: LibraryLoadEvent) {
         initialLibraryLoadState = LibraryLoadPolicy.reduce(initialLibraryLoadState, event)
+    }
+
+    /// Mirrors a failure into the grid state, carrying the first-load reducer's `retryable` verdict so the
+    /// shell's Retry affordance follows the recorded flag. A failure the reducer never classified (a
+    /// filtered route, a background refresh) stays retryable, as every unclassified failure must.
+    private func surfaceLoadFailure(_ message: String) {
+        state = .failed(message, retryable: initialLibraryLoadState.failure?.retryable ?? true)
     }
 
     /// Show `.all` content and restart the thumbnail crawl only when the flattened item sequence differs from
@@ -884,7 +975,8 @@ public final class TimelineViewModel {
                     filterDescription: Self.describe(filter),
                     elapsedMs: elapsedMilliseconds(since: start),
                     publishedLibraryChangeToken: loaded.validationToken,
-                    coversWholeLibrary: f == .all
+                    coversWholeLibrary: f == .all,
+                    contentUnchanged: true
                 )
             }
             let items = sections.flatMap(\.items)
@@ -932,7 +1024,7 @@ public final class TimelineViewModel {
                 failureReason: .cancelled
             )
         } catch {
-            if case .loaded = state {} else { state = .failed(error.localizedDescription) }
+            if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
             let failureReason: TimelineRefreshFailureReason
             if error is any LibraryChangeTerminalError {
                 failureReason = .scopeAccessLost

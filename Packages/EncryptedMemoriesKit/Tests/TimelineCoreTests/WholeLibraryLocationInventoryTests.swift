@@ -1314,6 +1314,11 @@ import Testing
         @Test(.timeLimit(.minutes(1)))
         func aReconciliationThatTakesOverAPublicationStartsTheScan() async throws {
             let fixture = try await LocationInventoryFixture.make()
+            // Hold every scan probe. A probe is recorded before its find is merged and
+            // persisted, so a held probe keeps the store frozen once a scan has started.
+            let probeGate = InventoryGate()
+            defer { probeGate.open() }
+            fixture.probeGate = probeGate
             fixture.seed(["b", "d"])
             await fixture.reconcile(nil)
             let release = InventoryGate()
@@ -1334,7 +1339,12 @@ import Testing
             await publication.value
 
             #expect(projections.value == 2)
+            // Wait until the scan the takeover started reaches its first probe instead of
+            // reading at a fixed moment. The held probe proves the scan started and that its
+            // first find is not persisted yet, so the store shows the takeover's prune only.
+            while await events.next() != .probe {}
             #expect(fixture.persistedUIDs() == [inventoryUID("b")])
+            probeGate.open()
             #expect(
                 fixture.session.startingTask != nil && fixture.session.isStarted,
                 "G684_TAKEOVER_STARTS: the takeover must start the scan that the publication still owed")

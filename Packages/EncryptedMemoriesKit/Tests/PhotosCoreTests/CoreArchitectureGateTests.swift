@@ -80,7 +80,7 @@ final class CoreArchitectureGateTests: XCTestCase {
         ),
         CoreTargetRule(
             name: "MediaCacheCore",
-            // MediaCacheCore has no Observation dependency; learned dimensions are stored in PhotosCore metadata.
+            // MediaCacheCore has no Observation dependency.
             allowedImports: ["Foundation", "PhotosCore"],
             expectedDependencies: ["PhotosCore"],
             extraForbiddenTokens: []
@@ -380,6 +380,111 @@ final class CoreArchitectureGateTests: XCTestCase {
         "MTLRenderCommandEncoder",
         "ProcessInfo.processInfo.physicalMemory",
         "ProcessInfo.processInfo.activeProcessorCount",
+    ]
+
+    // Rules for the Proton boundary (#1147). Every list below is named in the test that enforces it
+    // and is the only place that may admit a new importer; renaming a listed file is a conscious
+    // gate update, not a rename the test follows.
+
+    /// Rule: `ProtonDriveSDK` is Proton-internal plumbing. Only files under
+    /// `Sources/ProtonDriveBackend` may import it. Entries are repo-relative directory prefixes
+    /// with a trailing slash.
+    private static let protonDriveSDKImportAllowlist: [String] = [
+        "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/"
+    ]
+
+    /// Rule: the `ProtonCore*` modules are Proton-internal plumbing. They belong inside
+    /// `ProtonDriveBackend` and in the listed host startup files, which assemble the SDK keychain
+    /// and session state in the apps. Directories are repo-relative prefixes with a trailing
+    /// slash; files are exact repo-relative paths.
+    private static let protonCoreImportAllowlist: (directories: [String], files: [String]) = (
+        directories: [
+            "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/"
+        ],
+        files: [
+            "App/AppModel.swift",
+            "iOSApp/EncryptedMemoriesMobileApp.swift",
+            "iOSApp/MobileSessionModel.swift",
+        ]
+    )
+
+    /// Rule: the macOS and iOS apps import `ProtonDriveBackend` only in the listed composition
+    /// files, which wire backend services into app models, controllers and screens. Entries are
+    /// exact repo-relative paths.
+    private static let hostBackendImportAllowlist: Set<String> = [
+        "App/AppModel.swift",
+        "App/FolderBackupController.swift",
+        "App/MacLibraryRefreshController.swift",
+        "App/Offline/OfflineLibraryManager.swift",
+        "App/Views/MainView.swift",
+        "App/Views/SettingsView.swift",
+        "iOSApp/MobileAccountRuntime.swift",
+        "iOSApp/MobileLibraryModel.swift",
+        "iOSApp/MobileSessionModel.swift",
+        "iOSApp/MobileSettingsScreen.swift",
+        "iOSApp/MobileSignedInFixture.swift",
+    ]
+
+    /// Rule: a project.yml extension target must not depend on these modules. Extensions run in
+    /// other processes and must not gain Proton transport or credential access.
+    private static let extensionTargetForbiddenModules: [String] = [
+        "ProtonAuth",
+        "ProtonDriveBackend",
+    ]
+
+    /// Rule: an extension target may depend only on package products in this list. The list is
+    /// empty today because the apps ship no extension target yet. The first extension target
+    /// must widen this list ON PURPOSE: a module-name check alone is not enough,
+    /// because a product such as LibrarySourceRuntime transitively builds ProtonDriveBackend.
+    private static let extensionTargetAllowedProducts: [String] = []
+
+    /// The target `type:` spellings that mark an extension-family target, so a new XcodeGen
+    /// spelling does not slip past the extension rules. XcodeGen lowercases these on parse, but
+    /// the check compares case-insensitively anyway.
+    private static let extensionFamilyTypeMarkers: [String] = [
+        "extension",
+        "xpc-service",
+        "watchapp",
+        "messages",
+        "on-demand-install-capable",
+    ]
+
+    /// The declaration modifiers an SDK-facing file must not use. `public` is a reserved word, so
+    /// any occurrence in stripped code is a declaration modifier. `package` and `open` are also
+    /// legal identifiers, so they count only in front of a declaration keyword or modifier;
+    /// `open actor` and `open init` are not legal Swift and stay off the list.
+    private static let prohibitedDeclarationModifiers: [(token: String, pattern: String)] = [
+        ("public", #"(?<![.\w])public\b"#),
+        (
+            "package",
+            #"(?<![.\w])package(?=\s+(?:import|class|struct|enum|protocol|extension|func|var|let|typealias|init|subscript|static|final|override|nonisolated|lazy|weak|actor|associatedtype|macro|@))"#
+        ),
+        (
+            "open",
+            #"(?<![.\w])open(?=\s+(?:class|func|var|subscript|static|final|override|nonisolated|lazy|weak|unowned|dynamic))"#
+        ),
+    ]
+
+    /// The source trees the Proton gates scan for imports: the package sources and the two
+    /// shipped app trees. Entries are repo-relative directory prefixes with a trailing slash.
+    private static let protonGateScannedRoots: [String] = [
+        "Packages/EncryptedMemoriesKit/Sources/",
+        "App/",
+        "iOSApp/",
+    ]
+
+    /// Source trees the Proton gates deliberately do not scan: package and app test targets,
+    /// developer tools, vendored dependencies and build scripts. A test target that exercises
+    /// the backend boundary is their purpose, so it must stay out of the production rules.
+    /// Entries are repo-relative directory prefixes with a trailing slash.
+    private static let protonGateExcludedSourceTrees: [String] = [
+        "Packages/EncryptedMemoriesKit/Tests/",
+        "iOSTests/",
+        "iOSUITests/",
+        "macOSTests/",
+        "Tools/",
+        "Vendor/",
+        "scripts/",
     ]
 
     func testUniversalCoreImportsStayOnTargetAllowlists() throws {
@@ -1190,14 +1295,1052 @@ final class CoreArchitectureGateTests: XCTestCase {
         )
     }
 
-    private func swiftFiles(in directory: URL) throws -> [URL] {
+    // MARK: - Proton boundary rules
+    //
+    // Each rule body below is a pure function over a scanned file (a repository-relative path
+    // plus stripped source text) or over a file list, so the real-tree tests and the
+    // fixed-text samples share one implementation. A rule that loses its teeth fails its
+    // sample first, on the exact text that regressed.
+
+    /// One scanned source file as the boundary rules see it: its repository-relative path (the
+    /// unit every allowlist matches) and its comment- and string-stripped source text.
+    private struct ScannedSourceFile {
+        let path: String
+        let source: String
+    }
+
+    /// The files as the boundary rules see them. `base` resolves relative paths and
+    /// defaults to the repository root, so a sample tree outside the working tree keeps
+    /// its tree-relative path.
+    private func scannedSourceFiles(_ files: [URL], under base: URL? = nil) throws -> [ScannedSourceFile] {
+        try files.map { file in
+            ScannedSourceFile(path: repoRelativePath(of: file, under: base), source: try strippedCode(of: file))
+        }
+    }
+
+    /// Rule: only the `protonDriveSDKImportAllowlist` directories may import `ProtonDriveSDK`.
+    private static func protonDriveSDKImportViolations(in file: ScannedSourceFile) -> [String] {
+        guard importedModules(inSource: file.source).contains("ProtonDriveSDK") else { return [] }
+        guard protonDriveSDKImportAllowlist.contains(where: { file.path.hasPrefix($0) }) else {
+            return ["\(file.path): imports ProtonDriveSDK outside the allowlist"]
+        }
+        return []
+    }
+
+    /// Rule: the ProtonCore modules belong in the allowlisted directories and files.
+    private static func protonCoreImportViolations(in file: ScannedSourceFile) -> [String] {
+        let imports = importedModules(inSource: file.source)
+            .filter { $0.hasPrefix("ProtonCore") }
+            .sorted()
+        guard !imports.isEmpty else { return [] }
+        let inAllowedDirectories = protonCoreImportAllowlist.directories.contains {
+            file.path.hasPrefix($0)
+        }
+        let inAllowedFiles = protonCoreImportAllowlist.files.contains(file.path)
+        guard inAllowedDirectories || inAllowedFiles else {
+            return ["\(file.path): imports ProtonCore modules \(imports) outside the allowlist"]
+        }
+        return []
+    }
+
+    /// Rule: an SDK-facing file (any file that imports `ProtonDriveSDK`) declares nothing
+    /// `public`, `package` or `open`, so no SDK type can leak through a module's public
+    /// surface.
+    private static func sdkFacingSurfaceViolations(in file: ScannedSourceFile) -> [String] {
+        guard importedModules(inSource: file.source).contains("ProtonDriveSDK") else { return [] }
+        return
+            prohibitedDeclarationModifiers
+            .filter { file.source.range(of: $0.pattern, options: .regularExpression) != nil }
+            .map {
+                "\(file.path): declares \($0.token) API. Files that import ProtonDriveSDK must keep "
+                    + "the SDK surface internal."
+            }
+    }
+
+    /// Rule: the host apps import `ProtonDriveBackend` only in the listed composition files.
+    /// Both directions fail: an unlisted importer, and a listed file that stopped importing
+    /// the backend.
+    private static func hostBackendImportViolations(
+        files: [ScannedSourceFile],
+        allowlist: [String]
+    ) -> [String] {
+        var violations: [String] = []
+        var backendImporters: Set<String> = []
+        for file in files
+        where importedModules(inSource: file.source).contains("ProtonDriveBackend") {
+            backendImporters.insert(file.path)
+            if !allowlist.contains(file.path) {
+                violations.append(
+                    "\(file.path): imports ProtonDriveBackend but is not a listed composition file"
+                )
+            }
+        }
+        for listedFile in allowlist.sorted() where !backendImporters.contains(listedFile) {
+            violations.append(
+                "\(listedFile): is listed as a composition file but does not import ProtonDriveBackend"
+            )
+        }
+        return violations
+    }
+
+    /// Re-export predicates shared by every rule that checks `@_exported` imports, so the
+    /// real-tree tests and the sample tests flag the same modules. A second copy of either
+    /// test would drift from the real gate.
+    ///
+    /// The SDK and the ProtonCore modules are Proton-internal plumbing; re-exporting one
+    /// leaks it past the import allowlists wherever the file lives.
+    private static func isForbiddenProtonModuleReexport(_ module: String) -> Bool {
+        module == "ProtonDriveSDK" || module.hasPrefix("ProtonCore")
+    }
+
+    /// A re-export of the backend module hands its wired types to every importer.
+    private static func isForbiddenBackendModuleReexport(_ module: String) -> Bool {
+        module == "ProtonDriveBackend"
+    }
+
+    /// Rule: a re-export (`@_exported import`) of a module `forbidden` names leaks that module
+    /// through every importer of the re-exporting file's module, wherever the file lives, so
+    /// it bypasses an allowlist even inside an allowed directory.
+    private static func reexportBoundaryViolations(
+        in file: ScannedSourceFile,
+        forbidden: (String) -> Bool
+    ) -> [String] {
+        reexportedModules(inSource: file.source)
+            .filter(forbidden)
+            .map {
+                "\(file.path): re-exports \($0) with @_exported; a re-export leaks the Proton boundary"
+            }
+    }
+
+    /// Rule: only the allowlists in this file may import ProtonDriveSDK or the ProtonCore
+    /// modules. Production scope is every tree `protonGateScannedRoots` lists; test targets
+    /// exercise the backend boundary deliberately and stay out of scope.
+    func testProtonImportsStayOnModuleAllowlists() throws {
+        let scanned = try scannedSourceFiles(try protonGateProductionSourceFiles())
+        XCTAssertFalse(scanned.isEmpty, "Expected production source files for the Proton import gate")
+
+        var violations: [String] = []
+        var sdkImporters = 0
+        var protonCoreImporters = 0
+
+        for file in scanned {
+            let imports = Self.importedModules(inSource: file.source)
+            sdkImporters += imports.contains("ProtonDriveSDK") ? 1 : 0
+            protonCoreImporters += imports.contains { $0.hasPrefix("ProtonCore") } ? 1 : 0
+
+            violations += Self.reexportBoundaryViolations(
+                in: file,
+                forbidden: Self.isForbiddenProtonModuleReexport
+            )
+            violations += Self.protonDriveSDKImportViolations(in: file)
+            violations += Self.protonCoreImportViolations(in: file)
+        }
+
+        // Empty-input guard: the backend must still wrap the SDK and use ProtonCore. Zero importers
+        // means the scan or the architecture drifted; it must not look like a pass.
+        XCTAssertGreaterThanOrEqual(sdkImporters, 1, "Expected ProtonDriveBackend to still import ProtonDriveSDK")
+        XCTAssertGreaterThanOrEqual(
+            protonCoreImporters, 1, "Expected ProtonDriveBackend or a listed host file to still import ProtonCore")
+
+        for listedFile in Self.protonCoreImportAllowlist.files {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent(listedFile).path),
+                "ProtonCore allowlist entry does not exist anymore: \(listedFile)"
+            )
+        }
+
+        XCTAssertTrue(
+            violations.isEmpty,
+            """
+            Proton import allowlist gate failed:
+            \(violations.joined(separator: "\n"))
+
+            ProtonDriveSDK and the ProtonCore modules are Proton-internal plumbing. Only
+            ProtonDriveBackend may import ProtonDriveSDK, and ProtonCore belongs in ProtonDriveBackend
+            or in the listed host startup files. Route other code through the backend module and
+            widen the named allowlist only when the maintainers agree.
+            """
+        )
+    }
+
+    /// Rule: an SDK-facing production file (any file the production scan reaches that imports
+    /// `ProtonDriveSDK`) declares nothing `public`, `package` or `open`, so no SDK type can leak
+    /// through a module's public surface. Rule `testProtonImportsStayOnModuleAllowlists`
+    /// confines SDK importers to ProtonDriveBackend today; this rule still scans every
+    /// production file, so widening that allowlist later does not silently widen what may be
+    /// published here.
+    func testProtonSDKFacingBackendFilesDeclareNoPublicSurface() throws {
+        let scanned = try scannedSourceFiles(try protonGateProductionSourceFiles())
+        XCTAssertFalse(scanned.isEmpty, "Expected production source files")
+
+        let violations = scanned.flatMap(Self.sdkFacingSurfaceViolations(in:))
+
+        // Empty-input guard: zero SDK-facing files means the SDK moved and this rule lost its
+        // subject. Update it consciously instead of passing on an empty scan.
+        let sdkFacingFiles =
+            scanned
+            .filter { Self.importedModules(inSource: $0.source).contains("ProtonDriveSDK") }
+            .count
+        XCTAssertGreaterThanOrEqual(
+            sdkFacingFiles, 1, "Expected the production tree to still contain files that import ProtonDriveSDK")
+
+        XCTAssertTrue(
+            violations.isEmpty,
+            """
+            Proton SDK surface gate failed:
+            \(violations.joined(separator: "\n"))
+
+            SDK-facing backend files must declare nothing public, package or open. Publish wrappers
+            from backend files that do not import ProtonDriveSDK.
+            """
+        )
+    }
+
+    /// Rule: the macOS and iOS apps import `ProtonDriveBackend` only in the composition files the
+    /// allowlist names. The check runs in both directions: an unlisted importer fails, and a
+    /// listed file that stops importing the backend fails as a stale list entry. The host
+    /// trees come from `protonGateScannedRoots` (every scanned root outside `Packages/`),
+    /// the same list the production scan reads.
+    func testHostAppsImportBackendOnlyInCompositionFiles() throws {
+        let hostFiles = try protonGateHostFiles()
+        XCTAssertFalse(hostFiles.isEmpty, "Expected host app source files")
+
+        for listedFile in Self.hostBackendImportAllowlist {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent(listedFile).path),
+                "Listed composition file does not exist anymore: \(listedFile)"
+            )
+        }
+
+        var violations = Self.hostBackendImportViolations(
+            files: try scannedSourceFiles(hostFiles),
+            allowlist: Array(Self.hostBackendImportAllowlist)
+        )
+
+        // A backend re-export inside the production scan leaks the backend's types (and,
+        // through them, the SDK) to every module that imports the re-exporting module, so it
+        // bypasses this rule no matter where the file lives.
+        for file in try scannedSourceFiles(try protonGateProductionSourceFiles()) {
+            violations += Self.reexportBoundaryViolations(
+                in: file,
+                forbidden: Self.isForbiddenBackendModuleReexport
+            )
+        }
+
+        XCTAssertTrue(
+            violations.isEmpty,
+            """
+            Host backend import gate failed:
+            \(violations.joined(separator: "\n"))
+
+            The macOS and iOS apps import ProtonDriveBackend only in the listed composition files.
+            New backend wiring goes through those files, or the list gains a new composition file
+            that the maintainers agree on.
+            """
+        )
+    }
+
+    /// Rule: extension-family targets in project.yml must not depend on ProtonDriveBackend or
+    /// ProtonAuth, and may not depend on any product outside `extensionTargetAllowedProducts` —
+    /// empty today, so the first extension target widens that list on purpose. The
+    /// extension family is every target whose `type:` value contains one of
+    /// `extensionFamilyTypeMarkers`. When project.yml declares no extension target, this rule
+    /// has no dependency to forbid and passes; the parse anchors below keep that pass from
+    /// resting on a scan that read nothing, and the parse itself fails closed on manifest shapes
+    /// it cannot read.
+    func testExtensionTargetsStayWithinAllowedDependencies() throws {
+        let projectYAML = try String(contentsOf: repoRoot.appendingPathComponent("project.yml"), encoding: .utf8)
+        let targets: [ProjectYAMLTarget]
+        do {
+            targets = try Self.projectTargets(from: projectYAML)
+        } catch {
+            XCTFail("The project.yml parse failed closed: \(error)")
+            return
+        }
+
+        // Empty-input guard: the two shipped application targets prove the line-based parse still
+        // reads the manifest. Renaming either app is a conscious gate update, not a silent pass.
+        XCTAssertFalse(targets.isEmpty, "Could not read any target from project.yml")
+        XCTAssertTrue(
+            targets.contains { $0.name == "EncryptedMemories" },
+            "Expected the macOS application target in project.yml"
+        )
+        XCTAssertTrue(
+            targets.contains { $0.name == "EncryptedMemoriesMobile" },
+            "Expected the iOS application target in project.yml"
+        )
+
+        var violations: [String] = []
+        let extensionTargets = targets.filter { target in
+            Self.extensionFamilyTypeMarkers.contains {
+                target.type.localizedCaseInsensitiveContains($0)
+            }
+        }
+
+        for target in extensionTargets {
+            violations.append(
+                contentsOf: Self.extensionDependencyViolations(
+                    targetName: target.name,
+                    targetType: target.type,
+                    dependenciesBlock: target.dependencies
+                )
+            )
+        }
+
+        XCTAssertTrue(
+            violations.isEmpty,
+            """
+            Extension target dependency gate failed:
+            \(violations.joined(separator: "\n"))
+
+            Extension targets in project.yml must not depend on ProtonDriveBackend or ProtonAuth.
+            Extensions run in other processes and must not gain Proton transport or credential
+            access. Beyond that, an extension target may depend only on the products listed in
+            extensionTargetAllowedProducts; a product that transitively builds ProtonDriveBackend,
+            such as LibrarySourceRuntime, must not reach an extension by name. Give the extension
+            the narrow data it needs instead.
+            """
+        )
+    }
+
+    /// The dependency violations of one extension-family target: a message per forbidden or
+    /// unlisted name, and a message per dependency entry whose shape the gate cannot read. Pure
+    /// over the target's name, type and `dependencies:` block text, so the gate's sample tests
+    /// can pin each shape.
+    private static func extensionDependencyViolations(
+        targetName: String,
+        targetType: String,
+        dependenciesBlock: String
+    ) -> [String] {
+        var violations: [String] = []
+
+        for dependency in dependencyEntries(inDependenciesBlock: dependenciesBlock) {
+            guard !dependency.names.isEmpty else {
+                violations.append(
+                    """
+                    project.yml target \(targetName) (\(targetType)): dependency entry \
+                    '\(dependency.entry)' is not a package, product, target or sdk form the gate \
+                    understands. Teach the gate this shape instead of skipping it.
+                    """
+                )
+                continue
+            }
+
+            for name in dependency.names where !extensionTargetAllowedProducts.contains(name) {
+                if extensionTargetForbiddenModules.contains(name) {
+                    violations.append(
+                        """
+                        project.yml target \(targetName) (\(targetType)): extension targets must \
+                        not depend on \(name).
+                        """
+                    )
+                } else {
+                    violations.append(
+                        """
+                        project.yml target \(targetName) (\(targetType)): depends on '\(name)', \
+                        which is not in extensionTargetAllowedProducts.
+                        """
+                    )
+                }
+            }
+        }
+
+        return violations
+    }
+
+    /// Rule: the Proton gates scan every source tree. A directory that directly holds Swift
+    /// files must sit under a scanned root (`protonGateScannedRoots`) or under a documented
+    /// exclusion (`protonGateExcludedSourceTrees`); a new unlisted tree fails by name, so
+    /// nobody can park production code where the import and publication rules never read it.
+    /// When every tree is listed the rule passes; a wiped allowlist cannot produce that pass,
+    /// because the non-empty guards below fail first.
+    func testProtonGatesCoverEverySourceTree() throws {
+        let unlisted = try directoriesWithSwiftFiles()
+            .map { repoRelativePath(of: $0) }
+            .filter { path in
+                // A tree matches a list entry by prefix, or by being the entry itself
+                // without the trailing slash (a directory whose Swift files sit at its top).
+                !(Self.protonGateScannedRoots + Self.protonGateExcludedSourceTrees)
+                    .contains { path.hasPrefix($0) || path == String($0.dropLast()) }
+            }
+
+        // Empty-input guards: both lists must hold entries and the two app trees must remain
+        // scanned. Wiping a list turns the filter above into a constant `true` or `false`;
+        // these anchors keep that from looking like a pass.
+        XCTAssertFalse(Self.protonGateScannedRoots.isEmpty, "protonGateScannedRoots is empty")
+        XCTAssertFalse(Self.protonGateExcludedSourceTrees.isEmpty, "protonGateExcludedSourceTrees is empty")
+        XCTAssertTrue(
+            Self.protonGateScannedRoots.contains("App/")
+                && Self.protonGateScannedRoots.contains("iOSApp/"),
+            "Expected both app trees among the scanned roots"
+        )
+
+        // Every scanned root must actually hold a Swift file. An existing but empty root
+        // lists a tree the gates never read, and its empty scan would read as a pass.
+        for root in Self.protonGateScannedRoots {
+            let files = try swiftFiles(in: repoRoot.appendingPathComponent(String(root.dropLast())))
+            XCTAssertFalse(
+                files.isEmpty,
+                "Scanned root \(root) holds no Swift files; point the entry at a real source tree"
+            )
+        }
+
+        XCTAssertTrue(
+            unlisted.isEmpty,
+            """
+            Source tree coverage gate failed:
+            \(unlisted.joined(separator: "\n"))
+
+            Every directory that holds Swift files must sit under a scanned root or an excluded
+            tree. A new production tree joins the scan by adding it to protonGateScannedRoots;
+            a new test or vendored tree goes into protonGateExcludedSourceTrees. Either way the
+            listing is a conscious gate update. Both the production scan and the host
+            composition-file rule read their trees from protonGateScannedRoots, so the list
+            entry is the single place that adds a tree to the gate.
+            """
+        )
+    }
+
+    /// The scan helpers must fail closed on a missing path, on a path that is a regular
+    /// file, and on a nil enumerator: a nil enumerator silently shrinks a scan to nothing,
+    /// and an empty scan reads as a passing gate. Every probe sits outside the working tree,
+    /// so a crash can never leave a `.swift` file for a later scan to find.
+    func testScanHelpersThrowOnMissingDirectories() throws {
+        let probeBase = FileManager.default.temporaryDirectory
+        let missing = probeBase.appendingPathComponent("MissingSourceTree-\(UUID().uuidString)")
+
+        XCTAssertThrowsError(
+            try swiftFiles(in: missing),
+            "swiftFiles must refuse a missing path instead of returning nothing"
+        )
+        XCTAssertThrowsError(
+            try directoriesWithSwiftFiles(under: missing),
+            "directoriesWithSwiftFiles must refuse a missing path instead of returning nothing"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: missing.path),
+            "The probe directory must not exist; the helpers fail on a truly missing tree"
+        )
+
+        // A regular file is not a directory: FileManager hands out a non-nil, empty
+        // enumerator for it, so only the is-directory check makes this path fail closed.
+        let regularFile = probeBase.appendingPathComponent("GateProbe-\(UUID().uuidString).swift")
+        try "import Foundation\n".write(to: regularFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: regularFile) }
+        XCTAssertThrowsError(
+            try swiftFiles(in: regularFile),
+            "swiftFiles must refuse a path that is a regular file instead of returning nothing"
+        )
+        XCTAssertThrowsError(
+            try directoriesWithSwiftFiles(under: regularFile),
+            "directoriesWithSwiftFiles must refuse a path that is a regular file instead of "
+                + "returning nothing"
+        )
+    }
+
+    /// A new entry in `protonGateScannedRoots` must reach both gates that read the list: the
+    /// production scan behind the Proton import rules and the host trees behind the
+    /// composition-file rule, exactly as the coverage message states. A temporary sample
+    /// tree stands in for a new production tree; it sits under the system temporary
+    /// directory, never in the working tree, so a crash cannot leave a stray `.swift` file
+    /// for a later scan to find. The real roots stay untouched.
+    func testAddingAScannedRootFeedsTheProductionScanAndTheHostRule() throws {
+        let sampleBase = FileManager.default.temporaryDirectory
+        let treeName = "GateSampleTree-\(UUID().uuidString)"
+        let treeRoot = sampleBase.appendingPathComponent(treeName)
+        try FileManager.default.createDirectory(at: treeRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: treeRoot) }
+        try "import ProtonDriveBackend\n".write(
+            to: treeRoot.appendingPathComponent("Wiring.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let roots = ["\(treeName)/"]
+
+        let scannedPaths = try protonGateProductionSourceFiles(scanning: roots, under: sampleBase)
+            .map { repoRelativePath(of: $0, under: sampleBase) }
+        XCTAssertEqual(
+            scannedPaths,
+            ["\(treeName)/Wiring.swift"],
+            "A root added to the scanned list must feed the production scan"
+        )
+
+        let hostViolations = Self.hostBackendImportViolations(
+            files: try scannedSourceFiles(
+                try protonGateHostFiles(scanning: roots, under: sampleBase),
+                under: sampleBase
+            ),
+            allowlist: []
+        )
+        XCTAssertEqual(
+            hostViolations,
+            ["\(treeName)/Wiring.swift: imports ProtonDriveBackend but is not a listed composition file"],
+            "A root added to the scanned list must feed the host composition rule"
+        )
+    }
+
+    /// Every directory-entry allowlist the Proton gates use must end its entries with `/`:
+    /// the coverage checks match by prefix, and without the slash an entry such as
+    /// `Sources/ProtonDriveBackend` would also cover `Sources/ProtonDriveBackendSupport`.
+    /// File lists and module-name lists are exact-match and are deliberately not checked here.
+    func testDirectoryAllowlistEntriesEndWithTrailingSlash() {
+        let directoryLists: [(name: String, entries: [String])] = [
+            ("protonDriveSDKImportAllowlist", Self.protonDriveSDKImportAllowlist),
+            ("protonCoreImportAllowlist.directories", Self.protonCoreImportAllowlist.directories),
+            ("protonGateScannedRoots", Self.protonGateScannedRoots),
+            ("protonGateExcludedSourceTrees", Self.protonGateExcludedSourceTrees),
+        ]
+
+        for list in directoryLists {
+            // Empty-input guard: a wiped list would pass the slash check for free; require it
+            // to keep at least one entry so wiping it fails the gate instead.
+            XCTAssertFalse(list.entries.isEmpty, "\(list.name) is empty; it must list its trees")
+            for entry in list.entries where !entry.hasSuffix("/") {
+                XCTFail("'\(entry)' in \(list.name) must end with '/': the prefix checks rely on it")
+            }
+        }
+    }
+
+    // MARK: - Import, stripper and modifier samples
+    //
+    // The boundary rules lean on small parsers (import spellings, comment and string
+    // stripping, declaration-modifier matching). These sample tests pin every accepted and
+    // rejected shape against fixed source text, so a regression fails with the exact form that
+    // regressed instead of a whole-repo scan the whole suite must interpret.
+
+    /// Every import spelling the production scan must recognize. When a new Swift import form
+    /// appears, this sample grows first and the scan second. The access levels come from
+    /// SE-0409; attributes and the `import` keyword may each sit on their own line ahead of
+    /// the module name, and the compiler accepts the same-line and split spellings alike.
+    func testImportedModulesSamplesCoverEveryAcceptedImportSpelling() {
+        let sample = """
+            import Plain
+            import Tabbed\tAfterTab
+            @_implementationOnly import ImplementationOnly
+            @testable import Testable
+            @preconcurrency import Preconcurrency
+            @_spi(Private) import Spi
+            @_exported import ExportedFlag
+            @_spi(Foo) @_exported import BothAttributes
+            internal import InternalLevel
+            package import PackageLevel
+            public import PublicLevel
+            private import PrivateLevel
+            fileprivate import FileprivateLevel
+            @_exported public import ExportedPublicLevel
+            @_exported
+            import ExportedOwnLine
+            public
+            import
+            NewlinePublicLevel
+            import
+            NewlineModule
+            import struct Scoped.Struct
+            import class Scoped.Klass
+            import enum Scoped.Enuhm
+            import protocol Scoped.Proto
+            import typealias Scoped.Alias
+            import func Scoped.function
+            import var Scoped.variable
+            import let Scoped.constant
+            import DotPath.Sub.Deep
+            import Semi; import Second
+            import Trailing // import NotACount because this is a comment
+            let inString = "import NotInString"
+            /* import NotInBlockComment */
+            public func importThing()
+            let important = 1
+            internalValue
+            public
+            let notAnImport = 1
+            """
+            + "\n"
+
+        let modules = Self.importedModules(inSource: sample)
+        // `import Tabbed\tAfterTab` names only Tabbed: the module token ends at whitespace.
+        // The three-line `public` form needs the line join: parsed line by line it would
+        // leave `public`, `import` and the module name as fragments that name no module.
+        let expected: Set<String> = [
+            "Plain", "Tabbed", "ImplementationOnly", "Testable", "Preconcurrency",
+            "Spi", "ExportedFlag", "BothAttributes", "InternalLevel", "PackageLevel",
+            "PublicLevel", "PrivateLevel", "FileprivateLevel", "ExportedPublicLevel",
+            "ExportedOwnLine", "NewlinePublicLevel", "NewlineModule",
+            "Scoped", "DotPath", "Semi", "Second", "Trailing",
+        ]
+        XCTAssertEqual(modules, expected)
+        XCTAssertFalse(modules.contains("NotACount"))
+        XCTAssertFalse(modules.contains("NotInString"))
+        XCTAssertFalse(modules.contains("NotInBlockComment"))
+        XCTAssertFalse(modules.contains("importThing"))
+        XCTAssertFalse(modules.contains("important"))
+        XCTAssertFalse(modules.contains("internalValue"))
+        XCTAssertFalse(modules.contains("notAnImport"))
+    }
+
+    /// A re-export is any import carrying `@_exported`, alone or among other attributes, with
+    /// an access level included, in a scoped import included, and on its own line included.
+    /// Everything else stays out of the re-export set.
+    func testReexportedModulesSamplesFlagOnlyExportedImports() {
+        let sample = """
+            @_exported import Exported
+            @_spi(Foo) @_exported import AlsoExported
+            @_exported import struct Scoped.ExportedMember
+            @_exported
+            import OwnLineExported
+            @_exported public import PublicExportedLevel
+            public import AccessLevelWithoutAttribute
+            import Plain
+            @_implementationOnly import NotExported
+            """
+            + "\n"
+
+        let reexported = Self.reexportedModules(inSource: sample)
+        XCTAssertEqual(
+            reexported,
+            ["Exported", "AlsoExported", "Scoped", "OwnLineExported", "PublicExportedLevel"]
+        )
+        XCTAssertFalse(reexported.contains("AccessLevelWithoutAttribute"))
+    }
+
+    /// Each Proton boundary rule flags its own violating sample, so a rule that loses its
+    /// teeth fails on fixed text instead of only against the real tree. Every violation
+    /// sample pairs with a control of the same shape that must stay clean.
+    func testProtonBoundaryRulesFlagTheirOwnSampleViolations() {
+        // SDK allowlist: an access-level import of ProtonDriveSDK outside ProtonDriveBackend.
+        let leaking = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/PhotosCore/Leaking.swift",
+            source: "internal import ProtonDriveSDK\n"
+        )
+        XCTAssertTrue(
+            Self.protonDriveSDKImportViolations(in: leaking)
+                == ["\(leaking.path): imports ProtonDriveSDK outside the allowlist"],
+            "An access-level import outside the backend must trip the SDK allowlist"
+        )
+
+        // SDK allowlist control: the same import inside ProtonDriveBackend stays clean.
+        let driving = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Driving.swift",
+            source: "import ProtonDriveSDK\n"
+        )
+        XCTAssertTrue(Self.protonDriveSDKImportViolations(in: driving).isEmpty)
+
+        // ProtonCore allowlist: a ProtonCore import outside the listed directories and files.
+        let coreLeaking = ScannedSourceFile(
+            path: "App/UnlistedStartup.swift",
+            source: "import ProtonCoreUtilities\n"
+        )
+        XCTAssertFalse(
+            Self.protonCoreImportViolations(in: coreLeaking).isEmpty,
+            "A ProtonCore import outside the allowlist must produce a violation"
+        )
+
+        // ProtonCore allowlist control: inside a listed directory stays clean.
+        let coreDriving = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Networking.swift",
+            source: "import ProtonCoreUtilities\n"
+        )
+        XCTAssertTrue(Self.protonCoreImportViolations(in: coreDriving).isEmpty)
+
+        // Public surface: an SDK-facing file that publishes API.
+        let publishing = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Driving.swift",
+            source: "import ProtonDriveSDK\npublic func shipping() {}\n"
+        )
+        XCTAssertFalse(
+            Self.sdkFacingSurfaceViolations(in: publishing).isEmpty,
+            "An SDK-facing file with a public declaration must produce a violation"
+        )
+
+        // Public surface control: the same file keeping its declarations internal stays clean.
+        let contained = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Driving.swift",
+            source: "import ProtonDriveSDK\nfunc shipping() {}\n"
+        )
+        XCTAssertTrue(Self.sdkFacingSurfaceViolations(in: contained).isEmpty)
+
+        // Host list: an unlisted host file importing the backend must fail by name.
+        let unlistedHost = ScannedSourceFile(
+            path: "App/UnlistedWiring.swift",
+            source: "import ProtonDriveBackend\n"
+        )
+        let hostViolations = Self.hostBackendImportViolations(
+            files: [unlistedHost],
+            allowlist: Array(Self.hostBackendImportAllowlist)
+        )
+        XCTAssertTrue(
+            hostViolations.contains(
+                "\(unlistedHost.path): imports ProtonDriveBackend but is not a listed composition file"
+            ),
+            "A host file outside the composition list must fail by name"
+        )
+
+        // Host list: a composition entry whose file no longer imports the backend fails too.
+        XCTAssertEqual(
+            Self.hostBackendImportViolations(files: [], allowlist: ["App/Stale.swift"]),
+            ["App/Stale.swift: is listed as a composition file but does not import ProtonDriveBackend"]
+        )
+
+        // Host list control: a host file that imports only Foundation stays clean.
+        let quietHost = ScannedSourceFile(
+            path: "App/Quiet.swift",
+            source: "import Foundation\n"
+        )
+        XCTAssertTrue(Self.hostBackendImportViolations(files: [quietHost], allowlist: []).isEmpty)
+
+        // Re-export: the split attribute form leaks the boundary even inside an allowed
+        // directory. The predicate is the one the real-tree rules call.
+        let reexporting = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Driving.swift",
+            source: "@_exported\nimport ProtonDriveSDK\n"
+        )
+        XCTAssertEqual(
+            Self.reexportBoundaryViolations(
+                in: reexporting,
+                forbidden: Self.isForbiddenProtonModuleReexport
+            ),
+            [
+                "\(reexporting.path): re-exports ProtonDriveSDK with @_exported; "
+                    + "a re-export leaks the Proton boundary"
+            ],
+            "A re-export of a Proton module must produce a violation wherever the file lives"
+        )
+
+        // ProtonCore re-export: the same predicate flags the ProtonCore prefix too.
+        let coreReexporting = ScannedSourceFile(
+            path: "App/Startup.swift",
+            source: "@_exported import ProtonCoreUtilities\n"
+        )
+        XCTAssertEqual(
+            Self.reexportBoundaryViolations(
+                in: coreReexporting,
+                forbidden: Self.isForbiddenProtonModuleReexport
+            ),
+            [
+                "\(coreReexporting.path): re-exports ProtonCoreUtilities with @_exported; "
+                    + "a re-export leaks the Proton boundary"
+            ],
+            "A re-export of a ProtonCore module must produce a violation wherever the file lives"
+        )
+
+        // Backend re-export: the predicate behind the host rule flags a re-export of
+        // ProtonDriveBackend.
+        let backendReexporting = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/PhotosCore/Reexport.swift",
+            source: "@_exported import ProtonDriveBackend\n"
+        )
+        XCTAssertEqual(
+            Self.reexportBoundaryViolations(
+                in: backendReexporting,
+                forbidden: Self.isForbiddenBackendModuleReexport
+            ),
+            [
+                "\(backendReexporting.path): re-exports ProtonDriveBackend with @_exported; "
+                    + "a re-export leaks the Proton boundary"
+            ],
+            "A re-export of ProtonDriveBackend must produce a violation wherever the file lives"
+        )
+
+        // Re-export control: importing without @_exported inside the allowed directory stays
+        // clean.
+        XCTAssertTrue(
+            Self.reexportBoundaryViolations(
+                in: driving,
+                forbidden: Self.isForbiddenProtonModuleReexport
+            ).isEmpty
+        )
+    }
+
+    /// The stripper must blank line comments, nested block comments, plain literals (with
+    /// escapes), triple-quoted literals and raw literals (`#`-prefixed, one or two hashes).
+    /// The odd `"` inside the multi-line literal must not end it, so the `public func` after
+    /// the literal is still visible to the modifier scan.
+    func testStrippedSourceSamplesBlankEveryCommentAndStringShape() {
+        let sample = """
+            let keep = 1 // line comment with "quotes" inside
+            /* outer /* nested */ still comment */ let keepMore = 2
+            let escaped = "string with \\" escaped quote and // not a comment"
+            let multi = \"\"\"
+            a lone " is literal text, and // is not a comment
+            \"\"\"
+            let raw = #"raw string, " quotes stay, \\ stays, \\#(keep) interpolates"#
+            let rawRaw = ##"ends only at "# one-hash-quoted "# hash pair"##
+            public func visibleAfterStrings() {}
+            """
+            + "\n"
+
+        let stripped = Self.stripCommentsAndStringLiterals(from: sample)
+        XCTAssertTrue(stripped.contains("let keep = 1 "), "the plain code between literals must survive")
+        XCTAssertTrue(stripped.contains("let keepMore = 2"), "code after a nested comment must survive")
+        XCTAssertTrue(stripped.contains("visibleAfterStrings"), "code after a multi-line literal must survive")
+        XCTAssertFalse(stripped.contains("line comment with"), "a line comment must be blanked")
+        XCTAssertFalse(stripped.contains("still comment"), "a nested block comment must be blanked")
+        XCTAssertFalse(stripped.contains("escaped quote"), "a plain literal must be blanked")
+        XCTAssertFalse(stripped.contains("lone"), "a multi-line literal must be blanked")
+        XCTAssertFalse(stripped.contains("raw string"), "a raw literal must be blanked")
+        XCTAssertFalse(stripped.contains("ends only at"), "a two-hash raw literal must be blanked")
+        XCTAssertFalse(stripped.contains("interpolates"), "interpolation content must be blanked")
+    }
+
+    /// The modifier scan flags `public` everywhere and `package`/`open` only in front of a
+    /// declaration. `package` and `open` as identifiers, and `package`/`open` members reached
+    /// through a dot, must stay unflagged.
+    func testProhibitedDeclarationModifierSamplesSeparateDeclarationsFromIdentifiers() {
+        let identifiers = """
+            let package = x
+            var open = 1
+            func f(package: Int) {}
+            let a = other.package
+            let b = other.open
+            """
+            + "\n"
+        for modifier in Self.prohibitedDeclarationModifiers {
+            XCTAssertFalse(
+                identifiers.range(of: modifier.pattern, options: .regularExpression) != nil,
+                "'\(modifier.token)' used as an identifier must not be flagged"
+            )
+        }
+
+        let declarations = """
+            public func publicFunction() {}
+            package struct PackageStruct {}
+            package import SomeModule
+            open class OpenClass {}
+            open var openVariable = 1
+            package @MainActor struct Annotated {}
+            open func openMethod() {}
+            """
+            + "\n"
+        for modifier in Self.prohibitedDeclarationModifiers {
+            XCTAssertTrue(
+                declarations.range(of: modifier.pattern, options: .regularExpression) != nil,
+                "a '\(modifier.token)' declaration must be flagged"
+            )
+        }
+    }
+
+    /// The manifest shapes the line parse accepts: target names with trailing comments,
+    /// dependency entries at the key's own indentation and deeper, and target-less keys that
+    /// carry no dependency information.
+    func testProjectTargetsSamplesParseEveryAcceptedManifestShape() throws {
+        let manifest = """
+            name: EncryptedMemories
+            options:
+              bundleIdPrefix: at.oncloud
+            targets:
+              App: # a trailing comment must not hide the name
+                type: application
+                sources:
+                  - App
+                settings:
+                  base:
+                    OTHER_LDFLAGS[sdk=*]: -ObjC
+                dependencies:
+                  - package: PhotosCore
+                    products:
+                      - EncryptedMemoriesKit
+                - package: SameIndentPackage
+              Share:
+                type: app-extension
+                dependencies: # empty block with a comment
+              Empty:
+                type: application
+            """
+
+        let targets = try Self.projectTargets(from: manifest)
+        XCTAssertEqual(targets.map(\.name), ["App", "Share", "Empty"])
+        XCTAssertEqual(targets[0].type, "application")
+        XCTAssertEqual(targets[1].type, "app-extension")
+        XCTAssertTrue(
+            targets[0].dependencies.contains("SameIndentPackage"),
+            "an entry at the key's own indentation must be collected"
+        )
+        XCTAssertTrue(
+            targets[0].dependencies.contains("EncryptedMemoriesKit"),
+            "a nested products entry must be collected"
+        )
+        XCTAssertEqual(targets[2].dependencies, "", "a target with no dependencies key parses to no entries")
+    }
+
+    /// Every manifest shape the parse cannot read must fail closed instead of shrinking the
+    /// scan: tabs, odd indentation, `include:`, YAML anchors, aliases and merge keys, target
+    /// names away from indentation 2, and inline `targets:`/`type:`/`dependencies:` values.
+    /// `OTHER_LDFLAGS[sdk=*]` carries a `*` that is not an alias and must not fail.
+    func testProjectTargetsSamplesFailClosedOnUnreadableManifestShapes() {
+        let readable = """
+            settings:
+              base:
+                OTHER_LDFLAGS[sdk=*]: -ObjC
+            targets:
+              App:
+                type: application
+            """
+        XCTAssertNoThrow(try Self.projectTargets(from: readable))
+
+        let unreadable: [(shape: String, manifest: String)] = [
+            ("tab", "targets:\n  App:\n\ttype: application"),
+            ("odd indentation", "targets:\n   App:\n    type: application"),
+            ("include:", "include: shared.yml\ntargets:\n  App:\n    type: application"),
+            ("anchor", "targets:\n  App: &anchor\n    type: application"),
+            ("alias as value", "targets:\n  App:\n    type: *anchor"),
+            ("merge key", "targets:\n  App:\n    <<: *base"),
+            ("target name away from indentation 2", "targets:\n    App:\n      type: application"),
+            ("inline targets value", "targets: {App: {type: application}}"),
+            ("inline dependencies value", "targets:\n  App:\n    dependencies: [PhotosCore]"),
+        ]
+        for shape in unreadable {
+            XCTAssertThrowsError(
+                try Self.projectTargets(from: shape.manifest),
+                "the \(shape.shape) shape must fail closed"
+            ) { error in
+                XCTAssertTrue(
+                    String(describing: error).contains("project.yml"),
+                    "the \(shape.shape) failure must name the manifest"
+                )
+            }
+        }
+    }
+
+    /// The extension-family marker decides which targets the dependency rule reads. It matches
+    /// the documented spellings, case-insensitively, and does not match a plain application.
+    func testExtensionFamilySamplesMatchOnlyExtensionFamilyTargets() {
+        let markers = Self.extensionFamilyTypeMarkers
+        let manifest = """
+            targets:
+              ShareExtension:
+                type: app-extension
+              Share:
+                type: extensionKitExtension # note: trailing comment stripped by the parse
+              Service:
+                type: xpc-service
+              Watch:
+                type: watchapp2
+              Messages:
+                type: messages-application
+              ODIM:
+                type: on-demand-install-capable-view-controller-extension
+              App:
+                type: application
+            """
+
+        let targets = try! Self.projectTargets(from: manifest)
+        for target in targets {
+            let isFamily = markers.contains {
+                target.type.localizedCaseInsensitiveContains($0)
+            }
+            if target.name == "App" {
+                XCTAssertFalse(isFamily, "an application target is not an extension-family target")
+            } else {
+                XCTAssertTrue(isFamily, "target type '\(target.type)' must count as extension family")
+            }
+        }
+    }
+
+    /// An extension-family target may depend only on the products in
+    /// `extensionTargetAllowedProducts` (empty today). A forbidden module, an unlisted product
+    /// and an unreadable dependency shape each produce their own message.
+    func testExtensionDependencySamplesReportEachViolationShape() {
+        let block = """
+            dependencies:
+                  - package: PhotosCore
+                    products:
+                      - LibrarySourceRuntime
+                  - package: SomeKit
+                  - sdk: Pods_SomePods
+                  - import: PathFinding
+            """
+
+        let violations = Self.extensionDependencyViolations(
+            targetName: "Notifications",
+            targetType: "app-extension",
+            dependenciesBlock: block
+        )
+        // Entry one contributes two violations: the unlisted package PhotosCore and the
+        // unlisted product LibrarySourceRuntime. Every message names its own shape.
+        XCTAssertEqual(violations.count, 5)
+        let joined = violations.joined(separator: "\n")
+        XCTAssertTrue(joined.contains("PhotosCore"), "an unlisted package is named")
+        XCTAssertTrue(joined.contains("LibrarySourceRuntime"), "an unlisted product is named")
+        XCTAssertTrue(
+            joined.contains("is not in extensionTargetAllowedProducts"),
+            "an unlisted plain package is named with the list"
+        )
+        XCTAssertTrue(joined.contains("Pods_SomePods"), "an sdk dependency is named")
+        XCTAssertTrue(
+            joined.contains("Teach the gate this shape"),
+            "an unreadable dependency entry fails closed"
+        )
+
+        let direct = Self.extensionDependencyViolations(
+            targetName: "Notifications",
+            targetType: "app-extension",
+            dependenciesBlock: "dependencies:\n      - package: ProtonDriveBackend"
+        )
+        XCTAssertEqual(direct.count, 1)
+        XCTAssertTrue(
+            direct[0].contains("must not depend on ProtonDriveBackend"),
+            "the direct forbidden-module message names the module and the rule"
+        )
+
+        let empty = Self.extensionDependencyViolations(
+            targetName: "Notifications",
+            targetType: "app-extension",
+            dependenciesBlock: "dependencies:"
+        )
+        XCTAssertTrue(empty.isEmpty, "an extension target with no dependencies is not a violation")
+    }
+
+    /// The directories under `root` (by default the whole repository) that directly contain a
+    /// `.swift` file, sorted by path.
+    private func directoriesWithSwiftFiles(under root: URL? = nil) throws -> [URL] {
+        let directory = root ?? repoRoot
+        var isDirectory: ObjCBool = false
         guard
+            FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+            isDirectory.boolValue,
             let enumerator = FileManager.default.enumerator(
                 at: directory,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
             )
-        else { return [] }
+        else {
+            // Fail closed: a missing path, a path that is not a directory, or a nil enumerator
+            // must stop the gate, never shrink the scan to an empty result that reads as a pass.
+            throw GateScanError(
+                description: "directoriesWithSwiftFiles could not read \(directory.path); the coverage test "
+                    + "cannot walk a missing source tree"
+            )
+        }
+
+        var directories = Set<URL>()
+        for case let url as URL in enumerator {
+            guard url.pathExtension == "swift", !url.hasDirectoryPath else { continue }
+            // A `Package.swift` manifest describes its module; it is not source parked in a
+            // tree the gates do not scan, so it must not register its directory here.
+            guard url.lastPathComponent != "Package.swift" else { continue }
+            directories.insert(url.deletingLastPathComponent().standardizedFileURL)
+        }
+        return directories.sorted { $0.path < $1.path }
+    }
+
+    /// The `.swift` files under `directory`, sorted by path. Fails closed when the directory
+    /// is missing or unreadable: an empty result would silently shrink a rule's scan.
+    private func swiftFiles(in directory: URL) throws -> [URL] {
+        var isDirectory: ObjCBool = false
+        guard
+            FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+            isDirectory.boolValue,
+            let enumerator = FileManager.default.enumerator(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            throw GateScanError(
+                description: "swiftFiles could not read \(directory.path); a rule's scan must not shrink to "
+                    + "nothing on a missing path or a path that is not a directory"
+            )
+        }
 
         var results: [URL] = []
         for case let url as URL in enumerator {
@@ -1212,27 +2355,469 @@ final class CoreArchitectureGateTests: XCTestCase {
     }
 
     private func importedModules(in file: URL) throws -> Set<String> {
-        let source = try String(contentsOf: file, encoding: .utf8)
-        var modules = Set<String>()
+        Set(Self.imports(inSource: try strippedCode(of: file)).map(\.module))
+    }
 
-        for line in source.split(whereSeparator: { $0.isNewline }) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            let prefix: String
-            if trimmed.hasPrefix("@_exported import ") {
-                prefix = "@_exported import "
-            } else if trimmed.hasPrefix("@preconcurrency import ") {
-                prefix = "@preconcurrency import "
-            } else if trimmed.hasPrefix("import ") {
-                prefix = "import "
-            } else {
+    /// The modules `source` re-exports through `@_exported import`. A re-export leaks the
+    /// imported module through every importer of this file's module, so it bypasses an import
+    /// allowlist even when the file itself sits in an allowed directory. Pure over the source
+    /// text, so the gate's sample tests can pin the form.
+    private static func reexportedModules(inSource source: String) -> Set<String> {
+        Set(imports(inSource: source).filter(\.reexported).map(\.module))
+    }
+
+    /// The modules `source` imports, as a set of module names. Pure over the source text, so
+    /// the gate's sample tests can pin each accepted import spelling.
+    ///
+    /// Accepts any leading `@` attribute, scoped imports (`import struct Foo.Bar`), `;`
+    /// separators, and any whitespace. The module is the text before the first `.`. Imports
+    /// that only appear inside comments or string literals do not count: the stripper runs
+    /// first.
+    private static func importedModules(inSource source: String) -> Set<String> {
+        Set(imports(inSource: source).map(\.module))
+    }
+
+    /// Every import declaration of `source` as (module, reexported).
+    ///
+    /// An import declaration may spread its pieces across lines: the `@` attributes, the
+    /// access-level modifier and the `import` keyword each may sit alone on a line ahead of
+    /// the next piece, and the module name may follow `import` on the next line. The scan
+    /// therefore joins a line that stops mid declaration with the line after it before
+    /// parsing, and the sample test pins every joined shape. A line that stops after its
+    /// attributes or its access level always continues with an import or a declaration; only
+    /// the continuation that follows the `import` keyword is a reserved word, so the join can
+    /// manufacture no import the source does not declare.
+    private static func imports(inSource source: String) -> [(module: String, reexported: Bool)] {
+        let stripped = stripCommentsAndStringLiterals(from: source)
+        var found: [(module: String, reexported: Bool)] = []
+
+        var pending: String?
+        for rawLine in stripped.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = pending.map { $0 + " " + rawLine } ?? String(rawLine)
+            if isIncompleteImportPrefix(line) {
+                pending = line
                 continue
             }
-            let remainder = trimmed.dropFirst(prefix.count)
-            let moduleName = remainder.split(separator: " ").first.map(String.init) ?? String(remainder)
-            modules.insert(moduleName)
+            pending = nil
+            // One line may hold several statements: `import A; import B`.
+            for segment in line.split(separator: ";", omittingEmptySubsequences: false) {
+                found.append(contentsOf: imports(inSegment: segment))
+            }
         }
 
-        return modules
+        return found
+    }
+
+    /// The access levels an import declaration may carry between its attributes and the
+    /// `import` keyword. Each counts as an access level here only when whitespace follows it,
+    /// so an identifier such as `internalValue` never reads as one.
+    private static let importAccessLevels = [
+        "internal", "package", "public", "private", "fileprivate",
+    ]
+
+    /// Whether `line` stops inside an import declaration before its module name: only `@`
+    /// attributes and access levels so far, or exactly the `import` keyword. Such a line
+    /// continues on the next line; every other line is complete (or no import at all).
+    private static func isIncompleteImportPrefix(_ line: String) -> Bool {
+        guard let scanned = scanImportPrefix(Substring(line)) else { return false }
+        let rest = scanned.rest.trimmingCharacters(in: .whitespacesAndNewlines)
+        return rest.isEmpty || rest == "import"
+    }
+
+    /// Consumes the leading `@` attributes (each with balanced parenthesized arguments) and
+    /// access-level modifiers of an import declaration, returning the remainder and whether
+    /// a leading `@_exported` marks a re-export. Returns nil when the prefix stops mid
+    /// attribute or mid modifier: such a line is complete and must not join the next one.
+    private static func scanImportPrefix(
+        _ line: Substring
+    ) -> (rest: Substring, reexported: Bool)? {
+        var rest = line.drop(while: { $0.isWhitespace })
+        var reexported = false
+
+        while !rest.isEmpty {
+            if rest.hasPrefix("@") {
+                let nameStart = rest.index(after: rest.startIndex)
+                let nameEnd =
+                    rest[nameStart...].firstIndex { !($0.isLetter || $0.isNumber || $0 == "_") }
+                    ?? rest.endIndex
+                guard nameEnd != nameStart else { return nil }
+                if rest[nameStart..<nameEnd] == "_exported" { reexported = true }
+                var afterName = nameEnd
+                if afterName < rest.endIndex, rest[afterName] == "(" {
+                    // Skip the attribute's argument list, with balanced parentheses.
+                    var depth = 1
+                    afterName = rest.index(after: afterName)
+                    while afterName < rest.endIndex, depth > 0 {
+                        if rest[afterName] == "(" { depth += 1 }
+                        if rest[afterName] == ")" { depth -= 1 }
+                        afterName = rest.index(after: afterName)
+                    }
+                }
+                guard afterName == rest.endIndex || rest[afterName].isWhitespace else { return nil }
+                rest = rest[afterName...].drop(while: { $0.isWhitespace })
+                continue
+            }
+
+            if let modifier = importAccessLevels.first(where: { rest.hasPrefix($0) }) {
+                let afterModifier = rest.index(rest.startIndex, offsetBy: modifier.count)
+                guard afterModifier == rest.endIndex || rest[afterModifier].isWhitespace else {
+                    return nil
+                }
+                rest = rest[afterModifier...].drop(while: { $0.isWhitespace })
+                continue
+            }
+
+            break
+        }
+
+        return (rest, reexported)
+    }
+
+    /// The import declarations of one `;`-free segment of stripped source.
+    private static func imports(inSegment segment: Substring) -> [(module: String, reexported: Bool)] {
+        guard let scanned = scanImportPrefix(segment) else { return [] }
+        let rest = scanned.rest
+
+        guard
+            rest.hasPrefix("import"),
+            rest.count > "import".count,
+            rest[rest.index(rest.startIndex, offsetBy: "import".count)].isWhitespace
+        else { return [] }
+        var tail = rest.dropFirst("import".count).drop(while: { $0.isWhitespace })
+
+        // A scoped import names what it pulls in before the module: `import class Foo.Bar`.
+        for keyword in ["struct", "class", "enum", "protocol", "typealias", "func", "var", "let"] {
+            guard
+                tail.hasPrefix(keyword),
+                tail.count > keyword.count,
+                tail[tail.index(tail.startIndex, offsetBy: keyword.count)].isWhitespace
+            else { continue }
+            tail = tail.dropFirst(keyword.count).drop(while: { $0.isWhitespace })
+            break
+        }
+
+        // The module name ends at whitespace, `;`, or the `.` of a member path.
+        let token = tail.prefix { character in
+            character.isLetter || character.isNumber || character == "_" || character == "."
+        }
+        guard !token.isEmpty else { return [] }
+        let moduleName =
+            token.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+            .first
+            .map(String.init)
+            ?? String(token)
+        return [(moduleName, scanned.reexported)]
+    }
+
+    /// Every production Swift file the Proton gates scan: the trees `protonGateScannedRoots`
+    /// lists, the same list the coverage test explains. Test targets (`Tests/`,
+    /// `macOSTests/`, `iOSTests/`) exercise the backend boundary deliberately and are not
+    /// part of these rules. Adding a production tree means adding its entry to the list.
+    /// `roots` nil means the shared `protonGateScannedRoots` list; tests that add a temporary
+    /// tree pass that tree as the only root and resolve it under `base` (the repository root
+    /// by default), so a sample tree can live outside the working tree.
+    private func protonGateProductionSourceFiles(
+        scanning roots: [String]? = nil,
+        under base: URL? = nil
+    ) throws -> [URL] {
+        let baseURL = base ?? repoRoot
+        let rootsToScan = roots ?? Self.protonGateScannedRoots
+        var files: [URL] = []
+        for root in rootsToScan {
+            files += try swiftFiles(in: baseURL.appendingPathComponent(String(root.dropLast())))
+        }
+        return files
+    }
+
+    /// The host app source files among `roots`: every scanned tree outside `Packages/`. The
+    /// package targets build against the backend freely; only the hand-wired app trees obey
+    /// the composition-file rule, and they come from the same scanned-roots list as the
+    /// production scan. `base` resolves the root entries and defaults to the repository
+    /// root, so a sample host tree can live outside the working tree.
+    private func protonGateHostFiles(
+        scanning roots: [String]? = nil,
+        under base: URL? = nil
+    ) throws -> [URL] {
+        let baseURL = base ?? repoRoot
+        let rootsToScan = roots ?? Self.protonGateScannedRoots
+        var files: [URL] = []
+        for root in rootsToScan where !root.hasPrefix("Packages/") {
+            files += try swiftFiles(in: baseURL.appendingPathComponent(String(root.dropLast())))
+        }
+        return files
+    }
+
+    /// The path of `file` relative to `base` (the repository root by default), for failure
+    /// messages that survive a moved checkout.
+    private func repoRelativePath(of file: URL, under base: URL? = nil) -> String {
+        let root = (base ?? repoRoot).standardizedFileURL.path
+        let path = file.standardizedFileURL.path
+        guard path.hasPrefix(root + "/") else { return path }
+        return String(path.dropFirst(root.count + 1))
+    }
+
+    private struct ProjectYAMLTarget {
+        let name: String
+        let type: String
+        let dependencies: String
+    }
+
+    /// Why `projectTargets(from:)` stopped: project.yml contains a shape the line parse refuses
+    /// to guess about. The message names the offending line, so the failure is actionable.
+    private struct ProjectManifestError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// A source-tree scan that could not read its input. A missing or unreadable directory
+    /// must stop the gate instead of shrinking a rule's scan to nothing, which would read
+    /// as a pass.
+    private struct GateScanError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// The targets of project.yml: name, declared type and the comment-stripped text of the
+    /// `dependencies:` block including its entries, exactly as the manifest groups them.
+    ///
+    /// Pure over the manifest text, so the gate's sample tests can pin each accepted shape.
+    /// Fails closed with `ProjectManifestError` on shapes the parse cannot read: tab characters,
+    /// odd indentation, `include:`, YAML anchors, aliases and merge keys, target names at an
+    /// indentation other than 2, and inline values on the `targets:`, `type:` or
+    /// `dependencies:` keys. Failing closed is deliberate: a manifest the gate cannot read must
+    /// stop the build, not quietly shrink the scan.
+    private static func projectTargets(from projectYAML: String) throws -> [ProjectYAMLTarget] {
+        var targets: [ProjectYAMLTarget] = []
+        var name: String?
+        var type: String?
+        var dependencies: [String] = []
+        var dependenciesKeyIndent: Int?
+        var inTargetsSection = false
+
+        func flush() {
+            defer {
+                name = nil
+                type = nil
+                dependencies = []
+                dependenciesKeyIndent = nil
+            }
+            guard let name else { return }
+            targets.append(
+                ProjectYAMLTarget(
+                    name: name,
+                    type: type ?? "",
+                    dependencies: dependencies.joined(separator: "\n")
+                )
+            )
+        }
+
+        for rawLine in projectYAML.split(separator: "\n", omittingEmptySubsequences: false) {
+            guard !rawLine.contains("\t") else {
+                throw ProjectManifestError(description: "project.yml uses a tab character in: \(rawLine)")
+            }
+            let line = Self.lineWithoutComment(rawLine)
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            let indent = line.prefix { $0 == " " }.count
+
+            guard indent % 2 == 0 else {
+                throw ProjectManifestError(
+                    description: "project.yml line has odd indentation \(indent): \(trimmed)"
+                )
+            }
+            if Self.containsAnchorOrAlias(trimmed) {
+                throw ProjectManifestError(
+                    description: "project.yml uses a YAML anchor, alias or merge key in: \(trimmed)"
+                )
+            }
+
+            if indent == 0 {
+                flush()
+                if trimmed.hasPrefix("include:") {
+                    throw ProjectManifestError(
+                        description: "project.yml uses include:, which this parse cannot follow"
+                    )
+                }
+                if trimmed.hasPrefix("targets:") {
+                    guard trimmed == "targets:" else {
+                        throw ProjectManifestError(
+                            description:
+                                "project.yml targets: has an inline value; this parse only reads block style: \(trimmed)"
+                        )
+                    }
+                    inTargetsSection = true
+                } else {
+                    inTargetsSection = false
+                }
+                continue
+            }
+            guard inTargetsSection else { continue }
+
+            if indent == 2 {
+                guard trimmed.hasSuffix(":") else {
+                    throw ProjectManifestError(
+                        description: "expected a target name at indentation 2, found: \(trimmed)"
+                    )
+                }
+                let key = trimmed.dropLast()
+                let allowedName =
+                    !key.isEmpty
+                    && key.allSatisfy {
+                        $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "."
+                    }
+                guard allowedName else {
+                    throw ProjectManifestError(
+                        description: "unusual target name at indentation 2, expected `Name:`: \(trimmed)"
+                    )
+                }
+                flush()
+                name = String(key)
+                continue
+            }
+
+            guard name != nil else {
+                throw ProjectManifestError(
+                    description: "project.yml has content inside targets: before any target name: \(trimmed)"
+                )
+            }
+
+            // Dependency entries may sit deeper than their key or at the key's own indentation,
+            // which YAML also allows. Anything shallower, or a sibling key, ends the block.
+            if let keyIndent = dependenciesKeyIndent,
+                indent > keyIndent || (indent == keyIndent && trimmed.hasPrefix("-"))
+            {
+                dependencies.append(line)
+                continue
+            }
+            dependenciesKeyIndent = nil
+
+            if trimmed.hasPrefix("type:") {
+                guard indent == 4 else {
+                    throw ProjectManifestError(
+                        description: "type: of target \(name ?? "?") appears at indentation \(indent)"
+                            + " instead of 4; check the target's indentation in: \(trimmed)"
+                    )
+                }
+                let value = trimmed.dropFirst("type:".count).trimmingCharacters(in: .whitespaces)
+                guard !value.isEmpty else {
+                    throw ProjectManifestError(
+                        description: "type: of target \(name ?? "?") has no value: \(trimmed)"
+                    )
+                }
+                type = value
+            } else if trimmed.hasPrefix("dependencies:") {
+                guard indent == 4 else {
+                    throw ProjectManifestError(
+                        description: "dependencies: of target \(name ?? "?") appears at indentation \(indent)"
+                            + " instead of 4; check the target's indentation in: \(trimmed)"
+                    )
+                }
+                let value = trimmed.dropFirst("dependencies:".count).trimmingCharacters(in: .whitespaces)
+                guard value.isEmpty else {
+                    throw ProjectManifestError(
+                        description: "project.yml dependencies: of target \(name ?? "?") has an inline value;"
+                            + " this parse only reads block style: \(trimmed)"
+                    )
+                }
+                dependenciesKeyIndent = indent
+                dependencies.append(line)
+            }
+            // Any other key (sources:, settings:, …) and its nested lines carry no dependency
+            // information for these rules and are skipped.
+        }
+        flush()
+        return targets
+    }
+
+    /// The line without its YAML comment: everything from a `#` that starts the line or follows
+    /// a space. Quoted values that merely contain `#` keep it.
+    private static func lineWithoutComment(_ line: Substring) -> String {
+        var cut = line.endIndex
+        var index = line.startIndex
+        while index < line.endIndex {
+            guard line[index] == "#", index == line.startIndex || line[line.index(before: index)] == " "
+            else {
+                index = line.index(after: index)
+                continue
+            }
+            cut = index
+            break
+        }
+        return String(line[..<cut])
+    }
+
+    /// True when `line` starts with an anchor, alias or merge key, or carries one as its
+    /// `key: value` value: `&name`, `*name` or `<<:`. A `*` that is neither the first character
+    /// nor a whole leading identifier — for example `OTHER_LDFLAGS[sdk=*]: -ObjC` — is not a
+    /// YAML alias and does not trip this check.
+    private static func containsAnchorOrAlias(_ line: String) -> Bool {
+        guard let first = line.first else { return false }
+        if first == "&" || first == "*" || first == "<" { return true }
+        guard let colon = line.firstIndex(of: ":") else { return false }
+        let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        return value.range(of: #"^[&*][A-Za-z0-9_-]+(\s|$)"#, options: .regularExpression) != nil
+    }
+
+    /// Each `-` entry of a `dependencies:` block together with the package, product, target or
+    /// sdk names it references. Covers flow entries (`- {package: X, product: Y}`), keyed
+    /// entries whose value sits on the next line (`- package: X` plus `product: Y`) and keyed
+    /// entries with a block list value (`products:` followed by `- Y` lines). Entries with no
+    /// recognizable name keep an empty list so the rule can reject shapes the gate does not
+    /// understand. Pure over the block text, so the gate's sample tests can pin each shape.
+    private static func dependencyEntries(
+        inDependenciesBlock block: String
+    ) -> [(entry: String, names: [String])] {
+        var entries: [(entry: String, names: [String])] = []
+        var current: (entry: String, names: [String], indent: Int)?
+        var expectingListItem = false
+
+        func flush() {
+            defer { current = nil }
+            guard let current else { return }
+            entries.append((entry: current.entry, names: current.names))
+        }
+
+        func names(inValue value: Substring, into entry: inout (entry: String, names: [String], indent: Int)) {
+            let tokens = value.split { character in
+                !(character.isLetter || character.isNumber || character == "_"
+                    || character == "-" || character == ".")
+            }
+            entry.names.append(contentsOf: tokens.map(String.init))
+        }
+
+        for rawLine in block.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            let indent = rawLine.prefix { $0 == " " }.count
+
+            if trimmed.hasPrefix("-") {
+                if expectingListItem, let entry = current, indent > entry.indent {
+                    // A `- Name` line under a `products:` (or similar) key belongs to the
+                    // current entry.
+                    var entry = entry
+                    names(inValue: trimmed.dropFirst(), into: &entry)
+                    current = entry
+                    continue
+                }
+                flush()
+                current = (entry: trimmed, names: [], indent: indent)
+                expectingListItem = false
+            }
+            guard var entry = current else { continue }  // the `dependencies:` key line itself
+            defer {
+                current = entry
+            }
+
+            for match in rawLine.matches(of: #/(?:package|packages|products?|targets?|sdks?)\s*:\s*(\S[^\n]*)/#) {
+                names(inValue: match.1, into: &entry)
+            }
+            if rawLine.firstMatch(of: #/(?:package|packages|products?|targets?|sdks?)\s*:\s*\S/#) != nil {
+                // The key carries its value on this line.
+                expectingListItem = false
+            } else if rawLine.firstMatch(of: #/(?:package|packages|products?|targets?|sdks?)\s*:\s*$/#) != nil {
+                // The key carries its value as a block list on the following `- Name` lines.
+                expectingListItem = true
+            }
+        }
+        flush()
+        return entries
     }
 
     private func manifestLine(forTarget target: String, in manifest: String) -> String? {
@@ -1329,7 +2914,7 @@ final class CoreArchitectureGateTests: XCTestCase {
     private func strippedCode(of file: URL) throws -> String {
         let key = file.standardizedFileURL.path
         if let cached = Self.strippedSources.withLock({ $0[key] }) { return cached }
-        let code = stripCommentsAndStringLiterals(from: try String(contentsOf: file, encoding: .utf8))
+        let code = Self.stripCommentsAndStringLiterals(from: try String(contentsOf: file, encoding: .utf8))
         Self.strippedSources.withLock { $0[key] = code }
         return code
     }
@@ -1343,79 +2928,170 @@ final class CoreArchitectureGateTests: XCTestCase {
         return code.range(of: pattern, options: .regularExpression) != nil
     }
 
-    private func stripCommentsAndStringLiterals(from source: String) -> String {
+    /// `source` with every comment and string literal blanked out. Newlines are kept so the
+    /// result keeps the line layout of the input; everything else inside a comment or literal
+    /// becomes a space. In raw strings a backslash is literal and a quote only closes the
+    /// literal when the matching number of `#` follows; that is how the Swift compiler parses
+    /// them, verified against `swiftc`.
+    ///
+    /// Pure over the source text, so the gate's sample tests can pin each shape.
+    private static func stripCommentsAndStringLiterals(from source: String) -> String {
         var result = ""
+        result.reserveCapacity(source.count)
         var index = source.startIndex
-        var inLineComment = false
-        var inBlockComment = false
-        var inString = false
-        var escapingString = false
 
-        func nextIndex(after index: String.Index) -> String.Index {
-            source.index(after: index)
+        /// The number of `#`s in the run ending just before `quote`, 0 for a plain literal.
+        func rawHashes(before quote: String.Index) -> Int {
+            var hashes = 0
+            var probe = quote
+            while probe > source.startIndex, source[source.index(before: probe)] == "#" {
+                hashes += 1
+                probe = source.index(before: probe)
+            }
+            return hashes
+        }
+
+        func appendBlanked(until endIndex: String.Index) {
+            while index < endIndex {
+                result.append(source[index] == "\n" ? "\n" : " ")
+                index = source.index(after: index)
+            }
+        }
+
+        /// Blanks the string literal whose opening quote is at `openingQuote`. `hashes` is the
+        /// number of `#`s of a raw opening delimiter, 0 for a plain literal.
+        func consumeStringLiteral(openingQuote: String.Index, hashes: Int) {
+            var triple = false
+            let afterOpening = source.index(after: openingQuote)
+            if afterOpening < source.endIndex, source[afterOpening] == "\"" {
+                let third = source.index(after: afterOpening)
+                if third < source.endIndex, source[third] == "\"" { triple = true }
+            }
+            let openingEnd =
+                triple ? source.index(after: source.index(after: afterOpening)) : afterOpening
+            appendBlanked(until: openingEnd)
+
+            while index < source.endIndex {
+                let character = source[index]
+                let after = source.index(after: index)
+
+                if hashes == 0, character == "\\" {
+                    // In a plain literal the backslash escapes the next character.
+                    result.append("  ")
+                    index = after < source.endIndex ? source.index(after: after) : after
+                    continue
+                }
+                if hashes > 0, character == "\\", after < source.endIndex, source[after] == "#" {
+                    // In a raw literal only `\#` escapes; it covers the pair plus one character.
+                    result.append("   ")
+                    let afterPair = source.index(after: after)
+                    index = afterPair < source.endIndex ? source.index(after: afterPair) : afterPair
+                    continue
+                }
+                if character == "\"", !triple {
+                    var follow = after
+                    var followHashes = 0
+                    while follow < source.endIndex, source[follow] == "#" {
+                        followHashes += 1
+                        follow = source.index(after: follow)
+                    }
+                    if followHashes >= hashes {
+                        appendBlanked(until: follow)
+                        return
+                    }
+                }
+                if character == "\"", triple {
+                    if after < source.endIndex, source[after] == "\"" {
+                        let third = source.index(after: after)
+                        if third < source.endIndex, source[third] == "\"" {
+                            var follow = source.index(after: third)
+                            var followHashes = 0
+                            while follow < source.endIndex, source[follow] == "#" {
+                                followHashes += 1
+                                follow = source.index(after: follow)
+                            }
+                            if followHashes >= hashes {
+                                appendBlanked(until: follow)
+                                return
+                            }
+                        }
+                    }
+                }
+                result.append(character == "\n" ? "\n" : " ")
+                index = after
+            }
         }
 
         while index < source.endIndex {
             let character = source[index]
-            let next = nextIndex(after: index)
-            let nextCharacter = next < source.endIndex ? source[next] : nil
+            let next = source.index(after: index)
 
-            if inLineComment {
-                if character == "\n" {
-                    inLineComment = false
-                    result.append("\n")
-                } else {
-                    result.append(" ")
+            if character == "/" {
+                let after = next
+                if after < source.endIndex, source[after] == "/" {
+                    // Line comment: blank to end of line.
+                    while index < source.endIndex, source[index] != "\n" {
+                        result.append(" ")
+                        index = source.index(after: index)
+                    }
+                    continue
                 }
-                index = next
-                continue
-            }
-
-            if inBlockComment {
-                if character == "*", nextCharacter == "/" {
-                    inBlockComment = false
+                if after < source.endIndex, source[after] == "*" {
+                    // Block comment, possibly nested.
+                    var depth = 1
                     result.append("  ")
-                    index = nextIndex(after: next)
-                } else {
-                    result.append(character == "\n" ? "\n" : " ")
-                    index = next
+                    index = source.index(after: after)
+                    while index < source.endIndex, depth > 0 {
+                        let c = source[index]
+                        if c == "/", source.index(after: index) < source.endIndex,
+                            source[source.index(after: index)] == "*"
+                        {
+                            depth += 1
+                            result.append("  ")
+                            index = source.index(after: source.index(after: index))
+                        } else if c == "*", source.index(after: index) < source.endIndex,
+                            source[source.index(after: index)] == "/"
+                        {
+                            depth -= 1
+                            result.append("  ")
+                            index = source.index(after: source.index(after: index))
+                        } else {
+                            result.append(c == "\n" ? "\n" : " ")
+                            index = source.index(after: index)
+                        }
+                    }
+                    continue
                 }
-                continue
-            }
-
-            if inString {
-                if escapingString {
-                    escapingString = false
-                    result.append(" ")
-                } else if character == "\\" {
-                    escapingString = true
-                    result.append(" ")
-                } else if character == "\"" {
-                    inString = false
-                    result.append(" ")
-                } else {
-                    result.append(character == "\n" ? "\n" : " ")
-                }
-                index = next
-                continue
-            }
-
-            if character == "/", nextCharacter == "/" {
-                inLineComment = true
-                result.append("  ")
-                index = nextIndex(after: next)
-            } else if character == "/", nextCharacter == "*" {
-                inBlockComment = true
-                result.append("  ")
-                index = nextIndex(after: next)
-            } else if character == "\"" {
-                inString = true
-                result.append(" ")
-                index = next
-            } else {
                 result.append(character)
                 index = next
+                continue
             }
+
+            if character == "#" {
+                // A run of `#`s directly before a `"` opens a raw string literal.
+                var hashes = 0
+                var probe = index
+                while probe < source.endIndex, source[probe] == "#" {
+                    hashes += 1
+                    probe = source.index(after: probe)
+                }
+                if probe < source.endIndex, source[probe] == "\"" {
+                    appendBlanked(until: probe)  // the `#`s
+                    consumeStringLiteral(openingQuote: probe, hashes: hashes)
+                    continue
+                }
+                result.append(character)
+                index = next
+                continue
+            }
+
+            if character == "\"" {
+                consumeStringLiteral(openingQuote: index, hashes: 0)
+                continue
+            }
+
+            result.append(character)
+            index = next
         }
 
         return result

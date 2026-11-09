@@ -42,10 +42,6 @@ public struct MLModelInstallLayout: Sendable, Equatable {
         ["", "-wal", "-shm"].map { URL(fileURLWithPath: indexDatabaseURL.path + $0) }
     }
 
-    public var derivedIndexDatabaseFileURLs: [URL] {
-        ["", "-wal", "-shm"].map { URL(fileURLWithPath: derivedIndexDatabaseURL.path + $0) }
-    }
-
     public func modelDirectory(for id: MLModelID) -> URL {
         modelsDirectory.appendingPathComponent(safePathComponent(id.rawValue), isDirectory: true)
     }

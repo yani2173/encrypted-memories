@@ -24,7 +24,7 @@ package final class GridTransitionController {
 
     package var isActive: Bool { plan != nil }
 
-    /// Try to begin a click (toolbar/keyboard +/-) transition. Returns true iff a plan was built and
+    /// Try to begin a click (toolbar +/-) transition. Returns true iff a plan was built and
     /// Returns false when the host must use the stable instant snap.
     @discardableResult
     package func beginClick(

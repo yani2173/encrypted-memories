@@ -320,6 +320,15 @@ final class UploadCompletionRecorder: @unchecked Sendable {
     }
 }
 
+extension UploadBackupSyncQueueStore {
+    /// Read-only view of every runnable row through the store's own state reads; claiming would change the rows.
+    func runnableEntries() -> [UploadBackupSyncQueueEntry] {
+        UploadBackupSyncQueueManifestStore.runnableStates.flatMap {
+            entries(in: UploadBackupSyncQueueState(rawValue: $0)!, updatedBefore: .distantFuture, limit: .max)
+        }
+    }
+}
+
 extension XCTestCase {
     /// Polls `manager.snapshot()` until `predicate` holds or the timeout elapses.
     @discardableResult
@@ -352,5 +361,28 @@ func makeTempFiles(_ names: [String], in dir: URL) throws -> [URL] {
         let url = dir.appendingPathComponent(name)
         try Data("x".utf8).write(to: url)
         return url
+    }
+}
+
+func withDeniedSQLitePragma(in store: Any, _ body: () throws -> Void) throws {
+    let connection = try storeConnection(store)
+    connection.withLock {
+        XCTAssertEqual(
+            sqlite3_set_authorizer(
+                connection.database,
+                { _, action, _, _, _, _ in action == SQLITE_PRAGMA ? SQLITE_DENY : SQLITE_OK }, nil), SQLITE_OK)
+    }
+    defer { connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) } }
+    try body()
+}
+
+/// Records a failed test read even when a notification callback cannot throw.
+func queueEntryForTesting(
+    in queue: any UploadBackupSyncQueueStore, source: UploadSourceIdentity, revision: UploadBackupRevision,
+    file: StaticString = #filePath, line: UInt = #line
+) -> UploadBackupSyncQueueEntry? {
+    do { return try queue.entry(for: source, revision: revision) } catch {
+        XCTFail("The test queue read failed: \(error)", file: file, line: line)
+        return nil
     }
 }

@@ -390,7 +390,7 @@ import Testing
         func clear() { backing.clear() }
     }
 
-    private final class TrackingSession: MLSmartSearchSession, @unchecked Sendable {
+    private final class TrackingSession: WholePassSession, @unchecked Sendable {
         let descriptor: MLModelDescriptor
         private let indexFails: Bool
         private let lock = NSLock()
@@ -425,7 +425,7 @@ import Testing
         var shutdownCount: Int { lock.withLock { shutdowns } }
     }
 
-    private final class FixedSemanticSession: MLSmartSearchSession, @unchecked Sendable {
+    private final class FixedSemanticSession: WholePassSession, @unchecked Sendable {
         let descriptor: MLModelDescriptor
         private let permanentlyUnavailable: Set<PhotoUID>
         private let suppressionRead: BlockingSuppressionRead?
@@ -503,6 +503,20 @@ import Testing
         var sessions: [TrackingSession] { lock.withLock { storage } }
     }
 
+    /// Runs one armed action when a double reaches its authorization point.
+    private final class InventoryChangeTrigger: @unchecked Sendable {
+        private let lock = NSLock()
+        private var action: (@Sendable () -> Void)?
+        func arm(_ action: @escaping @Sendable () -> Void) { lock.withLock { self.action = action } }
+        func fire() {
+            let armed = lock.withLock { () -> (@Sendable () -> Void)? in
+                defer { action = nil }
+                return action
+            }
+            armed?()
+        }
+    }
+
     private final class MutableAssets: @unchecked Sendable {
         private let lock = NSLock()
         private var inventory: MLAssetInventorySnapshot
@@ -542,6 +556,7 @@ import Testing
         private let suppressionRead: BlockingSuppressionRead?
         private let deferredCount: Int
         private let afterProgressReport: (@Sendable () async -> Void)?
+        private let beforeAuthorization: (@Sendable () -> Void)?
         private var indexedAssets: [MLPipelineAssetRevision] = []
         private var indexes = 0
         private var shutdowns = 0
@@ -552,11 +567,13 @@ import Testing
             permanentlyUnavailable: Set<PhotoUID> = [],
             suppressionRead: BlockingSuppressionRead? = nil,
             deferredCount: Int = 0,
-            afterProgressReport: (@Sendable () async -> Void)? = nil
+            afterProgressReport: (@Sendable () async -> Void)? = nil,
+            beforeAuthorization: (@Sendable () -> Void)? = nil
         ) {
             self.results = results
             self.deferredCount = deferredCount
             self.afterProgressReport = afterProgressReport
+            self.beforeAuthorization = beforeAuthorization
             self.permanentlyUnavailable = permanentlyUnavailable
             self.suppressionRead = suppressionRead
             indexedAssets = initiallyIndexed.compactMap {
@@ -569,34 +586,8 @@ import Testing
 
         func availableBackends() async -> Set<MLSearchBackend> { [.recognizedText] }
 
-        func index(
-            assets: [MLPipelineAssetRevision],
-            shouldContinue: @escaping @Sendable () -> Bool,
-            observer: MLDerivedPipelineObserver
-        ) async -> MLDerivedPipelinePassOutcome {
-            await performIndex(
-                assets: assets,
-                allowsDestructiveReconciliation: true,
-                shouldContinue: shouldContinue,
-                observer: observer
-            )
-        }
-
-        func indexQuantum(
-            assets: [MLPipelineAssetRevision],
-            libraryGeneration: UInt64,
-            allowsDestructiveReconciliation: Bool,
-            maximumAssets: Int,
-            maximumConcurrentAssets: Int,
-            shouldContinue: @escaping @Sendable () -> Bool,
-            observer: MLDerivedPipelineObserver
-        ) async -> MLDerivedPipelinePassOutcome {
-            await performIndex(
-                assets: assets,
-                allowsDestructiveReconciliation: allowsDestructiveReconciliation,
-                shouldContinue: shouldContinue,
-                observer: observer
-            )
+        func hasIndexedTextEntries() async -> Bool {
+            lock.withLock { !indexedAssets.isEmpty }
         }
 
         func indexQuantum(
@@ -611,6 +602,7 @@ import Testing
         ) async -> MLDerivedPipelinePassOutcome {
             let authorized: Bool
             if allowsDestructiveReconciliation {
+                beforeAuthorization?()
                 authorized = await destructiveReconciliationIsAuthorized()
             } else {
                 authorized = false
@@ -1953,7 +1945,9 @@ import Testing
         let enable = Task { await harness.lifecycle.enable(with: local.id) }
         #expect(await waitUntil { await factory.started })
         #expect(await waitUntil(timeout: .milliseconds(250)) { phases.saw(.notInstalled(downloadable: false)) })
-        #expect(await harness.lifecycle.availableSearchScopes() == [.all, .text])
+        // The native index has not been created yet, so the OCR scope stays hidden. An empty
+        // scope list means the default scope only; the search interface maps it to that scope.
+        #expect(await harness.lifecycle.availableSearchScopes() == [])
 
         await factory.release()
         await enable.value
@@ -2074,6 +2068,34 @@ import Testing
         harness.assets.set([uid("a"), uid("b")])
         await harness.lifecycle.noteLibraryChanged()
         #expect(await waitUntil { nativeSearch.indexCount == 2 && nativeSearch.indexedUIDs.count == 2 })
+    }
+
+    @Test func nativeReconciliationIsRefusedWhenTheInventoryStopsBeingAuthoritativeDuringThePass() async throws {
+        let kept = uid("kept")
+        let removed = uid("removed")
+        let trigger = InventoryChangeTrigger()
+        let nativeSearch = RecordingNativeSearch(results: [], beforeAuthorization: { trigger.fire() })
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [localModelEntry()]),
+            payloads: [:],
+            assets: [kept, removed],
+            nativeSearch: nativeSearch
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: localModelEntry().id)
+        #expect(await waitUntil { nativeSearch.indexCount == 1 && nativeSearch.indexedUIDs.count == 2 })
+
+        // The pass starts on an authoritative inventory that no longer lists `removed`; the host loses
+        // authority before the pass asks to delete. The live recheck must refuse the deletion.
+        let assets = harness.assets
+        trigger.arm { assets.setHydrating([kept]) }
+        harness.assets.set([kept])
+        await harness.lifecycle.noteLibraryChanged()
+        #expect(await waitUntil { nativeSearch.indexCount == 2 })
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(Set(nativeSearch.indexedUIDs) == [kept, removed])
     }
 
     @Test func completedNativeBackendIndexesHydratingScopeWithoutReconcilingStoredRows() async throws {
@@ -2465,6 +2487,102 @@ import Testing
         #expect(nativeSearch.shutdownCount == 1)
     }
 
+    @Test func ocrScopeStaysHiddenWhileTheTextIndexIsEmpty() async throws {
+        let nativeSearch = RecordingNativeSearch(results: [])
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [localModelEntry()]),
+            payloads: [:],
+            assets: [],
+            nativeSearch: nativeSearch,
+            advertisedNativeSearchBackends: [.recognizedText, .documentText]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: localModelEntry().id)
+        #expect(await waitUntil { await harness.lifecycle.currentSnapshot().isEnabled })
+        // The device advertises OCR, but the library's text index holds no entry yet. The lifecycle
+        // reports no scope beyond the default one: an empty list means the default scope only,
+        // and the search interface maps an empty list to that scope.
+        #expect(await harness.lifecycle.availableSearchScopes() == [])
+    }
+
+    @Test func ocrScopeAppearsOnceTheTextIndexHoldsAnEntry() async throws {
+        let seeded = uid("seeded")
+        let nativeSearch = RecordingNativeSearch(results: [], initiallyIndexed: [seeded])
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [localModelEntry()]),
+            payloads: [:],
+            assets: [seeded],
+            nativeSearch: nativeSearch,
+            advertisedNativeSearchBackends: [.recognizedText, .documentText]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: localModelEntry().id)
+        #expect(
+            await waitUntil { await harness.lifecycle.availableSearchScopes() == [.all, .text] },
+            "the OCR scope must appear as soon as the text index holds one entry")
+    }
+
+    /// A conformer that does not report its text index is treated the same as an unreadable index:
+    /// the OCR scope stays hidden even though the backends are advertised.
+    @Test func ocrScopeStaysHiddenWhenTheNativeIndexReportsNoState() async throws {
+        final class SilentNativeSearch: MLNativeSearchServing, @unchecked Sendable {
+            func availableBackends() async -> Set<MLSearchBackend> { [.recognizedText, .documentText] }
+            func indexQuantum(
+                assets: [MLPipelineAssetRevision],
+                libraryGeneration: UInt64,
+                allowsDestructiveReconciliation: Bool,
+                destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
+                maximumAssets: Int,
+                maximumConcurrentAssets: Int,
+                shouldContinue: @escaping @Sendable () -> Bool,
+                observer: MLDerivedPipelineObserver
+            ) async -> MLDerivedPipelinePassOutcome {
+                let progress = MLDerivedPipelineProgress(
+                    total: 0,
+                    completed: 0,
+                    skipped: 0,
+                    permanentFailure: 0,
+                    retryPending: 0,
+                    generation: libraryGeneration
+                )
+                observer.report(progress)
+                return .init(reason: .drained, progress: progress)
+            }
+            func search(_ text: String, scope: MLSearchScope, limit: Int) async -> [PhotoUID] { [] }
+            func progress() async -> MLDerivedPipelineProgress {
+                .init(
+                    total: 0,
+                    completed: 0,
+                    skipped: 0,
+                    permanentFailure: 0,
+                    retryPending: 0,
+                    generation: 0)
+            }
+            func purge() async {}
+            func shutdown() async {}
+        }
+
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [localModelEntry()]),
+            payloads: [:],
+            assets: [],
+            nativeSearchFactoryOverride: { SilentNativeSearch() },
+            advertisedNativeSearchBackends: [.recognizedText, .documentText]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: localModelEntry().id)
+        #expect(await waitUntil { await harness.lifecycle.currentSnapshot().isEnabled })
+        // Like an unreadable index, a conformer without an answer yields no scope beyond the
+        // default one; the search interface maps the empty list to the default scope.
+        #expect(await harness.lifecycle.availableSearchScopes() == [])
+    }
+
     @Test func centralCoordinatorRunsNativeQuantumBeforeSemanticQuantum() async throws {
         final class Events: @unchecked Sendable {
             private let lock = NSLock()
@@ -2476,25 +2594,11 @@ import Testing
             let events: Events
             init(events: Events) { self.events = events }
             func availableBackends() async -> Set<MLSearchBackend> { [.recognizedText] }
-            func index(
-                assets: [MLPipelineAssetRevision],
-                shouldContinue: @escaping @Sendable () -> Bool,
-                observer: MLDerivedPipelineObserver
-            ) async -> MLDerivedPipelinePassOutcome {
-                await indexQuantum(
-                    assets: assets,
-                    libraryGeneration: 0,
-                    allowsDestructiveReconciliation: true,
-                    maximumAssets: assets.count,
-                    maximumConcurrentAssets: 1,
-                    shouldContinue: shouldContinue,
-                    observer: observer
-                )
-            }
             func indexQuantum(
                 assets: [MLPipelineAssetRevision],
                 libraryGeneration: UInt64,
                 allowsDestructiveReconciliation: Bool,
+                destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
                 maximumAssets: Int,
                 maximumConcurrentAssets: Int,
                 shouldContinue: @escaping @Sendable () -> Bool,
@@ -2526,7 +2630,7 @@ import Testing
             func purge() async {}
             func shutdown() async {}
         }
-        final class Semantic: MLSmartSearchSession, @unchecked Sendable {
+        final class Semantic: WholePassSession, @unchecked Sendable {
             let descriptor: MLModelDescriptor
             let events: Events
             init(descriptor: MLModelDescriptor, events: Events) {
@@ -2534,13 +2638,6 @@ import Testing
                 self.events = events
             }
             func index(_ assets: [PhotoUID], observer: MLIndexPassObserver) async -> MLIndexPassOutcome {
-                await indexQuantum(assets, maximumAssets: assets.count, observer: observer)
-            }
-            func indexQuantum(
-                _ assets: [PhotoUID],
-                maximumAssets: Int,
-                observer: MLIndexPassObserver
-            ) async -> MLIndexPassOutcome {
                 events.append("semantic")
                 let progress = MLIndexProgress(
                     phase: .completed,
@@ -2596,25 +2693,11 @@ import Testing
 
             func availableBackends() async -> Set<MLSearchBackend> { [.recognizedText] }
             func maximumConcurrentAssets() async -> Int { 3 }
-            func index(
-                assets: [MLPipelineAssetRevision],
-                shouldContinue: @escaping @Sendable () -> Bool,
-                observer: MLDerivedPipelineObserver
-            ) async -> MLDerivedPipelinePassOutcome {
-                await indexQuantum(
-                    assets: assets,
-                    libraryGeneration: 0,
-                    allowsDestructiveReconciliation: true,
-                    maximumAssets: assets.count,
-                    maximumConcurrentAssets: 1,
-                    shouldContinue: shouldContinue,
-                    observer: observer
-                )
-            }
             func indexQuantum(
                 assets: [MLPipelineAssetRevision],
                 libraryGeneration: UInt64,
                 allowsDestructiveReconciliation: Bool,
+                destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
                 maximumAssets: Int,
                 maximumConcurrentAssets: Int,
                 shouldContinue: @escaping @Sendable () -> Bool,
@@ -2697,25 +2780,11 @@ import Testing
             init(clock: Clock) { self.clock = clock }
             func availableBackends() async -> Set<MLSearchBackend> { [.recognizedText] }
             func maximumConcurrentAssets() async -> Int { 1 }
-            func index(
-                assets: [MLPipelineAssetRevision],
-                shouldContinue: @escaping @Sendable () -> Bool,
-                observer: MLDerivedPipelineObserver
-            ) async -> MLDerivedPipelinePassOutcome {
-                await indexQuantum(
-                    assets: assets,
-                    libraryGeneration: 0,
-                    allowsDestructiveReconciliation: true,
-                    maximumAssets: assets.count,
-                    maximumConcurrentAssets: 1,
-                    shouldContinue: shouldContinue,
-                    observer: observer
-                )
-            }
             func indexQuantum(
                 assets: [MLPipelineAssetRevision],
                 libraryGeneration: UInt64,
                 allowsDestructiveReconciliation: Bool,
+                destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
                 maximumAssets: Int,
                 maximumConcurrentAssets: Int,
                 shouldContinue: @escaping @Sendable () -> Bool,
@@ -3415,7 +3484,7 @@ import Testing
 
     @Test func staleQueryFromPreviousEpochIsDiscarded() async throws {
         /// Session whose search blocks until released.
-        final class BlockingSession: MLSmartSearchSession, @unchecked Sendable {
+        final class BlockingSession: WholePassSession, @unchecked Sendable {
             let descriptor: MLModelDescriptor
             private let lock = NSLock()
             private var releaseSearch: CheckedContinuation<Void, Never>?
@@ -4374,7 +4443,7 @@ import Testing
 
     @Test func shutdownAwaitsTheRunningIndexPassBeforeReturning() async throws {
         /// Session whose index pass blocks until released; stands in for CoreML mid-inference.
-        final class BlockingIndexSession: MLSmartSearchSession, @unchecked Sendable {
+        final class BlockingIndexSession: WholePassSession, @unchecked Sendable {
             let descriptor: MLModelDescriptor
             private let lock = NSLock()
             private var releaseIndex: CheckedContinuation<Void, Never>?

@@ -57,6 +57,19 @@ final class BackupWaitingForWiFiTests: XCTestCase {
         XCTAssertFalse(BackupThrottleInputs(runtime: snapshot, usesMobileData: true).waitsForWiFi)
     }
 
+    func testRuntimeSnapshotMapsWhetherTheAppRunsOnlyInTheBackground() {
+        let expected: [(LibraryExecutionOpportunity, Bool)] = [
+            (.foregroundActive, false), (.foregroundInactive, false), (.backgroundPermitted, true), (.suspended, true),
+        ]
+        for (opportunity, inBackground) in expected {
+            let snapshot = LibraryRuntimeSnapshot(executionOpportunity: opportunity)
+            XCTAssertEqual(
+                BackupThrottleInputs(runtime: snapshot, usesMobileData: false).isAppInBackground, inBackground,
+                "\(opportunity)")
+        }
+        XCTAssertFalse(BackupThrottleInputs().isAppInBackground, "platforms without the signal stay in the foreground")
+    }
+
     func testUnknownNetworkWaitsOnlyWhileMobileDataIsOff() {
         let snapshot = LibraryRuntimeSnapshot(network: .undetermined)
 
@@ -97,11 +110,11 @@ final class BackupWaitingForWiFiTests: XCTestCase {
         XCTAssertNil(display.localizedRetryDetail)
 
         let wifi = inputs(expensive: false, usesMobileData: BackupMobileDataPolicy.isEnabled(defaults: defaults))
-        XCTAssertTrue(status.endsWiFiWait(for: wifi))
+        XCTAssertTrue(wifi.canEndWiFiWait)
         XCTAssertEqual(policy.maxConcurrentItems(for: wifi), 6)
         defaults.set(true, forKey: AppSettingsKey.backupUsesMobileData)
         let allowed = inputs(expensive: true, usesMobileData: BackupMobileDataPolicy.isEnabled(defaults: defaults))
-        XCTAssertTrue(status.endsWiFiWait(for: allowed))
+        XCTAssertTrue(allowed.canEndWiFiWait)
         XCTAssertEqual(policy.maxConcurrentItems(for: allowed), 1)
     }
 
@@ -143,19 +156,21 @@ final class BackupWaitingForWiFiTests: XCTestCase {
 
     func testWiFiWaitEndsOnWiFiOrWhenTheSettingIsTurnedOn() {
         let waiting = BackupStatus(progress: waitingProgress(running: false, waitsForWiFi: true), isScanning: false)
-        XCTAssertFalse(waiting.endsWiFiWait(for: inputs(expensive: true, usesMobileData: false)))
-        XCTAssertTrue(waiting.endsWiFiWait(for: inputs(expensive: false, usesMobileData: false)), "Wi-Fi or Ethernet")
-        XCTAssertTrue(waiting.endsWiFiWait(for: inputs(expensive: true, usesMobileData: true)), "setting turned on")
+        XCTAssertEqual(waiting.phase, .waitingForWiFi)
+        XCTAssertFalse(inputs(expensive: true, usesMobileData: false).canEndWiFiWait)
+        XCTAssertTrue(inputs(expensive: false, usesMobileData: false).canEndWiFiWait, "Wi-Fi or Ethernet")
+        XCTAssertTrue(inputs(expensive: true, usesMobileData: true).canEndWiFiWait, "setting turned on")
 
         let other = BackupStatus(progress: waitingProgress(running: false, waitsForWiFi: false), isScanning: false)
-        XCTAssertFalse(other.endsWiFiWait(for: inputs(expensive: false, usesMobileData: true)))
+        XCTAssertNotEqual(other.phase, .waitingForWiFi, "only a Wi-Fi wait can end on a permitted path")
     }
 
     func testAnOfflinePathDoesNotEndTheWiFiWait() {
         let waiting = BackupStatus(progress: waitingProgress(running: false, waitsForWiFi: true), isScanning: false)
+        XCTAssertEqual(waiting.phase, .waitingForWiFi)
         for usesMobileData in [false, true] {
             XCTAssertFalse(
-                waiting.endsWiFiWait(for: inputs(expensive: false, usesMobileData: usesMobileData, available: false)),
+                inputs(expensive: false, usesMobileData: usesMobileData, available: false).canEndWiFiWait,
                 "A returned path must be reachable before it can end the Wi-Fi wait")
         }
     }

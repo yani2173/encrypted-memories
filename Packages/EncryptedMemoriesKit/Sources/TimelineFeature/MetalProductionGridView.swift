@@ -58,6 +58,9 @@ struct MetalProductionGridView: NSViewRepresentable {
     let onOpen: (PhotoItem, [PhotoItem]) -> Void
     var proxy: GridProxy<PhotoUID>?
     var selectionMode: Bool = false
+    var allowsPhotoActions: Bool = true
+    var isProvisionalPresentation: Bool = false
+    var allowsPlaceholderContentReady: Bool = false
     var onSelectionChange: (Set<PhotoUID>) -> Void = { _ in }
     var favoriteUIDs: Set<PhotoUID> = []
     /// Upload badges of pending photos; badge-only changes never rebuild the data source.
@@ -69,7 +72,7 @@ struct MetalProductionGridView: NSViewRepresentable {
     /// Reports a failed drag-out session (mapped to the shell's shared failure alert).
     var onDragOutFailed: ((DragOutFailureKind) -> Void)? = nil
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(isProvisionalPresentation: isProvisionalPresentation) }
 
     func makeNSView(context: Context) -> NSView {
         let coord = context.coordinator
@@ -92,12 +95,13 @@ struct MetalProductionGridView: NSViewRepresentable {
             return NSView()
         }
         host.coordinator.decorationsEnabled = true
+        host.coordinator.allowsPlaceholderContentReady = allowsPlaceholderContentReady
         host.eventLeadingInset = leadingEventInset
         host.topBarInset = topBarInset
         coord.host = host
         coord.allItems = allItems
-        coord.onOpen = onOpen
-        coord.onSelectionChange = onSelectionChange
+        coord.onOpen = allowsPhotoActions ? onOpen : nil
+        coord.onSelectionChange = allowsPhotoActions ? onSelectionChange : nil
         coord.onDragOutFailed = onDragOutFailed
         coord.dataRevision = dataRevision
         // A freshly created host opens at its route's initial viewport. At launch (generation 0) the host's
@@ -127,18 +131,6 @@ struct MetalProductionGridView: NSViewRepresentable {
         }
         coord.selection = selection
         coord.interaction = interaction
-        host.onCellClick = { [weak coord] point, clickCount, modifiers in
-            coord?.interaction?.handleClick(contentPoint: point, clickCount: clickCount, modifiers: modifiers)
-        }
-        host.onMarqueeBegan = { [weak coord] mods in
-            coord?.interaction?.handleMarqueeBegan(additive: mods.contains(.shift))
-        }
-        host.onMarqueeChanged = { [weak coord] rect in
-            coord?.interaction?.handleMarqueeChanged(contentRect: rect)
-        }
-        host.onMarqueeEnded = { [weak coord] in
-            coord?.interaction?.handleMarqueeEnded()
-        }
         // Drag-out: a threshold-crossing press on a tile starts a native NSFilePromiseProvider
         // dragging session; background presses fall through and the marquee behaves unchanged.
         if let dragOutProvider {
@@ -161,9 +153,6 @@ struct MetalProductionGridView: NSViewRepresentable {
                 onFailed: { [weak coord] kind in coord?.onDragOutFailed?(kind) }
             )
             coord.dragOut = dragOut
-            host.onDragOutThreshold = { [weak dragOut] event, contentPoint in
-                dragOut?.beginDrag(contentPoint: contentPoint, event: event) ?? false
-            }
         }
 
         let header = MetalGridHeaderRenderer(coordinator: host.coordinator)
@@ -174,12 +163,8 @@ struct MetalProductionGridView: NSViewRepresentable {
 
         let a11y = MetalGridAccessibilityProvider(host: host, coordinator: host.coordinator)
         a11y.items = allItems
-        // VoiceOver press activates the cell through the interaction controller so it honours the
-        // current selection mode (toggle vs. open), including mode changes after elements were built.
-        a11y.onActivate = { [weak interaction] uid in
-            interaction?.activate(uid: uid) ?? false
-        }
         coord.a11y = a11y
+        configurePhotoActions(host: host, coordinator: coord)
 
         host.onViewportChanged = { [weak coord] in
             coord?.viewportChanged()
@@ -196,21 +181,24 @@ struct MetalProductionGridView: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         guard let host = nsView as? MetalGridScrollHost else { return }
+        host.coordinator.allowsPlaceholderContentReady = allowsPlaceholderContentReady
         host.eventLeadingInset = leadingEventInset
         host.topBarInset = topBarInset
         host.updateFillOrder(gridFillOrder)
         host.updateGridProfileResolver(gridProfileResolver)
         let coord = context.coordinator
-        coord.onOpen = onOpen
-        coord.onSelectionChange = onSelectionChange
+        coord.onOpen = allowsPhotoActions ? onOpen : nil
+        coord.onSelectionChange = allowsPhotoActions ? onSelectionChange : nil
         coord.onDragOutFailed = onDragOutFailed
         coord.interaction?.selectionMode = selectionMode
+        configurePhotoActions(host: host, coordinator: coord)
         coord.a11y?.selected = host.coordinator.selectedUIDs
 
         coord.receiveContent(
             items: allItems, revision: dataRevision, routeGeneration: routeScrollGeneration,
             initialViewport: routeInitialViewport,
             markers: MetalGridProductionAdapter.monthMarkers(sections: sections),
+            isProvisionalPresentation: isProvisionalPresentation,
             makeSource: {
                 MetalGridProductionAdapter.makeDataSource(
                     sections: sections, feed: feed, metadataProvider: metadataProvider)
@@ -223,12 +211,48 @@ struct MetalProductionGridView: NSViewRepresentable {
         if MetalGridAccessibilityProvider.badgesChangeLabels(from: previousBadges, to: uploadBadges) {
             coord.a11y?.invalidate()
         }
-        // Honour a genuine external (+/- / keyboard / programmatic) level change, but ignore a stale `level`
+        // Honour a genuine external (+/- / programmatic) level change, but ignore a stale `level`
         // binding value left over from a host-led pinch commit - re-driving it would re-anchor at the viewport
         // centre and jump a different photo under the cursor. See `LevelBindingReconciler`.
         host.reconcileLevelBinding(level)
         wireProxy(host: host, levelBinding: $level, sourceRevision: sourceRevision)
         coord.header?.reposition()
+    }
+
+    private func configurePhotoActions(host: MetalGridScrollHost, coordinator coord: Coordinator) {
+        if allowsPhotoActions {
+            host.onCellClick = { [weak coord] point, clickCount, modifiers in
+                coord?.interaction?.handleClick(contentPoint: point, clickCount: clickCount, modifiers: modifiers)
+            }
+            host.onMarqueeBegan = { [weak coord] mods in
+                coord?.interaction?.handleMarqueeBegan(additive: mods.contains(.shift))
+            }
+            host.onMarqueeChanged = { [weak coord] rect in
+                coord?.interaction?.handleMarqueeChanged(contentRect: rect)
+            }
+            host.onMarqueeEnded = { [weak coord] in
+                coord?.interaction?.handleMarqueeEnded()
+            }
+            if let dragOut = coord.dragOut {
+                host.onDragOutThreshold = { [weak dragOut] event, contentPoint in
+                    dragOut?.beginDrag(contentPoint: contentPoint, event: event) ?? false
+                }
+            }
+            coord.a11y?.onActivate = { [weak interaction = coord.interaction] uid in
+                interaction?.activate(uid: uid) ?? false
+            }
+        } else {
+            host.onCellClick = nil
+            host.onMarqueeBegan = nil
+            host.onMarqueeChanged = nil
+            host.onMarqueeEnded = nil
+            host.onDragOutThreshold = nil
+            coord.a11y?.onActivate = nil
+        }
+        // Update existing elements immediately; their next geometry rebuild can be throttled.
+        for case let element as MetalGridA11yElement in host.accessibilityChildren() ?? [] {
+            element.onActivate = coord.a11y?.onActivate
+        }
     }
 
     /// The host initial-viewport policy for the current route: restore a remembered photo anchor, or open at
@@ -259,6 +283,8 @@ struct MetalProductionGridView: NSViewRepresentable {
         }
         // Keep the SwiftUI level synchronized with the settled pinch level.
         host.onZoomCommit = { settled in levelBinding.wrappedValue = settled }
+        // Report the first resident visible thumbnail to the shell.
+        host.coordinator.connectReadinessProxy(proxy, revision: sourceRevision)
         guard let proxy else { return }
         proxy.windowFrameForItem = { [weak host] uid in host?.windowFrame(forUID: uid) }
         proxy.scrollToItem = { [weak host] uid in host?.scrollToItem(uid) }
@@ -267,8 +293,6 @@ struct MetalProductionGridView: NSViewRepresentable {
         proxy.currentScrollAnchor = { [weak host] in host?.currentScrollAnchor() }
         proxy.zoomIn = stepIn
         proxy.zoomOut = stepOut
-        // Report the first fully rendered frame to the shell.
-        host.coordinator.onContentReady = { [weak proxy] in proxy?.reportContentReady(revision: sourceRevision) }
         // Forward live-resize activity so the shell can suspend expensive overlays.
         host.coordinator.liveResizeChanged = { [weak proxy] active in proxy?.liveResizeChanged?(active) }
         // Forward content-mode changes without changing geometry.
@@ -292,7 +316,13 @@ struct MetalProductionGridView: NSViewRepresentable {
         var onDragOutFailed: ((DragOutFailureKind) -> Void)?
         var dataRevision = 0
         var appliedRouteScrollGeneration = 0
+        private var wasProvisionalPresentation = false
+
+        init(isProvisionalPresentation: Bool = false) {
+            wasProvisionalPresentation = isProvisionalPresentation
+        }
         private struct OrderUpdate {
+            let preservesVisibleAnchor: Bool
             let items: [PhotoItem]
             let revision: Int
             let markers: [(index: Int, text: String)]
@@ -302,10 +332,13 @@ struct MetalProductionGridView: NSViewRepresentable {
 
         func receiveContent(
             items: [PhotoItem], revision: Int, routeGeneration: Int,
-            initialViewport: GridInitialViewport, markers: [(index: Int, text: String)],
+            initialViewport: GridInitialViewport, markers: @autoclosure () -> [(index: Int, text: String)],
+            isProvisionalPresentation: Bool = false,
             makeSource: @escaping () -> MetalGridDataSource
         ) {
             guard let host else { return }
+            let provisionalUpdate = isProvisionalPresentation || wasProvisionalPresentation
+            wasProvisionalPresentation = isProvisionalPresentation
             let routePending = routeGeneration != appliedRouteScrollGeneration
             guard revision != dataRevision else {
                 if deferredOrderUpdate == nil {
@@ -315,16 +348,19 @@ struct MetalProductionGridView: NSViewRepresentable {
                 return
             }
             if !routePending, deferredOrderUpdate?.revision == revision { return }
-            let update = OrderUpdate(items: items, revision: revision, markers: markers, makeSource: makeSource)
+            let update = OrderUpdate(
+                preservesVisibleAnchor: provisionalUpdate && !routePending,
+                items: items, revision: revision, markers: markers(), makeSource: makeSource)
             let visible = Set(host.coordinator.visibleCells().map(\.flatIndex))
             let decision: TimelineOrderRefinementPolicy.Decision =
                 routePending
                 ? .ordinaryUpdate
                 : TimelineOrderRefinementPolicy.decision(
                     incoming: items, previousCount: allItems.count, visibleIndices: visible,
+                    preservingVisibleAnchor: provisionalUpdate,
                     previous: { uid in host.coordinator.flatIndex(forUID: uid).map { ($0, self.allItems[$0]) } })
             if decision == .deferVisibleCorrection
-                || (decision == .applyCorrection && !host.coordinator.canPresentResize)
+                || (decision.preservesVisibleAnchor && !host.coordinator.canPresentResize)
             {
                 deferredOrderUpdate = update
                 return
@@ -333,17 +369,18 @@ struct MetalProductionGridView: NSViewRepresentable {
             let viewport =
                 routePending
                 ? initialViewport
-                : (decision == .applyCorrection
+                : (decision.preservesVisibleAnchor
                     ? host.currentScrollAnchor().map(GridInitialViewport.restore) ?? .preserve : .preserve)
-            apply(update, viewport: viewport, preservesPhase: decision == .applyCorrection)
+            apply(update, viewport: viewport, preservesPhase: decision.preservesVisibleAnchor)
             if routePending { appliedRouteScrollGeneration = routeGeneration }
         }
 
         func viewportChanged() {
             if let host, host.coordinator.canPresentResize, let pending = deferredOrderUpdate {
                 let visible = Set(host.coordinator.visibleCells().map(\.flatIndex))
-                if !TimelineOrderRefinementPolicy.movesVisiblePhoto(
-                    incoming: pending.items, visibleIndices: visible, previousUID: { self.allItems[$0].uid })
+                if pending.preservesVisibleAnchor
+                    || !TimelineOrderRefinementPolicy.movesVisiblePhoto(
+                        incoming: pending.items, visibleIndices: visible, previousUID: { self.allItems[$0].uid })
                 {
                     deferredOrderUpdate = nil
                     let viewport = host.currentScrollAnchor().map(GridInitialViewport.restore) ?? .preserve

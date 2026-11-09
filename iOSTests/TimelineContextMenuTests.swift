@@ -311,7 +311,7 @@ struct TimelineContextMenuTests {
         }
 
         init(mode: TileContentDisplayMode = .squareFillCrop) async throws {
-            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let scene = try #require(UIApplication.shared.foregroundWindowScene)
             window = UIWindow(windowScene: scene)
             let cache = ThumbnailCache(rootDirectory: root)
             feed = UIKitThumbnailFeed(cache: cache, loader: EmptyThumbnailLoader())

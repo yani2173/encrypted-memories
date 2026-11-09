@@ -18,11 +18,13 @@ final class MobileSessionModel: ObservableObject {
     @Published private(set) var statusText = MobileSessionModel.signInPrompt
     @Published private(set) var errorText: String?
 
-    let sessionStore = SessionKeychainStore()
+    /// After the first unlock since a restart, a background window on a locked device can read the session.
+    let sessionStore: SessionKeychainStore
     private let authController: ProtonAuthController
     /// The startup and sign-in guard shared with macOS: no session starts before the sign-out purge and cleanup ended.
-    private let startupCleanup = ProtonAuthStartupCleanup()
+    private let startupCleanup: ProtonAuthStartupCleanup
     private var protectedDataObserver: NSObjectProtocol?
+    private var protectedDataUnavailableObserver: NSObjectProtocol?
     private let webAuthenticationSession = ManagedWebAuthenticationSession()
     /// The window of the scene that started sign-in. The managed browser must appear in that window, not in
     /// whichever window happens to be key when Proton returns the authentication URL.
@@ -45,10 +47,10 @@ final class MobileSessionModel: ObservableObject {
 
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
         injectDefaultCryptoImplementation()
-        self.authController = ProtonAuthController(
-            store: sessionStore,
-            authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories)
-        )
+        sessionStore = SessionKeychainStore(accessibility: .afterFirstUnlockThisDeviceOnly)
+        let authentication = AuthenticationFactory().make(store: sessionStore, sessionReads: .shared)
+        authController = authentication.controller
+        startupCleanup = authentication.cleanup
         isCheckingSession = true
         statusText = L10n.string("auth.checking_session")
         protectedDataObserver = NotificationCenter.default.addObserver(
@@ -58,14 +60,59 @@ final class MobileSessionModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if !self.startupCleanup.succeeded {
+                if self.startupCleanup.isRunning {
+                    // The running cleanup may have failed on the locked device; it runs once more before it counts.
+                    self.startupCleanup.requestRetryIfRunning()
+                } else if !self.startupCleanup.succeeded {
                     self.beginStartupCleanup()
                 } else {
                     self.bootstrapSessionIfNeeded()
                 }
             }
         }
+        protectedDataUnavailableObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.startupCleanup.noteProtectedDataUnavailable()
+            }
+        }
+        // A background window whose last read was refused asks for one more read before it ends.
+        BackgroundAccountReadiness.shared.installReread { [weak self] in self?.bootstrapSessionIfNeeded() }
         beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)
+    }
+
+    #if DEBUG
+        /// Test seam, absent from release builds: a signed-out model around its own store. It begins no startup
+        /// cleanup and observes no unlock, so a test never touches the process's saved session.
+        init(isolatedStore: SessionKeychainStore) {
+            sessionStore = isolatedStore
+            let authentication = AuthenticationFactory().make(store: isolatedStore)
+            authController = authentication.controller
+            startupCleanup = authentication.cleanup
+        }
+    #endif
+
+    /// Both initializers use the same platform policy. The key path names the UIKit source without a second
+    /// test configuration; reading it does not start cleanup, read the Keychain or install an observer.
+    @MainActor struct AuthenticationFactory {
+        let lockedReadIsChecking = true
+        let protectedDataSource = \UIApplication.isProtectedDataAvailable
+
+        /// `sessionReads` learns each read of the saved session; only the process's own model passes it.
+        func make(
+            store: SessionKeychainStore, sessionReads: BackgroundAccountReadiness? = nil
+        ) -> (controller: ProtonAuthController, cleanup: ProtonAuthStartupCleanup) {
+            let source = protectedDataSource
+            return (
+                ProtonAuthController(
+                    store: store, authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories),
+                    lockedReadIsChecking: lockedReadIsChecking, sessionReads: sessionReads),
+                ProtonAuthStartupCleanup(isProtectedDataAvailable: { UIApplication.shared[keyPath: source] })
+            )
+        }
     }
 
     private func beginStartupCleanup(plaintextPurgeSucceeded: Bool? = nil, signInAfterCleanup: Bool = false) {
@@ -78,7 +125,8 @@ final class MobileSessionModel: ObservableObject {
             }
         #endif
         apply(.checking)
-        guard UIApplication.shared.isProtectedDataAvailable else { return }
+        // The cleanup reads no session and deletes only transient files or an armed sign-out purge, so it also runs
+        // on a locked device; a failure there waits for the unlock instead of closing sign-in.
         startupCleanup.begin(plaintextPurgeSucceeded: plaintextPurgeSucceeded) { [weak self] succeeded in
             guard let self else { return }
             if succeeded, signInAfterCleanup {
@@ -92,6 +140,9 @@ final class MobileSessionModel: ObservableObject {
     deinit {
         if let protectedDataObserver {
             NotificationCenter.default.removeObserver(protectedDataObserver)
+        }
+        if let protectedDataUnavailableObserver {
+            NotificationCenter.default.removeObserver(protectedDataUnavailableObserver)
         }
     }
 
@@ -181,20 +232,15 @@ final class MobileSessionModel: ObservableObject {
         }
     }
 
-    /// A WhenUnlocked Keychain item is unavailable during an early launch before iOS releases
-    /// protected data. Keep the session in the checking state and retry when the OS announces that
-    /// the existing item can be read; this must never look like an account sign-out.
+    /// Before the first unlock since a restart the session item cannot be read. The bootstrap then keeps the checking
+    /// state, and the app retries when the OS announces protected data; this must never look like a sign-out. After
+    /// the first unlock, a locked device reads the session.
     private func bootstrapSessionIfNeeded() {
         guard !startupCleanup.isRunning, session == nil, !isSigningIn, !isSigningOut else { return }
-        guard UIApplication.shared.isProtectedDataAvailable else {
-            apply(.checking)
-            return
-        }
-        guard startupCleanup.succeeded else {
-            apply(.signedOut(error: L10n.string("auth.sign_in_failed")))
-            return
-        }
-        apply(authController.bootstrap())
+        apply(
+            startupCleanup.startupState(signInFailed: L10n.string("auth.sign_in_failed")) {
+                authController.bootstrap()
+            })
     }
 }
 

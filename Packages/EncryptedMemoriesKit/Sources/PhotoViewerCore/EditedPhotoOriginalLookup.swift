@@ -10,6 +10,9 @@ public struct EditedPhotoOriginalState: Equatable, Sendable {
 
     public func canShowOriginal(of base: PhotoUID) -> Bool { originals[base] != nil }
 
+    /// The original that the viewer found for `base`, which a revert to original needs.
+    public func original(of base: PhotoUID) -> PhotoItem? { originals[base] }
+
     public func isShowingOriginal(of base: PhotoUID) -> Bool {
         showingOriginalOf == base && originals[base] != nil
     }

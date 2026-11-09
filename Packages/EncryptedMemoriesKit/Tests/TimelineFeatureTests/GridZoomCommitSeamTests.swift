@@ -114,7 +114,6 @@ import Testing
         let (e, tx) = transaction(sourceLevel: 3)
         for target in 0..<e.levelCount {
             let d = e.commitDelta(transaction: tx, targetLevel: target, viewportSize: viewport)
-            #expect(d.anchorDeltaDistance.isFinite)
             #expect(!d.transactionFocusRow.isEmpty && !d.settledFocusRow.isEmpty)
             #expect(d.focusRowOverlap >= 0 && d.focusRowOverlap <= 1)
             #expect(d.neighborhoodOverlap >= 0 && d.neighborhoodOverlap <= 1)

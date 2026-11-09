@@ -70,6 +70,189 @@ final class LocalizationTests: XCTestCase {
         return unit?["value"] as? String
     }
 
+    func testBulkBackUpAgainCopyUsesTheFrozenEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("backup.bulk_count_one %@", "%@ photo · Deleted in Proton Drive", "%@ Foto · In Proton Drive gelöscht"),
+            (
+                "backup.bulk_count_other %@", "%@ photos · Deleted in Proton Drive",
+                "%@ Fotos · In Proton Drive gelöscht"
+            ),
+            ("backup.bulk_action %@", "Back Up Again (%@)", "Erneut sichern (%@)"),
+            ("backup.bulk_title_one %@", "Back up %@ photo again?", "%@ Foto erneut sichern?"),
+            ("backup.bulk_title_other %@", "Back up %@ photos again?", "%@ Fotos erneut sichern?"),
+            (
+                "backup.bulk_message",
+                "Photos that were deleted in Proton Drive will be uploaded again. Unavailable photos stay unchanged.",
+                "Fotos, die in Proton Drive gelöscht wurden, werden erneut hochgeladen. Nicht verfügbare Fotos bleiben unverändert."
+            ),
+            ("backup.bulk_progress_one %@ %@", "%1$@ of %2$@ photo checked", "%1$@ von %2$@ Foto geprüft"),
+            ("backup.bulk_progress_other %@ %@", "%1$@ of %2$@ photos checked", "%1$@ von %2$@ Fotos geprüft"),
+            (
+                "backup.bulk_outcome_one %@ %@ %@", "%1$@ of %2$@ photo queued for backup. %3$@ unchanged.",
+                "%1$@ von %2$@ Foto für das Backup eingereiht. %3$@ unverändert."
+            ),
+            (
+                "backup.bulk_outcome_other %@ %@ %@", "%1$@ of %2$@ photos queued for backup. %3$@ unchanged.",
+                "%1$@ von %2$@ Fotos für das Backup eingereiht. %3$@ unverändert."
+            ),
+            (
+                "backup.bulk_queued_detail", "Queued photos are not backed up yet.",
+                "Eingereihte Fotos sind noch nicht gesichert."
+            ),
+            ("backup.bulk_cancelled", "Cancelled", "Abgebrochen"),
+            ("backup.bulk_dismiss_result", "Dismiss result", "Ergebnis schließen"),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
+    func testExcludedIncludeFailureCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("backup.excluded_include_failed", "Couldn’t back up this photo again.", "Wieder sichern nicht möglich.")
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
+    /// Pins the English and German text of the missing-library reason of Keep Only Favorites.
+    func testSeriesLibraryUnavailableCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            (
+                "error.series_library_unavailable",
+                "The library is not available right now.",
+                "Die Bibliothek ist gerade nicht verfügbar."
+            )
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
+    func testBurstExportFailureCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            (
+                "export.burst_load_failed",
+                "The photos of this burst could not be loaded, so nothing was exported.",
+                "Die Fotos dieser Serie konnten nicht geladen werden. Deshalb wurde nichts exportiert."
+            )
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: appCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: appCatalog), german, key)
+        }
+    }
+
+    func testBurstShareFailureCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            (
+                "viewer.share_burst_load_failed",
+                "The burst photos couldn’t be loaded for sharing.",
+                "Die Fotos der Serie konnten nicht zum Teilen geladen werden."
+            )
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: mobileCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: mobileCatalog), german, key)
+        }
+    }
+
+    /// One share failure text for each content: a series, one photo (also a Live Photo or the
+    /// original of an edited photo), or one video.
+    func testViewerShareFailureCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            (
+                "viewer.share_failed_photos",
+                "The photos couldn’t be prepared for sharing.",
+                "Die Fotos konnten nicht zum Teilen vorbereitet werden."
+            ),
+            (
+                "viewer.share_failed",
+                "The photo couldn’t be prepared for sharing.",
+                "Das Foto konnte nicht zum Teilen vorbereitet werden."
+            ),
+            (
+                "viewer.share_failed_video",
+                "The video couldn’t be prepared for sharing.",
+                "Das Video konnte nicht zum Teilen vorbereitet werden."
+            ),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: mobileCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: mobileCatalog), german, key)
+        }
+    }
+
+    func testBulkRestoreCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("albumsync.bulk_action %@", "Restore All (%@)", "Alle wiederherstellen (%@)"),
+            ("albumsync.bulk_title_one %@", "Restore %@ photo?", "%@ Foto wiederherstellen?"),
+            ("albumsync.bulk_title_other %@", "Restore %@ photos?", "%@ Fotos wiederherstellen?"),
+            (
+                "albumsync.bulk_message",
+                "Photos that are still in the Proton Drive trash are restored. Album sync then adds them to the album. "
+                    + "Photos that were deleted permanently stay unchanged.",
+                "Fotos, die noch im Proton-Papierkorb liegen, werden wiederhergestellt. Die Album-Synchronisierung "
+                    + "fügt sie danach zum Album hinzu. Endgültig gelöschte Fotos bleiben unverändert."
+            ),
+            (
+                "albumsync.bulk_outcome_one %@ %@ %@", "%1$@ of %2$@ photo restored. %3$@ unchanged.",
+                "%1$@ von %2$@ Foto wiederhergestellt. %3$@ unverändert."
+            ),
+            (
+                "albumsync.bulk_outcome_other %@ %@ %@", "%1$@ of %2$@ photos restored. %3$@ unchanged.",
+                "%1$@ von %2$@ Fotos wiederhergestellt. %3$@ unverändert."
+            ),
+            (
+                "albumsync.bulk_restored_detail", "Album sync adds restored photos to the album.",
+                "Die Album-Synchronisierung fügt wiederhergestellte Fotos zum Album hinzu."
+            ),
+            // Reused unchanged: the per-photo word and its error stay as they are.
+            ("contextmenu.restore", "Restore", "Wiederherstellen"),
+            ("albumsync.error_restore_photo", "Couldn't restore this photo.", "Wiederherstellen nicht möglich."),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
+    /// The owner froze these texts: the command, the alert title, the message, the confirm button and the failure. The
+    /// trash word is the one that the app uses elsewhere in each language. The failure offers no retry and does not
+    /// claim that nothing changed.
+    func testRevertToOriginalCopyUsesTheFrozenEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("viewer.revert_original", "Revert to Original\u{2026}", "Zum Original zurückkehren \u{2026}"),
+            ("viewer.revert_original_title", "Revert to Original", "Zum Original zurückkehren"),
+            (
+                "viewer.revert_original_message",
+                "The original becomes a new photo. The edited version moves to the Trash.",
+                "Das Original wird ein neues Foto. Die bearbeitete Version wandert in den Papierkorb."
+            ),
+            ("viewer.revert_original_confirm", "Revert", "Zurückkehren"),
+            (
+                "viewer.revert_original_failed", "The original couldn\u{2019}t be restored.",
+                "Das Original konnte nicht wiederhergestellt werden."
+            ),
+            ("action.cancel", "Cancel", "Abbrechen"),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+        for language in ["en", "de"] {
+            let failure = try XCTUnwrap(
+                try localizedValue("viewer.revert_original_failed", language: language, in: packageCatalog), language)
+            XCTAssertFalse(failure.localizedCaseInsensitiveContains("retry"), failure)
+            XCTAssertFalse(failure.localizedCaseInsensitiveContains("nothing was changed"), failure)
+            XCTAssertFalse(failure.localizedCaseInsensitiveContains("nichts"), failure)
+        }
+    }
+
     func testSourceLanguageIsEnglish() throws {
         XCTAssertEqual(try loadCatalog(appCatalog).sourceLanguage, "en")
         XCTAssertEqual(try loadCatalog(mobileCatalog).sourceLanguage, "en")
@@ -89,6 +272,39 @@ final class LocalizationTests: XCTestCase {
         for (key, english, german) in texts {
             XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
             XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
+    func testPartialMergeFailureCountUsesTotalForPluralSelection() throws {
+        let expected: [(language: String, failed: Int, total: Int, text: String)] = [
+            ("en", 1, 1, "1 of 1 group could not be merged."),
+            ("en", 1, 2, "1 of 2 groups could not be merged."),
+            ("en", 2, 2, "2 of 2 groups could not be merged."),
+            ("de", 1, 1, "1 von 1 Gruppe konnte nicht zusammengeführt werden."),
+            ("de", 1, 2, "1 von 2 Gruppen konnten nicht zusammengeführt werden."),
+            ("de", 2, 2, "2 von 2 Gruppen konnten nicht zusammengeführt werden."),
+        ]
+        for (language, failed, total, text) in expected {
+            let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)
+            let bundle = try XCTUnwrap(Bundle(path: path), language)
+            let translated = String(
+                localized: "duplicates.partial_failure_message \(failed) \(total)", bundle: bundle,
+                locale: Locale(identifier: language))
+            XCTAssertEqual(translated, text, "\(language) \(failed)/\(total)")
+        }
+    }
+
+    func testPartialMergeFailureReasonIsEnglishAndGerman() throws {
+        for (language, text) in [
+            ("en", "These groups could not be merged."),
+            ("de", "Diese Gruppen konnten nicht zusammengeführt werden."),
+        ] {
+            let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)
+            let bundle = try XCTUnwrap(Bundle(path: path), language)
+            XCTAssertEqual(
+                String(
+                    localized: "duplicates.merge_unavailable_reason", bundle: bundle,
+                    locale: Locale(identifier: language)), text)
         }
     }
 
@@ -271,6 +487,7 @@ final class LocalizationTests: XCTestCase {
             "device.requires_metal3 %@",
             "device.unsupported_reassurance", "device.unsupported_title",
             "albums.photo_count %lld",
+            "trash.empty_blocked_merge_message", "trash.empty_blocked_journal_message", "trash.empty_failed_message",
         ]
         for key in reps {
             let langs = cov[key] ?? []

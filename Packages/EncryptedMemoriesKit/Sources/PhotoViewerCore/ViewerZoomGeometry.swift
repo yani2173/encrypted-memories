@@ -27,18 +27,6 @@ public enum ViewerZoomGeometry {
         )
     }
 
-    /// Returns the media content size at a zoom level relative to its aspect-fit size.
-    /// Invalid or non-positive zoom values use the fit size.
-    public static func scaledMediaSize(
-        mediaSize: CGSize,
-        viewportSize: CGSize,
-        zoomScale: CGFloat
-    ) -> CGSize {
-        let fitted = aspectFitSize(mediaSize: mediaSize, viewportSize: viewportSize)
-        guard fitted != .zero, zoomScale.isFinite, zoomScale > 0 else { return fitted }
-        return CGSize(width: fitted.width * zoomScale, height: fitted.height * zoomScale)
-    }
-
     /// Returns the settled content origin for a proposed pan.
     ///
     /// A smaller axis is centered. A larger axis is clamped from its first media edge to its last media edge.

@@ -108,18 +108,21 @@ package final class MetalGridRenderer {
     }
 
     @MainActor
-    package func render(to target: MetalGridDrawableTarget, viewportSize: CGSize, groups: [MetalGridRenderGroup]) {
+    @discardableResult
+    package func render(
+        to target: MetalGridDrawableTarget, viewportSize: CGSize, groups: [MetalGridRenderGroup]
+    ) -> Bool {
         drainCompletedGpuTimings()
         lastFrameBoundaryWaitMs = 0
         let start = CFAbsoluteTimeGetCurrent()
         defer { lastEncodeMs = (CFAbsoluteTimeGetCurrent() - start) * 1000 }
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return false }
         let pass = target.renderPassDescriptor
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].clearColor = clearColor
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
             commandBuffer.commit()
-            return
+            return false
         }
         // Claim a pool slot only once we're committed to drawing (the guards above can early-return without
         // a matching signal). The completion handler releases it when the GPU is done with this frame.
@@ -137,6 +140,7 @@ package final class MetalGridRenderer {
         lastDrawCalls = drawCalls
         lastInstanceCount = instances
         lastTextureBinds = textureBinds
+        return instances == groups.reduce(0) { $0 + $1.quads.count }
     }
 
     /// Set the shared per-frame state (pipeline, sampler, viewport uniforms) on an encoder. Used by the
@@ -486,12 +490,43 @@ package final class MetalGridRenderer {
             return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
         }
 
+        static inline float segmentDistance(float2 p, float2 a, float2 b) {
+            float2 ab = b - a;
+            float t = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+            return length(p - (a + t * ab));
+        }
+
         fragment float4 metalGridFragment(
             VertexOut in [[stage_in]],
             texture2d<float> tex [[texture(0)]],
             sampler s [[sampler(0)]]
         ) {
             int mode = int(in.mode + 0.5);
+            if (mode == 3) {
+                // The approved photo-outline icon is defined in a 100 by 100 coordinate space.
+                // Evaluating it per fragment keeps the shared placeholder sharp at every zoom level.
+                float side = max(min(in.size.x, in.size.y), 1.0);
+                float2 p = (in.local / side - float2(0.29)) * (100.0 / 0.42);
+                float edge = abs(roundedRectSDF(p - float2(12.0, 18.0), float2(76.0, 64.0), 14.0));
+                float sun = abs(length(p - float2(68.0, 37.0)) - 6.0);
+                float landscape = min(
+                    min(segmentDistance(p, float2(14.0, 66.0), float2(35.0, 46.0)),
+                        segmentDistance(p, float2(35.0, 46.0), float2(54.0, 64.0))),
+                    min(segmentDistance(p, float2(54.0, 64.0), float2(64.0, 54.0)),
+                        segmentDistance(p, float2(64.0, 54.0), float2(86.0, 75.0))));
+                float antialias = 100.0 / (side * 0.42);
+                float icon = 1.0 - smoothstep(1.5 - antialias, 1.5 + antialias, min(edge, min(sun, landscape)));
+                float diagonal = (p.x + p.y) / 200.0;
+                // The approved light beam: 40 icon units wide at 45 degrees (20 * sqrt(2) / 200 along the diagonal),
+                // linear falloff, white at the opacity the quad carries in color.a, drawn only on the icon strokes.
+                float beam = in.borderWidth < -1.0
+                    ? 0.0 : max(1.0 - abs(diagonal - in.borderWidth) / 0.14142, 0.0);
+                float gray = mix(mix(0.16, 0.48, icon), in.color.r, icon * beam * in.color.a);
+                float mask = in.radius <= 0.0 ? 1.0
+                    : 1.0 - smoothstep(-1.0, 1.0, roundedRectSDF(in.local, in.size, in.radius));
+                float coverage = in.alpha * mask;
+                return float4(float3(gray * coverage), coverage);
+            }
             if (mode == 2) {
                 // Rounded-rect ring: outer fill minus an inner fill inset by borderWidth. Always SDF-based -
                 // at radius 0 the SDF degenerates to the plain rect ring, so no separate path is needed.

@@ -30,19 +30,16 @@ struct DedupeXAttr: Decodable {
 
     struct Lineage: Decodable {
         let version: Int
-        let reason: String?
         let replaces: [String]
 
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             version = try values.decode(Int.self, forKey: .version)
             replaces = try values.decode([String].self, forKey: .replaces)
-            reason = try? values.decode(String.self, forKey: .reason)
         }
 
         enum CodingKeys: String, CodingKey {
             case version = "V"
-            case reason = "Reason"
             case replaces = "Replaces"
         }
     }
@@ -64,6 +61,22 @@ struct DedupeXAttr: Decodable {
             case iCloudID = "ICloudID"
             case modificationTime = "ModificationTime"
         }
+    }
+}
+
+/// Parses the ISO 8601 modification time of `iOS.photos`, with or without fractional seconds. Create one per pass:
+/// the formatters are reused for every photo of the pass and are not shared between passes.
+struct IOSPhotosModificationTimeParser {
+    private let fractional = ISO8601DateFormatter()
+    private let standard = ISO8601DateFormatter()
+
+    init() {
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        standard.formatOptions = [.withInternetDateTime]
+    }
+
+    func date(from raw: String) -> Date? {
+        fractional.date(from: raw) ?? standard.date(from: raw)
     }
 }
 

@@ -30,4 +30,16 @@ struct SmartSearchToolbarPresentationPolicyTests {
             ) == .retain
         )
     }
+
+    @Test func aScopeThatLeftTheAvailableListFallsBackToAll() {
+        #expect(
+            SmartSearchToolbarPresentationPolicy.scopeFallback(.text, availableScopes: [.all]) == .all)
+    }
+
+    @Test func aSelectedScopeThatIsStillAvailableIsKept() {
+        #expect(
+            SmartSearchToolbarPresentationPolicy.scopeFallback(.text, availableScopes: [.all, .text]) == .text)
+        #expect(
+            SmartSearchToolbarPresentationPolicy.scopeFallback(.all, availableScopes: [.all, .text]) == .all)
+    }
 }

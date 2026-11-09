@@ -79,6 +79,8 @@ final class ExactDuplicatesRankingStressTests: XCTestCase {
 
 /// The scan of the screen from memory; the ranking runs through the real finder.
 private final class StressRankingFinder: ExactDuplicateMerging, @unchecked Sendable {
+    func confirmNoPendingMerges() async -> Bool { true }
+    func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
     let groups: [ExactDuplicateGroup]
     let ranking: ExactDuplicateFinder
 

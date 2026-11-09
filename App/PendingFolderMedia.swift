@@ -14,13 +14,13 @@ import UploadCore
 /// entry of a removed folder cannot reach a file the person no longer shared.
 final class PendingFolderAccess: @unchecked Sendable {
     private let lock = NSLock()
-    private var roots: [String] = []
+    private var current = WatchedFolderScope.unavailable
 
-    func setRoots(_ urls: [URL]) {
-        let paths = urls.map {
-            $0.standardizedFileURL.path.hasSuffix("/") ? $0.standardizedFileURL.path : $0.standardizedFileURL.path + "/"
-        }
-        lock.withLock { roots = paths }
+    /// The watched folders now; a returned file reads it to tell an unreadable folder from a removed one.
+    var scope: WatchedFolderScope { lock.withLock { current } }
+
+    func setScope(_ scope: WatchedFolderScope) {
+        lock.withLock { current = scope }
     }
 
     /// The file behind a pending file UID, when it lies in a watched folder.
@@ -30,9 +30,7 @@ final class PendingFolderAccess: @unchecked Sendable {
     }
 
     func fileURL(forPath path: String) -> URL? {
-        let roots = lock.withLock { self.roots }
-        guard roots.contains(where: { path.hasPrefix($0) }) else { return nil }
-        return URL(fileURLWithPath: path)
+        scope.readableURL(forPath: path)
     }
 }
 

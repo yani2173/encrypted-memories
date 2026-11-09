@@ -4,7 +4,7 @@
 // renderer, geometry, and gesture code.
 
 package struct GridTransitionTuning: Equatable, Sendable {
-    // Click (toolbar or keyboard +/-).
+    // Click (toolbar +/-).
     package var clickDurationMs: Double = 420
     package var clickRampFraction: Double = 0.20
     package var c1EdgeFraction: Double = 0.20

@@ -187,12 +187,16 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         guard !included.isEmpty else { return UploadBackupSyncScanResult() }
         var candidates: [UploadBackupAssetCandidate] = []
         var result = UploadBackupSyncScanResult()
-        let mayHaveDismissals = queue.containsAny(in: [.dismissedFailure, .discovered, .checking])
+        let mayHaveDismissals = try readQueue {
+            try queue.containsAny(in: [.dismissedFailure, .discovered, .checking])
+        }
         guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
         for candidate in included {
             try Task.checkCancellation()
             if mayHaveDismissals {
-                let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+                let row = try readQueue {
+                    try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+                }
                 guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
                 if let row, row.isDismissedSourceRecheck || row.state == .dismissedFailure {
                     result.scanned += 1
@@ -281,11 +285,47 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         return generation
     }
 
+    /// The pending decision remains durable until a real pass rechecks this exact compound.
+    public func reopenRestoredCompound(
+        _ candidate: UploadBackupAssetCandidate, isCurrent: @Sendable () -> Bool
+    ) async throws -> Bool {
+        try Task.checkCancellation()
+        guard isCurrent() else { return false }
+        guard
+            let row = try readQueue({
+                try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+            })
+        else {
+            guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
+            try await preflight.markPending(candidate.snapshot)
+            return isCurrent()
+        }
+        guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
+        guard row.state.isTerminalSuccess else {
+            guard row.remoteCommitReconciliation == nil, !row.state.isActive else { return false }
+            try await preflight.markPending(candidate.snapshot)
+            return isCurrent()
+        }
+        guard let reopen = queue.restoredCompoundReopener else {
+            throw Self.localStateError("Backup queue does not support a restored compound recheck")
+        }
+        try await preflight.markPending(candidate.snapshot)
+        try Task.checkCancellation()
+        guard isCurrent() else { return false }
+        guard let reopened = reopen(row, now()) else {
+            throw Self.localStateError("Backup queue could not recheck a restored compound")
+        }
+        guard reopened else { return false }
+        return true
+    }
+
     public func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
         var missing: [UploadBackupAssetCandidate] = []
         for candidate in candidates {
             try Task.checkCancellation()
-            let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+            let row = try readQueue {
+                try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+            }
             guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             if row?.state == .sourceMissing || row?.state == .dismissedFailure { missing.append(candidate) }
         }
@@ -330,10 +370,12 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             if proven.contains(snapshot.source) { continue }
             if await backupHoldsLateMain(snapshot.source, formerMain: reopening.formerMain) { continue }
             try Task.checkCancellation()
+            _ = try readQueue { try queue.entry(for: snapshot.source, revision: snapshot.revision) }
+            guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             guard try await preflight.reopen(snapshot) else { continue }
             pending.append(reopening.candidate)
             try Task.checkCancellation()
-            let row = queue.entry(for: snapshot.source, revision: snapshot.revision)
+            let row = try readQueue { try queue.entry(for: snapshot.source, revision: snapshot.revision) }
             guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             guard let row, row.state == .completed || row.state == .alreadyBackedUp else { continue }
             guard queue.remove(source: snapshot.source, revision: snapshot.revision) else {
@@ -445,16 +487,18 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         _ candidates: [UploadBackupAssetCandidate]
     ) throws -> [UploadBackupAssetCandidate] {
         guard let exclusions, !candidates.isEmpty else { return candidates }
-        var excluded: [UploadSourceIdentity.Kind: Set<String>] = [:]
+        var answers: [UploadSourceIdentity.Kind: [String: BackupSourceExclusion]] = [:]
         for kind in Set(candidates.map(\.snapshot.source.kind)) {
             let identifiers = candidates.filter { $0.snapshot.source.kind == kind }.map(\.snapshot.source.identifier)
-            guard let kindExclusions = exclusions.excludedIdentifiers(kind: kind, among: identifiers) else {
+            guard let kindAnswers = exclusions.exclusions(kind: kind, among: identifiers) else {
                 throw UploadError.backend("Backup exclusions are unavailable")
             }
-            excluded[kind] = kindExclusions
+            answers[kind] = kindAnswers
         }
+        // A photo whose pending row this build cannot read is queued like an included one; the runner lets it wait
+        // before its file is read, so no scan, reopening or repair loses it (#982).
         return candidates.filter { candidate in
-            excluded[candidate.snapshot.source.kind]?.contains(candidate.snapshot.source.identifier) != true
+            answers[candidate.snapshot.source.kind]?[candidate.snapshot.source.identifier] != .excluded
         }
     }
 
@@ -477,6 +521,14 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         }
     }
 
+    private func readQueue<Value>(_ read: () throws -> Value) throws -> Value {
+        do {
+            return try read()
+        } catch is SQLiteStoreUnknownReadError {
+            throw Self.localStateError("Backup queue could not be read")
+        }
+    }
+
     private static func localStateError(_ diagnostic: StaticString) -> UploadError {
         PhotoDiagnostics.shared.increment("backup.queue.localStateUnavailable")
         PhotoDiagnostics.shared.emitDebug("BackupSync", ["error": String(describing: diagnostic)])
@@ -484,7 +536,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     }
 
     public func summary() -> UploadBackupSyncQueueSummary {
-        queue.summary()
+        (queue.summary() ?? UploadBackupSyncQueueSummary())
     }
 
     private func entry(

@@ -15,7 +15,7 @@ struct TipJarCelebrationWindowOverlayTests {
     @Test("The native foreground window never becomes key and forwards every touch")
     func windowRemainsNonKeyAndPassesThroughTouches() throws {
         let scene = try #require(
-            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+            UIApplication.shared.foregroundWindowScene
         )
         let window = TipJarCelebrationPassthroughWindow(windowScene: scene)
 

@@ -77,6 +77,11 @@ public final class GridProxy<ItemID: Hashable & Sendable> {
         deliverContentReadyIfPossible()
     }
 
+    public func invalidatePendingContentReady() {
+        pendingContentReadyRevision = nil
+        if !firstContentReadyDelivered { firstContentReadyReported = false }
+    }
+
     private func deliverFirstContentReadyIfPossible() {
         guard firstContentReadyReported, !firstContentReadyDelivered, let onFirstContentReady else { return }
         firstContentReadyDelivered = true

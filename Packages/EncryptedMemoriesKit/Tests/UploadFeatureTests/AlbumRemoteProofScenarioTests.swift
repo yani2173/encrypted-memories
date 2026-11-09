@@ -61,12 +61,12 @@ final class AlbumRemoteProofScenarioTests: XCTestCase {
         XCTAssertEqual(second.alreadyMember, 1)
         let members = try await deviceB.server.childMainLinkIDs(albumID: "own-album")
         XCTAssertEqual(members, [original.nodeID], "The compound main attaches; its related video is never a member")
-        XCTAssertEqual(deviceB.queue.entry(for: stored.source, revision: stored.revision), stored)
+        XCTAssertEqual(try deviceB.queue.entry(for: stored.source, revision: stored.revision), stored)
         XCTAssertEqual(deviceB.identities.record(for: stored.source), manifest)
         XCTAssertEqual(deviceB.library.resolutions.count, resolutions)
         XCTAssertEqual(deviceB.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploads)
         try deviceB.relaunch()
-        XCTAssertEqual(deviceB.queue.entry(for: stored.source, revision: stored.revision), stored)
+        XCTAssertEqual(try deviceB.queue.entry(for: stored.source, revision: stored.revision), stored)
         XCTAssertEqual(deviceB.identities.record(for: stored.source), manifest)
     }
 
@@ -129,7 +129,7 @@ private final class ScenarioAlbumBackup: AlbumSyncBackupExecuting, @unchecked Se
         } else {
             let candidate = try device.library.candidate()
             row = try XCTUnwrap(
-                device.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+                try device.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         }
         return AlbumSyncBackupReport(
             total: 1, backedUp: device.state(of: row) == .alreadyBackedUp ? 1 : 0,

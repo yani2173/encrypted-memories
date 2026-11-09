@@ -112,18 +112,19 @@ final class BackupReceiptRevisionTests: XCTestCase {
             identityResolver: RecordFailingIdentityResolver(inner: pipeline, failures: 2), events: events
         ).runUntilDrained(mode: .eligibleOnly)
         let receipt = try XCTUnwrap(
-            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         XCTAssertEqual(receipt.queueBinding?.revision, entry.revision)
         XCTAssertEqual(receipt.queueBinding?.uploadedRevision, UploadBackupRevision(date: uploaded))
         XCTAssertEqual(uploader.requests.count, 1)
         let hashes = hasher.hashCount
 
-        clock.advance(by: 2)
+        let due = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+        clock.advance(by: max(0, due.timeIntervalSince(clock.now)))
         _ = await makeRunner(identityResolver: pipeline, events: events).runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertEqual(uploader.requests.count, 1, "the committed bytes are never uploaded again")
         XCTAssertEqual(hasher.hashCount, hashes, "settling a receipt needs no hash")
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         XCTAssertEqual(identityStore.record(for: entry.source)?.remoteLinkID, receipt.receipt.remoteLinkID)
         XCTAssertFalse(events.kinds.contains(.deduplicated), "the source keeps its uploaded handoff")
         XCTAssertTrue(events.kinds.contains(.uploaded))
@@ -142,7 +143,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
                 inner: pipeline, failures: 2, failureFilename: "drifted-live.mov")
         ).runUntilDrained(mode: .eligibleOnly)
         let receipt = try XCTUnwrap(
-            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         XCTAssertEqual(receipt.source.resource, .livePairedVideo)
         XCTAssertEqual(receipt.queueBinding?.uploadedRevision, UploadBackupRevision(date: uploaded))
 
@@ -153,7 +154,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
             uploader.requests.filter { $0.name == "drifted-live.mov" }.count, 1,
             "the committed video is never uploaded again")
         XCTAssertEqual(identityStore.record(for: receipt.source)?.remoteLinkID, receipt.receipt.remoteLinkID)
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     // MARK: - Route: the source returned to the queued revision after another one was uploaded
@@ -169,12 +170,13 @@ final class BackupReceiptRevisionTests: XCTestCase {
         _ = await makeRunner(identityResolver: RecordFailingIdentityResolver(inner: pipeline, failures: 2))
             .runUntilDrained(mode: .eligibleOnly)
         let receipt = try XCTUnwrap(
-            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         XCTAssertNotEqual(receipt.queueBinding?.uploadedRevision, entry.revision)
 
         resolver.setModified(resolver.defaultModified, for: entry.source.identifier)
         hasher.contentSeeds[path] = nil
-        clock.advance(by: 2)
+        let due = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+        clock.advance(by: max(0, due.timeIntervalSince(clock.now)))
         let recorder = RecordingIdentityResolver(inner: pipeline)
         _ = await makeRunner(identityResolver: recorder).runUntilDrained(mode: .eligibleOnly)
 
@@ -182,7 +184,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
             recorder.linkIDs.contains(receipt.receipt.remoteLinkID), "the receipt of B must not settle A")
         XCTAssertEqual(uploader.requests.count, 2, "A uploads its own bytes")
         XCTAssertNotEqual(identityStore.record(for: entry.source)?.sha1Hex, receipt.identity.sha1Hex)
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     // MARK: - Route: the manifest write failed after the remote commit
@@ -201,7 +203,8 @@ final class BackupReceiptRevisionTests: XCTestCase {
         let changed = resolver.defaultModified.addingTimeInterval(120)
         resolver.setModified(changed, for: entry.source.identifier)
         hasher.contentSeeds[URL(fileURLWithPath: entry.source.identifier).path] = "changed content"
-        clock.advance(by: 2)
+        let due = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+        clock.advance(by: max(0, due.timeIntervalSince(clock.now)))
         _ = await makeRunner(identityResolver: pipeline).runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertEqual(uploader.requests.count, 2, "the changed revision uploads its own bytes")
@@ -209,7 +212,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
         XCTAssertEqual(record.modificationDate, changed)
         XCTAssertNotEqual(record.sha1Hex, receipt.identity.sha1Hex, "the record must hold the hash of the new bytes")
         XCTAssertNotEqual(record.remoteLinkID, receipt.receipt.remoteLinkID)
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     /// The scan queued the new revision, and the pass backs it up before it reaches the receipt of the old one. The old
@@ -220,7 +223,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
         _ = await makeRunner(identityResolver: RecordFailingIdentityResolver(inner: pipeline, failures: 2))
             .runUntilDrained(mode: .eligibleOnly)
         let receipt = try XCTUnwrap(
-            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
 
         let changed = resolver.defaultModified.addingTimeInterval(120)
         resolver.setModified(changed, for: entry.source.identifier)
@@ -229,7 +232,8 @@ final class BackupReceiptRevisionTests: XCTestCase {
             source: entry.source, revision: UploadBackupRevision(date: changed),
             originalFilename: entry.originalFilename, byteCount: entry.byteCount, updatedAt: clock.now)
         XCTAssertTrue(queueStore.upsert(newer))
-        clock.advance(by: 2)
+        let due = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+        clock.advance(by: max(0, due.timeIntervalSince(clock.now)))
         // One item at a time: the newer revision runs first, the receipt of the old one after it.
         let recorder = RecordingIdentityResolver(inner: pipeline)
         _ = await makeRunner(identityResolver: recorder, concurrency: 1).runUntilDrained(mode: .eligibleOnly)
@@ -243,7 +247,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
         XCTAssertEqual(record.modificationDate, changed, "the newer backup keeps its record")
         XCTAssertNotEqual(record.sha1Hex, receipt.identity.sha1Hex)
         XCTAssertNotEqual(record.remoteLinkID, receipt.receipt.remoteLinkID)
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     // MARK: - Route: the committed resource was not available for reconciliation
@@ -288,7 +292,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
         let record = try XCTUnwrap(identityStore.record(for: video))
         XCTAssertNotEqual(record.remoteLinkID, "earlier-video", "the earlier receipt must not settle the new video")
         XCTAssertNotEqual(record.sha1Hex, receipt.identity.sha1Hex)
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     // MARK: - Fixtures
@@ -411,7 +415,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
             return .recorded
         }
 
-        func isExcluded(source: UploadSourceIdentity) -> Bool? { false }
+        func exclusion(of source: UploadSourceIdentity) -> BackupSourceExclusion? { .included }
 
         func reportProgress(source: UploadSourceIdentity, revision: UploadBackupRevision, step: Int?) {}
     }

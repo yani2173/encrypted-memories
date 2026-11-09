@@ -8,7 +8,6 @@ import TimelineCore
 @testable import TimelineFeature
 
 @MainActor private final class ActivateDataSource: MetalGridDataSource {
-    let label = "a11y-activate-test"
     let sectionCounts = [4]
     let flatUIDs = (0..<4).map { PhotoUID(volumeID: "a11y-activate", nodeID: "\($0)") }
     var onImagesAvailable: (() -> Void)?

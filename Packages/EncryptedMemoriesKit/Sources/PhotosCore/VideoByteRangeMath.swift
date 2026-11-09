@@ -1,8 +1,8 @@
 import Foundation
 
 /// A half-open byte range `[lower, upper)` into the *cleartext* file. Pure value type so the range
-/// bookkeeping used by the streaming loader and byte cache without AVFoundation or network dependencies.
-public struct ByteRange: Equatable, Sendable, Comparable {
+/// bookkeeping of the streaming loader works without AVFoundation or network dependencies.
+public struct ByteRange: Equatable, Sendable {
     public var lower: Int  // inclusive
     public var upper: Int  // exclusive
 
@@ -12,88 +12,7 @@ public struct ByteRange: Equatable, Sendable, Comparable {
         self.upper = upper
     }
 
-    public init(offset: Int, length: Int) {
-        self.init(lower: offset, upper: offset + length)
-    }
-
     public var length: Int { upper - lower }
-    public var isEmpty: Bool { upper <= lower }
-
-    public func contains(_ offset: Int) -> Bool { offset >= lower && offset < upper }
-
-    /// Intersection with `other`, or `nil` if they don't overlap.
-    public func intersection(_ other: ByteRange) -> ByteRange? {
-        let lo = Swift.max(lower, other.lower)
-        let hi = Swift.min(upper, other.upper)
-        return lo < hi ? ByteRange(lower: lo, upper: hi) : nil
-    }
-
-    public static func < (a: ByteRange, b: ByteRange) -> Bool {
-        a.lower != b.lower ? a.lower < b.lower : a.upper < b.upper
-    }
-}
-
-/// A set of non-overlapping, coalesced byte ranges - the "what have we got on disk?" model for the
-/// byte cache and the buffered-progress UI. Adjacent and overlapping ranges merge automatically so
-/// Adjacent and overlapping ranges merge into one minimal range, such as `[0,10)` plus `[10,20)`
-/// becoming `[0,20)`.
-public struct ByteRangeSet: Equatable, Sendable {
-    public private(set) var ranges: [ByteRange]
-
-    public init(_ ranges: [ByteRange] = []) {
-        self.ranges = []
-        for r in ranges { insert(r) }
-    }
-
-    public var isEmpty: Bool { ranges.isEmpty }
-
-    /// Total covered bytes across all ranges.
-    public var coveredBytes: Int { ranges.reduce(0) { $0 + $1.length } }
-
-    /// Inserts a range, merging it with any that overlap or abut it (so the set stays minimal).
-    public mutating func insert(_ range: ByteRange) {
-        guard !range.isEmpty else { return }
-        var merged = range
-        var result: [ByteRange] = []
-        for r in ranges {
-            if r.upper < merged.lower || r.lower > merged.upper {
-                result.append(r)  // disjoint (and not abutting) - keep as is
-            } else {
-                merged = ByteRange(
-                    lower: Swift.min(r.lower, merged.lower),
-                    upper: Swift.max(r.upper, merged.upper))
-            }
-        }
-        result.append(merged)
-        result.sort()
-        ranges = result
-    }
-
-    /// True if `range` is fully covered by the set (no holes).
-    public func covers(_ range: ByteRange) -> Bool {
-        guard !range.isEmpty else { return true }
-        var cursor = range.lower
-        for r in ranges where r.lower <= cursor {
-            if r.upper > cursor { cursor = r.upper }
-            if cursor >= range.upper { return true }
-        }
-        return cursor >= range.upper
-    }
-
-    /// The sub-ranges of `range` not yet covered (the holes the loader still has to fetch).
-    public func missingPieces(in range: ByteRange) -> [ByteRange] {
-        guard !range.isEmpty else { return [] }
-        var holes: [ByteRange] = []
-        var cursor = range.lower
-        for r in ranges.sorted() {
-            guard r.upper > range.lower, r.lower < range.upper else { continue }
-            if r.lower > cursor { holes.append(ByteRange(lower: cursor, upper: Swift.min(r.lower, range.upper))) }
-            cursor = Swift.max(cursor, r.upper)
-            if cursor >= range.upper { break }
-        }
-        if cursor < range.upper { holes.append(ByteRange(lower: cursor, upper: range.upper)) }
-        return holes
-    }
 }
 
 /// One cleartext block of the file: its index plus where its decrypted bytes live in the whole file.
@@ -109,8 +28,6 @@ public struct ClearBlock: Equatable, Sendable {
         self.clearOffset = clearOffset
         self.clearSize = clearSize
     }
-
-    public var clearRange: ByteRange { ByteRange(offset: clearOffset, length: clearSize) }
 }
 
 /// One block's contribution to a requested range: which block to read, and the sub-slice of that
@@ -163,7 +80,7 @@ public struct VideoBlockMap: Sendable {
     ///
     /// Blocks are stored in ascending `clearOffset` order (so their cleartext *ends* are non-decreasing);
     /// a binary search skips straight to the first block that can overlap the window instead of scanning
-    /// every block from the front - the output is byte-for-byte identical to the old linear scan.
+    /// every block from the front. The result equals a linear scan of every block.
     public func slices(offset: Int, length: Int) -> [BlockSlice] {
         let reqStart = Swift.max(0, offset)
         let reqEnd = Swift.min(offset + length, totalSize)
@@ -188,11 +105,6 @@ public struct VideoBlockMap: Sendable {
             }
         }
         return out
-    }
-
-    /// The block indices a request touches (for prefetch / cancellation bookkeeping).
-    public func blockIndices(offset: Int, length: Int) -> [Int] {
-        slices(offset: offset, length: length).map(\.blockIndex)
     }
 
     /// Up to `count` non-empty blocks (in file order) whose cleartext bytes extend past `clearOffset` -

@@ -25,6 +25,18 @@ enum StreamingError: Error, Equatable {
     case incompleteStream(streamed: Int, expected: Int)
 }
 
+/// Only a block layout that contradicts itself no matter which page of the answer arrived is permanent. A count
+/// mismatch, a missing revision or a size that disagrees with the blocks can come from an incomplete answer, so a
+/// new attempt can change it and keeps Retry.
+extension StreamingError: VideoPlaybackClassifiable {
+    var videoPlaybackError: VideoPlaybackError? {
+        switch self {
+        case .negativeBlockSize, .blockSizeSumOverflow: return .malformedContent
+        default: return nil
+        }
+    }
+}
+
 /// One block's fetch info + its position in the *cleartext* file (from XAttr block sizes), so the
 /// resource loader can map a requested byte range to the blocks it needs.
 struct VideoBlock: Sendable {
@@ -75,17 +87,41 @@ actor PhotoVideoStreamSource {
     private var shareKey: UnlockableKey?
     private var nodeKeyCache: [String: UnlockableKey] = [:]
 
-    init(session: DriveSession, crypto: DriveCrypto, shareID: String) {
+    /// How long after `prefetchEncrypted` resolved a clip the next `prepare` of the same clip reuses that answer.
+    /// The block addresses in the answer age with it; the lifetime of Proton block URLs is not stated in this
+    /// repository, so this value is a cautious guess. A shorter window needs only this constant.
+    nonisolated static let prefetchReuseWindow: Duration = .seconds(20)
+    private let prepareFile: (@Sendable (PhotoUID) async throws -> PreparedVideo)?
+    private let now: @Sendable () -> ContinuousClock.Instant
+    /// The clip that the last `prefetchEncrypted` prepared. One `prepare` of that clip takes it, once, within the window.
+    private var prefetched: (video: PreparedVideo, until: ContinuousClock.Instant)?
+
+    /// `prepareFile` and `now` are test seams; production resolves the file through the key chain and the clock.
+    init(
+        session: DriveSession, crypto: DriveCrypto, shareID: String,
+        prepareFile: (@Sendable (PhotoUID) async throws -> PreparedVideo)? = nil,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
+    ) {
         self.session = session
         self.crypto = crypto
         self.shareID = shareID
+        self.prepareFile = prepareFile
+        self.now = now
     }
 
     /// Resolves keys + block map for the file `uid`. Throws `.notAVideo` if the link isn't a video
     /// (after the full key/XAttr resolve, since the UTI comes from the resolved link), so the viewer
     /// can fall back to the image path.
     func prepare(uid: PhotoUID) async throws -> PreparedVideo {
-        let prepared = try await prepareAnyFile(uid: uid)
+        if let kept = prefetched {
+            prefetched = nil
+            if kept.video.uid == uid, now() < kept.until { return kept.video }
+        }
+        return try await prepareVideo(uid: uid)
+    }
+
+    private func prepareVideo(uid: PhotoUID) async throws -> PreparedVideo {
+        let prepared = try await resolveFile(uid: uid)
         guard
             prepared.contentTypeUTI.hasPrefix("public.movie")
                 || prepared.contentTypeUTI.hasPrefix("public.video")
@@ -103,24 +139,7 @@ actor PhotoVideoStreamSource {
         let prepared = try await prepareAnyFile(uid: uid)
         var out = Data()
         out.reserveCapacity(prepared.totalSize)
-        let total = max(prepared.totalSize, 1)
-        onProgress(0)
-        for block in prepared.blocks {
-            try Task.checkCancellation()
-            guard block.clearSize > 0 else { continue }
-            let encrypted = try await encryptedBlockData(block, priority: .immediate)
-            let clear = try crypto.decryptBlock(encrypted, sessionKey: prepared.sessionKey)
-            guard clear.count >= block.clearSize else {
-                throw StreamingError.decryptedBlockLengthMismatch(
-                    blockIndex: block.index, expected: block.clearSize, actual: clear.count)
-            }
-            out.append(clear.prefix(block.clearSize))
-            onProgress(min(1, Double(out.count) / Double(total)))
-        }
-        guard out.count == prepared.totalSize else {
-            throw StreamingError.incompleteStream(streamed: out.count, expected: prepared.totalSize)
-        }
-        onProgress(1)
+        try await decryptBlocks(of: prepared, allowsExpensiveNetwork: true, onProgress: onProgress) { out.append($0) }
         return out
     }
 
@@ -133,6 +152,17 @@ actor PhotoVideoStreamSource {
         onProgress: @Sendable (Double) -> Void
     ) async throws {
         let prepared = try await prepareAnyFile(uid: uid)
+        try await decryptBlocks(
+            of: prepared, allowsExpensiveNetwork: allowsExpensiveNetwork, onProgress: onProgress, onChunk: onChunk)
+    }
+
+    /// Fetches and decrypts the blocks of `prepared` in order and hands each decrypted block to `onChunk`.
+    private func decryptBlocks(
+        of prepared: PreparedVideo,
+        allowsExpensiveNetwork: Bool,
+        onProgress: @Sendable (Double) -> Void,
+        onChunk: (Data) async throws -> Void
+    ) async throws {
         let total = max(prepared.totalSize, 1)
         var streamed = 0
         onProgress(0)
@@ -154,6 +184,11 @@ actor PhotoVideoStreamSource {
             throw StreamingError.incompleteStream(streamed: streamed, expected: prepared.totalSize)
         }
         onProgress(1)
+    }
+
+    private func resolveFile(uid: PhotoUID) async throws -> PreparedVideo {
+        if let prepareFile { return try await prepareFile(uid) }
+        return try await prepareAnyFile(uid: uid)
     }
 
     private func prepareAnyFile(uid: PhotoUID) async throws -> PreparedVideo {
@@ -266,13 +301,7 @@ actor PhotoVideoStreamSource {
         allowsExpensiveNetwork: Bool = true
     ) async throws -> Data {
         if priority == .immediate {
-            return try await session.requestGovernor.withPriorityScope(
-                .immediate,
-                // This direct path already supplies `.immediate` to the actual block request.
-                // Do not promote unrelated read-ahead that happens to overlap this demand.
-                promoting: [],
-                suspending: [.storageUpload]
-            ) {
+            return try await withDemandPriority {
                 try await session.fetchBlock(
                     url: block.url, token: block.token, priority: priority, priorityHandle: priorityHandle,
                     allowsExpensiveNetwork: allowsExpensiveNetwork)
@@ -284,6 +313,8 @@ actor PhotoVideoStreamSource {
     }
 
     /// Keep upload admission suspended through joining, cache verification and any failed-prefetch retry.
+    /// The scope promotes nothing: the request inside supplies `.immediate` itself, and unrelated read-ahead that
+    /// overlaps this demand must not be promoted.
     func withDemandPriority<T: Sendable>(
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {
@@ -298,11 +329,15 @@ actor PhotoVideoStreamSource {
 
     /// Fully downloads the clip's encrypted blocks into the shared range cache (no plaintext written anywhere),
     /// so a later streaming play serves entirely from local encrypted bytes. Used after a Live Photo motion
-    /// request and before playback starts. Idempotent: skips blocks already cached.
+    /// request and before playback starts. Idempotent: skips blocks already cached. A completed prefetch keeps the
+    /// prepared clip for one `prepare` of the same clip until `prefetchReuseWindow` after the prefetch started to
+    /// resolve it, so the player does not resolve the same link and revision again. A prefetch always resolves the
+    /// clip itself and never takes the clip that an earlier prefetch kept.
     func prefetchEncrypted(uid: PhotoUID) async throws {
         let cache = VideoByteRangeCache.shared
         let ownerGeneration = cache.captureOwnerGeneration()
-        let prepared = try await prepare(uid: uid)
+        let started = now()
+        let prepared = try await prepareVideo(uid: uid)
         for block in prepared.blocks {
             try Task.checkCancellation()
             let lookup = await cache.lookupAsync(uid: prepared.uid, block: block.index)
@@ -316,6 +351,8 @@ actor PhotoVideoStreamSource {
                 ownerGeneration: ownerGeneration
             )
         }
+        // The streaming asset that follows prepares the same clip: hand it this answer instead of two more requests.
+        prefetched = (prepared, started + Self.prefetchReuseWindow)
     }
 
     // MARK: - Key chain

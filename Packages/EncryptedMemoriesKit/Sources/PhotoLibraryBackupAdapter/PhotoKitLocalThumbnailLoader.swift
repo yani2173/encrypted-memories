@@ -6,9 +6,11 @@ import Photos
 import PhotosCore
 
 /// Grid thumbnails of pending Apple Photos assets, straight from PhotoKit. No Proton request and no
-/// encrypted disk copy: PhotoKit already caches its own thumbnails. Network access is allowed so an
-/// iCloud-optimized library still shows its photos.
+/// encrypted disk copy: PhotoKit already caches its own thumbnails. Existing callers allow iCloud downloads;
+/// problem-list previews explicitly select localOnly.
 public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
+    public enum NetworkMode: Sendable { case allowed, localOnly }
+
     private static let maxConcurrentRequests = 4
     /// How long a quick, lower-quality version of a new photo may wait for the final one. The camera still
     /// processes a new photo for a while and has only the quick version; its new revision brings the final one.
@@ -18,12 +20,23 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
     private static let freshWindow: TimeInterval = 3600
 
     private let request: PhotoKitImageRequest
+    private let networkMode: NetworkMode
+    var fetchAssets: @Sendable ([String]) async -> [PHAsset] = Self.assets
     private let onMissing: (@Sendable ([PhotoUID]) -> Void)?
 
     /// `onMissing` hears about photos that no longer exist in Apple Photos (deleted before their upload).
-    public init(request: @escaping PhotoKitImageRequest, onMissing: (@Sendable ([PhotoUID]) -> Void)? = nil) {
+    public init(
+        request: @escaping PhotoKitImageRequest, onMissing: (@Sendable ([PhotoUID]) -> Void)? = nil,
+        networkMode: NetworkMode = .allowed
+    ) {
         self.request = request
+        self.networkMode = networkMode
         self.onMissing = onMissing
+    }
+
+    /// Problem lists use only previews already available on this device.
+    public static func problemListPreviews(request: @escaping PhotoKitImageRequest) -> Self {
+        Self(request: request, networkMode: .localOnly)
     }
 
     /// A small thumbnail for a list row, such as the excluded photos in the Backup settings.
@@ -41,13 +54,7 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
             uid.localPendingNamespace == .photoLibrary ? uid.nodeID : nil
         }
         guard !identifiers.isEmpty else { return [:] }
-        let assets = await Task.detached(priority: .userInitiated) { () -> [PHAsset] in
-            let result = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
-            var assets: [PHAsset] = []
-            assets.reserveCapacity(result.count)
-            result.enumerateObjects { asset, _, _ in assets.append(asset) }
-            return assets
-        }.value
+        let assets = await fetchAssets(identifiers)
         if let onMissing, assets.count < identifiers.count {
             let found = Set(assets.map(\.localIdentifier))
             let missing = identifiers.filter { !found.contains($0) }
@@ -61,8 +68,8 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
                 guard next < assets.count, !Task.isCancelled else { return }
                 let asset = assets[next]
                 next += 1
-                group.addTask { [request] in
-                    let image = await Self.image(for: asset, side: side, request: request)
+                group.addTask { [request, networkMode] in
+                    let image = await Self.image(for: asset, side: side, request: request, networkMode: networkMode)
                     return (PhotoUID(localPending: .photoLibrary, identifier: asset.localIdentifier), image)
                 }
             }
@@ -75,12 +82,22 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
         }
     }
 
+    private static func assets(_ identifiers: [String]) async -> [PHAsset] {
+        await Task.detached(priority: .userInitiated) { () -> [PHAsset] in
+            let result = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+            var assets: [PHAsset] = []
+            assets.reserveCapacity(result.count)
+            result.enumerateObjects { asset, _, _ in assets.append(asset) }
+            return assets
+        }.value
+    }
+
     private static func image(
-        for asset: PHAsset, side: CGFloat, request: PhotoKitImageRequest
+        for asset: PHAsset, side: CGFloat, request: PhotoKitImageRequest, networkMode: NetworkMode
     ) async -> DecodedThumbnail? {
         let options = PHImageRequestOptions()
         options.resizeMode = .fast
-        options.isNetworkAccessAllowed = true
+        options.isNetworkAccessAllowed = networkMode == .allowed
         options.isSynchronous = false
         let size = CGSize(width: side, height: side)
         let isFresh = asset.creationDate.map { Date().timeIntervalSince($0) < freshWindow } ?? false

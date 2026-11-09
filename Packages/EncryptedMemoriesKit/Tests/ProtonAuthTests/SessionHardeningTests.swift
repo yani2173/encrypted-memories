@@ -66,7 +66,6 @@ struct SessionHardeningTests {
             account: "installation",
             keychain: keychain
         )
-        defer { store.clear() }
 
         let first = store.loadOrCreate()
         #expect(!first.isEmpty)

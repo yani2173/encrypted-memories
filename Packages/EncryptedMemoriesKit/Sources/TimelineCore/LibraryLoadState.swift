@@ -3,11 +3,14 @@ import PhotosCore
 
 /// Shared first-load presentation state.
 ///
-/// `contentReady` follows the first visible thumbnails; `empty`
+/// `contentReady` follows the first presentable frame of a completed listing; `empty`
 /// and `failed` are terminal. Progress remains indeterminate because inventory count is not a measured fraction.
 public enum LibraryLoadState: Equatable, Sendable {
     /// The backend is preparing the inventory and has no count yet.
     case preparingInventory
+
+    /// Qualified known rows may draw placeholders while the metadata listing remains unfinished.
+    case provisionalContent(count: Int, frameReady: Bool)
 
     /// The inventory count is known, but visible thumbnails are not ready.
     case loadingContent(count: Int, usingCachedInventory: Bool)
@@ -15,7 +18,7 @@ public enum LibraryLoadState: Equatable, Sendable {
     /// A persisted empty inventory is awaiting server validation.
     case validatingCachedContent(count: Int)
 
-    /// The first visible thumbnails are drawn and the grid is presentable.
+    /// The listing completed and the grid drew its first presentable content frame.
     case contentReady(count: Int)
 
     /// The library finished loading and contains no photos.
@@ -33,6 +36,7 @@ public extension LibraryLoadState {
     /// after a failure. `empty` reports `0` so the shell can render "0 photos" calmly.
     var knownCount: Int? {
         switch self {
+        case .provisionalContent(let count, _): return count
         case .loadingContent(let count, _): return count
         case .validatingCachedContent(let count): return count
         case .contentReady(let count): return count
@@ -44,13 +48,23 @@ public extension LibraryLoadState {
     /// True while the shell must show the onboarding/loading UI (spinner + factual status), not the grid.
     var isLoading: Bool {
         switch self {
+        case .provisionalContent(_, let ready): return !ready
         case .preparingInventory, .loadingContent, .validatingCachedContent: return true
         case .contentReady, .empty, .failed: return false
         }
     }
 
-    /// True once the grid is safe to present (first thumbnails drawn). The shell shows the timeline here.
+    /// Known fresh metadata can reveal its placeholder frame. Cached inventory keeps its existing thumbnail gate.
+    var allowsPlaceholderContentReady: Bool {
+        switch self {
+        case .provisionalContent(let count, _), .loadingContent(let count, false): return count > 0
+        default: return false
+        }
+    }
+
+    /// True once the grid drew presentable content. A provisional frame does not certify a completed listing.
     var isContentReady: Bool {
+        if case .provisionalContent(_, let ready) = self { return ready }
         if case .contentReady = self { return true }
         return false
     }
@@ -77,7 +91,7 @@ public extension LibraryLoadState {
     var hasSettled: Bool {
         switch self {
         case .contentReady, .empty, .failed: return true
-        case .preparingInventory, .loadingContent, .validatingCachedContent: return false
+        case .preparingInventory, .provisionalContent, .loadingContent, .validatingCachedContent: return false
         }
     }
 }
@@ -85,6 +99,8 @@ public extension LibraryLoadState {
 /// Events that drive `LibraryLoadState`. All inputs are plain scalars so the reducer stays a pure, trivially
 /// testable value transform with no dependency on the feed/backend/crawl machinery.
 public enum LibraryLoadEvent: Equatable, Sendable {
+    /// Known rows from an unfinished listing, with no completeness or empty-library authority.
+    case provisionalInventoryResolved(count: Int)
     /// The inventory count became known - from either a cached snapshot (`cached: true`) or a fresh server load
     /// (`cached: false`). A fresh count requires a successful complete listing, or app-owned empty initialization.
     case inventoryResolved(count: Int, cached: Bool)
@@ -93,7 +109,7 @@ public enum LibraryLoadEvent: Equatable, Sendable {
     /// changed, which makes the currently rendered cached frame obsolete.
     case authoritativeInventoryResolved(count: Int, requiresNewFrame: Bool)
 
-    /// The grid reported that the first visible thumbnails are drawn.
+    /// The grid reported a presentable frame for known photos.
     case firstContentReady
 
     /// Loading failed. `retryable` requests a retry affordance in the shell.
@@ -111,6 +127,16 @@ public enum LibraryLoadEvent: Equatable, Sendable {
 public enum LibraryLoadPolicy {
     public static func reduce(_ state: LibraryLoadState, _ event: LibraryLoadEvent) -> LibraryLoadState {
         switch event {
+        case .provisionalInventoryResolved(let count):
+            guard count > 0 else { return state }
+            switch state {
+            case .preparingInventory:
+                return .provisionalContent(count: count, frameReady: false)
+            case .provisionalContent(_, let ready):
+                return .provisionalContent(count: count, frameReady: ready)
+            default:
+                return state
+            }
         case .contentLoadFailed(let message):
             switch state {
             case .contentReady, .empty: return state
@@ -125,7 +151,7 @@ public enum LibraryLoadPolicy {
             // empty/ready grid - a later (background refresh) failure must not replace it: the user keeps their
             // photos and browses offline instead of hitting an error wall.
             switch state {
-            case .preparingInventory, .failed:
+            case .preparingInventory, .provisionalContent, .failed:
                 return .failed(message: message, retryable: retryable)
             case .loadingContent(let count, let usingCachedInventory) where usingCachedInventory:
                 // The server validation failed, but a cached inventory is already mounting. Accept that
@@ -156,6 +182,7 @@ public enum LibraryLoadPolicy {
             guard count >= 0 else { return .preparingInventory }
             guard count > 0 else { return .empty }
             if case .contentReady = state { return .contentReady(count: count) }
+            if case .provisionalContent(_, true) = state { return .contentReady(count: count) }
             if case .validatingCachedContent = state, !requiresNewFrame {
                 return .contentReady(count: count)
             }
@@ -163,6 +190,8 @@ public enum LibraryLoadPolicy {
 
         case .firstContentReady:
             switch state {
+            case .provisionalContent(let count, _):
+                return .provisionalContent(count: count, frameReady: true)
             case .loadingContent(let count, _):
                 // A fully drawn cached viewport is already useful, truthful content. Server-token validation
                 // continues in the background and only publishes a replacement when the inventory really

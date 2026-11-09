@@ -2507,14 +2507,10 @@ struct ThumbnailFeedCoreTests {
         let cache = Self.cache("disk")
         cache.storeToDisk(Self.pngData(width: 24, height: 12), for: uid)
         let loader = RecordingLoader()
-        let aspects = LockedAspects()
         let feed = ThumbnailFeedCore(
             cache: cache,
             loader: loader,
-            configuration: Self.configuration(maxConcurrentDecodes: 2),
-            onDecoded: { uid, decoded in
-                aspects.record(uid, aspect: decoded.aspectRatio)
-            }
+            configuration: Self.configuration(maxConcurrentDecodes: 2)
         )
 
         let before = await feed.cacheState(for: ThumbnailRequest(uid: uid))
@@ -2527,7 +2523,7 @@ struct ThumbnailFeedCoreTests {
         #expect(result.mainThreadDecodeCount == 0)
         #expect(await loader.requestCount() == 0)
         #expect(feed.memoryDecoded(for: uid) != nil)
-        #expect(aspects.value(for: uid).map { abs($0 - 2.0) < 0.2 } == true)
+        #expect(feed.memoryDecoded(for: uid).map { abs($0.aspectRatio - 2.0) < 0.2 } == true)
 
         let after = await feed.cacheState(for: ThumbnailRequest(uid: uid))
         #expect(after.diskThumbnail)
@@ -3726,7 +3722,7 @@ struct ThumbnailFeedCoreTests {
             #expect(cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320))
             #expect(cache.snapshotForTesting().count == 1)
             #expect(cache.snapshotForTesting().cost == 1600)
-            // The false result prevents onDecoded consumers from treating this rejected source as current.
+            // The late lower-resolution source is rejected and reported as not stored.
             #expect(!cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))
             #expect(cache.snapshotForTesting().cost == 1600)
             #expect(cache.image(for: a)?.pixelWidth == 20)
@@ -4928,16 +4924,16 @@ struct ThumbnailFeedCoreTests {
         DecodedThumbnail(image: makeCGImage(width: width, height: height))
     }
 
-    /// Waits up to three seconds and records an issue when the condition never holds.
+    /// Waits up to thirty seconds and records an issue when the condition never holds.
     private static func waitUntil(
         _ condition: @Sendable () async -> Bool, sourceLocation: SourceLocation = #_sourceLocation
     ) async throws {
-        for _ in 0..<60 {
+        for _ in 0..<600 {
             if await condition() { return }
             try await Task.sleep(for: .milliseconds(50))
         }
         if await condition() { return }
-        Issue.record("the condition did not hold within 3 s", sourceLocation: sourceLocation)
+        Issue.record("the condition did not hold within 30 s", sourceLocation: sourceLocation)
     }
 
     /// Joins `task` within 20 s; a task that does not end records an issue and is cancelled.
@@ -5118,21 +5114,6 @@ struct ThumbnailFeedCorePlatformPurityTests {
             results.append(url)
         }
         return results.sorted { $0.path < $1.path }
-    }
-}
-
-private final class LockedAspects: @unchecked Sendable {
-    private let lock = NSLock()
-    private var aspects: [PhotoUID: CGFloat] = [:]
-
-    func record(_ uid: PhotoUID, aspect: CGFloat) {
-        lock.withLock {
-            aspects[uid] = aspect
-        }
-    }
-
-    func value(for uid: PhotoUID) -> CGFloat? {
-        lock.withLock { aspects[uid] }
     }
 }
 

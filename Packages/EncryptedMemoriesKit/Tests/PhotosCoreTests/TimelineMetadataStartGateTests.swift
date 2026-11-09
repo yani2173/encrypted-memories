@@ -17,7 +17,7 @@ final class TimelineMetadataStartGateTests: XCTestCase {
     func testThePassStartsOnlyAfterTheBuildEnds() async {
         let waits = HeldWaits()
         let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: waits.sleep)
-        let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+        let reconciliation = TimelineMetadataReconciliation(startGate: gate, taskPriority: .userInitiated)
         let events = StartGateEvents()
         let started = AsyncTestSignal()
         gate.buildStarted()
@@ -43,7 +43,8 @@ final class TimelineMetadataStartGateTests: XCTestCase {
         let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: HeldWaits().sleep)
         gate.open()
         let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .suspended))
-        let reconciliation = TimelineMetadataReconciliation(startGate: gate, runtimeState: state)
+        let reconciliation = TimelineMetadataReconciliation(
+            startGate: gate, runtimeState: state, taskPriority: .userInitiated)
         let started = AsyncTestSignal()
         reconciliation.schedule(inventory) { _ in started.fire() }
         await awaitHeldSnapshots(1, in: reconciliation)
@@ -60,7 +61,8 @@ final class TimelineMetadataStartGateTests: XCTestCase {
         let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: waits.sleep)
         gate.buildStarted()
         let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .foregroundActive))
-        let reconciliation = TimelineMetadataReconciliation(startGate: gate, runtimeState: state)
+        let reconciliation = TimelineMetadataReconciliation(
+            startGate: gate, runtimeState: state, taskPriority: .userInitiated)
         let started = AsyncTestSignal()
         reconciliation.schedule(inventory) { _ in started.fire() }
         let waiting = await waits.waitUntilRequested(1)
@@ -114,7 +116,7 @@ final class TimelineMetadataStartGateTests: XCTestCase {
     func testRetirementEndsAHeldPassWithoutRunningIt() async {
         let waits = HeldWaits()
         let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: waits.sleep)
-        let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+        let reconciliation = TimelineMetadataReconciliation(startGate: gate, taskPriority: .userInitiated)
         let events = StartGateEvents()
         reconciliation.schedule(inventory) { _ in await events.append("pass") }
         let waiting = await waits.waitUntilRequested(1)
@@ -134,7 +136,7 @@ final class TimelineMetadataStartGateTests: XCTestCase {
     /// Schedules a pass behind `gate`, releases `releasing` of the gate's waits one by one, and reports whether the
     /// pass started. Before the last release the pass must still be held.
     private func passStarts(gate: TimelineMetadataStartGate, waits: HeldWaits, releasing: Int) async -> Bool {
-        let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+        let reconciliation = TimelineMetadataReconciliation(startGate: gate, taskPriority: .userInitiated)
         let started = AsyncTestSignal()
         reconciliation.schedule(inventory) { _ in started.fire() }
         if releasing > 0 {

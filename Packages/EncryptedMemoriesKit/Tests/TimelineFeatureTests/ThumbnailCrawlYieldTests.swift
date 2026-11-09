@@ -48,14 +48,6 @@ final class ClockBox: @unchecked Sendable {
 
 @Suite("Thumbnail crawl yield / offline decoupling", .serialized)
 struct ThumbnailCrawlYieldTests {
-    @Test func offlineDisabledStillAllowsThumbnailCrawl() {
-        // The split: thumbnails always crawl; the toggle only governs (future) derivative offline caching.
-        #expect(OfflineLibraryPolicy.shouldCrawlThumbnails(offlineEnabled: false) == true)
-        #expect(OfflineLibraryPolicy.shouldCrawlThumbnails(offlineEnabled: true) == true)
-        #expect(OfflineLibraryPolicy.shouldCacheOfflineDerivatives(offlineEnabled: false) == false)
-        #expect(OfflineLibraryPolicy.shouldCacheOfflineDerivatives(offlineEnabled: true) == true)
-    }
-
     @Test func crawlRunsIndependentlyOfAnyOfflineFlag() async throws {
         let uids = (0..<4).map { PhotoUID(volumeID: "v", nodeID: "crawl-\(UUID())-\($0)") }
         let loader = RecordingLoader(payloads: Dictionary(uniqueKeysWithValues: uids.map { ($0, Self.bytes()) }))

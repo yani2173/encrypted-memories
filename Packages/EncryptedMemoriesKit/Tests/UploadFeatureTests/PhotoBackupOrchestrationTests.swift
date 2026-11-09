@@ -121,7 +121,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         XCTAssertTrue(ran)
         XCTAssertEqual(Set(uploader.requests.map(\.name)), ["IMG_A.HEIC", "IMG_B.HEIC"], "both new assets upload once")
-        XCTAssertEqual(queue.summary().uploaded, 2)
+        XCTAssertEqual(queue.summary()!.uploaded, 2)
         XCTAssertEqual(catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 2, present: 2, removed: 0))
         XCTAssertNil(lockStore.currentLock(), "the lock is released when the pass finishes")
         XCTAssertTrue(catalog.hasCompletedFullScan(), "a successful full pass unlocks future incremental scans")
@@ -191,7 +191,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let ran = await runPass(owner: .foreground)
 
         XCTAssertTrue(ran)
-        XCTAssertEqual(catalog.entry(for: "B")?.isRemoved, true, "the vanished asset is marked removed")
+        XCTAssertEqual(try catalog.entry(for: "B")?.isRemoved, true, "the vanished asset is marked removed")
         XCTAssertEqual(resolver.resolveCount(for: "B"), 1, "a removed asset is never re-resolved")
         XCTAssertEqual(uploader.requests.count, 2, "removed assets are never uploaded; deletions are not mirrored")
     }
@@ -206,9 +206,10 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         XCTAssertTrue(ran)
         XCTAssertEqual(
-            catalog.entry(for: "B")?.isRemoved, true, "a PhotoKit deleted identifier is marked removed in the catalog")
-        XCTAssertEqual(catalog.entry(for: "A")?.isRemoved, false)
-        XCTAssertEqual(catalog.entry(for: "C")?.isRemoved, false)
+            try catalog.entry(for: "B")?.isRemoved, true,
+            "a PhotoKit deleted identifier is marked removed in the catalog")
+        XCTAssertEqual(try catalog.entry(for: "A")?.isRemoved, false)
+        XCTAssertEqual(try catalog.entry(for: "C")?.isRemoved, false)
         XCTAssertEqual(uploader.requests.count, 3, "targeted deletion does not upload or re-resolve anything")
     }
 
@@ -247,7 +248,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             store: catalog, enumerator: enumerator, chunkSize: 50, now: { [clock] in clock!.now })
         _ = try await preScan.run(engine: engine, identifiers: nil)
         XCTAssertEqual(uploader.requests.count, 0, "precondition: the interrupted prior pass uploaded nothing")
-        XCTAssertEqual(queue.summary().uploaded, 0, "precondition: A and B are queued, not yet uploaded")
+        XCTAssertEqual(queue.summary()!.uploaded, 0, "precondition: A and B are queued, not yet uploaded")
 
         // Record how many uploads have happened at the instant the next pass begins scanning.
         let uploadsWhenScanStarted = IntBox()
@@ -280,9 +281,10 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             // expected
         }
         XCTAssertFalse(catalog.hasCompletedFullScan(), "an interrupted scan is NOT complete")
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2, "the frontier is persisted so the next run resumes there")
-        XCTAssertEqual(queue.summary().total, 2, "only the two observed assets are queued so far")
-        let epochStart = catalog.fullScanProgress()?.epochStart
+        XCTAssertEqual(
+            try catalog.fullScanProgress()?.cursor, 2, "the frontier is persisted so the next run resumes there")
+        XCTAssertEqual(queue.summary()!.total, 2, "only the two observed assets are queued so far")
+        let epochStart = try catalog.fullScanProgress()?.epochStart
         XCTAssertNotNil(epochStart)
 
         // Run 2 (later wall clock) resumes at the cursor, skips A/B, finishes C/D/E, and completes.
@@ -292,9 +294,9 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         XCTAssertTrue(
             catalog.hasCompletedFullScan(), "reaching the library's end across resumed runs completes the scan")
-        XCTAssertNil(catalog.fullScanProgress(), "a completed epoch clears its resume state")
+        XCTAssertNil(try catalog.fullScanProgress(), "a completed epoch clears its resume state")
         XCTAssertEqual(
-            queue.summary().total, 5, "all five assets are queued exactly once (A/B not re-enqueued on resume)")
+            queue.summary()!.total, 5, "all five assets are queued exactly once (A/B not re-enqueued on resume)")
         XCTAssertEqual(
             catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 5, present: 5, removed: 0),
             "assets observed by the EARLIER run must not be swept as removed when a later run finishes the epoch")
@@ -327,7 +329,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let firstFinished = try await startScanPass(history: history)
         XCTAssertFalse(firstFinished)
         XCTAssertEqual(enumerator.readCount, 2)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2)
 
         enumerator.throwAfter = nil
         enumerator.readCount = 0
@@ -336,9 +338,9 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         XCTAssertTrue(secondFinished)
         XCTAssertEqual(enumerator.readCount, 3, "the resumed scan reads only the photos after the saved position")
         XCTAssertTrue(catalog.hasCompletedFullScan())
-        XCTAssertNil(catalog.fullScanProgress())
+        XCTAssertNil(try catalog.fullScanProgress())
         XCTAssertEqual(catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 5, present: 5, removed: 0))
-        XCTAssertEqual(queue.summary().total, 5)
+        XCTAssertEqual(queue.summary()!.total, 5)
     }
 
     /// A photo added and a photo edited while the first scan was interrupted are queued after the resume.
@@ -347,7 +349,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let history = FakeChangeHistory()
         enumerator.throwAfter = 2
         try await startScanPass(history: history)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2, "A and B were read before the interruption")
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2, "A and B were read before the interruption")
 
         // While the app is closed: a new photo F arrives, and B, which the scan already read, is edited.
         let edited = modDate.addingTimeInterval(3_600)
@@ -362,9 +364,9 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         XCTAssertTrue(finished)
         XCTAssertEqual(enumerator.readCount, 5, "F and B from the change history, then C, D, and E")
-        XCTAssertEqual(catalog.presentEntries(for: ["B"])["B"]?.modificationDate, edited)
+        XCTAssertEqual(catalog.presentEntries(for: ["B"])?["B"]?.modificationDate, edited)
         let editedB = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "B")
-        XCTAssertNotNil(queue.entry(for: editedB, revision: UploadBackupRevision(date: edited)))
+        XCTAssertNotNil(try queue.entry(for: editedB, revision: UploadBackupRevision(date: edited)))
         XCTAssertEqual(catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 6, present: 6, removed: 0))
 
         _ = await runner.runUntilDrained()
@@ -381,7 +383,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let history = FakeChangeHistory()
         enumerator.throwAfter = 2
         try await startScanPass(history: history)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2)
 
         // X, an imported photo with an older capture date, lands before the saved position. A, already read, is deleted.
         enumerator.infos = [
@@ -396,11 +398,11 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         XCTAssertTrue(finished)
         XCTAssertEqual(enumerator.readCount, 4, "X from the change history, then C, D, and E")
-        let present = catalog.presentEntries(for: ["A", "B", "C", "D", "E", "X"])
+        let present = try XCTUnwrap(catalog.presentEntries(for: ["A", "B", "C", "D", "E", "X"]))
         XCTAssertEqual(Set(present.keys), ["B", "C", "D", "E", "X"])
         XCTAssertEqual(catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 6, present: 5, removed: 1))
         let x = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "X")
-        XCTAssertNotNil(queue.entry(for: x, revision: UploadBackupRevision(date: modDate)))
+        XCTAssertNotNil(try queue.entry(for: x, revision: UploadBackupRevision(date: modDate)))
         XCTAssertTrue(catalog.hasCompletedFullScan())
     }
 
@@ -417,8 +419,8 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         enumerator.readCount = 0
         try await startScanPass(history: history)
         XCTAssertEqual(enumerator.readCount, 1, "only the new photo is read")
-        XCTAssertNil(catalog.fullScanProgress(), "no full scan starts")
-        XCTAssertEqual(queue.summary().total, 4)
+        XCTAssertNil(try catalog.fullScanProgress(), "no full scan starts")
+        XCTAssertEqual(queue.summary()!.total, 4)
 
         enumerator.readCount = 0
         try await startScanPass(history: history)
@@ -442,7 +444,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         enumerator.readCount = 0
         let rescanFinished = try await startScanPass(history: history)
         XCTAssertFalse(rescanFinished)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2)
 
         enumerator.throwAfter = nil
         enumerator.readCount = 0
@@ -450,9 +452,9 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         XCTAssertTrue(finished)
         XCTAssertEqual(enumerator.readCount, 3, "the rescan resumes after A and B")
-        XCTAssertNil(catalog.fullScanProgress())
+        XCTAssertNil(try catalog.fullScanProgress())
         XCTAssertEqual(
-            catalog.presentEntries(for: ["E"])["E"]?.modificationDate, edited,
+            catalog.presentEntries(for: ["E"])?["E"]?.modificationDate, edited,
             "the edit that the expired history lost is found by the resumed rescan")
     }
 
@@ -471,7 +473,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         enumerator.throwAfter = 2
         let rescanFinished = try await startScanPass(history: history)
         XCTAssertFalse(rescanFinished)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2)
         XCTAssertFalse(history.prepare().changes.requiresFullRescan, "the rescan stored a newer token")
 
         enumerator.throwAfter = nil
@@ -479,7 +481,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         enumerator.failsSnapshot = true
         let failedFinished = try await startScanPass(history: history)
         XCTAssertFalse(failedFinished)
-        XCTAssertNil(catalog.fullScanProgress(), "the failed snapshot cleared the earlier resume point")
+        XCTAssertNil(try catalog.fullScanProgress(), "the failed snapshot cleared the earlier resume point")
 
         // After a relaunch the live request is gone, and the change history since the token is empty.
         history.relaunch()
@@ -487,7 +489,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let finished = try await startScanPass(history: history)
 
         XCTAssertTrue(finished)
-        XCTAssertNotNil(catalog.presentEntries(for: ["G"])["G"], "the owed scan runs and reads G")
+        XCTAssertNotNil(catalog.presentEntries(for: ["G"])?["G"], "the owed scan runs and reads G")
         XCTAssertTrue(catalog.hasCompletedFullScan())
         _ = await runner.runUntilDrained()
         XCTAssertTrue(uploader.requests.map(\.name).contains("IMG_G.HEIC"))
@@ -510,7 +512,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         defer { survivor.close() }
 
         XCTAssertFalse(survivor.hasCompletedFullScan(), "the rescan is still owed")
-        XCTAssertNotNil(survivor.fullScanProgress(), "the published snapshot survives")
+        XCTAssertNotNil(try survivor.fullScanProgress(), "the published snapshot survives")
         XCTAssertEqual(survivor.fullScanSnapshotCount(), 5)
     }
 
@@ -531,7 +533,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let survivor = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: survivorURL))
         defer { survivor.close() }
         let d = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "D")
-        XCTAssertNotNil(survivor.entry(for: d, revision: UploadBackupRevision(date: modDate)))
+        XCTAssertNotNil(try survivor.entry(for: d, revision: UploadBackupRevision(date: modDate)))
     }
 
     /// A photo added while the first scan was interrupted is queued before the scan resumes. The token moves when the
@@ -553,7 +555,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let survivor = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: survivorURL))
         defer { survivor.close() }
         let f = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "F")
-        XCTAssertNotNil(survivor.entry(for: f, revision: UploadBackupRevision(date: modDate)))
+        XCTAssertNotNil(try survivor.entry(for: f, revision: UploadBackupRevision(date: modDate)))
     }
 
     func testRollbackJournalStoresAdvanceTheFullScanAndIncrementalTokens() async throws {
@@ -590,7 +592,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         try await startScanPass(history: history)
         XCTAssertTrue(history.prepare().changes.changedIdentifiers.isEmpty, "the incremental token moves too")
         XCTAssertNotNil(
-            queue.entry(
+            try queue.entry(
                 for: .init(kind: .photoLibraryAsset, identifier: "B"),
                 revision: UploadBackupRevision(date: modDate)))
     }
@@ -627,7 +629,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         try await startScanPass(history: history)
         XCTAssertEqual(history.prepare().changes.changedIdentifiers, ["F", "G"], "the token stays before F and G")
         let g = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "G")
-        XCTAssertNotNil(queue.entry(for: g, revision: UploadBackupRevision(date: modDate)))
+        XCTAssertNotNil(try queue.entry(for: g, revision: UploadBackupRevision(date: modDate)))
 
         // Once the queue checkpoint succeeds, the next pass moves the token.
         reader.map(closePinnedReader)
@@ -663,19 +665,20 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
                 survivingQueue.close()
             }
             // The store reads at least one identifier, so a scan position of zero reads none here.
-            let cursor = survivingCatalog.fullScanProgress()?.cursor ?? 0
+            let cursor = try survivingCatalog.fullScanProgress()?.cursor ?? 0
             var identifiers = Set(
-                cursor > 0 ? survivingCatalog.fullScanSnapshotIdentifiers(startingAt: 0, limit: cursor) : [])
+                cursor > 0
+                    ? try XCTUnwrap(survivingCatalog.fullScanSnapshotIdentifiers(startingAt: 0, limit: cursor)) : [])
             var after: String?
             while true {
-                let page = survivingCatalog.presentEntries(afterLocalIdentifier: after, limit: 500)
-                guard let last = page.last else { break }
-                identifiers.formUnion(page.map(\.localIdentifier))
-                after = last.localIdentifier
+                let page = try XCTUnwrap(survivingCatalog.presentEntries(afterLocalIdentifier: after, limit: 500))
+                guard let last = page.lastLocalIdentifier else { break }
+                identifiers.formUnion(page.entries.map(\.localIdentifier))
+                after = last
             }
             largestCatalog = max(largestCatalog, identifiers.count)
-            let withoutQueueRow = identifiers.filter {
-                survivingQueue.entry(
+            let withoutQueueRow = try identifiers.filter {
+                try survivingQueue.entry(
                     for: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: $0),
                     revision: UploadBackupRevision(date: modDate)) == nil
             }
@@ -780,16 +783,16 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         }
         try await startScanPass(history: history)
         XCTAssertTrue(catalog.hasCompletedFullScan())
-        XCTAssertNil(catalog.presentEntries(for: ["Z"])["Z"], "Z is not in the snapshot of this scan")
+        XCTAssertNil(try XCTUnwrap(catalog.presentEntries(for: ["Z"]))["Z"], "Z is not in the snapshot of this scan")
 
         enumerator.afterIdentifierSnapshot = nil
         enumerator.readCount = 0
         try await startScanPass(history: history)
 
         XCTAssertEqual(enumerator.readCount, 1, "only Z is read")
-        XCTAssertNotNil(catalog.presentEntries(for: ["Z"])["Z"])
+        XCTAssertNotNil(try XCTUnwrap(catalog.presentEntries(for: ["Z"]))["Z"])
         let z = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "Z")
-        XCTAssertNotNil(queue.entry(for: z, revision: UploadBackupRevision(date: modDate)))
+        XCTAssertNotNil(try queue.entry(for: z, revision: UploadBackupRevision(date: modDate)))
     }
 
     /// A photo taken/edited while a pass is already running must land in the durable queue and be
@@ -864,7 +867,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         XCTAssertEqual(
             resolver.resolveCount(for: "A"), resolveCountA,
             "already-backed A is not re-uploaded (dedup preflight intact)")
-        XCTAssertEqual(queue.summary().uploaded, 3)
+        XCTAssertEqual(queue.summary()!.uploaded, 3)
     }
 
     /// While the scan runs, the drain loop waits for queue writes instead of polling. A photo enqueued after the
@@ -896,11 +899,11 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let scanStillRuns = await !scanDone.isDone()
         XCTAssertTrue(scanStillRuns, "C uploads while the scan still runs")
         // A cancel while the upload is in flight returns the row to the queue; wait until the queue shows it as uploaded.
-        try await waitForCondition { queue.summary().uploaded == 1 }
+        try await waitForCondition { queue.summary()!.uploaded == 1 }
         await scanDone.markDone()
         reconcile.cancel()
         _ = await reconcile.value
-        XCTAssertEqual(queue.summary().uploaded, 1)
+        XCTAssertEqual(queue.summary()!.uploaded, 1)
     }
 
     /// A retry date that passes during a long scan wakes the drain at that date; no queue write happens.
@@ -1105,7 +1108,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         try await engine.enqueue(candidate)
 
         // A must still be `completed` (terminal success), not `discovered`.
-        let entry = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+        let entry = try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
         XCTAssertNotNil(entry, "the queue row exists")
         XCTAssertEqual(entry?.state, .completed, "a terminal row is never regressed by a concurrent upsert")
 
@@ -1113,7 +1116,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let uploadsBefore = uploader.requests.count
         _ = await runner.runUntilDrained()
         XCTAssertEqual(uploader.requests.count, uploadsBefore, "a regressed row would cause a duplicate upload")
-        XCTAssertEqual(queue.summary().uploaded, 1, "still exactly one uploaded")
+        XCTAssertEqual(queue.summary()!.uploaded, 1, "still exactly one uploaded")
     }
 
     /// Directly prove the state guard protects the active phase too: claim a row into `checking`
@@ -1129,16 +1132,16 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "A")
         let revision = UploadBackupRevision(date: modDate)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .discovered)
 
         // Claim A to state flips to `checking` (atomically, begin immediate). Note: `claimRunnable`
         // returns the entries in their PRE-claim state (the select runs before the update); the
         // authoritative post-claim state is read back via `entry(for:)` below.
-        let claimed = queue.claimRunnable(limit: 16, claimedAt: clock.now)
+        let claimed = try XCTUnwrap(queue.claimRunnable(limit: 16, claimedAt: clock.now))
         XCTAssertEqual(claimed.count, 1)
         XCTAssertEqual(claimed.first?.state, .discovered, "returned entry reflects pre-claim state")
         XCTAssertEqual(
-            queue.entry(for: source, revision: revision)?.state, .checking,
+            try queue.entry(for: source, revision: revision)?.state, .checking,
             "claimRunnable atomically flipped discovered → checking in the DB")
 
         // now the concurrent targeted enqueue arrives: it sees A as `.newAsset` (nothing in the
@@ -1153,11 +1156,11 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         // A must still be `checking`; the upsert was a no-op on state because checking is protected.
         XCTAssertEqual(
-            queue.entry(for: source, revision: revision)?.state, .checking,
+            try queue.entry(for: source, revision: revision)?.state, .checking,
             "an upsert must never regress an in-flight checking row back to discovered")
 
         // A second claimRunnable must find zero runnable rows (A is still checking, not discovered).
-        let reclaimed = queue.claimRunnable(limit: 16, claimedAt: clock.now)
+        let reclaimed = try XCTUnwrap(queue.claimRunnable(limit: 16, claimedAt: clock.now))
         XCTAssertEqual(
             reclaimed.count, 0,
             "the guarded row is not reclaimable; no double-claim or double-upload path remains")

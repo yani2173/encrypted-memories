@@ -15,7 +15,7 @@ import os
 @MainActor
 public final class AppleSmartSearchBackgroundCoordinator {
     public static let shared = AppleSmartSearchBackgroundCoordinator()
-    public static let processingTaskIdentifier = "at.oncloud.encryptedmemories.smart-search.processing"
+    nonisolated public static let processingTaskIdentifier = "at.oncloud.encryptedmemories.smart-search.processing"
 
     private let reference = WeakAsyncReference<MLSmartSearchLifecycle>()
     private let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "SmartSearchBackground")
@@ -29,6 +29,16 @@ public final class AppleSmartSearchBackgroundCoordinator {
         private var windows: Set<UUID> = []
         private var processing: [UUID: Task<Void, Never>] = [:]
         private var transitionTask: Task<Void, Never>?
+        private lazy var submitter = BackgroundTaskRequestSubmitter(
+            cancelRequest: {
+                BGTaskScheduler.shared.cancel(
+                    taskRequestWithIdentifier: AppleSmartSearchBackgroundCoordinator.processingTaskIdentifier)
+            },
+            onErrorAfterCancel: { [logger] error in
+                logger.error(
+                    "Smart Search background submission failed after a cancel: \(error.localizedDescription, privacy: .public)"
+                )
+            })
     #elseif os(macOS)
         private var activityScheduler: NSBackgroundActivityScheduler?
         private var activityGeneration = UUID()
@@ -116,7 +126,7 @@ public final class AppleSmartSearchBackgroundCoordinator {
 
     private func cancelScheduling() {
         #if os(iOS)
-            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.processingTaskIdentifier)
+            submitter.cancel()
         #elseif os(macOS)
             activityScheduler?.invalidate()
             activityScheduler = nil
@@ -127,14 +137,20 @@ public final class AppleSmartSearchBackgroundCoordinator {
     private func schedule() {
         guard !schedulingStopped else { return }
         #if os(iOS)
-            let request = BGProcessingTaskRequest(identifier: Self.processingTaskIdentifier)
-            request.requiresExternalPower = true
-            request.requiresNetworkConnectivity = false
-            request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
-            do { try BGTaskScheduler.shared.submit(request) } catch {
-                logger.error(
-                    "Smart Search background submission failed: \(error.localizedDescription, privacy: .public)")
-            }
+            // The date counts from this call, not from the moment the request reaches the scheduler.
+            let earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+            submitter.submit(
+                blocking: {
+                    try BGTaskScheduler.shared.submit(Self.processingRequest(earliestBeginDate: earliestBeginDate))
+                },
+                offMainThread: Self.offMainSubmission(earliestBeginDate: earliestBeginDate),
+                completion: { [logger] error in
+                    BackgroundWorkLog.system.requestSubmitted(
+                        .smartSearch, earliestBegin: earliestBeginDate, errorCode: error.map { ($0 as NSError).code })
+                    guard let error else { return }
+                    logger.error(
+                        "Smart Search background submission failed: \(error.localizedDescription, privacy: .public)")
+                })
         #elseif os(macOS)
             guard activityScheduler == nil else { return }
             let scheduler = NSBackgroundActivityScheduler(identifier: Self.processingTaskIdentifier)
@@ -170,6 +186,55 @@ public final class AppleSmartSearchBackgroundCoordinator {
     }
 
     #if os(iOS)
+        nonisolated static func processingRequest(earliestBeginDate: Date) -> BGProcessingTaskRequest {
+            let request = BGProcessingTaskRequest(identifier: processingTaskIdentifier)
+            request.requiresExternalPower = true
+            request.requiresNetworkConnectivity = false
+            request.earliestBeginDate = earliestBeginDate
+            return request
+        }
+
+        /// The iOS 27 call, which must not run on the main thread; nil before iOS 27.
+        nonisolated static func offMainSubmission(earliestBeginDate: Date) -> (@Sendable () async throws -> Void)? {
+            guard #available(iOS 27.0, *) else { return nil }
+            return {
+                try await BGTaskScheduler.shared.submitTaskRequest(
+                    processingRequest(earliestBeginDate: earliestBeginDate))
+            }
+        }
+
+        /// The end once the wait for the requests returned. The ledger records an expiry that came during the wait; the
+        /// success stays the one read at the end of the work, so a finished pass is not reported as failed only because
+        /// the window expired while it waited for the scheduler.
+        nonisolated static func windowEndAfterWait(
+            _ workEnd: (outcome: BackgroundWindowOutcome, reportsSuccess: Bool), didExpire: Bool
+        ) -> (outcome: BackgroundWindowOutcome, reportsSuccess: Bool?) {
+            (workEnd.outcome.afterTheEndWait(didExpire: didExpire), workEnd.reportsSuccess)
+        }
+
+        /// Reads the cancel first, then the expiry. The expiration handler marks the expiry before it cancels, so a cancel
+        /// that the read sees always comes with a seen expiry when the expiry caused it.
+        nonisolated static func endSnapshot(
+            isCancelled: () -> Bool, didExpire: () -> Bool
+        ) -> (didExpire: Bool, wasCancelled: Bool) {
+            let wasCancelled = isCancelled()
+            return (didExpire(), wasCancelled)
+        }
+
+        /// How a Smart Search window ends: its outcome, and the success that the OS hears. `result` is nil when no
+        /// catch-up ran: such a window failed, unless it expired. That includes a window that arrives after `stop()`.
+        /// The success is the one the OS heard before windows were recorded: false without a catch-up, else true
+        /// exactly when the catch-up was neither cancelled nor stopped, even when the window expired meanwhile.
+        nonisolated static func windowEnd(
+            result: MLBackgroundProcessingResult?, didExpire: Bool, wasCancelled: Bool
+        ) -> (outcome: BackgroundWindowOutcome, reportsSuccess: Bool) {
+            guard let result else { return (didExpire ? .expired : .failed, false) }
+            let completed = !wasCancelled && result != .cancelled
+            let outcome = BackgroundWindowOutcome.afterWork(didExpire: didExpire, didComplete: completed)
+            // A deferred pass could not index now. The OS hears success, as before.
+            return (outcome == .ran && result == .deferred ? .notNeeded : outcome, completed)
+        }
+
         /// Serialize lifecycle transitions. Each queued transition reads the latest opportunity,
         /// so an expired background task cannot disable a newly foregrounded app.
         private func reconcileExecution() -> Task<Void, Never> {
@@ -185,9 +250,28 @@ public final class AppleSmartSearchBackgroundCoordinator {
         }
 
         private func handle(_ task: BGProcessingTask) {
+            let completion = BackgroundWindowCompletion(kind: .smartSearch) { task.setTaskCompleted(success: $0) }
+            // Every end waits, bounded, until the requests of this window reached the scheduler: before iOS 27 they went
+            // out at once.
+            let pendingRequests: @Sendable () async -> Void = { [submitter] in
+                await submitter.pendingSubmissionsEnded()
+            }
             guard !schedulingStopped else {
-                task.setTaskCompleted(success: false)
+                let end = Self.windowEnd(result: nil, didExpire: false, wasCancelled: false)
+                Task {
+                    await completion.finish(end.outcome, reportsSuccess: end.reportsSuccess, after: pendingRequests)
+                }
                 return
+            }
+            // One read of the cancel and the expiry at the end of the work gives the outcome and the success. After
+            // the wait, only the recorded outcome takes a later expiry into account.
+            func finish(_ result: MLBackgroundProcessingResult?) async {
+                let snapshot = Self.endSnapshot(isCancelled: { Task.isCancelled }, didExpire: { completion.didExpire })
+                let workEnd = Self.windowEnd(
+                    result: result, didExpire: snapshot.didExpire, wasCancelled: snapshot.wasCancelled)
+                await completion.finish(after: pendingRequests) {
+                    Self.windowEndAfterWait(workEnd, didExpire: completion.didExpire)
+                }
             }
             // A cold, locked launch may not restore when-unlocked credentials. Preserve the
             // security policy and retry later; never start a second login/session bootstrap.
@@ -196,14 +280,25 @@ public final class AppleSmartSearchBackgroundCoordinator {
             let operation = Task { [weak self] in
                 defer { task.expirationHandler = nil }
                 guard let self else {
-                    task.setTaskCompleted(success: false)
+                    await finish(nil)
                     return
                 }
-                guard let lifecycle = await self.reference.whenReady(timeout: .seconds(30)),
-                    !Task.isCancelled, self.reference.value === lifecycle
-                else {
+                // A launch without a scene has not started the account yet; an operation that the window's end
+                // cancelled before it ran starts nothing and ends below.
+                let waitStart = ContinuousClock.now
+                BackgroundLaunchAccountStart.shared.ensureStarted(unlessCancelled: Task.isCancelled)
+                let wait = await BackgroundAccountReadiness.shared.wait(for: self.reference, timeout: .seconds(30))
+                BackgroundWorkLog.system.accountWait(.smartSearch, wait, waited: .now - waitStart)
+                if case .cannotRun = wait {
+                    // The reads of the saved sign-in show that no account can come in this window.
                     self.processing.removeValue(forKey: id)
-                    task.setTaskCompleted(success: false)
+                    await completion.finish(
+                        wait.outcomeWithoutService(didExpire: completion.didExpire), after: pendingRequests)
+                    return
+                }
+                guard case .ready(let lifecycle) = wait, !Task.isCancelled, self.reference.value === lifecycle else {
+                    self.processing.removeValue(forKey: id)
+                    await finish(nil)
                     return
                 }
                 self.windows.insert(id)
@@ -216,10 +311,14 @@ public final class AppleSmartSearchBackgroundCoordinator {
                 await self.reconcileExecution().value
                 if !self.isForeground { await lifecycle.releaseMemory() }
                 self.processing.removeValue(forKey: id)
-                task.setTaskCompleted(success: !Task.isCancelled && result != .cancelled)
+                await finish(result)
             }
             processing[id] = operation
-            task.expirationHandler = { operation.cancel() }
+            task.expirationHandler = {
+                BackgroundWorkLog.system.expirationReceived(.smartSearch)
+                completion.markExpired()
+                operation.cancel()
+            }
         }
     #endif
 }

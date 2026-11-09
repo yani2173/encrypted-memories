@@ -18,6 +18,22 @@ final class ViewerTitleFormatterTests: XCTestCase {
         XCTAssertEqual(s, "4.454 von 35.666")  // 1-based index, German grouping + "von"
     }
 
+    /// In the folded layout the details show the date, the time and the place; the title keeps only the position.
+    func testFoldedDetailsLeaveOnlyThePositionInTheTitle() {
+        let folded = ViewerTitleFormatter.make(
+            captureDate: date("2026-06-17T16:53:58Z"), index: 0, total: 3, locationName: "Hallstatt",
+            detailsShowDateAndPlace: true, locale: english)
+        XCTAssertEqual(folded, ViewerTitle(line1: "1 of 3", line2: ""))
+        let resolving = ViewerTitleFormatter.make(
+            captureDate: date("2026-06-17T16:53:58Z"), index: 0, total: 3, locationIsResolving: true,
+            detailsShowDateAndPlace: true, locale: english)
+        XCTAssertEqual(resolving, ViewerTitle(line1: "1 of 3", line2: ""))
+        // Without the folded details the title keeps the place and the date.
+        let flat = ViewerTitleFormatter.make(
+            captureDate: date("2026-06-17T16:53:58Z"), index: 0, total: 3, locationName: "Hallstatt", locale: english)
+        XCTAssertEqual(flat.line1, "Hallstatt")
+    }
+
     func testPositionStringEnglishConnector() {
         let s = ViewerTitleFormatter.positionString(index: 0, total: 22884, locale: english)
         XCTAssertEqual(s, "1 of 22,884")

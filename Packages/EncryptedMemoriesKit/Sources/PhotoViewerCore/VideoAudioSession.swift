@@ -1,7 +1,7 @@
 #if os(iOS)
     import AVFoundation
 
-    /// A video plays its sound also when the Ring/Silent switch is set to silent, as in Photos, and the volume
+    /// A video plays its sound also when the Ring/Silent switch is set to silent, and the volume
     /// buttons control it. Only a playing video takes the audio session. When the last video player goes away, the
     /// default category returns, so browsing and Live Photos follow the switch again.
     @MainActor

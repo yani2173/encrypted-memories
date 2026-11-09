@@ -27,6 +27,14 @@ public final class AlbumSyncController {
         var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
         var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
         var localSource: any AlbumSyncLocalAlbumSource = PhotoKitAlbumSource()
+        var backupExecutorOverride: (any AlbumSyncBackupExecuting)? = nil
+        var recoveryCatalog: @Sendable (String) -> any UploadBackupAssetCatalog = {
+            PhotoLibraryBackupCatalog(localIdentifiers: [$0])
+        }
+        var recoveryResourceResolver: (any BackupResourceResolving)?
+        var bulkActionPause: @MainActor (TimeInterval) async throws -> Void = {
+            try await Task.sleep(for: .seconds($0))
+        }
 
         public init(accountDataDirectory: URL, databasePolicy: LibraryDatabasePolicy) {
             self.accountDataDirectory = accountDataDirectory
@@ -132,8 +140,22 @@ public final class AlbumSyncController {
     /// The ids currently in the persisted selection (for pre-checking the picker).
     public var selectedAlbumIDs: Set<String> { Set(selectedAlbums.map(\.id)) }
 
+    private let remoteOps: any AlbumSyncRemoteAlbumOps
+    private let identityResolver: (any UploadIdentityResolving)?
+    private let recoveryCatalog: @Sendable (String) -> any UploadBackupAssetCatalog
+    private let recoveryResourceResolver: any BackupResourceResolving
+    private var recoveryTask: Task<AlbumSyncPhotoRecovery.Result, any Error>?
+    private var recoveryContextTask: Task<AlbumSyncPhotoRecovery.Context?, any Error>?
+    private var recoveryGeneration = UUID()
+    private var recoveryContexts: [String: AlbumSyncPhotoRecovery.Context] = [:]
+    private struct FinishedProblems {
+        let id = UUID()
+        let items: [BackupFailedItem]
+    }
+    private var finishedProblems: [String: FinishedProblems] = [:]
+    public private(set) var problemListRevision = UUID()
     private let runner: AlbumSyncRunner?
-    private let backupExecutor: PhotoAlbumBackupExecutor?
+    private let backupExecutor: (any AlbumSyncBackupExecuting)?
     private let remoteLinkLookup: (any AlbumSyncRemoteLinkLookup)?
     private let localSource: any AlbumSyncLocalAlbumSource
     private let mappingStore: AlbumSyncMappingStore?
@@ -163,8 +185,19 @@ public final class AlbumSyncController {
         configuration: Configuration,
         identityResolver: (any UploadIdentityResolving)?,
         uploader: any PhotoUploading,
-        remoteOps: any AlbumSyncRemoteAlbumOps
+        remoteOps: any AlbumSyncRemoteAlbumOps,
+        tagAdder: (any PhotoTagAdding)? = nil
     ) {
+        self.remoteOps = remoteOps
+        self.identityResolver = identityResolver
+        bulkPhotoActions = BulkPhotoActionRunner(sleep: configuration.bulkActionPause)
+        recoveryCatalog = configuration.recoveryCatalog
+        let recoveryTempStore = BackupTempFileStore(
+            directory: configuration.accountDataDirectory.appendingPathComponent("album-sync-restore-temp"))
+        recoveryTempStore.sweep()
+        recoveryResourceResolver =
+            configuration.recoveryResourceResolver
+            ?? PhotoLibraryResourceResolver(tempStore: recoveryTempStore)
         currentAccessState = configuration.currentAccessState
         changeSleep = configuration.changeSleep
         localSource = configuration.localSource
@@ -186,12 +219,15 @@ public final class AlbumSyncController {
         remoteLinkLookup = lookup
 
         if let mappingStore, let lookup, let identityResolver {
-            let executor = PhotoAlbumBackupExecutor(
-                accountDataDirectory: directory,
-                databasePolicy: configuration.databasePolicy,
-                identityResolver: identityResolver,
-                uploader: uploader
-            )
+            let executor =
+                configuration.backupExecutorOverride
+                ?? PhotoAlbumBackupExecutor(
+                    accountDataDirectory: directory,
+                    databasePolicy: configuration.databasePolicy,
+                    identityResolver: identityResolver,
+                    uploader: uploader,
+                    tagAdder: tagAdder
+                )
             backupExecutor = executor
             runner = AlbumSyncRunner(
                 localSource: localSource,
@@ -246,15 +282,12 @@ public final class AlbumSyncController {
         startObservingChangesIfNeeded()
     }
 
-    public func refreshAccessState() {
-        accessState = currentAccessState()
-    }
-
     // MARK: - Selection
 
     /// Applies the picker result: `ids` becomes the new selection. Removed albums keep their
     /// Proton mapping (re-selecting reuses the same remote album); nothing remote is touched.
     public func applySelection(_ ids: Set<String>) {
+        invalidateRecovery()
         guard let mappingStore, mappingStore.isOperational() else {
             reportMappingStoreUnavailable()
             return
@@ -280,6 +313,9 @@ public final class AlbumSyncController {
                 reportMappingStoreUnavailable()
                 break
             }
+            recoveryContexts[removed] = nil
+            finishedProblems[removed] = nil
+            problemListRevision = UUID()
             openConflicts[removed] = nil
         }
         reloadSelection()
@@ -288,10 +324,14 @@ public final class AlbumSyncController {
 
     /// The row's ✕: stop syncing this album. Keeps the mapping - never touches Proton.
     public func removeFromSelection(_ albumID: String) {
+        invalidateRecovery()
+        recoveryContexts[albumID] = nil
         guard mappingStore?.removeSelection(localAlbumID: albumID) == true else {
             reportMappingStoreUnavailable()
             return
         }
+        finishedProblems[albumID] = nil
+        problemListRevision = UUID()
         openConflicts[albumID] = nil
         queuedAlbumIDs.removeAll { $0 == albumID }
         if pendingConflict?.album.id == albumID { pendingConflict = nil }
@@ -353,19 +393,273 @@ public final class AlbumSyncController {
         )
     }
 
+    /// The full finished run stays in this session; after relaunch only the saved cache is available.
+    public func problemListItems(albumID: String) -> [BackupFailedItem] {
+        guard selectedAlbumIDs.contains(albumID) else { return [] }
+        return finishedProblems[albumID]?.items ?? lastRunStore.items(albumID: albumID)
+    }
+
+    public func problemSnapshot(albumID: String) async -> BackupProblemSnapshot? {
+        guard !isShuttingDown, selectedAlbumIDs.contains(albumID) else { return nil }
+        let revision = problemListRevision
+        let items = problemListItems(albumID: albumID)
+        let snapshot = await Task.detached(priority: .utility) {
+            BackupProblemSnapshot.album(items: items)
+        }.value
+        guard !isShuttingDown, selectedAlbumIDs.contains(albumID), revision == problemListRevision else { return nil }
+        return snapshot
+    }
+
+    public func makeProblemListSession(albumID: String) -> BackupProblemListSession {
+        BackupProblemListSession(
+            fixedActionMessage: { [weak self] in
+                guard let self, !isShuttingDown, selectedAlbumIDs.contains(albumID),
+                    lastMessage == L10n.string("albumsync.error_restore_photo")
+                else { return nil }
+                return lastMessage
+            }, read: { [weak self] in await self?.problemSnapshot(albumID: albumID) })
+    }
+
+    /// This finished-run token does not change when later work is stopped.
+    public func problemListID(albumID: String) -> UUID? {
+        finishedProblems[albumID]?.id
+    }
+
+    /// Native Restore controls can announce their disabled state before a tap.
+    public func canRestorePhotos(albumID: String) -> Bool {
+        !isShuttingDown && !isSyncing && recoveryTask == nil && !isBulkRestoring
+            && selectedAlbumIDs.contains(albumID) && recoveryContexts[albumID] != nil
+    }
+
+    /// Explicitly restores one exact photo through the current finished-run membership and context.
+    public func restorePhoto(_ item: BackupFailedItem, albumID: String) async throws -> AlbumSyncPhotoRecovery.Result {
+        guard !isBulkRestoring else { throw AlbumSyncPhotoRecovery.Error.unavailable }
+        return try await restoreAdmittedPhoto(item, albumID: albumID)
+    }
+
+    /// The single exact restore path; a running bulk restore calls it for each confirmed row.
+    private func restoreAdmittedPhoto(
+        _ item: BackupFailedItem, albumID: String
+    ) async throws -> AlbumSyncPhotoRecovery.Result {
+        try Task.checkCancellation()
+        guard recoveryTask == nil, !isSyncing, !isShuttingDown,
+            let context = recoveryContexts[albumID]
+        else { throw AlbumSyncPhotoRecovery.Error.unavailable }
+        let generation = recoveryGeneration
+        let task = Task {
+            try await self.performRestore(item, albumID: albumID, generation: generation, context: context)
+        }
+        recoveryTask = task
+        defer {
+            recoveryTask = nil
+            startBatchIfIdle()
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// The album problem list restores the existing copy, then uses the normal sync to add it to the album.
+    public func restorePhotoFromProblemList(_ item: BackupFailedItem, albumID: String) async {
+        do {
+            _ = try await restorePhoto(item, albumID: albumID)
+            syncNow(albumID: albumID)
+        } catch {
+            guard !UploadError.isCancellation(error) else { return }
+            setMessage(L10n.string("albumsync.error_restore_photo"))
+        }
+    }
+
+    // MARK: - Bulk restore
+
+    public let bulkPhotoActions: BulkPhotoActionRunner
+    /// The confirmation that prepareRestore made and the finished run it covers; each run has its own id.
+    private var bulkRestoreConsent: (problemListID: UUID, confirmationID: UUID)?
+    /// From start to settlement no album sync starts, also between photos of the run.
+    private var isBulkRestoring = false
+    private var bulkRestoreStopped = false
+    private var bulkRestoreRestored = 0
+    /// The album whose run or result the shared runner holds; only that album's list shows them.
+    public private(set) var bulkRestoreAlbumID: String?
+    private var bulkRestoreTask: Task<Void, Never>?
+
+    public func isBulkRestoreAvailable(albumID: String) -> Bool {
+        canRestorePhotos(albumID: albumID)
+    }
+
+    /// Consent covers every deleted row of the finished run, beyond the loaded page. No row changes here.
+    public func prepareRestore(albumID: String) async -> BulkPhotoActionRunner.Confirmation? {
+        guard isBulkRestoreAvailable(albumID: albumID), let finished = finishedProblems[albumID] else { return nil }
+        let deleted = finished.items.filter { $0.issue == .remoteDeletion }
+        guard let confirmation = bulkPhotoActions.prepare(deleted, action: .restore) else { return nil }
+        bulkRestoreConsent = (finished.id, confirmation.id)
+        return confirmation
+    }
+
+    /// Call only from the visible confirmation. Each row uses the existing exact restore; a refused row stays.
+    @discardableResult
+    public func startRestore(_ confirmation: BulkPhotoActionRunner.Confirmation, albumID: String) -> Bool {
+        // Only the confirmation that prepareRestore made (always .restore), for the album's current run, can start.
+        guard let consent = bulkRestoreConsent,
+            consent.confirmationID == confirmation.id, finishedProblems[albumID]?.id == consent.problemListID,
+            isBulkRestoreAvailable(albumID: albumID)
+        else { return false }
+        let generation = recoveryGeneration
+        guard
+            bulkPhotoActions.start(
+                confirmation,
+                perform: { [weak self] item in
+                    guard let self else { return false }
+                    // Stop, selection changes and a new finished run invalidate recovery; the run ends there.
+                    guard recoveryGeneration == generation else {
+                        bulkPhotoActions.cancel()
+                        return false
+                    }
+                    do {
+                        _ = try await restoreAdmittedPhoto(item, albumID: albumID)
+                        bulkRestoreRestored += 1
+                        return true
+                    } catch {
+                        return false
+                    }
+                })
+        else { return false }
+        isBulkRestoring = true
+        bulkRestoreStopped = false
+        bulkRestoreRestored = 0
+        bulkRestoreAlbumID = albumID
+        bulkRestoreTask = Task { [weak self, bulkPhotoActions] in
+            await bulkPhotoActions.waitUntilFinished()
+            guard let self else { return }
+            isBulkRestoring = false
+            bulkRestoreConsent = nil
+            bulkRestoreTask = nil
+            guard !isShuttingDown else { return }
+            // The normal album sync adds restored copies once; after Stop the next sync reconciles them.
+            if !bulkRestoreStopped, bulkRestoreRestored > 0 {
+                syncNow(albumID: albumID)
+            } else {
+                startBatchIfIdle()
+            }
+        }
+        return true
+    }
+
+    func waitUntilBulkRestoreSettled() async { await bulkRestoreTask?.value }
+
+    private func invalidateRecovery() {
+        recoveryGeneration = UUID()
+        recoveryTask?.cancel()
+    }
+
+    private func captureRecoveryContext() async throws -> AlbumSyncPhotoRecovery.Context? {
+        let task = Task { [remoteOps] in try await remoteOps.photoRecoveryContext() }
+        recoveryContextTask = task
+        defer { recoveryContextTask = nil }
+        let context: AlbumSyncPhotoRecovery.Context?
+        do {
+            context = try await task.value
+        } catch {
+            if UploadError.isCancellation(error) {
+                if stopState.isRequested || isShuttingDown { throw AlbumSyncError.stopped }
+                throw error
+            }
+            context = nil
+        }
+        if stopState.isRequested || isShuttingDown { throw AlbumSyncError.stopped }
+        try Task.checkCancellation()
+        if task.isCancelled { throw CancellationError() }
+        return context
+    }
+
+    private func validateRecovery(_ item: BackupFailedItem, albumID: String, generation: UUID) async throws {
+        try requireRecoveryAdmission(item, albumID: albumID, generation: generation)
+        guard let source = item.source,
+            case .present(let identifiers) = try await localSource.albumContents(albumID: albumID),
+            identifiers.contains(source.identifier)
+        else { throw AlbumSyncPhotoRecovery.Error.unavailable }
+        try requireRecoveryAdmission(item, albumID: albumID, generation: generation)
+    }
+
+    private func requireRecoveryAdmission(_ item: BackupFailedItem, albumID: String, generation: UUID) throws {
+        try Task.checkCancellation()
+        guard !isShuttingDown, !isSyncing, generation == recoveryGeneration,
+            currentAccessState().allowsBackup, mappingStore?.isOperational() == true,
+            selectedAlbumIDs.contains(albumID), item.issue == .remoteDeletion,
+            let source = item.source, source.kind == .photoLibraryAsset, source.resource == .primary,
+            finishedProblems[albumID]?.items.contains(item) == true
+        else { throw AlbumSyncPhotoRecovery.Error.unavailable }
+    }
+
+    private func performRestore(
+        _ item: BackupFailedItem, albumID: String, generation: UUID, context: AlbumSyncPhotoRecovery.Context
+    ) async throws -> AlbumSyncPhotoRecovery.Result {
+        try await validateRecovery(item, albumID: albumID, generation: generation)
+        guard let source = item.source, let identityResolver,
+            let record = await identityResolver.identityRecord(for: source)
+        else { throw AlbumSyncPhotoRecovery.Error.unavailable }
+        try await validateRecovery(item, albumID: albumID, generation: generation)
+        let catalog = recoveryCatalog(source.identifier)
+        let candidate = try await AlbumSyncPhotoRecovery.candidate(for: source, catalog: catalog)
+        try await validateRecovery(item, albumID: albumID, generation: generation)
+        if let revision = item.revision, revision != candidate.snapshot.revision {
+            throw AlbumSyncPhotoRecovery.Error.unavailable
+        }
+        let entry = UploadBackupSyncQueueEntry(
+            source: source, revision: candidate.snapshot.revision, originalFilename: candidate.originalFilename,
+            byteCount: candidate.byteCount, updatedAt: Date())
+        guard let prepared = try await recoveryResourceResolver.resolve(entry) else {
+            throw AlbumSyncPhotoRecovery.Error.unavailable
+        }
+        defer { prepared.cleanup?() }
+        guard AlbumSyncPhotoRecovery.sameVersion(candidate.snapshot, prepared.candidate.snapshot) else {
+            throw AlbumSyncPhotoRecovery.Error.unavailable
+        }
+        return try await AlbumSyncPhotoRecovery.restore(
+            record: record, descriptor: prepared.descriptor, remote: remoteOps, expectedContext: context
+        ) { [self] in
+            try await validateRecovery(item, albumID: albumID, generation: generation)
+            let current = try await AlbumSyncPhotoRecovery.candidate(for: source, catalog: catalog)
+            guard current == candidate, await identityResolver.identityRecord(for: source) == record else {
+                throw AlbumSyncPhotoRecovery.Error.unavailable
+            }
+            try await validateRecovery(item, albumID: albumID, generation: generation)
+        }
+    }
+
     public func stopSync() {
+        if isBulkRestoring {
+            bulkRestoreStopped = true
+            bulkPhotoActions.cancel()
+        }
+        invalidateRecovery()
+        recoveryContextTask?.cancel()
         stopState.stopPressed(isSyncing: isSyncing, queuedAlbums: queuedAlbumIDs.count)
         queuedAlbumIDs.removeAll()
         changeDebounceTask?.cancel()
         changeDebounceTask = nil
         changePendingDuringSync = false
         guard let runner else { return }
-        Task { await runner.stop() }
+        let contextRead = recoveryContextTask
+        Task {
+            await runner.stop()
+            _ = await contextRead?.result
+        }
     }
 
     /// Ordered sign-out boundary for the album mapping database and any per-run backup stores.
     public func shutdown() async {
         isShuttingDown = true
+        finishedProblems.removeAll()
+        problemListRevision = UUID()
+        invalidateRecovery()
+        recoveryContextTask?.cancel()
+        let activeRecovery = recoveryTask
+        let bulkRestore = bulkRestoreTask
+        await bulkPhotoActions.shutdown()
+        await bulkRestore?.value
         changeSubscription?.cancel()
         changeSubscription = nil
         isObservingChanges = false
@@ -378,6 +672,7 @@ public final class AlbumSyncController {
         await runner?.stop()
         await backupExecutor?.stop()
         await activeSync?.value
+        _ = await activeRecovery?.result
         await remoteLinkLookup?.shutdown()
         mappingStore?.close()
         onRemoteAlbumsChanged = nil
@@ -395,7 +690,8 @@ public final class AlbumSyncController {
     }
 
     private func startBatchIfIdle() {
-        guard !isShuttingDown, let runner, !isSyncing, !queuedAlbumIDs.isEmpty else { return }
+        guard !isShuttingDown, let runner, !isSyncing, recoveryTask == nil, !isBulkRestoring, !queuedAlbumIDs.isEmpty
+        else { return }
         isSyncing = true
         remoteAlbumsChangedDuringBatch = false
         stopState.batchStarted()
@@ -404,8 +700,11 @@ public final class AlbumSyncController {
         syncTask = Task { [weak self] in
             while let album = self?.dequeueNextAlbum() {
                 do {
+                    let generation = self?.recoveryGeneration
+                    let recoveryContext = try await self?.captureRecoveryContext()
                     let report = try await runner.sync(album: album, resolution: .automatic)
-                    self?.recordFinishedRun(report.problems, albumID: album.id)
+                    let currentContext = generation == self?.recoveryGeneration ? recoveryContext : nil
+                    self?.recordFinishedRun(report.problems, albumID: album.id, recoveryContext: currentContext)
                     self?.remoteAlbumsChangedDuringBatch = true
                     self?.showStopResult(after: .finished(report))
                 } catch let error as AlbumSyncError {
@@ -582,9 +881,22 @@ public final class AlbumSyncController {
     /// Only a finished run replaces the list; a stopped or failed run keeps the previous one. The runner has stored
     /// the new count before it reports the end of the run, so the row reloads only after the list is stored: it never
     /// combines the new count with the previous run's list.
-    func recordFinishedRun(_ problems: [BackupFailedItem], albumID: String) {
+    func recordFinishedRun(
+        _ problems: [BackupFailedItem], albumID: String,
+        recoveryContext: AlbumSyncPhotoRecovery.Context? = nil
+    ) {
+        guard !isShuttingDown else { return }
+        invalidateRecovery()
+        if selectedAlbumIDs.contains(albumID) {
+            recoveryContexts[albumID] = recoveryContext
+            finishedProblems[albumID] = FinishedProblems(items: problems)
+        } else {
+            recoveryContexts[albumID] = nil
+            finishedProblems[albumID] = nil
+        }
         lastRunStore.record(problems, albumID: albumID)
         reloadSelection()
+        problemListRevision = UUID()
     }
 
     private func reportMappingStoreUnavailable() {
@@ -596,7 +908,7 @@ public final class AlbumSyncController {
         /// UI-test account. It uses the real mapping store and last-run file, without PhotoKit or a network.
         public func installNotInAlbumFixtureForTesting(albumID: String, title: String) -> Bool {
             guard let mappingStore, mappingStore.isOperational() else { return false }
-            let items = AlbumSyncProblemList.items(
+            var items = AlbumSyncProblemList.items(
                 missingIdentifiers: ["fixture-network"],
                 attachFailedIdentifiers: ["fixture-attach"],
                 backup: AlbumSyncBackupReport(
@@ -607,6 +919,13 @@ public final class AlbumSyncController {
                             reason: L10n.string("backup.issue_network"), isPermanent: false, issue: .network)
                     ],
                     filenames: ["fixture-attach": "attach fixture.heic"]))
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncRestoreFixture") {
+                items = AlbumSyncProblemList.items(
+                    missingIdentifiers: [], attachFailedIdentifiers: [], trashedIdentifiers: ["fixture-trashed"],
+                    backup: AlbumSyncBackupReport(
+                        total: 1, backedUp: 0, failed: 0, sourceMissing: 0, skippedRemoteDeletion: 1,
+                        filenames: ["fixture-trashed": "trashed fixture.heic"]))
+            }
             let now = Date()
             guard
                 mappingStore.addSelection(AlbumSyncSelection(localAlbumID: albumID, title: title, addedAt: now)),
@@ -619,6 +938,12 @@ public final class AlbumSyncController {
             // Keep the fixture independent of PhotoKit authorization on the simulator.
             accessState = .denied
             reloadSelection()
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncBulkRestoreFixture") {
+                // A finished run with a session context offers Restore All; denied access keeps every row.
+                recordFinishedRun(
+                    items, albumID: albumID,
+                    recoveryContext: .init(sessionID: UUID(), volumeID: "fixture-volume", hashKeyEpoch: "fixture"))
+            }
             return true
         }
     #endif

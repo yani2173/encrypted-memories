@@ -189,12 +189,7 @@ struct BurstFilmstripView: NSViewRepresentable {
 private final class BurstThumbnailItem: NSCollectionViewItem {
     static let reuseID = NSUserInterfaceItemIdentifier("BurstThumbnailItem")
 
-    private var loadTask: Task<Void, Never>?
-    private var representedUID: PhotoUID?
-    private var visibleThumbnail: VisibleThumbnailSession?
-
-    // A released item must not leave its load running; cancelling it ends a Duplicates read access.
-    deinit { loadTask?.cancel() }
+    private lazy var loader = FilmstripThumbnailLoader<NSImage> { [weak self] in self?.cellView?.image = $0 }
 
     override func loadView() {
         view = BurstThumbnailCellView(frame: NSRect(x: 0, y: 0, width: 72, height: 72))
@@ -202,65 +197,41 @@ private final class BurstThumbnailItem: NSCollectionViewItem {
 
     override func prepareForReuse() {
         super.prepareForReuse()
-        cancelThumbnailLoad()
-        representedUID = nil
-        cellView?.image = nil
+        loader.reset()
         cellView?.selected = false
     }
 
     func configure(
         photo: PhotoItem, selected: Bool, itemSide: CGFloat, feed: ThumbnailFeed, allowsVisibleDuplicateThumbnails: Bool
     ) {
-        cancelThumbnailLoad()
-        representedUID = photo.uid
         view.frame.size = NSSize(width: itemSide, height: itemSide)
         cellView?.selected = selected
         // A Duplicates copy may lie outside the library, so it reads only while on screen (`loadVisibleThumbnail`).
-        guard !allowsVisibleDuplicateThumbnails else {
-            visibleThumbnail = VisibleThumbnailSession(feed: feed.feedCore)
-            cellView?.image = nil
-            return
-        }
-        visibleThumbnail = nil
-        cellView?.image = feed.memoryImage(for: photo.uid)
-        guard cellView?.image == nil else { return }
-        loadTask = Task {
-            let image = await feed.image(for: photo.uid)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                guard self.representedUID == photo.uid else { return }
-                self.cellView?.image = image
-            }
-        }
-    }
-
-    func loadVisibleThumbnail() {
-        guard let visibleThumbnail, let uid = representedUID else { return }
-        loadTask?.cancel()
-        visibleThumbnail.select(uid)
-        cellView?.image = visibleThumbnail.memoryImage(for: uid)
-        guard cellView?.image == nil else { return }
-        loadTask = Task { [weak self] in
-            let image = await visibleThumbnail.visibleImage(for: uid)
-            guard !Task.isCancelled, let self, self.representedUID == uid else { return }
-            self.cellView?.image = image
+        if allowsVisibleDuplicateThumbnails {
+            let session = VisibleThumbnailSession(feed: feed.feedCore)
+            loader.configure(
+                uid: photo.uid,
+                source: .duplicatesCopy(
+                    FilmstripVisibleReads(
+                        select: { session.select($0) },
+                        memoryImage: { session.memoryImage(for: $0) },
+                        image: { await session.visibleImage(for: $0) })))
+        } else {
+            loader.configure(
+                uid: photo.uid,
+                source: .library(
+                    memoryImage: { feed.memoryImage(for: $0) },
+                    image: { await feed.image(for: $0) }))
         }
     }
 
-    /// Revokes the read access of a Duplicates copy that left the screen.
-    func endVisibleThumbnail() {
-        guard visibleThumbnail != nil else { return }
-        cancelThumbnailLoad()
-        cellView?.image = nil
-    }
+    func loadVisibleThumbnail() { loader.loadVisible() }
 
-    func cancelThumbnailLoad() {
-        visibleThumbnail?.end()
-        loadTask?.cancel()
-        loadTask = nil
-    }
+    func endVisibleThumbnail() { loader.endVisible() }
 
-    var uid: PhotoUID? { representedUID }
+    func cancelThumbnailLoad() { loader.cancel() }
+
+    var uid: PhotoUID? { loader.uid }
 
     func setSelected(_ selected: Bool) {
         cellView?.selected = selected

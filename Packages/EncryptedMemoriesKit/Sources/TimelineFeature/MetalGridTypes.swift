@@ -4,10 +4,10 @@ import GridCore
 
 // MARK: - Metal grid shared value types
 //
-// Per-frame render accounting and HUD state for the Metal-backed photo grid. The scroll host owns
+// Per-frame render accounting for the Metal-backed photo grid. The scroll host owns
 // physics, and the viewport-sized MTKView draws visible items through the texture cache.
 
-/// Per-frame render accounting for the `[MetalGrid]` diagnostics block + the in-lab HUD overlay.
+/// Per-frame render accounting for the `[MetalGridPerf]` diagnostics block.
 struct MetalGridStats: Equatable, Sendable {
     var visibleItems = 0
     var overscanItems = 0
@@ -126,27 +126,6 @@ struct MetalGridStats: Equatable, Sendable {
         stats.gpuMs = gpuMs
         return stats
     }
-}
-
-/// Texture-cache diagnostics (the `[MetalGridCache]` block).
-struct MetalGridCacheStats: Equatable, Sendable {
-    var textureCount = 0
-    var pinnedVisible = 0
-    var lruSize = 0
-    var uploadQueueDepth = 0
-
-    var summary: String {
-        "textureCount=\(textureCount) pinnedVisible=\(pinnedVisible) lruSize=\(lruSize) uploadQueueDepth=\(uploadQueueDepth)"
-    }
-}
-
-/// Everything the SwiftUI HUD overlay mirrors each (throttled) update.
-struct MetalGridHUD: Equatable, Sendable {
-    var stats = MetalGridStats()
-    var cache = MetalGridCacheStats()
-    var level = 2
-    var totalItems = 0
-    var dataSource = "-"  // "real" / "synthetic"
 }
 
 typealias MetalGridBudget = GridTextureBudget

@@ -165,9 +165,6 @@ struct MainView: View {
         self.backend = facade.backend
         self.uploadCoordinator = facade.uploadCoordinator
         _albumActions = State(initialValue: AlbumActionCoordinator(repository: facade.albums))
-        // Learned thumbnail dimensions persist into the library metadata DB (photos.w/h) through the
-        // backend bridge - batched by the coalescer, so decode callbacks never touch the DB directly.
-        let dimensions = PhotoDimensionCoalescer(store: backend)
         // Use the SHARED, account-configured cache (AppModel.prepareBackend calls
         // OfflineLibraryManager.shared.configure(session:) before this view is built) so the encrypted
         // disk cache uses the durable per-account session-derived key and survives relaunch. A fresh
@@ -175,8 +172,7 @@ struct MainView: View {
         // every launch.
         let feed = ThumbnailFeed(
             cache: OfflineLibraryManager.shared.cache,
-            loader: facade.librarySources,
-            dimensions: dimensions
+            loader: facade.librarySources
         )
         self.feed = feed
         self.temporalCoverImageLoader = TimelineTemporalCoverImageLoader(
@@ -212,10 +208,12 @@ struct MainView: View {
                         albums: albums,
                         isLoadingAlbums: albumActions.showsAlbumLoadingPlaceholder,
                         albumCatalogFailed: albumCatalogFailed,
+                        albumLoadFailure: albumActions.loadFailure,
                         sharedAlbums: albumActions.sharedAlbums,
                         sharedAlbumPresentation: albumActions.presentation(for:),
                         isLoadingSharedAlbums: albumActions.showsSharedAlbumLoadingPlaceholder,
                         sharedAlbumCatalogFailed: albumActions.sharedLoadErrorMessage != nil,
+                        sharedAlbumLoadFailure: albumActions.sharedLoadFailure,
                         canLeaveSharedAlbum: albumActions.canLeaveSharedAlbum,
                         canCreateAlbum: albumActions.canCreate,
                         canAddPhotos: albumActions.canAddPhotos && !albumActions.isWorking,
@@ -342,13 +340,13 @@ struct MainView: View {
             .task { await uploadCoordinator.start() }
             .task { await startLibraryChangeMonitor() }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesUploadPhotos)) { notification in
-                performUploadUIAction("uploadPhotos", trigger: uploadTrigger(from: notification))
+                performUploadUIAction(.uploadPhotos, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesUploadFolder)) { notification in
-                performUploadUIAction("uploadFolder", trigger: uploadTrigger(from: notification))
+                performUploadUIAction(.uploadFolder, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesShowUploadQueue)) { notification in
-                performUploadUIAction("showQueue", trigger: uploadTrigger(from: notification))
+                performUploadUIAction(.showQueue, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesNewAlbum)) { _ in
                 presentCreateAlbum()
@@ -362,6 +360,9 @@ struct MainView: View {
             }
             .onChange(of: model.photoBackupController?.uploadedLibraryMutationRevision) { _, _ in
                 scheduleLibraryRefreshAfterBackupUpload()
+            }
+            .onChange(of: model.photoBackupController?.isSyncing ?? false) { wasRunning, isRunning in
+                if wasRunning && !isRunning { libraryRefresh.backupPassDidEnd() }
             }
             .sheet(isPresented: $uploadCoordinator.isDestinationSheetPresented) {
                 UploadDestinationSheet(coordinator: uploadCoordinator)
@@ -715,7 +716,10 @@ struct MainView: View {
             onClearRecentSearches: clearSearchHistory
         )
         .onSubmit(of: .search) { recordSearchHistory(searchText) }
-        .onChange(of: searchScope) { _, scope in semanticQuery?.setScope(scope) }
+        .onChange(of: searchScope) { _, scope in
+            semanticQuery?.setScope(scope)
+            recommitSuggestionTitle()
+        }
         // Keep the native Liquid Glass toolbar. The real insets keep grid and viewer geometry aligned.
         .environment(\.gridLeadingEventInset, leadingObstructionInset)
         .environment(\.gridTopBarInset, topBarInset)
@@ -725,12 +729,12 @@ struct MainView: View {
     /// Native upload menu for the system toolbar.
     private var uploadToolbarMenu: some View {
         Menu {
-            Button("menu.upload_photos") { performUploadUIAction("uploadPhotos", trigger: .toolbar) }
+            Button("menu.upload_photos") { performUploadUIAction(.uploadPhotos, trigger: .toolbar) }
                 .disabled(!uploadCoordinator.uploadCapabilities.canUpload)
-            Button("menu.upload_folder") { performUploadUIAction("uploadFolder", trigger: .toolbar) }
+            Button("menu.upload_folder") { performUploadUIAction(.uploadFolder, trigger: .toolbar) }
                 .disabled(!uploadCoordinator.uploadCapabilities.canUpload)
             Divider()
-            Button("menu.show_uploads") { performUploadUIAction("showQueue", trigger: .toolbar) }
+            Button("menu.show_uploads") { performUploadUIAction(.showQueue, trigger: .toolbar) }
         } label: {
             Label("toolbar.upload", systemImage: "tray.and.arrow.up")
         }
@@ -1089,14 +1093,24 @@ struct MainView: View {
             streamer: media, metadataProvider: media,
             albumMembershipProvider: facade.albums,
             placeNameResolver: NativePlaceNameResolver.shared,
-            knownLocationUIDs: Set(offline.locationIndex.coordinates.map(\.uid)),
+            hasKnownLocation: offline.locationIndex.hasKnownLocation,
             burstProvider: backend,
             previewCache: offline.previewCache,
             originalsCache: offline.originalsCache,
             cacheOriginals: offline.offlineEnabled,
             originalsCapBytes: offline.originalsCapBytes,
             allowsVisibleDuplicateThumbnails: allowsVisibleDuplicateThumbnails,
-            editedOriginalProvider: backend as? any EditedPhotoOriginalProviding)
+            editedOriginalProvider: backend as? any EditedPhotoOriginalProviding,
+            editedPhotoReverter: facade.editedPhotoReverter,
+            mutationAction: viewerMutationAction,
+            onReverted: { main in
+                // The edited photo moved to the Trash: it leaves the grid and the Duplicates screen at once, and the
+                // refresh brings the restored original, a new library photo, into the grid.
+                await timelineModel.commitTrash([main])
+                if mapClusterPresentation != nil { await mapClusterModel.commitTrash([main]) }
+                duplicates?.didTrashElsewhere([main.uid])
+                refreshLibraryManually()
+            })
     }
 
     /// Shows local photos on their way to Proton in the whole-library grid.
@@ -1173,21 +1187,15 @@ struct MainView: View {
         )
     }
 
-    /// Aspect-fit rect of `image` centred in `size` - the photo's fullscreen frame.
-    private func fitRect(_ image: NSImage, in size: CGSize) -> CGRect {
-        let ia = image.size.width / max(image.size.height, 1)
-        let ra = size.width / max(size.height, 1)
-        var w = size.width
-        var h = size.height
-        if ia > ra { h = w / ia } else { w = h * ia }
-        return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
-    }
-
-    /// Aspect-fit rect of `image` centred within an arbitrary `rect` (used to fit inside the media region
-    /// below the top bar, not the whole window).
+    /// Aspect-fit rect of `image` centred within `rect` (used to fit inside the media region below the top bar, not
+    /// the whole window).
     private func fitRect(_ image: NSImage, in rect: CGRect) -> CGRect {
-        let fitted = fitRect(image, in: rect.size)
-        return fitted.offsetBy(dx: rect.minX, dy: rect.minY)
+        let ia = image.size.width / max(image.size.height, 1)
+        let ra = rect.width / max(rect.height, 1)
+        var w = rect.width
+        var h = rect.height
+        if ia > ra { h = w / ia } else { w = h * ia }
+        return CGRect(x: rect.minX + (rect.width - w) / 2, y: rect.minY + (rect.height - h) / 2, width: w, height: h)
     }
 
     // MARK: - Chrome
@@ -1265,7 +1273,7 @@ struct MainView: View {
         case .album(_, let name): return name
         case .sharedAlbum(_, _, let name): return name
         case .trash: return String(localized: "sidebar.recently_deleted")
-        case .map: return "Map"
+        case .map: return String(localized: "sidebar.map")
         case .duplicates: return L10n.string("duplicates.title")
         }
     }
@@ -1446,17 +1454,15 @@ struct MainView: View {
 
     // MARK: - Upload
 
-    private func performUploadUIAction(_ action: String, trigger: UploadUITrigger) {
-        logUploadUI(action: action, trigger: trigger)
+    private func performUploadUIAction(_ action: UploadUIAction, trigger: UploadUITrigger) {
+        DebugLog.log("[UploadUI] action=\(action.rawValue) trigger=\(trigger.rawValue)")
         switch action {
-        case "uploadPhotos":
+        case .uploadPhotos:
             presentUploadPhotos()
-        case "uploadFolder":
+        case .uploadFolder:
             presentUploadFolder()
-        case "showQueue":
+        case .showQueue:
             uploadCoordinator.isQueueVisible = true
-        default:
-            break
         }
     }
 
@@ -1494,6 +1500,11 @@ struct MainView: View {
         libraryRefresh.scheduleUploadRefresh(event, host: refreshHost)
     }
 
+    /// A Merge All changes the library token many times; the change monitor then waits and refreshes once afterwards.
+    @MainActor private func isMergingDuplicates() -> Bool {
+        duplicates?.isMerging == true
+    }
+
     private func startLibraryChangeMonitor() async {
         // Coalesce with the timeline view's startup task, then seed monitoring with the token observed by the
         // shared cache validator. Starting earlier would consume a mutation during launch as a fresh baseline.
@@ -1508,6 +1519,7 @@ struct MainView: View {
         await libraryChangeMonitor.start(
             provider: provider,
             initialToken: timelineModel.initialLibraryChangeToken,
+            holdRefresh: { await isMergingDuplicates() },
             onTerminal: { [model] _ in
                 await model.recoverBackendAfterScopeAccessLoss()
             },
@@ -1516,16 +1528,12 @@ struct MainView: View {
     }
 
     private func scheduleLibraryRefreshAfterBackupUpload() {
-        libraryRefresh.scheduleBackupUploadRefresh(host: refreshHost)
+        libraryRefresh.scheduleBackupUploadRefresh(
+            host: refreshHost, passIsRunning: model.photoBackupController?.isSyncing ?? false)
     }
 
     private func refreshLibraryManually() {
         libraryRefresh.refreshManually(host: refreshHost)
-    }
-
-    private func logUploadUI(action: String, trigger: UploadUITrigger) {
-        let line = "[UploadUI] action=\(action) trigger=\(trigger.rawValue)"
-        DebugLog.log(line)
     }
 
     /// Honest Map empty state, mirroring the iOS states and the standard macOS library empty surface.
@@ -1593,8 +1601,9 @@ struct MainView: View {
                 try await facade.albums.setAlbumCover(albumID: albumID, photoUID: uid)
                 await loadAlbums()
             } catch {
-                albumCoverFailureMessage = String(
-                    localized: "albums.cover_failed_message \(error.localizedDescription)")
+                albumCoverFailureMessage = LibraryActionFailureMessage.message(
+                    for: error, action: .albumCover, specificAlbumReason: albumCoverSpecificReason(error),
+                    underlyingError: (error as? AlbumError)?.underlyingCause, text: libraryActionFailureText)
             }
         }
     }
@@ -1784,6 +1793,7 @@ struct MainView: View {
         let items = items.filter { !$0.uid.isLocalPending }
         let uids = items.map(\.uid)
         isTrashMutating = true
+        let restoredPendingGrid = model.pendingGrid
         // The account configuration this restore belongs to; a later sign-in rejects its location clean-up.
         let locationOwner = OfflineLibraryManager.shared.captureLocationOwner()
         Task {
@@ -1803,7 +1813,7 @@ struct MainView: View {
             }
             do {
                 try await backend.restore(uids)
-                await model.pendingGrid?.photosRestored(uids)
+                let pendingRestore = await restoredPendingGrid?.restoreSources(ofRemote: uids)
                 await timelineModel.commitRestore(items)
                 await OfflineLibraryManager.shared.reconcileLocations(
                     items: timelineModel.wholeLibraryItemsForLocations,
@@ -1812,6 +1822,9 @@ struct MainView: View {
                     recrawlRestoredItems: true
                 )
                 await reloadFavorites()
+                if pendingRestore?.isReadable == false {
+                    trashActionFailureMessage = String(localized: "alert.restore_failed_message")
+                }
                 selectionMode = false
                 selectedUIDs = []
                 if closeViewer { closePhoto() }
@@ -1844,7 +1857,8 @@ struct MainView: View {
                 selectedUIDs = []
                 selectionMode = false
             } catch {
-                trashActionFailureMessage = L10n.string("trash.empty_failed_message")
+                trashActionFailureMessage = L10n.string(
+                    dynamicKey: RecentlyDeletedEmptying.failureMessageKey(for: error))
             }
         }
     }
@@ -1869,7 +1883,7 @@ struct MainView: View {
         }
         clearPendingSuggestionText()
         switch searchDiscovery.commitDecision(
-            for: value, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot)
+            for: value, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot, scope: searchScope)
         {
         case .structured(let suggestion):
             commitSuggestion(suggestion, text: value)
@@ -1906,6 +1920,19 @@ struct MainView: View {
         searchDebounceTask = nil
     }
 
+    /// A suggestion's result set answers only the Smart Search scope. When the scope changes while the field shows
+    /// a suggestion title, the title is committed again: another scope searches it as text, and Smart Search returns
+    /// to the suggestion. Typed text needs nothing here; the semantic coordinator reruns it in the new scope.
+    private func recommitSuggestionTitle() {
+        let decision = searchDiscovery.commitDecision(
+            for: searchText, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot, scope: searchScope)
+        guard activeCommittedSuggestion != nil || decision != .text else { return }
+        // The scope change reran the title as text; a title that a suggestion owns must not run as a Smart Search
+        // query while that suggestion is deferred.
+        if decision != .text { semanticQuery?.clear() }
+        scheduleSearchCommit(searchText)
+    }
+
     private func clearPendingSuggestionText() {
         pendingSuggestionDeadlineTask?.cancel()
         pendingSuggestionDeadlineTask = nil
@@ -1918,7 +1945,7 @@ struct MainView: View {
     private func resolvePendingSuggestionText(force: Bool = false) {
         guard let pending = pendingSuggestionText else { return }
         let decision = searchDiscovery.commitDecision(
-            for: pending, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot)
+            for: pending, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot, scope: searchScope)
         if case .deferUntilRefresh = decision, !force { return }
         clearPendingSuggestionText()
         guard pending == searchText else { return }
@@ -2583,9 +2610,13 @@ struct MainView: View {
                 exportFailureMessage = result.message
                 if !result.saved.isEmpty { refreshLibraryManually() }
             } catch {
-                DebugLog.log("save to library failed: \(error)")
-                exportFailureTitle = L10n.string("library.save_to_library_failed")
-                exportFailureMessage = error.localizedDescription
+                if let message = LibraryActionFailureMessage.message(
+                    for: error, action: .saveToLibrary, text: libraryActionFailureText)
+                {
+                    DebugLog.log("save to library failed: \(error)")
+                    exportFailureTitle = L10n.string("library.save_to_library_failed")
+                    exportFailureMessage = message
+                }
             }
         }
     }
@@ -2672,41 +2703,33 @@ struct MainView: View {
         for sourceItems: [PhotoItem],
         preferredSeriesNameSource: PhotoItem?
     ) async -> ExportRequest {
-        var expanded: [PhotoItem] = []
-        var seen = Set<PhotoUID>()
-        var expandedSingleSeries = false
+        let result = await BurstExportExpansion.expand(
+            sourceItems: sourceItems,
+            preferredSeriesNameSource: preferredSeriesNameSource,
+            burstGroupReader: { try await backend.burstGroup(containing: $0) }
+        )
 
-        func appendUnique(_ item: PhotoItem) {
-            guard seen.insert(item.uid).inserted else { return }
-            expanded.append(item)
-        }
-
-        let memberIDSet = Set(
-            (preferredSeriesNameSource?.burstMemberIDs ?? []).map {
-                PhotoUID(volumeID: preferredSeriesNameSource?.uid.volumeID ?? "", nodeID: $0)
-            })
-        let sourceUIDSet = Set(sourceItems.map(\.uid))
-        let alreadyExpandedPreferredSeries =
-            sourceItems.count > 1
-            && preferredSeriesNameSource?.isBurstCandidate == true
-            && !memberIDSet.isEmpty
-            && sourceUIDSet.isSubset(of: memberIDSet)
-
-        if alreadyExpandedPreferredSeries {
-            sourceItems.forEach(appendUnique)
-            expandedSingleSeries = true
-        } else {
-            for item in sourceItems {
-                if item.isBurstCandidate,
-                    let group = try? await backend.burstGroup(containing: item.uid),
-                    group.count > 1
-                {
-                    group.forEach(appendUnique)
-                    expandedSingleSeries = true
-                } else {
-                    appendUnique(item)
-                }
-            }
+        let expanded: [PhotoItem]
+        let expandedSingleSeries: Bool
+        switch result {
+        case .success(let items, let singleSeries):
+            expanded = items
+            expandedSingleSeries = singleSeries
+        case .burstLoading:
+            // Only the viewer's decision reports a burst that is still loading; `expand`
+            // awaits every group read. Nothing failed, so the export does not start.
+            return ExportRequest(items: [], zipSuggestedName: nil)
+        case .cancelled:
+            // A cancelled read (for example during sign-out) is quiet, like a cancelled
+            // transfer in `performExport`: both use `LibraryActionFailureMessage`.
+            return ExportRequest(items: [], zipSuggestedName: nil)
+        case .burstReadFailed(let failedSources):
+            // Reading the burst group failed, so nothing is exported; presenting only the tapped
+            // photo as a successful export would silently lose the rest of the series.
+            DebugLog.log("burst group read failed during export: \(failedSources.count) source(s)")
+            exportFailureTitle = String(localized: "export.failed_title")
+            exportFailureMessage = String(localized: "export.burst_load_failed")
+            return ExportRequest(items: [], zipSuggestedName: nil)
         }
 
         let zipName: String?
@@ -2791,15 +2814,35 @@ struct MainView: View {
                     items: items, to: dest, provider: backend, onProgress: onProgress)
             }
             NSWorkspace.shared.activateFileViewerSelecting([dest])
-        } catch is CancellationError {
-            // User cancelled from the ring popover; the worker's `defer` already discarded any partial output.
-        } catch OriginalExportWriter.Failure.lowDisk {
-            exportFailureTitle = String(localized: "export.low_disk_title")
-            exportFailureMessage = String(localized: "export.low_disk_message")
         } catch {
-            DebugLog.log("export failed: \(error)")
-            exportFailureTitle = String(localized: "export.failed_title")
-            exportFailureMessage = String(localized: "export.failed_message \(error.localizedDescription)")
+            if let message = LibraryActionFailureMessage.message(
+                for: error, action: .export, text: libraryActionFailureText)
+            {
+                let title = LibraryActionFailureMessage.exportTitle(for: error)
+                if title != .lowDiskTitle { DebugLog.log("export failed: \(error)") }
+                exportFailureTitle = libraryActionFailureText(title)
+                exportFailureMessage = message
+            }
+        }
+    }
+
+    private func albumCoverSpecificReason(_ error: any Error) -> String? {
+        guard let albumError = error as? AlbumError else { return nil }
+        switch albumError {
+        case .unsupported, .sharedAlbumReadOnly, .albumCreatedButPhotosNotAdded, .partialAdd, .partialAddWithCauses:
+            return albumError.errorDescription
+        case .backend, .requestFailed:
+            return nil
+        }
+    }
+
+    private func libraryActionFailureText(_ text: LibraryActionFailureMessage.Text) -> String {
+        switch text {
+        case .albumCover: String(localized: "albums.cover_failed_generic")
+        case .export: String(localized: "export.failed_generic")
+        case .lowDisk: String(localized: "export.low_disk_message")
+        case .exportTitle: String(localized: "export.failed_title")
+        case .lowDiskTitle: String(localized: "export.low_disk_title")
         }
     }
 

@@ -4,6 +4,7 @@ import json
 import re
 import plistlib
 from pathlib import Path
+import shutil
 import sys
 import subprocess
 import tempfile
@@ -970,11 +971,40 @@ else:
                 tree.extractall(root, filter='data')
             self.assertFalse((root / sources / 'PhotosCore/UpgradeTestProbe.swift').exists())
             apply_overlay(root, repo, 'v1.0.5', sha)
+            pinned = repo / 'scripts/upgrade-test/overlays/v1.0.5.payload'
             for relative in PAYLOAD:
                 with self.subTest(file=relative):
-                    self.assertEqual((root / sources / relative).read_bytes(), (repo / sources / relative).read_bytes())
+                    expected = pinned / relative if (pinned / relative).is_file() else repo / sources / relative
+                    self.assertEqual((root / sources / relative).read_bytes(), expected.read_bytes())
+            # v1.0.5 has no UploadNetworkReservation; the candidate's backend stub since #711 needs it,
+            # so v1.0.5 must receive the pinned stub from before #711.
+            backend = 'ProtonDriveBackend/UpgradeTestBackend.swift'
+            self.assertTrue((pinned / backend).is_file())
+            self.assertNotEqual((root / sources / backend).read_bytes(), (repo / sources / backend).read_bytes())
             metal = (root / sources / 'MetalRenderingCore/Metal3RuntimeCapability.swift').read_text()
             self.assertIn('#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)', metal)
+
+    def test_a_pinned_test_entry_file_must_belong_to_a_release_without_its_own_entry(self):
+        repo = Path(__file__).resolve().parents[2]
+        sources = Path('Packages/EncryptedMemoriesKit/Sources')
+        with tempfile.TemporaryDirectory() as directory:
+            root, automation = Path(directory) / 'source', Path(directory) / 'automation'
+            shutil.copytree(repo / 'scripts/upgrade-test/overlays', automation / 'scripts/upgrade-test/overlays')
+            (root / sources / 'PhotosCore').mkdir(parents=True)
+            (root / sources / 'PhotosCore/UpgradeTestProbe.swift').touch()
+            pinned = automation / 'scripts/upgrade-test/overlays/v1.1.0-beta.3.payload'
+            (pinned / 'ProtonDriveBackend').mkdir(parents=True)
+            (pinned / 'ProtonDriveBackend/UpgradeTestBackend.swift').touch()
+            with self.assertRaisesRegex(JourneyError, 'has its own test entry'):
+                apply_overlay(root, automation, 'v1.1.0-beta.3', 'a' * 40)
+            (root / sources / 'PhotosCore/UpgradeTestProbe.swift').unlink()
+            shutil.rmtree(pinned)
+            pinned = automation / 'scripts/upgrade-test/overlays/v1.0.5.payload'
+            shutil.rmtree(pinned)
+            (pinned / 'ProtonDriveBackend').mkdir(parents=True)
+            (pinned / 'ProtonDriveBackend/UpgradeTestBackendTypo.swift').touch()
+            with self.assertRaisesRegex(JourneyError, 'outside the test-entry payload'):
+                apply_overlay(root, automation, 'v1.0.5', 'a' * 40)
 
     def test_a_rebuilt_product_replaces_its_restored_copy(self):
         # Release run 38171860265 saved the macOS candidate product. A later gate restored it without its source,

@@ -232,6 +232,9 @@ public protocol MLDerivedPipelineStore: Sendable {
         in key: MLPipelineExecutionKey,
         limit: Int
     ) -> [MLDerivedSearchHit]
+    /// Returns `true` when at least one committed token row exists for the key's artifacts under the
+    /// account. An unreadable store returns `false`, so callers treat an unknown index as empty.
+    func hasIndexedEntries(for key: MLPipelineExecutionKey) -> Bool
     /// Removes artifacts for assets that are no longer present in the authoritative library
     /// inventory. Call only after a complete inventory pass so a partial crawl cannot erase data.
     @discardableResult
@@ -530,6 +533,17 @@ public final class InMemoryMLDerivedPipelineStore: MLDerivedPipelineStore, @unch
             .sorted { Self.uidOrder($0.uid, $1.uid) }
             .prefix(limit)
             .map { $0 }
+        }
+    }
+
+    public func hasIndexedEntries(for key: MLPipelineExecutionKey) -> Bool {
+        lock.withLock {
+            records.contains { storedKey, record in
+                storedKey.accountIdentifier == key.accountIdentifier
+                    && key.artifacts.contains(record.artifact)
+                    && record.state == .completed
+                    && !(record.output?.normalizedSearchTokens.isEmpty ?? true)
+            }
         }
     }
 

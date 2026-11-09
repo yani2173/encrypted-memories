@@ -46,6 +46,8 @@ PRIORITY_LABELS = {
     "P2": ("fbca04", "Normal: important bug with limited impact or a practical workaround"),
     "P3": ("cfd3d7", "Low: minor defect, polish issue, or low-impact bug"),
 }
+# Earlier runs named the label "priority:<value>"; a rerun must still recognise it.
+LEGACY_PRIORITY_PREFIX = "priority:"
 
 STOP_WORDS = {
     "about", "after", "again", "also", "and", "app", "before", "bug", "but", "can", "could",
@@ -219,7 +221,7 @@ def llm_payload(
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "duplicate_issue_number": {"type": "integer", "minimum": 0},
             "reason": {"type": "string", "maxLength": 300},
-            "priority": {"type": "string", "enum": [*PRIORITY_LABELS, "NONE"]},
+            "priority": {"type": "string", "enum": [*PRIORITY_LABELS]},
             "priority_reason": {"type": "string", "maxLength": 300},
             "actionability": {"type": "string", "enum": sorted(ACTIONABILITY_VALUES)},
             "actionability_reason": {"type": "string", "maxLength": 300},
@@ -271,12 +273,17 @@ def llm_payload(
                     "Then compare the issue with the listed candidates. Mark a duplicate only when both issues "
                     "describe the same observable problem or the same requested outcome. Similar areas, platforms, "
                     "or keywords are not enough. Prefer false negatives over false positives. Select only a listed "
-                    "candidate number. Use 0 when there is no duplicate. Assign P0 through P3 only when the new issue "
-                    "kind is bug. Use NONE for every feature or other issue. For bugs, use this strict rubric: "
-                    "P0 only for credible data loss or corruption, security or privacy risk, or a broad outage of "
-                    "launch, sign-in, or another core function without a safe workaround; P1 for a major regression "
-                    "or blocked core workflow without a practical workaround; P2 for an important but limited bug "
-                    "with a workaround; P3 for a minor, polish, or low-impact bug. Before responding, internally "
+                    "candidate number. Use 0 when there is no duplicate. Assign exactly one priority from P0 "
+                    "through P3 to every issue, whatever its kind. Never answer NONE. For a bug, use this strict "
+                    "rubric: P0 only for credible data loss or corruption, security or privacy risk, or a broad "
+                    "outage of launch, sign-in, or another core function without a safe workaround; P1 for a major "
+                    "regression or blocked core workflow without a practical workaround; P2 for an important but "
+                    "limited bug with a workaround; P3 for a minor, polish, or low-impact bug. For a feature or "
+                    "other issue (improvement, test or tooling work, idea), use this rubric: P0 only for credible "
+                    "data loss or corruption, security or privacy risk, or a broad outage; P1 only for work that a "
+                    "release cannot ship without; P2 for a normal feature or improvement; P3 for minor polish, a "
+                    "test or tooling nicety, an optimization without a visible problem, or an idea. "
+                    "Before responding, internally "
                     "verify the complete response against the schema, candidate allowlist, and priority rules. "
                     "Return only the requested JSON object."
                 ),
@@ -326,7 +333,7 @@ def parse_decision(content: str, candidate_numbers: set[int]) -> dict[str, Any]:
         raise RuntimeError("LLM API returned an invalid candidate number")
     if not isinstance(reason, str):
         raise RuntimeError("LLM API returned an invalid reason")
-    if not isinstance(priority, str) or priority not in {*PRIORITY_LABELS, "NONE"}:
+    if not isinstance(priority, str) or priority not in PRIORITY_LABELS:
         raise RuntimeError("LLM API returned an invalid priority")
     if not isinstance(priority_reason, str):
         raise RuntimeError("LLM API returned an invalid priority reason")
@@ -374,11 +381,9 @@ def is_bug_issue(issue: dict[str, Any]) -> bool:
     return "bug" in labels or title.startswith("[bug]") or title.startswith("[bug]:")
 
 
-def enforced_priority(issue: dict[str, Any], proposed: str) -> str | None:
-    if not is_bug_issue(issue):
-        return None
+def enforced_priority(proposed: str) -> str:
     if proposed not in PRIORITY_LABELS:
-        raise RuntimeError("LLM API did not return a priority for a bug")
+        raise RuntimeError("LLM API did not return a priority")
     return proposed
 
 
@@ -462,7 +467,15 @@ def current_priority_label(
         token=token,
         api_url=api_url,
     )
-    return next((f"priority:{priority}" for priority in PRIORITY_LABELS if f"priority:{priority}" in names), None)
+    return next(
+        (
+            label
+            for priority in PRIORITY_LABELS
+            for label in (priority, f"{LEGACY_PRIORITY_PREFIX}{priority}")
+            if label in names
+        ),
+        None,
+    )
 
 
 def safe_reason(value: str) -> str:
@@ -474,7 +487,7 @@ def safe_reason(value: str) -> str:
 
 def triage_comment(
     decision: dict[str, Any],
-    priority: str | None,
+    priority: str,
     candidate: dict[str, Any] | None,
     *,
     duplicate_label_preserved: bool = False,
@@ -508,10 +521,7 @@ def triage_comment(
             f"- Possible duplicate: [#{candidate['number']}]({candidate['html_url']}). "
             f"{safe_reason(decision['reason'])}"
         )
-    if priority is None:
-        lines.append("- Priority: not assigned because automated priorities apply only to bug reports.")
-    else:
-        lines.append(f"- Initial priority: **{priority}**. {safe_reason(decision['priority_reason'])}")
+    lines.append(f"- Initial priority: **{priority}**. {safe_reason(decision['priority_reason'])}")
     lines.extend(
         [
             "",
@@ -589,7 +599,7 @@ def main() -> int:
         repo,
         "triage:checked",
         "0e8a16",
-        "Automated duplicate and bug-priority triage completed",
+        "Automated duplicate and priority triage completed",
         token=github_token,
         api_url=api_url,
     )
@@ -612,7 +622,7 @@ def main() -> int:
             {candidate["number"] for candidate in candidates},
         ),
     )
-    priority = enforced_priority(issue, decision["priority"])
+    priority = enforced_priority(decision["priority"])
     current_labels = current_issue_labels(
         repo,
         issue["number"],
@@ -622,29 +632,27 @@ def main() -> int:
     existing_duplicate_label = any(
         label.casefold() == POSSIBLE_DUPLICATE_LABEL.casefold() for label in current_labels
     )
-    comment_priority: str | None = None
     labels = ["triage:checked"]
-    if priority is not None:
-        priority_label = current_priority_label(
+    priority_label = current_priority_label(
+        repo,
+        issue["number"],
+        token=github_token,
+        api_url=api_url,
+        label_names=current_labels,
+    )
+    if priority_label is None:
+        priority_color, priority_description = PRIORITY_LABELS[priority]
+        priority_label = priority
+        ensure_label(
             repo,
-            issue["number"],
+            priority_label,
+            priority_color,
+            priority_description,
             token=github_token,
             api_url=api_url,
-            label_names=current_labels,
         )
-        if priority_label is None:
-            priority_color, priority_description = PRIORITY_LABELS[priority]
-            priority_label = f"priority:{priority}"
-            ensure_label(
-                repo,
-                priority_label,
-                priority_color,
-                f"Initial automated bug priority. {priority_description}",
-                token=github_token,
-                api_url=api_url,
-            )
-        labels.append(priority_label)
-        comment_priority = priority_label.removeprefix("priority:")
+    labels.append(priority_label)
+    comment_priority = priority_label.removeprefix(LEGACY_PRIORITY_PREFIX)
     duplicate_candidate: dict[str, Any] | None = None
     if decision["is_duplicate"] and decision["confidence"] >= DUPLICATE_THRESHOLD:
         ensure_label(

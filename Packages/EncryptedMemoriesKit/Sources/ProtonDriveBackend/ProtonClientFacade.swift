@@ -15,6 +15,8 @@ struct UploadIdentityResolverComposition: Sendable {
     /// Earlier uploads of edited photos that the backup replaces. Nil when the upload manifest or the journal is
     /// unavailable.
     let replacementJournal: (any EditReplacementJournaling)?
+    /// The fingerprint cache for the content index. Nil when the manifest cannot open.
+    let fingerprintCache: ExactDuplicateFingerprintCache?
     let close: @Sendable () -> Void
 }
 
@@ -42,6 +44,11 @@ public final class ProtonClientFacade {
     public let photoTagAdder: any PhotoTagAdding
     /// "Keep Only Favorites" for a series of the account's own library. Nil while uploads are disabled.
     public let seriesDissolution: SeriesDissolutionOrchestrator?
+    /// The journaled revert to original of edited photos. The app resumes it at start; it finishes only the trash and
+    /// device steps of a confirmed copy and never makes a copy. Nil while uploads are disabled.
+    public let editedOriginalRevert: EditedOriginalRevert?
+    /// Starts a revert to original for the viewer. Nil while uploads are disabled.
+    public let editedPhotoReverter: (any EditedPhotoReverting)?
     /// Replaces the earlier upload of a photo that was edited in the photo library. Nil while uploads are disabled.
     public let editedPhotoReplacement: EditedPhotoReplacement?
     /// Finds and merges exact duplicates of the own library. Nil while uploads are disabled.
@@ -72,6 +79,8 @@ public final class ProtonClientFacade {
         photoUploader: any PhotoUploading,
         photoTagAdder: any PhotoTagAdding,
         seriesDissolution: SeriesDissolutionOrchestrator?,
+        editedOriginalRevert: EditedOriginalRevert?,
+        editedPhotoReverter: (any EditedPhotoReverting)?,
         editedPhotoReplacement: EditedPhotoReplacement?,
         exactDuplicates: ExactDuplicateFinder?,
         uploadIdentityResolver: (any UploadIdentityResolving)?,
@@ -89,6 +98,8 @@ public final class ProtonClientFacade {
         self.photoUploader = photoUploader
         self.photoTagAdder = photoTagAdder
         self.seriesDissolution = seriesDissolution
+        self.editedOriginalRevert = editedOriginalRevert
+        self.editedPhotoReverter = editedPhotoReverter
         self.editedPhotoReplacement = editedPhotoReplacement
         self.exactDuplicates = exactDuplicates
         self.uploadIdentityResolver = uploadIdentityResolver
@@ -105,7 +116,7 @@ public final class ProtonClientFacade {
         identityComposition: UploadIdentityResolverComposition,
         settlementStore: UploadManualSettlementStore?
     ) -> ProtonClientFacade {
-        // Albums: SDK 0.32.1 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
+        // Albums: SDK 0.33.0 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
         // retained only for writes the SDK does not expose.
         // Recently Deleted lists photos that left every inventory. The coordinator authorizes their
         // thumbnails from that listing; a weak reference keeps the bridge from retaining the coordinator.
@@ -130,12 +141,8 @@ public final class ProtonClientFacade {
                             + "ok=\(result.attachedCount + result.alreadyMemberCount) failed=\(result.failedCount) "
                             + "reason=\(result.firstFailureMessage ?? "unknown")"
                     )
-                    throw AlbumError.partialAdd(
-                        succeeded: result.attachedCount + result.alreadyMemberCount,
-                        total: photoUIDs.count,
-                        message: result.firstFailureMessage ?? "add to album failed"
-                    )
                 }
+                try result.requireComplete(for: photoUIDs)
             },
             removeProvider: { photoUIDs, albumID in
                 try await bridge.removePhotos(photoUIDs, fromAlbum: albumID)
@@ -175,6 +182,12 @@ public final class ProtonClientFacade {
             canSetAlbumCover: albumsRepo.capabilities.canSetCover
         )
 
+        // The metadata of earlier duplicate rankings lives in the account data directory, so sign-out removes it with
+        // the other account stores. One cache serves the whole account: the duplicate service invalidates it, the
+        // finder reads it. Nil when the file cannot open: the ranking then reads every node.
+        let fingerprintCache = identityComposition.fingerprintCache
+        let editedOriginalRevert = bridge.makeEditedOriginalRevert(
+            duplicateChecker: identityComposition.duplicateChecker, albums: albumCarryOver)
         return ProtonClientFacade(
             backend: bridge,
             librarySources: librarySources,
@@ -187,6 +200,8 @@ public final class ProtonClientFacade {
                 duplicateChecker: identityComposition.duplicateChecker,
                 albums: albumCarryOver
             ),
+            editedOriginalRevert: editedOriginalRevert,
+            editedPhotoReverter: editedOriginalRevert.map { bridge.makeEditedPhotoReverter(revert: $0) },
             editedPhotoReplacement: {
                 guard let checker = identityComposition.duplicateChecker,
                     let identities = identityComposition.identityStore,
@@ -217,23 +232,26 @@ public final class ProtonClientFacade {
                         accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent()),
                     remote: bridge,
                     albums: albumCarryOver,
+                    fingerprintCache: fingerprintCache,
                     log: { DebugLog.log($0) }
                 )
             }(),
             uploadIdentityResolver: identityResolver,
             accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent(),
             accountDatabasePolicy: bridge.uploadManifestPolicy,
-            albumSyncRemoteOps: ProtonAlbumSyncRemoteOps(
+            albumSyncRemoteOps: ProtonAlbumSyncRemoteOps.withRecovery(
                 service: albumWrite,
                 listProvider: { try await albumsRepo.listAlbums() },
-                duplicateChecker: identityComposition.duplicateChecker
+                duplicateChecker: identityComposition.duplicateChecker,
+                bridge: bridge
             ),
             accountInfoRefresher: { try await bridge.refreshAccountInfo() },
             shutdownHandler: {
                 await librarySources.shutdown()
                 await manager.shutdown()
                 // Bridge shutdown closes shared admission and joins backend, album, sync, upload,
-                // and identity work before any account-scoped resolver store is closed.
+                // and identity work before any account-scoped resolver store is closed. The
+                // composition closes the shared fingerprint cache with the other account stores.
                 await bridge.shutdown()
                 identityComposition.close()
             }
@@ -286,6 +304,8 @@ public final class ProtonClientFacade {
                 backend: backend, librarySources: sources, albums: albums, uploads: manager,
                 uploadCoordinator: coordinator, photoUploader: backend, photoTagAdder: backend,
                 seriesDissolution: nil,
+                editedOriginalRevert: nil,
+                editedPhotoReverter: nil,
                 editedPhotoReplacement: nil,
                 exactDuplicates: nil,
                 uploadIdentityResolver: pipeline, accountDataDirectory: directory,

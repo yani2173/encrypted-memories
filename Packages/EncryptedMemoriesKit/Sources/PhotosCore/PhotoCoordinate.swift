@@ -20,6 +20,12 @@ public struct PhotoCoordinate: Sendable, Equatable, Codable, Identifiable {
         self.longitude = longitude
         self.date = date
     }
+
+    /// Wraps `longitude` into `[-180, 180)` degrees.
+    public static func normalizedLongitude(_ longitude: Double) -> Double {
+        let shifted = (longitude + 180).truncatingRemainder(dividingBy: 360)
+        return (shifted >= 0 ? shifted : shifted + 360) - 180
+    }
 }
 
 public enum PhotoCoordinateText {

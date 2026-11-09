@@ -13,6 +13,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// The bound keeps a pathological library cheap: past 256 rows the root uploads as its own photo.
     static let rootMatchBatchSize = 8
     static let rootMatchBound = 256
+    /// How long the state that `prime` read for a name row proves a copy. Another device can trash the copy after
+    /// that read; an older answer is read again before a name row counts as a backup, like an index row (#553).
+    static let primedStateLifetime: TimeInterval = 15
 
     private let store: any UploadIdentityStore
     private let hasher: any UploadHashing
@@ -22,6 +25,11 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     private let batchSize: Int
     private let replacementJournal: (any EditReplacementJournaling)?
     private let now: @Sendable () -> Date
+    private struct RestoredCheck: Sendable {
+        let context: UploadRestoredCompoundContext
+        let isCurrent: @Sendable () -> Bool
+    }
+    private var restoredChecks: [UploadSourceIdentity: RestoredCheck] = [:]
 
     /// Per-batch remote view from each name hash to matching remote items.
     private var duplicateCache: [String: [RemotePhotoDuplicate]] = [:]
@@ -35,6 +43,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// `prime` fills both in batches, so a resolve normally reads no visibility itself.
     private var rootVisibility: [String: RemoteLinkVisibility] = [:]
     private var rootVisibilityAsked: Set<String> = []
+    /// When a complete read answered for each link in `rootVisibility`, also for a link that the answer left out.
+    private var rootVisibilityReadAt: [String: Date] = [:]
+    /// The primed links in the order of the upcoming roots, so a refresh reads the next ones in the same request.
+    private var rootVisibilityOrder: [String] = []
+    private var rootVisibilityPositions: [String: Int] = [:]
+    /// Refreshes in flight, one entry per link, so resolves at the same time share one read.
+    private var stateRefreshes: [String: Task<[String: RemoteLinkVisibility], any Error>] = [:]
     /// `prime` is nonthrowing. Defer cancellation only to the source identities in its batch.
     /// Other callers share this pipeline and must not inherit a stopped batch's cancellation.
     /// Ordinary prefetch errors remain best effort. An explicit view invalidation permits a fresh retry.
@@ -87,6 +102,63 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
     // MARK: - UploadIdentityResolving
 
+    public func prepareRestoredCompound(
+        _ context: UploadRestoredCompoundContext, isCurrent: @escaping @Sendable () -> Bool
+    ) async throws {
+        try Task.checkCancellation()
+        guard context.source.resource == .primary, isCurrent() else { throw CancellationError() }
+        restoredChecks[context.source] = RestoredCheck(context: context, isCurrent: isCurrent)
+    }
+
+    public func endRestoredCompound(_ context: UploadRestoredCompoundContext) async {
+        if restoredChecks[context.source]?.context == context { restoredChecks.removeValue(forKey: context.source) }
+    }
+
+    public func restoredPhotoOutcome(
+        _ context: UploadRestoredCompoundContext
+    ) async throws -> PendingBackupReturnOutcome {
+        guard let check = restoredChecks[context.source], check.context == context, check.isCurrent() else {
+            return .unreadable
+        }
+        let members = context.requiredMembers.map { resource in
+            store.record(
+                for: UploadSourceIdentity(
+                    kind: context.source.kind, identifier: context.source.identifier, resource: resource))?.remoteLinkID
+        }
+        let read = try await checker.linkVisibility(
+            of: Array(Set([context.confirmedRemote.nodeID] + members.compactMap { $0 })).sorted())
+        try Task.checkCancellation()
+        guard check.isCurrent(), restoredChecks[context.source]?.context == context,
+            let state = read[context.confirmedRemote.nodeID], state.hasExplicitPhotoState
+        else { return .unreadable }
+        guard state.isActiveMain else { return state.trashTime != nil ? .remoteTrashed : .unreadable }
+        guard
+            members.allSatisfy({ link in
+                guard let link, let member = read[link] else { return false }
+                return member.hasExplicitPhotoState && member.isActive
+                    && member.mainPhotoLinkID == context.confirmedRemote.nodeID
+            })
+        else { return .waiting(until: now().addingTimeInterval(60)) }
+        return .completed
+    }
+
+    @discardableResult
+    private func restoredCheck(for descriptor: UploadResourceDescriptor) throws -> RestoredCheck? {
+        let source = UploadSourceIdentity(kind: descriptor.source.kind, identifier: descriptor.source.identifier)
+        guard let check = restoredChecks[source] else { return nil }
+        // The source changed since the Restore check began: its context does not guard another version. Revisions
+        // have no order, so an older queued version also backs up as an ordinary upload.
+        if descriptor.backupRevision != check.context.revision, !check.isCurrent() { return nil }
+        guard descriptor.backupRevision == check.context.revision, check.isCurrent() else { throw CancellationError() }
+        return check
+    }
+
+    private func validateRestoredCheck(_ captured: RestoredCheck?, for descriptor: UploadResourceDescriptor) throws {
+        let current = try restoredCheck(for: descriptor)
+        guard captured?.context == current?.context else { throw CancellationError() }
+        guard captured?.isCurrent() != false else { throw CancellationError() }
+    }
+
     public func remoteAssetProofs(
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
@@ -113,6 +185,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
     public func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         try Task.checkCancellation()
+        let restoring = try restoredCheck(for: descriptor)
         if let primingCancellation, primingCancellation.sources.contains(descriptor.source) {
             throw primingCancellation.error
         }
@@ -150,6 +223,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             let remoteLink = cached.remoteLinkID,
             let digest = UploadContentSHA1.digest(fromHex: cached.sha1Hex)
         {
+            try validateRestoredCheck(restoring, for: descriptor)
             let identity = UploadIdentity(
                 correctedName: cached.correctedName, nameHash: cached.nameHash,
                 sha1Hex: cached.sha1Hex, sha1Digest: digest, contentHash: cached.contentHash
@@ -202,8 +276,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         let replacement = try await replacementScope(
             for: descriptor, cached: cached, sha1Hex: sha1Hex, nameHash: nameHash, contentHash: contentHash)
         try Task.checkCancellation()
-        func result(_ decision: UploadDuplicateDecision) -> UploadPreflightResult {
-            UploadPreflightResult(
+        func result(_ decision: UploadDuplicateDecision) throws -> UploadPreflightResult {
+            do { try validateRestoredCheck(restoring, for: descriptor) } catch {
+                releasePendingUploadClaims(ownedBy: descriptor)
+                throw error
+            }
+            return UploadPreflightResult(
                 identity: identity, decision: decision,
                 lineage: decision.uploadsBytes ? lineage(of: replacement, for: descriptor) : nil)
         }
@@ -225,8 +303,11 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             outcome: hmacReusable ? cached?.outcome : nil,
             updatedAt: now()
         )
+        try validateRestoredCheck(restoring, for: descriptor)
         try persistRecord(record, readFrom: cached)
 
+        // What the server said about the copies under the main photo, read at most once in this resolve.
+        var relatedReads = RelatedProofReads()
         // Account-wide content dedupe + same-run coalescing. Loop invariant on exit: either we
         // returned a known-content skip, or we hold the pending-upload claim for this content.
         let contentKey = Self.contentKey(epoch: epoch, contentHash: contentHash)
@@ -238,7 +319,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             if !preservesKnownDeletion, !isBurstMember, !requiresRelatedMatch,
                 let known = try await trustedMatch(
                     contentHash: contentHash, epoch: epoch, sha1Hex: sha1Hex, isRoot: isRoot,
-                    descriptor: descriptor, replacement: replacement),
+                    descriptor: descriptor, replacement: replacement, reads: &relatedReads),
                 let knownLink = known.remoteLinkID
             {
                 let allowsAdoption: Bool
@@ -255,12 +336,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     allowsAdoption = true
                 }
                 if allowsAdoption {
+                    try validateRestoredCheck(restoring, for: descriptor)
                     record.remoteVolumeID = known.remoteVolumeID
                     record.remoteLinkID = knownLink
                     record.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
                     record.updatedAt = now()
                     try persistRecord(record)
-                    return result(.skip(.knownFromManifest, remoteLinkID: knownLink))
+                    return try result(.skip(.knownFromManifest, remoteLinkID: knownLink))
                 }
             }
             guard pendingContentUploads[contentKey] != nil else {
@@ -272,6 +354,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             // Identical bytes are uploading right now - wait until that attempt settles
             // (recordUploaded or uploadDidFail), then re-check the manifest.
             try await waitForPendingClaim(contentKey, kind: .content)
+            // The check after the wait reads the states again.
+            relatedReads = RelatedProofReads()
         }
 
         // Filename reuse is valid (for example after resetting an iPhone), but Proton drafts are
@@ -284,10 +368,16 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             releasePendingContentClaim(contentKey, owner: descriptor)
             throw error
         }
+        // The name claim can wait for another upload of this name; the states read before it are read again.
+        relatedReads = RelatedProofReads()
 
         let remoteItems: [RemotePhotoDuplicate]
         do {
-            remoteItems = try await duplicates(forNameHash: nameHash)
+            // A retained trash fact needs fresh evidence, not a name row cached by an earlier run.
+            remoteItems =
+                preservesKnownDeletion
+                ? try await checker.findDuplicates(nameHashes: [nameHash])
+                : try await duplicates(forNameHash: nameHash)
             try Task.checkCancellation()
         } catch {
             if Task.isCancelled || UploadError.isCancellation(error) {
@@ -297,9 +387,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
             let detailedLookupError = error
             // The detailed endpoint is normally faster because `prime` batches large libraries.
-            // The SDK gives us a safe exact fallback: a positive result proves the bytes are
-            // already active; an empty/failed result cannot authorize an upload, so fail closed
-            // with the original detailed-lookup error.
+            // The SDK gives us an exact fallback: a positive match names a candidate copy, which
+            // `countsAsBackup` must still prove below; an empty/failed result cannot authorize
+            // an upload, so fail closed with the original detailed-lookup error.
             var exactMatches: [PhotoUID] = []
             do {
                 if !isBurstMember && !requiresRelatedMatch && replacement.isEmpty {
@@ -313,10 +403,22 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 if UploadError.isCancellation(error) { throw error }
                 throw detailedLookupError
             }
-            if isRoot, !exactMatches.isEmpty {
+            if !exactMatches.isEmpty {
                 do {
-                    let related = try await relatedLinks(among: Set(exactMatches.map(\.nodeID)))
-                    exactMatches.removeAll { related.contains($0.nodeID) }
+                    var fallbackReads = RelatedProofReads()
+                    if isRoot {
+                        let related = try await relatedLinks(
+                            among: Set(exactMatches.map(\.nodeID)), requiresActiveMain: false, reads: &fallbackReads)
+                        exactMatches.removeAll { related.contains($0.nodeID) }
+                    }
+                    // An exact match adopts the same proof as a name row: a state read of this check must
+                    // prove the copy, see `countsAsBackup`. For a root, an answer without role data never proves
+                    // the backup (#876). A non-root accepts any active match, because its legitimate copy is
+                    // a related file (documented in `countsAsBackup`).
+                    for exact in exactMatches {
+                        try await readPrimedState(exact.nodeID, reads: &fallbackReads)
+                    }
+                    exactMatches.removeAll { !countsAsBackup($0.nodeID, isRoot: isRoot, reads: fallbackReads) }
                 } catch {
                     releasePendingUploadClaims(ownedBy: descriptor)
                     throw error
@@ -326,20 +428,19 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 let decision = UploadDuplicateDecision.skip(.activeDuplicate, remoteLinkID: exact.nodeID)
                 do {
                     try Task.checkCancellation()
+                    try validateRestoredCheck(restoring, for: descriptor)
                     try persist(decision, in: &record, readFrom: cached)
                 } catch {
                     releasePendingUploadClaims(ownedBy: descriptor)
                     throw error
                 }
                 releasePendingUploadClaims(ownedBy: descriptor)
-                return result(decision)
+                return try result(decision)
             }
             releasePendingUploadClaims(ownedBy: descriptor)
             throw detailedLookupError
         }
 
-        // What the server said about the copies under the main photo, read at most once in this resolve.
-        var relatedReads = RelatedProofReads()
         let nameCandidates: (items: [RemotePhotoDuplicate], provesLive: Bool)
         do {
             nameCandidates = try await candidates(
@@ -350,11 +451,16 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             releasePendingUploadClaims(ownedBy: descriptor)
             throw error
         }
-        let nameDecision = UploadDuplicateDecisionPolicy.decide(
-            primary: .init(source: descriptor.source, nameHash: nameHash, contentHash: contentHash),
-            remoteItems: nameCandidates.items,
-            currentClientUID: currentClientUID
-        )
+        let nameDecision: UploadDuplicateDecision
+        do {
+            nameDecision = try await verifiedNameDecision(
+                nameCandidates.items,
+                primary: .init(source: descriptor.source, nameHash: nameHash, contentHash: contentHash),
+                isRoot: isRoot, reads: &relatedReads)
+        } catch {
+            releasePendingUploadClaims(ownedBy: descriptor)
+            throw error
+        }
 
         // Finish both passes before asking about deletion: same bytes outside the scope can prove a deletion,
         // and an active copy under another name can prove the photo live.
@@ -382,15 +488,28 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                         let excluded =
                             blockedByDraft
                             ? try await relatedLinks(
-                                among: Set(contentCandidates.items.compactMap(\.linkID)), requiresActiveMain: true)
+                                among: Set(contentCandidates.items.compactMap(\.linkID)), requiresActiveMain: true,
+                                reads: &relatedReads)
                             : []
-                        if let remoteContent = contentCandidates.items.first(where: {
-                            guard blockedByDraft else { return true }
-                            guard $0.linkState == .active, $0.contentHash == contentHash,
-                                let linkID = $0.linkID, !linkID.isEmpty
-                            else { return false }
-                            return !excluded.contains(linkID)
-                        }) {
+                        var adopted: RemotePhotoDuplicate?
+                        for item in contentCandidates.items {
+                            if blockedByDraft {
+                                guard item.linkState == .active, item.contentHash == contentHash,
+                                    let linkID = item.linkID, !linkID.isEmpty, !excluded.contains(linkID)
+                                else { continue }
+                            }
+                            // An index row can outlive its photo for a short time, so an active row counts only when
+                            // a state read of this check says that the copy is active.
+                            if item.linkState == .active, let linkID = item.linkID, !linkID.isEmpty {
+                                try await readInThisCheck([linkID], reads: &relatedReads)
+                                guard
+                                    countsAsBackup(linkID, isRoot: isRoot, reads: relatedReads)
+                                else { continue }
+                            }
+                            adopted = item
+                            break
+                        }
+                        if let remoteContent = adopted {
                             decision = decisionForRemoteContent(
                                 remoteContent,
                                 replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)
@@ -403,13 +522,21 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 } catch {
                     guard blockedByDraft else { throw error }
                     if UploadError.isCancellation(error) { throw error }
+                    // Transient network and retryable service failures follow the normal check's retry without an
+                    // attempt. Other failures leave the draft protected (#877).
+                    if case UploadError.retryableBackend = error { throw error }
+                    if BackupSyncRunner.isTransientNetwork(error) { throw error }
                     try Task.checkCancellation()
                     decision = nameDecision
                 }
             }
-            // A vanished trash entry does not revoke the person's deletion. Keep that decision for this exact
-            // resource identity; an active duplicate above still converges without a new upload.
-            if decision.uploadsBytes, preservesKnownDeletion {
+            if let link = relatedReads.restoredMemberLinkID, relatedReads.restoredMemberIsUnderDestination {
+                decision = .skip(.activeDuplicate, remoteLinkID: link)
+            }
+            // A vanished trash entry does not revoke the person's deletion: the trash was emptied, or the copy left
+            // it otherwise. The photo stays deleted in Proton and never uploads; the record keeps the trash fact, so
+            // every later check reads the server again, and an active copy found there still counts (#984).
+            if decision.uploadsBytes, preservesKnownDeletion, relatedReads.restoredMemberLinkID == nil {
                 decision = .skip(.deletedRemotely, remoteLinkID: cached?.remoteLinkID)
             }
             if decision.uploadsBytes, !replacement.isEmpty, !provesLive,
@@ -428,6 +555,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 }
             }
             try Task.checkCancellation()
+            try validateRestoredCheck(restoring, for: descriptor)
             try noteRestored(decision, in: replacement, of: descriptor.source)
             if decision != .awaitDeletionCheck {
                 try replacementJournal?.clearDeletionCheck(for: descriptor.source)
@@ -438,7 +566,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             throw error
         }
         if !decision.uploadsBytes { releasePendingUploadClaims(ownedBy: descriptor) }
-        return result(decision)
+        return try result(decision)
     }
 
     /// Complete lineage reads can discover a live main without a local manifest. Failed or incomplete reads leave
@@ -664,6 +792,39 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         requiresActiveMain: Bool = false,
         relatedReads: inout RelatedProofReads
     ) async throws -> (items: [RemotePhotoDuplicate], provesLive: Bool) {
+        if !relatedReads.restoredMemberChecked {
+            relatedReads.restoredMemberChecked = true
+            if let check = try restoredCheck(for: descriptor), let destination = descriptor.mainRemoteLinkID,
+                let cached = store.record(for: descriptor.source), cached.isValid(for: descriptor),
+                cached.outcome == UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue,
+                let member = cached.remoteLinkID
+            {
+                let confirmed = check.context.confirmedRemote.nodeID
+                let visibility = try await checker.linkVisibility(
+                    of: Array(Set([confirmed, destination, member])).sorted())
+                try Task.checkCancellation()
+                guard check.isCurrent(), restoredChecks[check.context.source]?.context == check.context else {
+                    throw CancellationError()
+                }
+                if let oldMain = visibility[confirmed], oldMain.hasExplicitPhotoState, oldMain.isActiveMain,
+                    let newMain = visibility[destination], newMain.hasExplicitPhotoState, newMain.isActiveMain,
+                    let file = visibility[member], file.hasExplicitPhotoState, file.isActive,
+                    file.mainPhotoLinkID == confirmed || file.mainPhotoLinkID == destination
+                {
+                    relatedReads.restoredMemberLinkID = member
+                    relatedReads.restoredMemberIsUnderDestination = file.mainPhotoLinkID == destination
+                }
+            }
+        }
+        // Only the exact retained member with fresh positive proof can replace its earlier trash row.
+        let remoteItems = remoteItems.map { item in
+            guard item.linkID == relatedReads.restoredMemberLinkID, item.linkID != nil,
+                item.contentHash == contentHash, item.linkState == .trashed
+            else { return item }
+            return RemotePhotoDuplicate(
+                nameHash: item.nameHash, contentHash: item.contentHash, linkState: .active,
+                linkID: item.linkID, clientUID: item.clientUID)
+        }
         if descriptor.source.resource.isBurstMember {
             return (
                 try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor), false
@@ -700,8 +861,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     // The main photo can be in the trash, and the server refuses its list then. The role of each copy
                     // answers in that case too. Every active copy with these bytes needs an answer that states its
                     // role: a failed read, a copy the answer leaves out, or an answer without the photo state fails
-                    // the check, so an unproven own copy never uploads a second time. A trashed copy without a stated
-                    // role keeps its earlier meaning as a deletion by the person.
+                    // the check, so an unproven own copy never uploads a second time. A trashed copy proves deletion
+                    // only when its stated role names this main photo.
                     let unasked = toProve.subtracting(relatedReads.askedLinks)
                     if !unasked.isEmpty {
                         let read = try await checker.linkVisibility(of: unasked.sorted())
@@ -714,7 +875,6 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                         throw UploadError.backend("The role of a copy with these bytes is unavailable")
                     }
                     relatedLinkIDs = stated.filter { relatedReads.visibility[$0]?.mainPhotoLinkID == mainLinkID }
-                        .union(trashedToProve.subtracting(stated))
                 }
             }
             return (
@@ -733,7 +893,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 return (remoteItems, false)
             }
             return (
-                try await rootEligible(remoteItems, contentHash: contentHash, requiresActiveMain: requiresActiveMain),
+                try await rootEligible(
+                    remoteItems, contentHash: contentHash, requiresActiveMain: requiresActiveMain,
+                    reads: &relatedReads),
                 false
             )
         }
@@ -748,6 +910,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             visibility = optional
         } else {
             visibility = try await checker.linkVisibility(of: asked.sorted())
+            relatedReads.askedLinks.formUnion(asked)
+            relatedReads.visibility.merge(visibility) { _, new in new }
         }
         try Task.checkCancellation()
         func isLiveMain(_ linkID: String) -> Bool {
@@ -830,22 +994,25 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// under an edited photo, or a paired video. Those bytes do not make a photo of their own, so the primary
     /// uploads as its own photo. With a replacement, `candidates` already counts only live main photos.
     private func rootEligible(
-        _ remoteItems: [RemotePhotoDuplicate], contentHash: String, requiresActiveMain: Bool
+        _ remoteItems: [RemotePhotoDuplicate], contentHash: String, requiresActiveMain: Bool,
+        reads: inout RelatedProofReads
     ) async throws -> [RemotePhotoDuplicate] {
         let matches = Set(
             remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }.compactMap(\.linkID))
         guard !matches.isEmpty else { return remoteItems }
-        let related = try await relatedLinks(among: matches, requiresActiveMain: requiresActiveMain)
+        let related = try await relatedLinks(among: matches, requiresActiveMain: requiresActiveMain, reads: &reads)
         guard !related.isEmpty else { return remoteItems }
         return remoteItems.filter { item in item.linkID.map { !related.contains($0) } ?? true }
     }
 
     /// The manifest row whose remote link this resource may adopt. For a root, a primary row proves no main photo:
     /// an earlier version stored the related file that a primary adopted. So a root weighs up to `rootMatchBound`
-    /// rows and takes the first one whose link the server does not name as a related file.
+    /// rows and takes the first one whose link the server does not name as a related file. Another device can have
+    /// trashed the copy since the row was written, so a row counts only when a state read of this check proves its
+    /// copy, see `countsAsBackup`.
     private func trustedMatch(
         contentHash: String, epoch: String, sha1Hex: String, isRoot: Bool,
-        descriptor: UploadResourceDescriptor, replacement: UploadReplacementScope
+        descriptor: UploadResourceDescriptor, replacement: UploadReplacementScope, reads: inout RelatedProofReads
     ) async throws -> UploadIdentityRecord? {
         let guardsRoot = isRoot && replacement.isEmpty
         let rows = store.trustedRecords(
@@ -855,7 +1022,21 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 && (!isRoot || known.source.resource == .primary)
                 && (replacement.isEmpty || known.source == descriptor.source)
         }
-        guard guardsRoot else { return rows.first }
+        // A failed read adopts nothing; the remote check below decides.
+        func read(_ linkIDs: Set<String>) async throws -> Bool {
+            do {
+                try await readInThisCheck(linkIDs, reads: &reads)
+                return true
+            } catch {
+                if Task.isCancelled || UploadError.isCancellation(error) { throw error }
+                return false
+            }
+        }
+        guard guardsRoot else {
+            guard let row = rows.first, let linkID = row.remoteLinkID, try await read([linkID]) else { return nil }
+            let proves = countsAsBackup(linkID, isRoot: isRoot, reads: reads)
+            return proves ? row : nil
+        }
         // Several sources can name one related link; it is weighed once.
         var rejected: Set<String> = []
         var remaining = rows[...]
@@ -868,11 +1049,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 batchLinks.insert(linkID)
             }
             guard !batch.isEmpty else { break }
-            let related = try await relatedLinks(among: batchLinks)
-            if let eligible = batch.first(where: { $0.remoteLinkID.map { !related.contains($0) } ?? false }) {
+            guard try await read(batchLinks) else { return nil }
+            if let eligible = batch.first(where: { row in
+                row.remoteLinkID.map { countsAsBackup($0, isRoot: true, reads: reads) } ?? false
+            }) {
                 return eligible
             }
-            rejected.formUnion(related)
+            rejected.formUnion(batchLinks)
         }
         return nil
     }
@@ -885,14 +1068,32 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     private func relatedLinks(
         among linkIDs: Set<String>, requiresActiveMain: Bool = false
     ) async throws -> Set<String> {
+        var reads = RelatedProofReads()
+        return try await relatedLinks(among: linkIDs, requiresActiveMain: requiresActiveMain, reads: &reads)
+    }
+
+    /// Like `relatedLinks(among:requiresActiveMain:)`, and records the states that answered in `reads`.
+    private func relatedLinks(
+        among linkIDs: Set<String>, requiresActiveMain: Bool, reads: inout RelatedProofReads
+    ) async throws -> Set<String> {
         var known = rootVisibility
-        let unasked = linkIDs.subtracting(rootVisibilityAsked)
+        // A blocked name needs a positive answer of this check: a copy that an earlier check saw inactive, or that the
+        // server did not name, can be back. Such a copy is read again once in this check (#877).
+        let staleNegatives =
+            requiresActiveMain
+            ? linkIDs.filter { linkID in
+                rootVisibilityAsked.contains(linkID) && !reads.askedLinks.contains(linkID)
+                    && rootVisibility[linkID].map(Self.provesActiveMain) != true
+            } : []
+        let unasked = linkIDs.subtracting(rootVisibilityAsked).union(staleNegatives)
         if !unasked.isEmpty {
             let generation = cacheGeneration
             var read: [String: RemoteLinkVisibility] = [:]
             do {
                 read = try await checker.linkVisibility(of: unasked.sorted())
                 try Task.checkCancellation()
+                reads.askedLinks.formUnion(unasked)
+                reads.visibility.merge(read) { _, new in new }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -909,7 +1110,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         return linkIDs.filter {
             if requiresActiveMain {
-                return known[$0].map { $0.hasExplicitPhotoState && $0.isActiveMain } != true
+                return known[$0].map(Self.provesActiveMain) != true
             }
             return known[$0]?.mainPhotoLinkID != nil
         }
@@ -925,11 +1126,125 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         try replacementJournal?.unretire([linkID], for: source)
     }
 
-    /// What one resolve learned about the copies that could prove a secondary.
+    /// Reads the state of each of `linkIDs` once in this check. A copy that an earlier check read, or whose read
+    /// failed, is read again. A failed read fails the check.
+    private func readInThisCheck(_ linkIDs: Set<String>, reads: inout RelatedProofReads) async throws {
+        let unasked = linkIDs.subtracting(reads.askedLinks)
+        guard !unasked.isEmpty else { return }
+        let read = try await checker.linkVisibility(of: unasked.sorted())
+        try Task.checkCancellation()
+        reads.askedLinks.formUnion(unasked)
+        reads.visibility.merge(read) { _, new in new }
+    }
+
+    /// Takes the state of `linkID` for this check from `prime` while that answer is at most `primedStateLifetime`
+    /// old. Otherwise reads it again, together with the next primed links whose answers are just as old, at most
+    /// `batchSize` links in one request, so a large batch of roots costs about one request for each `batchSize`
+    /// roots. A resolve that needs a link of a running refresh waits for it. A failed read fails the check.
+    private func readPrimedState(_ linkID: String, reads: inout RelatedProofReads) async throws {
+        guard !reads.askedLinks.contains(linkID) else { return }
+        guard !isCurrentPrimedState(linkID) else {
+            reads.askedLinks.insert(linkID)
+            reads.visibility[linkID] = rootVisibility[linkID]
+            return
+        }
+        let read: [String: RemoteLinkVisibility]
+        if let running = stateRefreshes[linkID] {
+            PhotoDiagnostics.shared.increment("upload.stateRefreshJoined")
+            read = try await running.value
+        } else {
+            var batch = [linkID]
+            if let position = rootVisibilityPositions[linkID] {
+                for next in rootVisibilityOrder[(position + 1)...] {
+                    guard batch.count < batchSize else { break }
+                    if !isCurrentPrimedState(next), stateRefreshes[next] == nil { batch.append(next) }
+                }
+            }
+            let checker = checker
+            let links = batch
+            let refresh = Task { try await checker.linkVisibility(of: links) }
+            let generation = cacheGeneration
+            for link in batch { stateRefreshes[link] = refresh }
+            defer {
+                for link in batch where stateRefreshes[link] == refresh { stateRefreshes[link] = nil }
+            }
+            read = try await refresh.value
+            if generation == cacheGeneration {
+                let answeredAt = now()
+                rootVisibilityAsked.formUnion(batch)
+                for link in batch {
+                    rootVisibility[link] = read[link]
+                    rootVisibilityReadAt[link] = answeredAt
+                }
+            }
+        }
+        try Task.checkCancellation()
+        reads.askedLinks.insert(linkID)
+        reads.visibility[linkID] = read[linkID]
+    }
+
+    /// Whether a complete read answered for `linkID` at most `primedStateLifetime` ago.
+    private func isCurrentPrimedState(_ linkID: String) -> Bool {
+        guard let answeredAt = rootVisibilityReadAt[linkID] else { return false }
+        let age = now().timeIntervalSince(answeredAt)
+        return age >= 0 && age <= Self.primedStateLifetime
+    }
+
+    /// Whether a state answer explicitly proves an active main photo. An answer without the photo role data
+    /// never proves a root backup (#876). See `countsAsBackup`.
+    private static func provesActiveMain(_ state: RemoteLinkVisibility) -> Bool {
+        state.isActiveMain && state.hasExplicitPhotoState
+    }
+
+    /// Whether the read of this check proves that `linkID` backs up this resource. The copy must be active; a copy
+    /// that the answer leaves out is no active copy. A root photo is backed up only by a main photo, not by another
+    /// photo's related file, and only by an answer that explicitly carries the photo state: an answer without role
+    /// data never proves a root backup (#876). A non-root, such as a paired video, has no role of its own to carry:
+    /// its legitimate copy is another photo's related file, so any active answer proves it.
+    private func countsAsBackup(_ linkID: String, isRoot: Bool, reads: RelatedProofReads) -> Bool {
+        guard let state = reads.visibility[linkID], state.isActive else { return false }
+        guard isRoot else { return true }
+        return Self.provesActiveMain(state)
+    }
+
+    /// The decision of the name rows. A name row can outlive its copy like an index row: an active duplicate counts
+    /// only when a current state proves its copy, see `readPrimedState`. Otherwise a copy in the trash stays a
+    /// deletion by the person, a copy in another inactive state becomes unknown, a copy that the answer leaves out or
+    /// that is no main photo leaves the rows, and the rows decide again.
+    private func verifiedNameDecision(
+        _ items: [RemotePhotoDuplicate], primary: UploadDuplicateDecisionPolicy.Resource, isRoot: Bool,
+        reads: inout RelatedProofReads
+    ) async throws -> UploadDuplicateDecision {
+        var items = items
+        while true {
+            let decision = UploadDuplicateDecisionPolicy.decide(
+                primary: primary, remoteItems: items, currentClientUID: currentClientUID)
+            guard case .skip(.activeDuplicate, let linkID?) = decision else { return decision }
+            try await readPrimedState(linkID, reads: &reads)
+            if countsAsBackup(linkID, isRoot: isRoot, reads: reads) {
+                return decision
+            }
+            let state = reads.visibility[linkID]
+            items = items.compactMap { item in
+                guard item.linkID == linkID else { return item }
+                // A copy in the trash stays the person's deletion. Another state that is not active is unknown: the
+                // policy then neither uploads nor counts a deletion.
+                guard let state, !state.isActive else { return nil }
+                return RemotePhotoDuplicate(
+                    nameHash: item.nameHash, contentHash: item.contentHash,
+                    linkState: state.trashTime == nil ? nil : .trashed, linkID: item.linkID, clientUID: item.clientUID)
+            }
+        }
+    }
+
+    /// What one resolve learned about the copies that could prove a secondary or a matching copy.
     private struct RelatedProofReads {
         var relatedByMain: [String: Set<String>] = [:]
         var visibility: [String: RemoteLinkVisibility] = [:]
         var askedLinks: Set<String> = []
+        var restoredMemberChecked = false
+        var restoredMemberLinkID: String?
+        var restoredMemberIsUnderDestination = false
     }
 
     /// Applies the burst-member rule. The server names the related photos of the member's main photo only when
@@ -981,7 +1296,14 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             )
             try Task.checkCancellation()
             if let active = exactMatches.first {
-                return .skip(.activeDuplicate, remoteLinkID: active.nodeID)
+                // The exact SDK row carries no role data. A state read of this check must prove an
+                // active main photo (#876) before this read-only path may skip. An unproven match is
+                // not adopted; revalidation falls through to the name-row and content evidence.
+                var fallbackReads = RelatedProofReads()
+                try await readPrimedState(active.nodeID, reads: &fallbackReads)
+                if countsAsBackup(active.nodeID, isRoot: true, reads: fallbackReads) {
+                    return .skip(.activeDuplicate, remoteLinkID: active.nodeID)
+                }
             }
         }
 
@@ -1151,6 +1473,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         duplicateCache.removeAll()
         rootVisibility.removeAll()
         rootVisibilityAsked.removeAll()
+        rootVisibilityReadAt.removeAll()
+        rootVisibilityOrder.removeAll()
+        rootVisibilityPositions.removeAll()
+        stateRefreshes.removeAll()
         primingCancellation = nil
         // Don't cancel running lookups (their callers still get server truth as of their start),
         // but stop new callers from joining them and stop their results from repopulating the
@@ -1182,9 +1508,15 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         var pendingSet: Set<String> = []
         var correctedNamesToHash: [String] = []
         var correctedNamesToHashSet: Set<String> = []
-        // The names of the roots, see `rootEligible`. Their active rows get one batched visibility read below.
-        var rootNameHashes: Set<String> = []
+        // The names of the roots in the order of `descriptors`, see `rootEligible`. Their active rows get one
+        // batched visibility read below.
+        var rootNameHashes: [String] = []
+        var rootNameHashSet: Set<String> = []
         var rootCorrectedNames: Set<String> = []
+
+        func appendRootNameHash(_ hash: String) {
+            if rootNameHashSet.insert(hash).inserted { rootNameHashes.append(hash) }
+        }
 
         func appendPendingHash(_ hash: String) {
             if duplicateCache[hash] == nil, inFlight[hash] == nil, pendingSet.insert(hash).inserted {
@@ -1216,7 +1548,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 if isRoot { rootCorrectedNames.insert(corrected) }
                 continue
             }
-            if isRoot { rootNameHashes.insert(nameHash) }
+            if isRoot { appendRootNameHash(nameHash) }
             appendPendingHash(nameHash)
         }
 
@@ -1226,7 +1558,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 try Task.checkCancellation()
                 if hashes.count == correctedNamesToHash.count {
                     for (corrected, hash) in zip(correctedNamesToHash, hashes) {
-                        if rootCorrectedNames.contains(corrected) { rootNameHashes.insert(hash) }
+                        if rootCorrectedNames.contains(corrected) { appendRootNameHash(hash) }
                         appendPendingHash(hash)
                     }
                 }
@@ -1281,21 +1613,30 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// Reads the role of every active row under the names of the upcoming roots, in batches of at most
     /// `batchSize` links: Proton's `links/fetch_metadata` takes 150 links per request, like the duplicates
     /// endpoint. The content hash of a new item is unknown before hashing, so every active row of the name
-    /// counts. An ordinary failed batch counts as asked: its rows stay as listed. Cancellation instead stays
-    /// deferred in this view and propagates at resolve.
+    /// counts. An ordinary failed batch counts as asked: its rows stay as listed, and a name row of it is read
+    /// again before it counts as a backup. Cancellation instead stays deferred in this view and propagates at
+    /// resolve.
     private func primeRootVisibility(
-        ofNameHashes nameHashes: Set<String>, sources: Set<UploadSourceIdentity>
+        ofNameHashes nameHashes: [String], sources: Set<UploadSourceIdentity>
     ) async {
         let generation = cacheGeneration
-        let rows = nameHashes.flatMap { duplicateCache[$0] ?? [] }
-        let links = Set(rows.filter { $0.linkState == .active }.compactMap(\.linkID))
-            .subtracting(rootVisibilityAsked).sorted()
+        var links: [String] = []
+        var seen = rootVisibilityAsked
+        for row in nameHashes.flatMap({ duplicateCache[$0] ?? [] }) where row.linkState == .active {
+            if let linkID = row.linkID, seen.insert(linkID).inserted { links.append(linkID) }
+        }
+        for linkID in links where rootVisibilityPositions[linkID] == nil {
+            rootVisibilityPositions[linkID] = rootVisibilityOrder.count
+            rootVisibilityOrder.append(linkID)
+        }
         for start in stride(from: 0, to: links.count, by: batchSize) {
             let chunk = Array(links[start..<min(start + batchSize, links.count)])
             let read: [String: RemoteLinkVisibility]
+            var answeredAt: Date?
             do {
                 try Task.checkCancellation()
                 read = try await checker.linkVisibility(of: chunk)
+                answeredAt = now()
             } catch {
                 guard generation == cacheGeneration else { return }
                 if Task.isCancelled || UploadError.isCancellation(error) {
@@ -1306,7 +1647,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
             guard generation == cacheGeneration else { return }
             rootVisibilityAsked.formUnion(chunk)
-            rootVisibility.merge(read) { _, new in new }
+            if let answeredAt {
+                // A complete answer replaces every link of the chunk, also one that the answer leaves out.
+                for linkID in chunk {
+                    rootVisibility[linkID] = read[linkID]
+                    rootVisibilityReadAt[linkID] = answeredAt
+                }
+            }
         }
     }
 

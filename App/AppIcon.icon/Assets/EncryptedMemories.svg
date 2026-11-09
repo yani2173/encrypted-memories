@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="Encrypted Memories app icon">
+  <defs>
+    <linearGradient id="em-bg" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4F9FA7"></stop>
+      <stop offset="1" stop-color="#246674"></stop>
+    </linearGradient>
+    <radialGradient id="em-glow" cx="430" cy="300" r="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8DD4D1" stop-opacity="0.50"></stop>
+      <stop offset="0.6" stop-color="#4F9FA7" stop-opacity="0"></stop>
+    </radialGradient>
+    <linearGradient id="em-back" x1="0" y1="254" x2="0" y2="714" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A4D6D5"></stop>
+      <stop offset="1" stop-color="#68B5B7"></stop>
+    </linearGradient>
+    <linearGradient id="em-pane" x1="0" y1="310" x2="0" y2="770" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFDF8"></stop>
+      <stop offset="1" stop-color="#DDF2EC"></stop>
+    </linearGradient>
+    <radialGradient id="em-orb" cx="560" cy="572" r="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFE2A8"></stop>
+      <stop offset="0.5" stop-color="#FFD08A" stop-opacity="0.78"></stop>
+      <stop offset="1" stop-color="#FFD08A" stop-opacity="0"></stop>
+    </radialGradient>
+    <clipPath id="em-clip"><rect x="252" y="310" width="460" height="460" rx="96"></rect></clipPath>
+  </defs>
+
+  <path d="M1024.0 512.0 L1023.8 665.3 L1023.0 714.2 L1021.8 749.6 L1020.0 778.3 L1017.8 802.7 L1015.1 824.2 L1011.8 843.3 L1008.0 860.7 L1003.7 876.5 L998.9 891.0 L993.5 904.4 L987.6 916.7 L981.0 928.2 L973.9 938.8 L966.1 948.6 L957.7 957.7 L948.6 966.1 L938.8 973.9 L928.2 981.0 L916.7 987.6 L904.4 993.5 L891.0 998.9 L876.5 1003.7 L860.7 1008.0 L843.3 1011.8 L824.2 1015.1 L802.7 1017.8 L778.3 1020.0 L749.6 1021.8 L714.2 1023.0 L665.3 1023.8 L512.0 1024.0 L358.7 1023.8 L309.8 1023.0 L274.4 1021.8 L245.7 1020.0 L221.3 1017.8 L199.8 1015.1 L180.7 1011.8 L163.3 1008.0 L147.5 1003.7 L133.0 998.9 L119.6 993.5 L107.3 987.6 L95.8 981.0 L85.2 973.9 L75.4 966.1 L66.3 957.7 L57.9 948.6 L50.1 938.8 L43.0 928.2 L36.4 916.7 L30.5 904.4 L25.1 891.0 L20.3 876.5 L16.0 860.7 L12.2 843.3 L8.9 824.2 L6.2 802.7 L4.0 778.3 L2.2 749.6 L1.0 714.2 L0.2 665.3 L0.0 512.0 L0.2 358.7 L1.0 309.8 L2.2 274.4 L4.0 245.7 L6.2 221.3 L8.9 199.8 L12.2 180.7 L16.0 163.3 L20.3 147.5 L25.1 133.0 L30.5 119.6 L36.4 107.3 L43.0 95.8 L50.1 85.2 L57.9 75.4 L66.3 66.3 L75.4 57.9 L85.2 50.1 L95.8 43.0 L107.3 36.4 L119.6 30.5 L133.0 25.1 L147.5 20.3 L163.3 16.0 L180.7 12.2 L199.8 8.9 L221.3 6.2 L245.7 4.0 L274.4 2.2 L309.8 1.0 L358.7 0.2 L512.0 0.0 L665.3 0.2 L714.2 1.0 L749.6 2.2 L778.3 4.0 L802.7 6.2 L824.2 8.9 L843.3 12.2 L860.7 16.0 L876.5 20.3 L891.0 25.1 L904.4 30.5 L916.7 36.4 L928.2 43.0 L938.8 50.1 L948.6 57.9 L957.7 66.3 L966.1 75.4 L973.9 85.2 L981.0 95.8 L987.6 107.3 L993.5 119.6 L998.9 133.0 L1003.7 147.5 L1008.0 163.3 L1011.8 180.7 L1015.1 199.8 L1017.8 221.3 L1020.0 245.7 L1021.8 274.4 L1023.0 309.8 L1023.8 358.7 L1024.0 512.0 Z" fill="url(#em-bg)"></path>
+  <path d="M1024.0 512.0 L1023.8 665.3 L1023.0 714.2 L1021.8 749.6 L1020.0 778.3 L1017.8 802.7 L1015.1 824.2 L1011.8 843.3 L1008.0 860.7 L1003.7 876.5 L998.9 891.0 L993.5 904.4 L987.6 916.7 L981.0 928.2 L973.9 938.8 L966.1 948.6 L957.7 957.7 L948.6 966.1 L938.8 973.9 L928.2 981.0 L916.7 987.6 L904.4 993.5 L891.0 998.9 L876.5 1003.7 L860.7 1008.0 L843.3 1011.8 L824.2 1015.1 L802.7 1017.8 L778.3 1020.0 L749.6 1021.8 L714.2 1023.0 L665.3 1023.8 L512.0 1024.0 L358.7 1023.8 L309.8 1023.0 L274.4 1021.8 L245.7 1020.0 L221.3 1017.8 L199.8 1015.1 L180.7 1011.8 L163.3 1008.0 L147.5 1003.7 L133.0 998.9 L119.6 993.5 L107.3 987.6 L95.8 981.0 L85.2 973.9 L75.4 966.1 L66.3 957.7 L57.9 948.6 L50.1 938.8 L43.0 928.2 L36.4 916.7 L30.5 904.4 L25.1 891.0 L20.3 876.5 L16.0 860.7 L12.2 843.3 L8.9 824.2 L6.2 802.7 L4.0 778.3 L2.2 749.6 L1.0 714.2 L0.2 665.3 L0.0 512.0 L0.2 358.7 L1.0 309.8 L2.2 274.4 L4.0 245.7 L6.2 221.3 L8.9 199.8 L12.2 180.7 L16.0 163.3 L20.3 147.5 L25.1 133.0 L30.5 119.6 L36.4 107.3 L43.0 95.8 L50.1 85.2 L57.9 75.4 L66.3 66.3 L75.4 57.9 L85.2 50.1 L95.8 43.0 L107.3 36.4 L119.6 30.5 L133.0 25.1 L147.5 20.3 L163.3 16.0 L180.7 12.2 L199.8 8.9 L221.3 6.2 L245.7 4.0 L274.4 2.2 L309.8 1.0 L358.7 0.2 L512.0 0.0 L665.3 0.2 L714.2 1.0 L749.6 2.2 L778.3 4.0 L802.7 6.2 L824.2 8.9 L843.3 12.2 L860.7 16.0 L876.5 20.3 L891.0 25.1 L904.4 30.5 L916.7 36.4 L928.2 43.0 L938.8 50.1 L948.6 57.9 L957.7 66.3 L966.1 75.4 L973.9 85.2 L981.0 95.8 L987.6 107.3 L993.5 119.6 L998.9 133.0 L1003.7 147.5 L1008.0 163.3 L1011.8 180.7 L1015.1 199.8 L1017.8 221.3 L1020.0 245.7 L1021.8 274.4 L1023.0 309.8 L1023.8 358.7 L1024.0 512.0 Z" fill="url(#em-glow)"></path>
+
+
+  <rect x="312" y="254" width="460" height="460" rx="96" fill="url(#em-back)"></rect>
+  <rect x="312" y="254" width="460" height="460" rx="96" fill="none" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="3"></rect>
+
+
+  <rect x="252" y="310" width="460" height="460" rx="96" fill="url(#em-pane)"></rect>
+
+
+  <g clip-path="url(#em-clip)">
+    <circle cx="560" cy="572" r="116" fill="url(#em-orb)"></circle>
+    <circle cx="560" cy="572" r="54" fill="#FFD08A"></circle>
+    <circle cx="400" cy="830" r="250" fill="#7BC9C8" fill-opacity="0.66"></circle>
+    <circle cx="690" cy="872" r="275" fill="#4EA4A7" fill-opacity="0.74"></circle>
+    <ellipse cx="378" cy="406" rx="168" ry="92" transform="rotate(-24 378 406)" fill="#FFFFFF" fill-opacity="0.16"></ellipse>
+    <polygon points="252,310 452,310 318,770 252,770" fill="#FFFFFF" fill-opacity="0.10"></polygon>
+  </g>
+
+
+  <rect x="252" y="310" width="460" height="460" rx="96" fill="none" stroke="#FFFFFF" stroke-opacity="0.5" stroke-width="3"></rect>
+</svg>

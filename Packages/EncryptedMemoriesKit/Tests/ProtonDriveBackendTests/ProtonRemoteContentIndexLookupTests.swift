@@ -12,31 +12,31 @@ struct ProtonRemoteContentIndexLookupTests {
             remoteLinkID: "remote-link"
         )
 
-        let duplicate = try ProtonRemoteContentIndexLookup.duplicate(
+        let duplicate = try ProtonRemoteContentIndexLookup.duplicates(
             contentHash: "content",
-            record: record,
+            records: [record],
             health: .degraded(indexedCount: 10, unresolvedCount: 20)
-        )
+        ).first
 
         #expect(duplicate?.linkID == "remote-link")
         #expect(duplicate?.linkState == .active)
     }
 
     @Test func legacyMetadataGapPermitsAvailabilityFirstMiss() throws {
-        let duplicate = try ProtonRemoteContentIndexLookup.duplicate(
+        let duplicate = try ProtonRemoteContentIndexLookup.duplicates(
             contentHash: "content",
-            record: nil,
+            records: [],
             health: .degraded(indexedCount: 900, unresolvedCount: 100)
-        )
+        ).first
 
         #expect(duplicate == nil)
     }
 
     @Test func unavailableLocalIndexRemainsFailClosed() {
         #expect(throws: (any Error).self) {
-            _ = try ProtonRemoteContentIndexLookup.duplicate(
+            _ = try ProtonRemoteContentIndexLookup.duplicates(
                 contentHash: "content",
-                record: nil,
+                records: [],
                 health: .unavailable
             )
         }

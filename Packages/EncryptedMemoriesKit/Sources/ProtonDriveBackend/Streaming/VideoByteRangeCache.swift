@@ -17,7 +17,7 @@ public final class VideoByteRangeCache: @unchecked Sendable {
     private let lock = NSLock()
     /// Filesystem work runs on one dedicated queue so range-serving tasks never block the cooperative executor.
     private let ioQueue = DispatchQueue(label: "me.proton.photos.video-byte-range-cache", qos: .utility)
-    private let budgetBytes: Int
+    let budgetBytes: Int
     private let fm = FileManager.default
     /// Shared fence used by detached range fetches that can return after `clearAll()`.
     private let writerGeneration = CacheWriterGeneration()
@@ -31,11 +31,14 @@ public final class VideoByteRangeCache: @unchecked Sendable {
     }
 
     init(
-        budgetBytes: Int = 512 * 1024 * 1024,
+        budgetBytes: Int? = nil,
         rootDirectory: URL? = nil,
-        runtimeState: LibraryRuntimeState = .shared
+        runtimeState: LibraryRuntimeState = .shared,
+        policyBudget: @Sendable (DiskCacheBudgetPolicy) -> Int = { policy in
+            VideoByteRangeCache.byteLimit(for: policy.videoBudget)
+        }
     ) {
-        self.budgetBytes = budgetBytes
+        self.budgetBytes = budgetBytes ?? policyBudget(DiskCacheBudgetPolicy(platform: .mobile))
         self.runtimeState = runtimeState
         let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         self.root =
@@ -49,6 +52,13 @@ public final class VideoByteRangeCache: @unchecked Sendable {
                 if critical, !wasCritical { await self?.clearForStoragePressureAsync() }
                 wasCritical = critical
             }
+        }
+    }
+
+    static func byteLimit(for budget: DiskCacheBudgetPolicy.Budget) -> Int {
+        switch budget {
+        case .bytes(let bytes): Int(clamping: bytes)
+        case .unlimited: Int.max
         }
     }
 

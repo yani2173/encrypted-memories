@@ -1035,6 +1035,11 @@ public actor MLSmartSearchLifecycle {
         if let nativeSearch {
             backends.formUnion(await nativeSearch.availableBackends())
         }
+        // Advertised backends describe device capability, not the index contents. The OCR scope is
+        // offered only after the current library's text index holds at least one committed entry.
+        if await nativeSearch?.hasIndexedTextEntries() != true {
+            backends.subtract([.recognizedText, .documentText])
+        }
         return MLSearchScopePolicy.availableScopes(for: backends)
     }
 

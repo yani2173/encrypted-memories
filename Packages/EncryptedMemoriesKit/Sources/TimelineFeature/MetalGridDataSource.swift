@@ -9,7 +9,6 @@ import TimelineCore
 /// Supplies the grid structure, flat UID order, and decoded RAM images for GPU texture upload.
 @MainActor
 protocol MetalGridDataSource: AnyObject {
-    var label: String { get }  // "real" (the only production source)
     var sectionCounts: [Int] { get }
     var flatUIDs: [PhotoUID] { get }
     /// Cheap "is a RAM image ready?" check (no decode/conversion) - drives upload selection.
@@ -66,7 +65,6 @@ extension MetalGridDataSource {
 /// contains one count for the flattened UID order, or is empty for an empty library.
 @MainActor
 final class RealMetalGridDataSource: MetalGridDataSource {
-    let label = "real"
     let sectionCounts: [Int]
     let flatUIDs: [PhotoUID]
     var onImagesAvailable: (() -> Void)?
@@ -84,8 +82,8 @@ final class RealMetalGridDataSource: MetalGridDataSource {
         feed: ThumbnailFeed,
         metadataProvider: (any PhotoMetadataProvider)? = nil
     ) {
-        let uids = sections.flatMap { $0.items.map(\.uid) }
         let items = sections.flatMap(\.items)
+        let uids = items.map(\.uid)
         self.flatUIDs = uids
         self.sectionCounts = uids.isEmpty ? [] : [uids.count]  // one continuous section (production photo wall)
         self.feed = feed

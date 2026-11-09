@@ -51,6 +51,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         libraryChangeDelay: Duration = .zero,
         unreadableRetryDelay: Duration = .seconds(60),
         unreadableRetryLimit: Duration = .seconds(30 * 60),
+        clock: ResultWriteClock? = nil,
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) -> PendingBackupCoordinator {
         PendingBackupCoordinator(
@@ -72,7 +73,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 unreadableRetryDelay: unreadableRetryDelay,
                 unreadableRetryLimit: unreadableRetryLimit
             ),
-            now: { [date] in date },
+            now: { [date] in clock?.now ?? date },
             sleep: sleep
         )
     }
@@ -126,8 +127,828 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         return snapshot
     }
 
+    /// Runs `action` and returns the first published snapshot that matches, so the wait ends on the publish itself
+    /// instead of polling a deadline. The listener can start after `action`; the stream keeps the newest snapshot
+    /// (`.bufferingNewest(1)`), so this is safe only for a predicate that stays true once it is true. A caller whose
+    /// predicate can turn false again could miss its match. A pass already in flight can only cause a false pass,
+    /// never a false failure; without the reconcile heal publish the target test fails, so the fired timer path is
+    /// the one exercised. The timeout only stops a test whose publish never comes.
+    private func publishedSnapshot(
+        _ description: String,
+        after action: () -> Void,
+        where predicate: @escaping @Sendable (PendingBackupSnapshot) -> Bool
+    ) async throws -> PendingBackupSnapshot {
+        let published = expectation(description: description)
+        let snapshots = coordinator.snapshots
+        let listener = Task { () -> PendingBackupSnapshot? in
+            for await snapshot in snapshots where predicate(snapshot) {
+                published.fulfill()
+                return snapshot
+            }
+            return nil
+        }
+        action()
+        await fulfillment(of: [published], timeout: 30)
+        listener.cancel()
+        let snapshot = await listener.value
+        return try XCTUnwrap(snapshot, description)
+    }
+
+    /// Waits until `clock` holds a live wait of `duration`. The wait ends on the registration itself; the timeout only
+    /// stops a test whose timer never registers.
+    private func waitForLiveWait(
+        _ duration: Duration, on clock: ResultWriteClock, _ description: String
+    ) async {
+        let registered = expectation(description: description)
+        let waiter = Task {
+            await clock.waitForLiveWait(duration)
+            registered.fulfill()
+        }
+        await fulfillment(of: [registered], timeout: 30)
+        waiter.cancel()
+    }
+
     private func tileIDs(_ snapshot: PendingBackupSnapshot) -> [String] {
         snapshot.tiles.map(\.key.identifier)
+    }
+
+    // MARK: - Restore recheck obligations (#829 part 2)
+
+    private final class AppliedTrashReadCount: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        var count: Int { lock.withLock { value } }
+        func next() -> Int {
+            lock.withLock {
+                value += 1
+                return value
+            }
+        }
+    }
+
+    func testConfirmedRestoreRechecksActiveStateAfterLateTrashApplies() async throws {
+        await coordinator.close()
+        let relations = FakeChecker()
+        coordinator = makeCoordinator(relations: relations)
+        let id = "restore-before-trash-applies"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "late-trash-photo")
+        let pendingEffects = try XCTUnwrap(effects)
+        let postApplyReads = AppliedTrashReadCount()
+        // The fake records a trash only after its before-application gate opens. A compensating restore
+        // changes that same server state; the probe never substitutes a canned successful recheck.
+        relations.onVisibilityLookup = { [relations] in
+            // One genuine post-apply trash read must precede the bounded, ordinary read failure.
+            // The second lookup ends this drain even if the compensation obligation is removed.
+            if !pendingEffects.trashed.isEmpty, postApplyReads.next() > 1 {
+                relations.linkVisibilityError = UploadError.backend("The bounded follow-up read is unavailable")
+                return
+            }
+            let active = pendingEffects.trashed.count <= pendingEffects.restored.count
+            relations.linkVisibilityByID[remote.nodeID] = RemoteLinkVisibility(
+                isActive: active, mainPhotoLinkID: nil, trashTime: active ? nil : 1_750_000_001)
+        }
+        defer { relations.onVisibilityLookup = nil }
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the source really owns the restored photo") { $0.tiles.first?.handoff == remote }
+        let gate = LookupGate()
+        effects.trashGate = gate
+        let running = try XCTUnwrap(coordinator)
+        let deleting = Task { await running.exclude([sourceKey.localUID]) }
+        guard await gate.entered(within: .seconds(5)) else {
+            gate.open()
+            _ = await deleting.value
+            return XCTFail("the trash request must wait before applying its remote effect")
+        }
+        do {
+            XCTAssertTrue(effects.trashed.isEmpty, "the server has not applied the held trash")
+            // The person's Proton restore succeeds now, before the old trash takes effect.
+            await coordinator.restoreSources(ofRemote: [remote])
+            let included = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertEqual(included.desired, .included)
+            XCTAssertEqual(included.remote, remote)
+        } catch {
+            gate.open()
+            _ = await deleting.value
+            throw error
+        }
+        gate.open()
+        let deleted = await deleting.value
+
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(effects.trashed, [[remote]], "the old trash really applies after the person's restore")
+        XCTAssertGreaterThan(relations.linkVisibilityCallCount, 0, "acknowledgement requires a fresh activity read")
+        XCTAssertEqual(effects.restored, [[remote]], "the later applied trash requires exactly one compensation")
+        XCTAssertEqual(postApplyReads.count, 2, "The genuine trash read and bounded follow-up must both execute")
+    }
+
+    func testRemoteRestoreReadmitsTheExcludedKeyBesideASourceWithoutPendingState() async throws {
+        let (good, missing, before, _) = try await restoreWithMissingDiscoveredKey()
+        XCTAssertEqual(before.desired, .excluded)
+        XCTAssertNotEqual(
+            store.sourceState(for: good)?.desired, .excluded, "A source without pending state must not block it")
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertFalse(snapshot.excludedTiles.contains { $0.key == good })
+        XCTAssertEqual(effects.returned, [[good]], "Only the excluded key returns to the backup")
+        XCTAssertTrue(effects.restored.isEmpty, "Proton already restored this photo")
+        XCTAssertEqual(store.sourceStateRead(for: missing), .readable(nil), "Nothing pending is created for it")
+    }
+
+    func testRemoteRestoreLeavesASourceWithoutPendingStateOutOfTheResult() async throws {
+        let (good, _, _, result) = try await restoreWithMissingDiscoveredKey()
+        XCTAssertTrue(result.discoveryComplete, "the handoffs themselves were read completely")
+        XCTAssertEqual(Set(result.outcomes.keys), [good], "A source without pending state has no outcome")
+        XCTAssertNotEqual(result.outcomes[good], .unreadable)
+        XCTAssertTrue(result.isReadable, "The host must not report a failed restore")
+    }
+
+    // An upload leaves a handoff; a delete in the timeline only trashes the Proton photo and writes no pending
+    // state. Restoring it from Recently Deleted must not report a failure.
+    func testRestoringAPhotoDeletedOnlyInProtonIsReadableAndChangesNothing() async throws {
+        let id = "timeline-deleted-source"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "timeline-deleted-photo")
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the handoff belongs to the source") { $0.tiles.first?.handoff == remote }
+        XCTAssertEqual(store.sourceStateRead(for: sourceKey), .readable(nil), "The timeline delete wrote no state")
+
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertTrue(result.discoveryComplete)
+        XCTAssertEqual(result.outcomes, [:], "Nothing was pending for this source")
+        XCTAssertTrue(result.isReadable, "The host must not report a failed restore")
+        XCTAssertEqual(store.sourceStateRead(for: sourceKey), .readable(nil))
+        XCTAssertTrue(effects.returned.isEmpty)
+        XCTAssertTrue(effects.restored.isEmpty)
+    }
+
+    private func restoreWithMissingDiscoveredKey() async throws -> (
+        PendingSourceKey, PendingSourceKey, PendingSourceState, PendingBackupRestoreResult
+    ) {
+        await coordinator.close()
+        coordinator = makeCoordinator()
+        let good = key("readable-restore-source")
+        let missing = key("missing-restore-source")
+        let remote = PhotoUID(volumeID: "vol", nodeID: "shared-restored-photo")
+        enqueue(good.identifier, state: .uploading)
+        for sourceKey in [good, missing] {
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+                .recorded)
+        }
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: good, presentation: nil, remote: remote)], at: date))
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: good, generation: 1, remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: good, generation: 1, at: date))
+        let before = try XCTUnwrap(store.sourceState(for: good))
+        XCTAssertEqual(store.sourceStateRead(for: missing), .readable(nil))
+        await coordinator.start()
+
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+        return (good, missing, before, result)
+    }
+
+    func testRestoreRecheckCleansMarkerForSameUIDAndGeneration() async throws {
+        try await assertRestoreRecheckMarkerCleanup(changesGeneration: false)
+    }
+
+    func testRestoreRecheckKeepsMarkerForNewerUIDAndGeneration() async throws {
+        try await assertRestoreRecheckMarkerCleanup(changesGeneration: true)
+    }
+
+    private func assertRestoreRecheckMarkerCleanup(changesGeneration: Bool) async throws {
+        await coordinator.close()
+        let id = "restored-marker-source"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "restored-marker-photo")
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        coordinator = makeCoordinator(relations: relations)
+        enqueue(id, state: .alreadyBackedUp)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: sourceKey, presentation: nil, remote: remote)], at: date))
+        let excluded = try XCTUnwrap(store.sourceState(for: sourceKey))
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [excluded]), [sourceKey])
+        XCTAssertTrue(
+            Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 5000)", of: id, at: storeURL))
+        await coordinator.start()
+        let later = date.timeIntervalSince1970 + 5000
+        if changesGeneration {
+            effects.onReturn = { [storeURL] in
+                XCTAssertTrue(
+                    PendingBackupCoordinatorTests.setColumns(
+                        "generation=generation+1, remote_link_id='newer-marker-photo', next_attempt_at=\(later)",
+                        of: id, at: storeURL))
+            }
+        }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertTrue(effects.trashed.isEmpty, "no live trash was started by this marker-recovery fixture")
+        XCTAssertTrue(effects.restored.isEmpty, "a freshly active photo needs no additional restore")
+        if changesGeneration {
+            let current = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertEqual(current.generation, excluded.generation + 2)
+            XCTAssertEqual(current.remote?.nodeID, "newer-marker-photo")
+            XCTAssertEqual(current.remoteOperation, .remoteTrash, "an old recheck never clears a newer marker")
+            XCTAssertTrue(current.needsQueueSync)
+        } else {
+            XCTAssertNil(
+                store.sourceState(for: sourceKey), "a successful same-UID recheck must retire the stale marker row")
+        }
+    }
+
+    // MARK: - Confirmed Proton restore (#829)
+
+    func testConfirmedRemoteRestoreOfPhotoSendsNoSecondRestore() async throws {
+        try await assertConfirmedRemoteRestore(mediaType: "image/heic", isLivePhoto: false)
+    }
+
+    func testConfirmedRemoteRestoreOfVideoSendsNoSecondRestore() async throws {
+        try await assertConfirmedRemoteRestore(mediaType: "video/quicktime", isLivePhoto: false)
+    }
+
+    func testConfirmedRemoteRestoreOfLivePhotoSendsNoSecondRestore() async throws {
+        try await assertConfirmedRemoteRestore(mediaType: "image/heic", isLivePhoto: true)
+    }
+
+    func testRestoringAHistoricalHandoffStillRestoresTheDifferentCurrentTrashTarget() async throws {
+        let id = "historical-restore"
+        let sourceKey = key(id)
+        let historical = PhotoUID(volumeID: "vol", nodeID: "historical-A")
+        let current = PhotoUID(volumeID: "vol", nodeID: "current-B")
+        enqueue(id, state: .uploading)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: sourceKey, revision: UploadBackupRevision(rawValue: revision.rawValue - 1),
+                    remote: historical, kind: .uploaded, createdAt: date.addingTimeInterval(-1))), .recorded)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: sourceKey, revision: revision, remote: current, kind: .uploaded, createdAt: date)),
+            .recorded)
+        await coordinator.start()
+        await waitForSnapshot("the current handoff is B") { $0.tiles.first?.handoff == current }
+        let excluded = await coordinator.exclude([sourceKey.localUID])
+        XCTAssertTrue(excluded)
+        let before = try XCTUnwrap(store.sourceState(for: sourceKey))
+        XCTAssertEqual(before.desired, .excluded)
+        XCTAssertEqual(before.remote, current)
+        XCTAssertTrue(before.remoteTrashed)
+        XCTAssertEqual(effects.trashed, [[current]], "B really reached the fake remote trash")
+        XCTAssertEqual(store.handoffs(forRemoteLinkIDs: [historical.nodeID]).map(\.key), [sourceKey])
+        let pendingStore = try XCTUnwrap(store)
+        let pendingEffects = try XCTUnwrap(effects)
+        effects.onVolumeLookup = {
+            guard let state = pendingStore.sourceState(for: sourceKey) else {
+                XCTFail("B's compensation must remain durable before its restore dispatch")
+                return
+            }
+            XCTAssertEqual(state.remote, current)
+            XCTAssertTrue(state.remoteTrashed, "restoring A is not evidence that B left the trash")
+            XCTAssertTrue(state.needsRemoteRestore, "B still needs the ordinary include compensation")
+        }
+        effects.onReturn = {
+            XCTAssertEqual(pendingEffects.restored, [[current]], "restore B before returning the local source")
+            XCTAssertFalse(pendingStore.sourceState(for: sourceKey)?.remoteTrashed ?? true)
+        }
+
+        // Only A was restored by the person; B still needs its ordinary remote restore.
+        await coordinator.restoreSources(ofRemote: [historical])
+
+        XCTAssertEqual(effects.restored, [[current]], "a historical A handoff must not silently mark B restored")
+        XCTAssertEqual(effects.order.suffix(2), ["restore", "return"])
+        XCTAssertEqual(effects.returned, [[sourceKey]])
+    }
+
+    private func assertConfirmedRemoteRestore(mediaType: String, isLivePhoto: Bool) async throws {
+        let id = "restored-source"
+        enqueue(id, state: .uploading)
+        metadata.set(
+            key(id),
+            PendingPresentationMetadata(
+                captureTime: date, mediaType: mediaType, isLivePhoto: isLivePhoto, displayName: "restored-media"))
+        await coordinator.start()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "restored-photo")
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the handoff belongs to the source") { $0.tiles.first?.handoff == remote }
+        let excluded = await coordinator.exclude([key(id).localUID])
+        XCTAssertTrue(excluded)
+        let prior = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertTrue(prior.remoteTrashed)
+        let pendingStore = try XCTUnwrap(store)
+        let sourceKey = key(id)
+        effects.onReturn = {
+            guard let state = pendingStore.sourceState(for: sourceKey) else {
+                XCTFail("the included source must remain durable until queue acknowledgement")
+                return
+            }
+            XCTAssertEqual(state.remote, remote, "the confirmed restored UID remains provenance")
+            XCTAssertEqual(state.generation, prior.generation + 1)
+            XCTAssertTrue(state.needsQueueSync)
+            XCTAssertFalse(state.remoteTrashed)
+            XCTAssertFalse(state.needsRemoteTrash)
+            XCTAssertFalse(state.needsRemoteRestore)
+        }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertTrue(effects.restored.isEmpty, "Proton already restored this photo")
+        XCTAssertEqual(effects.returned, [[sourceKey]])
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertFalse(snapshot.excludedTiles.contains { $0.key == sourceKey })
+        await coordinator.restoreSources(ofRemote: [remote])
+        XCTAssertTrue(effects.restored.isEmpty)
+        XCTAssertEqual(effects.returned, [[sourceKey]], "repeating the same restore is idempotent")
+    }
+
+    func testRemoteRestoreRefusesAReverseLookupThatCannotBePrepared() async throws {
+        let remote = try await prepareRemoteRestoreLookup()
+        let before = try XCTUnwrap(store.sourceState(for: key("lookup-source")))
+        let failure = SourceListFailure(table: "handoff")
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        failure.remove(from: store)
+        XCTAssertTrue(failure.denied, "the real reverse SELECT must be rejected")
+        XCTAssertEqual(store.sourceState(for: before.key), before)
+        XCTAssertTrue(effects.restored.isEmpty, "unreadable discovery grants no restore effect")
+        XCTAssertTrue(effects.returned.isEmpty, "cached state must not bypass unreadable discovery")
+    }
+
+    func testRemoteRestoreRefusesAnInterruptedReverseLookup() async throws {
+        let remote = try await prepareRemoteRestoreLookup()
+        let before = try XCTUnwrap(store.sourceState(for: key("lookup-source")))
+        let failure = KeyedReadFailure(matching: "FROM handoff WHERE remote_link_id=?", limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        failure.remove(from: store)
+        XCTAssertEqual(failure.count, 1, "the real reverse SELECT must be interrupted")
+        XCTAssertEqual(store.sourceState(for: before.key), before)
+        XCTAssertTrue(effects.restored.isEmpty)
+        XCTAssertTrue(effects.returned.isEmpty, "an interrupted read cannot become cached absence")
+    }
+
+    private func prepareRemoteRestoreLookup() async throws -> PhotoUID {
+        let id = "lookup-source"
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "lookup-photo")
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the reverse lookup has a real handoff") { $0.tiles.first?.handoff == remote }
+        let excluded = await coordinator.exclude([key(id).localUID])
+        XCTAssertTrue(excluded)
+        XCTAssertTrue(try XCTUnwrap(store.sourceState(for: key(id))).remoteTrashed)
+        return remote
+    }
+
+    func testConfirmedRemoteRestoreKeepsADelayedTrashAcknowledgementFromRestoringAgain() async throws {
+        let id = "delayed-trash"
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "delayed-trash-photo")
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the handoff is visible") { $0.tiles.first?.handoff == remote }
+        let gate = LookupGate()
+        effects.trashCompletionGate = gate
+        let running = try XCTUnwrap(coordinator)
+        let sourceKey = key(id)
+        let held = Task { await running.exclude([sourceKey.localUID]) }
+        let reached = await gate.entered(within: .seconds(5))
+        guard reached else {
+            XCTFail("the trash must apply before its acknowledgement is held")
+            gate.open()
+            _ = await held.value
+            return
+        }
+        defer { gate.open() }
+        XCTAssertEqual(effects.trashed, [[remote]], "the fake remote already applied the trash")
+        do {
+            let inFlight = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertEqual(inFlight.remoteOperation, .remoteTrash)
+
+            // Proton has now restored the photo; only the earlier trash acknowledgement is delayed.
+            await coordinator.restoreSources(ofRemote: [remote])
+            let included = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertEqual(included.desired, .included)
+            XCTAssertEqual(included.remote, remote)
+            XCTAssertFalse(included.needsRemoteRestore, "the confirmed restore must not schedule a redundant call")
+            XCTAssertFalse(included.remoteTrashed)
+        } catch {
+            gate.open()
+            _ = await held.value
+            throw error
+        }
+        gate.open()
+        let excluded = await held.value
+
+        XCTAssertTrue(excluded)
+        XCTAssertTrue(effects.restored.isEmpty, "the old acknowledgement must not restore this photo again")
+        XCTAssertEqual(effects.returned, [[sourceKey]])
+    }
+
+    // MARK: - Later trash after an unreadable handoff (#842)
+
+    func testLaterTrashRetriesAfterTheLatestHandoffDoesNotDecode() async throws {
+        try await laterTrashAfterUnreadableHandoff(.decode)
+    }
+
+    func testLaterTrashRetriesAfterTheLatestHandoffLookupFails() async throws {
+        try await laterTrashAfterUnreadableHandoff(.lookup)
+    }
+
+    func testLaterTrashRetriesAfterTheLatestHandoffStepIsInterrupted() async throws {
+        try await laterTrashAfterUnreadableHandoff(.step)
+    }
+
+    func testLaterTrashRetriesAfterItsSourceRereadIsInterrupted() async throws {
+        try await laterTrashAfterUnreadableHandoff(.sourceRead)
+    }
+
+    func testLaterTrashRetriesAfterItsSchedulingWriteIsRejected() async throws {
+        try await laterTrashAfterUnreadableHandoff(.write)
+    }
+
+    func testLaterTrashRepeatedReadFailureKeepsBackingOffWithoutResendingTheEarlierUpload() async throws {
+        try await laterTrashAfterUnreadableHandoff(.decode, repeatFailure: true)
+    }
+
+    func testLaterTrashRetryDoesNotUndoANewerReturnToBackup() async throws {
+        try await laterTrashAfterUnreadableHandoff(.decode, returnToBackup: true)
+    }
+
+    func testLaterTrashRecoveryStartsAgainAfterRepairAndAnotherUnreadableCommit() async throws {
+        try await laterTrashAfterUnreadableHandoff(.decode, secondEpisode: true)
+    }
+
+    private enum LaterHandoffFault { case decode, lookup, step, write, sourceRead }
+
+    private func seedLaterTrash(acknowledgedAt createdAt: Date) throws -> PhotoUID {
+        let later = PhotoUID(volumeID: "vol", nodeID: "later-upload")
+        XCTAssertNotNil(
+            store.exclude(
+                [PendingExclusionRequest(key: key("later"), presentation: nil, remote: earlier)], at: date))
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key("later"), revision: revision, remote: later, kind: .uploaded, createdAt: createdAt)),
+            .excludedRemoteNeedsTrash)
+        XCTAssertTrue(store.acknowledgeHandoffs([(key("later"), revision)]))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key("later"), generation: 1, at: date))
+        XCTAssertEqual(store.sourceState(for: key("later"))?.remote, earlier)
+        return later
+    }
+
+    private func laterTrashAfterUnreadableHandoff(
+        _ fault: LaterHandoffFault, repeatFailure: Bool = false, returnToBackup: Bool = false,
+        secondEpisode: Bool = false
+    ) async throws {
+        await coordinator.close()
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        let later = try seedLaterTrash(acknowledgedAt: date)
+        let gate = LookupGate()
+        defer { gate.open() }
+        effects.trashGate = gate
+        let running = try XCTUnwrap(coordinator)
+        let trigger = key("trigger").localUID
+        let pass = Task { await running.restore([trigger]) }
+        guard await gate.entered(within: .seconds(5)) else {
+            gate.open()
+            _ = await pass.value
+            XCTFail("the earlier upload never reached the trash gate")
+            return
+        }
+        let denial = SourceListFailure(
+            table: fault == .write ? "source_state" : "handoff", untilRemoved: true,
+            action: fault == .write ? SQLITE_UPDATE : SQLITE_READ, column: fault == .write ? "remote_link_id" : nil,
+            transient: true)
+        let interruption = KeyedReadFailure(
+            matching: fault == .sourceRead
+                ? "FROM source_state WHERE source_kind=? AND source_id=?" : Self.latestHandoffRead,
+            skip: fault == .sourceRead ? 1 : 0, limit: fault == .sourceRead ? 1 : .max)
+        defer { denial.remove(from: store) }
+        defer { interruption.remove(from: store) }
+        switch fault {
+        case .decode:
+            XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='later';"))
+        case .lookup: try denial.install(on: store)
+        case .step: try interruption.install(on: store)
+        case .write: try denial.install(on: store)
+        case .sourceRead: try interruption.install(on: store)
+        }
+        gate.open()
+        _ = await pass.value
+
+        let completed = try XCTUnwrap(store.sourceState(for: key("later")))
+        XCTAssertTrue(completed.remoteTrashed, "the confirmed trash of A must be saved independently of the B read")
+        XCTAssertFalse(completed.needsRemoteTrash, "an unreadable B is not permission to trash A again")
+        XCTAssertNil(completed.remoteOperation, "the confirmed request is no longer in flight")
+        XCTAssertEqual(completed.remote, earlier)
+        XCTAssertEqual(Array(effects.trashed.joined()), [earlier])
+        if fault == .lookup || fault == .write { XCTAssertTrue(denial.denied, "the requested SQL must actually fail") }
+        if fault == .step { XCTAssertGreaterThan(interruption.count, 0, "the latest handoff step must actually fail") }
+        if fault == .sourceRead {
+            XCTAssertEqual(interruption.count, 1, "only the helper's second source read must fail")
+        }
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
+        XCTAssertEqual(clock.waits, [.seconds(60)], "the unreadable later handoff must keep a degraded retry")
+        if repeatFailure {
+            clock.advance(by: .seconds(60))
+            try await pollWhileFalse { clock.waits.contains(.seconds(120)) }
+            XCTAssertEqual(clock.waits, [.seconds(60), .seconds(120)])
+            XCTAssertEqual(Array(effects.trashed.joined()), [earlier], "the second denied cycle must not resend A")
+        }
+        if returnToBackup {
+            let returned = await coordinator.restore([key("later").localUID])
+            XCTAssertTrue(returned)
+            XCTAssertEqual(effects.restored, [[earlier]], "the person's later return restores the confirmed A")
+        }
+
+        denial.remove(from: store)
+        interruption.remove(from: store)
+        if fault == .decode {
+            XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='later';"))
+        }
+        clock.advance(by: repeatFailure ? .seconds(120) : .seconds(60))
+        if returnToBackup {
+            _ = await coordinator.restore([trigger])
+            XCTAssertEqual(Array(effects.trashed.joined()), [earlier], "a newer included source must never trash B")
+            await coordinator.close()
+            return
+        }
+        try await pollWhileFalse { effects.trashed.joined().contains(later) }
+        XCTAssertEqual(
+            Array(effects.trashed.joined()), [earlier, later], "repair must trash B once without resending A")
+        let finished = try XCTUnwrap(store.sourceState(for: key("later")))
+        XCTAssertEqual(finished.remote, later)
+        XCTAssertTrue(finished.remoteTrashed)
+        XCTAssertFalse(finished.needsRemoteTrash)
+        _ = await coordinator.restore([trigger])
+        XCTAssertEqual(
+            Array(effects.trashed.joined()), [earlier, later], "another reconcile must not resend either photo")
+        if secondEpisode {
+            let next = PhotoUID(volumeID: "vol", nodeID: "next-upload")
+            let newest = PhotoUID(volumeID: "vol", nodeID: "newest-upload")
+            for (revision, remote) in [(Int64(11), next), (Int64(12), newest)] {
+                XCTAssertEqual(
+                    store.recordHandoff(
+                        PendingHandoff(
+                            key: key("later"), revision: UploadBackupRevision(rawValue: revision), remote: remote,
+                            kind: .uploaded, createdAt: clock.now.addingTimeInterval(Double(revision)))),
+                    .excludedRemoteNeedsTrash)
+            }
+            // The next committed upload stays due until its date, then its confirmed trash discovers another fault.
+            clock.advance(by: .seconds(12))
+            let nextGate = LookupGate()
+            defer { nextGate.open() }
+            effects.trashGate = nextGate
+            let nextPass = Task { await running.restore([trigger]) }
+            guard await nextGate.entered(within: .seconds(5)) else {
+                nextGate.open()
+                _ = await nextPass.value
+                XCTFail("the second episode did not reach its trash gate")
+                return
+            }
+            XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='later' AND revision_us=12;"))
+            nextGate.open()
+            _ = await nextPass.value
+            try await pollWhileFalse { clock.waits.filter { $0 == .seconds(60) }.count >= 2 }
+            XCTAssertEqual(Array(effects.trashed.joined()), [earlier, later, next])
+            XCTAssertEqual(clock.waits.last, .seconds(60), "a new failure episode starts at the first backoff again")
+            XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='later' AND revision_us=12;"))
+            clock.advance(by: .seconds(60))
+            try await pollWhileFalse { effects.trashed.joined().contains(newest) }
+            XCTAssertEqual(Array(effects.trashed.joined()), [earlier, later, next, newest])
+        }
+        await coordinator.close()
+    }
+
+    func testLaterTrashRecoveryKeepsAnOldAcknowledgedHandoffAfterRestart() async throws {
+        await coordinator.close()
+        let later = try seedLaterTrash(acknowledgedAt: date.addingTimeInterval(-8 * 24 * 60 * 60))
+        XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='later';"))
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key("later"), generation: 1, remoteLinkID: earlier.nodeID, at: date)
+        )
+        XCTAssertTrue(try XCTUnwrap(store.sourceState(for: key("later"))).remoteTrashed)
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='later';"))
+        recorder.finish()
+        store.close()
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        recorder = PendingBackupEventRecorder(
+            store: store, replacementLedger: .shared(accountDataDirectory: directory), now: { [date] in date })
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+
+        try await pollWhileFalse { effects.trashed.joined().contains(later) }
+        XCTAssertEqual(Array(effects.trashed.joined()), [later], "startup must recover B without resending saved A")
+        XCTAssertEqual(store.latestHandoffsRead(for: [key("later")])[key("later")]?.handoff?.remote, later)
+        XCTAssertEqual(store.sourceState(for: key("later"))?.remote, later)
+        await coordinator.close()
+    }
+
+    private func seedLaterTrashRecoveryBatch(_ count: Int) throws {
+        for index in 0..<count {
+            let id = "batch-\(index)"
+            let before = PhotoUID(volumeID: "vol", nodeID: "a-\(index)")
+            let later = PhotoUID(volumeID: "vol", nodeID: "b-\(index)")
+            let revision = UploadBackupRevision(rawValue: 9)
+            XCTAssertNotNil(
+                store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: before)], at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: 1, at: date))
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(key: key(id), revision: revision, remote: later, kind: .uploaded, createdAt: date)),
+                .excludedRemoteNeedsTrash)
+            XCTAssertTrue(store.acknowledgeHandoffs([(key(id), revision)]))
+            // Save A's completion while its next read fails, then repair B before startup without emitting an event.
+            XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='\(id)';"))
+            XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
+            XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='\(id)';"))
+        }
+    }
+
+    func testLaterTrashStartupRecoveryReadsANewerGeneration() async throws {
+        try await laterTrashStartupReadsNewDecision(returnFirst: false)
+    }
+
+    func testLaterTrashStartupRecoveryReusesAKeyAfterReturn() async throws {
+        try await laterTrashStartupReadsNewDecision(returnFirst: true)
+    }
+
+    private func laterTrashStartupReadsNewDecision(returnFirst: Bool) async throws {
+        await coordinator.close()
+        try seedLaterTrashRecoveryBatch(1)
+        // An unrelated incomplete row makes later reconciles reload the complete source inventory.
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key("bad"), presentation: nil, remote: nil)], at: date))
+        try setDesired("invalid", of: "bad")
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        let target = PhotoUID(volumeID: "vol", nodeID: "b-0")
+        try await pollWhileFalse { effects.trashed.joined().contains(target) }
+        XCTAssertEqual(Array(effects.trashed.joined()), [target])
+        let first = try XCTUnwrap(store.sourceState(for: key("batch-0")))
+        if returnFirst {
+            let returned = await coordinator.restore([key("batch-0").localUID])
+            XCTAssertTrue(returned)
+            XCTAssertNil(store.sourceState(for: key("batch-0")), "the returned source leaves the pending store")
+        }
+
+        XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='batch-0';"))
+        let excluded = try XCTUnwrap(
+            store.exclude(
+                [PendingExclusionRequest(key: key("batch-0"), presentation: nil, remote: earlier)], at: date)?.first)
+        XCTAssertEqual(excluded.generation, returnFirst ? first.generation : first.generation + 1)
+        XCTAssertTrue(store.completeEffect(.queueSync, for: excluded.key, generation: excluded.generation, at: date))
+        // This generation needs its own recorded proof; the prior delete's duties ended at the new decision.
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='batch-0';"))
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: excluded.key, revision: UploadBackupRevision(rawValue: 9), remote: target, kind: .uploaded,
+                    createdAt: date)),
+            .excludedRemoteNeedsTrash)
+        XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='batch-0';"))
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: excluded.key, generation: excluded.generation, remoteLinkID: earlier.nodeID, at: date
+            ))
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='batch-0';"))
+        _ = await coordinator.restore([key("trigger").localUID])
+
+        try await pollWhileFalse { effects.trashed.joined().count >= 2 }
+        XCTAssertEqual(
+            Array(effects.trashed.joined()), [target, target], "a new decision must re-enter startup recovery")
+        await coordinator.close()
+    }
+
+    func testLaterTrashRecoveryAdvancesHealthyKeysBesideAnUnreadableKeyAcrossBatches() async throws {
+        await coordinator.close()
+        try seedLaterTrashRecoveryBatch(201)
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+
+        try await pollWhileFalse { effects.trashed.joined().count >= 200 }
+        XCTAssertEqual(failure.count, 1)
+        XCTAssertEqual(effects.trashed.joined().count, 200, "all healthy keys must advance across the batch boundary")
+        XCTAssertTrue(effects.trashed.joined().allSatisfy { $0.nodeID.hasPrefix("b-") })
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
+        try await settle()
+        XCTAssertEqual(
+            clock.waits.last, .seconds(60), "healthy startup groups must not postpone the failed key's retry")
+        failure.remove(from: store)
+        clock.advance(by: .seconds(60))
+        try await pollWhileFalse { effects.trashed.joined().count >= 201 }
+        XCTAssertEqual(effects.trashed.joined().count, 201, "the failed key must remain retryable")
+        XCTAssertEqual(Set(effects.trashed.joined()).count, 201, "recovery must not repeat completed targets")
+        await coordinator.close()
+    }
+
+    func testLaterTrashStartupYieldsAfterOneBatchAndStopsWritingAfterClose() async throws {
+        await coordinator.close()
+        try seedLaterTrashRecoveryBatch(201)
+        let gate = LookupGate()
+        defer { gate.open() }
+        effects.trashGate = gate
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertGreaterThan(snapshot.membershipRevision, 0, "the first snapshot must precede recovery's remote work")
+        guard await gate.entered(within: .seconds(5)) else {
+            XCTFail("the first recovery batch did not reach its trash gate")
+            await coordinator.close()
+            return
+        }
+        let beforeClose = store.sourceStates()
+        XCTAssertEqual(beforeClose.filter { $0.remote?.nodeID.hasPrefix("b-") == true }.count, 100)
+        await coordinator.close()
+        gate.open()
+        try await settle()
+        XCTAssertEqual(store.sourceStates(), beforeClose, "close must prevent the queued second batch from writing")
+    }
+
+    func testLaterTrashUnreadableStartupSchedulesBackoffUntilRepair() async throws {
+        await coordinator.close()
+        try seedLaterTrashRecoveryBatch(1)
+        XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='batch-0';"))
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
+        try await settle()
+        XCTAssertEqual(clock.waits, [.seconds(60)], "an unreadable-only batch must still start reconciliation backoff")
+        XCTAssertTrue(effects.trashed.isEmpty)
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='batch-0';"))
+        clock.advance(by: .seconds(60))
+        let target = PhotoUID(volumeID: "vol", nodeID: "b-0")
+        try await pollWhileFalse { effects.trashed.joined().contains(target) }
+        XCTAssertEqual(Array(effects.trashed.joined()), [target])
+        await coordinator.close()
+    }
+
+    func testLaterTrashUnchangedRecoveryKeepsTheExistingTimerAndPublication() async throws {
+        await coordinator.close()
+        XCTAssertNotNil(
+            store.exclude(
+                [PendingExclusionRequest(key: key("unchanged"), presentation: nil, remote: earlier)], at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key("unchanged"), generation: 1, at: date))
+        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key("unchanged"), generation: 1, at: date))
+        excludedLater("future")
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key("future"), generation: 1, at: date))
+        let before = store.sourceStates()
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        let first = await coordinator.currentSnapshot()
+        try await pollWhileFalse { !clock.waits.isEmpty }
+        try await settle()
+
+        XCTAssertEqual(clock.waits, [.seconds(5000)], "a batch without new work must not replace the existing timer")
+        XCTAssertEqual(store.sourceStates(), before, "unchanged recovery must not update any source-state value")
+        let after = await coordinator.currentSnapshot()
+        XCTAssertEqual(
+            after.membershipRevision, first.membershipRevision, "recovery must not publish another membership")
+        XCTAssertTrue(effects.trashed.isEmpty)
+        clock.advance(by: .seconds(5000))
+        let target = PhotoUID(volumeID: "vol", nodeID: "future")
+        try await pollWhileFalse { effects.trashed.joined().contains(target) }
+        XCTAssertEqual(
+            Array(effects.trashed.joined()), [target], "the retained timer must still dispatch the other source")
+        await coordinator.close()
     }
 
     func testDismissedMissingSourceRecheckStaysHiddenThroughIncrementalReloadAndRelaunch() async throws {
@@ -150,10 +971,10 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         ordinary.lastError = nil
         ordinary.state = .queuedForUpload
         XCTAssertTrue(queue.upsert(ordinary))
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         var released = pending
         released.state = .checking
-        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: date).count, 1)
+        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: date)?.count, 1)
         released.lastError = nil
         XCTAssertEqual(
             queue.updateDismissedSourceRecheck(released, matchingState: .checking, matchingLastError: reason), true)
@@ -175,10 +996,13 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
     private func makeJournalCoordinator(
         identities: (any UploadIdentityStore)? = nil,
-        relations: (any UploadDuplicateChecking)? = nil
+        relations: (any UploadDuplicateChecking)? = nil,
+        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) throws -> EditReplacementJournalFileStore {
         let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
-        coordinator = makeCoordinator(replacementJournal: journal, identities: identities, relations: relations)
+        coordinator = makeCoordinator(
+            replacementJournal: journal, identities: identities, relations: relations,
+            sleep: sleep)
         return journal
     }
 
@@ -971,6 +1795,49 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.trashTiles.map(\.item.uid), [kept], "\"Recently Deleted\" drops them as well")
     }
 
+    /// The state of one excluded photo cannot be read at start and the photo has no handoff, so the check of the
+    /// excluded list cannot examine it. Once a later read of the states succeeds, the check examines that photo.
+    func testAnExcludedPhotoWhoseStateFailedToLoadIsCheckedAgainAfterARead() async throws {
+        let requests = ["good", "bad"].map { id in
+            let presentation = PendingPresentationMetadata(
+                captureTime: date, mediaType: "image/heic", displayName: "\(id).heic")
+            metadata.set(key(id), presentation)
+            return PendingExclusionRequest(key: key(id), presentation: presentation, remote: nil)
+        }
+        XCTAssertNotNil(store.exclude(requests, at: date))
+        try setDesired("invalid", of: "bad")
+        let gate = OpenGate()
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(sleep: { duration in
+            delays.append(duration)
+            if duration >= .seconds(60), delays.values.filter({ $0 >= .seconds(60) }).count == 1 {
+                await gate.wait()
+            } else {
+                try await Task.sleep(for: duration)
+            }
+        })
+        await coordinator.start()
+        await coordinator.noteLibraryChanged()
+        var deadline = ContinuousClock.now + .seconds(5)
+        while metadata.reads(of: key("good")) < 2 || !delays.values.contains(where: { $0 >= .seconds(60) }),
+            ContinuousClock.now < deadline
+        {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(metadata.reads(of: key("good")), 2, "the start and the library change each checked the list")
+        XCTAssertEqual(metadata.reads(of: key("bad")), 0, "a state that did not load cannot be examined")
+
+        try setDesired("excluded", of: "bad")
+        gate.open()
+
+        deadline = ContinuousClock.now + .seconds(5)
+        while metadata.reads(of: key("bad")) == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(metadata.reads(of: key("bad")), 1, "the next read of the states lets the check examine it")
+    }
+
     func testABurstOfLibraryChangesSharesOneCheck() async throws {
         await coordinator.close()
         let gate = PendingMembershipSleepGate()
@@ -1187,56 +2054,16 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(effects.order.suffix(2), ["restore", "return"])
     }
 
-    /// The person restored the Proton photo of a deleted photo from the Proton trash. The local photo returns to the
-    /// backup without a second Proton restore, and restoring the same photo again changes nothing (#829).
-    func testARestoreFromTheProtonTrashReturnsTheLocalPhotoToTheBackupOnce() async throws {
-        let remote = try await deleteAnUploadedPhoto("back")
-
-        await coordinator.restoreSources(ofRemote: [remote])
-        await coordinator.restoreSources(ofRemote: [remote])
-
-        XCTAssertTrue(effects.restored.isEmpty, "the photo is out of the Proton trash already")
-        XCTAssertEqual(effects.returned, [[key("back")]], "the local photo returns to the backup once")
-        XCTAssertNotEqual(store.sourceState(for: key("back"))?.desired, .excluded)
-    }
-
-    /// A restore from the Proton trash that cannot read the stored state leaves the local photo excluded (#829).
-    func testARestoreFromTheProtonTrashThatCannotReadTheStateKeepsThePhotoExcluded() async throws {
-        let remote = try await deleteAnUploadedPhoto("back")
-        let failure = KeyedReadFailure()
-        try failure.install(on: store)
-        defer { failure.remove(from: store) }
-
-        await coordinator.restoreSources(ofRemote: [remote])
-
-        failure.remove(from: store)
-        XCTAssertGreaterThan(failure.count, 0)
-        XCTAssertTrue(effects.restored.isEmpty)
-        XCTAssertTrue(effects.returned.isEmpty, "nothing returns to the backup on an unreadable state")
-        XCTAssertEqual(store.sourceState(for: key("back"))?.desired, .excluded)
-    }
-
-    /// Deletes an uploaded pending photo, which moves its Proton photo to the Proton trash, and returns that photo.
-    private func deleteAnUploadedPhoto(_ id: String) async throws -> PhotoUID {
-        enqueue(id, state: .uploading)
-        await coordinator.start()
-        let remote = PhotoUID(volumeID: "vol", nodeID: "link-\(id)")
-        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
-        await waitForSnapshot("handoff known") { $0.tiles.first?.handoff != nil }
-        await coordinator.exclude([PhotoUID(localPending: .photoLibrary, identifier: id)])
-        XCTAssertEqual(effects.trashed, [[remote]])
-        return remote
-    }
-
     /// An edit uploads while its tile hides the earlier upload of this device. The tile of that upload retired,
     /// so only the store still knows its handoff.
     private func startPendingEdit(
         earlierKind: PendingHandoffKind = .uploaded,
         identities: (any UploadIdentityStore)? = FakeIdentityStore(),
-        relations: (any UploadDuplicateChecking)? = FakeChecker()
+        relations: (any UploadDuplicateChecking)? = FakeChecker(),
+        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) async throws {
         await coordinator.close()
-        let journal = try makeJournalCoordinator(identities: identities, relations: relations)
+        let journal = try makeJournalCoordinator(identities: identities, relations: relations, sleep: sleep)
         try journal.addSuperseded(earlier, for: source("p"))
         enqueue("p", state: .completed)
         enqueueEdit("p", state: .uploading)
@@ -1279,10 +2106,13 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     /// tile name the earlier upload.
     private func startPendingEditWithoutHandoff(
         identities: (any UploadIdentityStore)?,
-        relations: (any UploadDuplicateChecking)? = FakeChecker()
+        relations: (any UploadDuplicateChecking)? = FakeChecker(),
+        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) async throws {
         await coordinator.close()
-        let journal = try makeJournalCoordinator(identities: identities, relations: relations)
+        let journal = try makeJournalCoordinator(
+            identities: identities, relations: relations,
+            sleep: sleep)
         try journal.addSuperseded(earlier, for: source("p"))
         enqueue("p", state: .completed)
         enqueueEdit("p", state: .uploading)
@@ -1346,7 +2176,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
     // Mutation: return nil from `newestEarlierMain`; the restore has no photo to bring back.
     func testRestoringAnEditWithoutAHandoffBringsTheEarlierUploadBack() async throws {
-        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore())
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[earlier.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore(), relations: relations)
         await coordinator.exclude([key("p").localUID])
 
         await coordinator.restore([key("p").localUID])
@@ -1358,7 +2190,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
     // Mutation: drop the source-state lookup in `restoreSources(ofRemote:)`; the source stays deleted.
     func testRestoringTheEarlierUploadFromTheProtonTrashRestoresAnEditWithoutAHandoff() async throws {
-        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore())
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[earlier.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore(), relations: relations)
         await coordinator.exclude([key("p").localUID])
 
         await coordinator.restoreSources(ofRemote: [earlier])
@@ -1398,6 +2232,26 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(
             Set(effects.trashed.flatMap { $0 }), [earlier, committed],
             "the person deleted the photo, so neither the earlier upload nor the edit stays in the library")
+    }
+
+    func testDeletingAnOlderTileTrashesALaterCommitWhoseEventIsStillPending() async throws {
+        try await startPendingEdit()
+        let committed = PhotoUID(volumeID: "vol", nodeID: "later-edit-commit")
+        let later = UploadBackupRevision(rawValue: edit.rawValue + 1)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("p"), revision: later, remote: committed, kind: .uploaded, createdAt: date)),
+            .recorded)
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertEqual(
+            snapshot.tiles.first?.revision, edit,
+            "the durable upload event has not reached this tile")
+        let deleted = await coordinator.exclude([key("p").localUID])
+        XCTAssertTrue(deleted)
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.contains(committed) }
+        XCTAssertEqual(
+            Set(effects.trashed.flatMap { $0 }), [earlier, committed],
+            "the delete keeps the existing this-or-later revision contract")
     }
 
     // Mutation: return the handoff's photo in `hiddenEarlierUpload` before the `isNeededElsewhere` guard.
@@ -1570,7 +2424,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     }
 
     func testRestoringADeletedEditBringsTheEarlierUploadBackBeforeTheBackupSeesIt() async throws {
-        try await startPendingEdit()
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[earlier.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        try await startPendingEdit(relations: relations)
         await coordinator.exclude([key("p").localUID])
 
         await coordinator.restore([key("p").localUID])
@@ -1581,7 +2437,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     }
 
     func testRestoringAfterAnUndoInPhotosBringsTheEarlierUploadBack() async throws {
-        try await startPendingEdit()
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[earlier.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        try await startPendingEdit(relations: relations)
         await coordinator.exclude([key("p").localUID])
 
         // The person reverts the edit in Photos while the photo is deleted in the app.
@@ -1712,7 +2570,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 if duration >= .seconds(60) { await retry.wait() } else { try await Task.sleep(for: duration) }
             })
         await coordinator.start()
-        XCTAssertTrue(effects.favorites.isEmpty, "while one state is unreadable, a source without state is unknown")
+        XCTAssertEqual(effects.favorites, [remote], "a readable rowless source acts while another state is unreadable")
 
         try setDesired("excluded", of: "bad")
         retry.open()
@@ -1787,8 +2645,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertFalse(delays.values.contains(.seconds(1)))
     }
 
-    /// A trash finished, the store now owes the trash of a later commit, and the source's keyed read fails. The pass
-    /// must not trust the last known state and dispatch the new trash again and again; it waits for the backoff.
+    /// The queue result is saved before the trash starts. Only the reads after that trash fail; the pending
+    /// trash completion prevents another dispatch when the backoff opens the next pass.
     func testATrashWhoseStateCannotBeReadAfterwardsIsNotDispatchedAgainInTheSamePass() async throws {
         XCTAssertNotNil(
             store.exclude(
@@ -1800,32 +2658,50 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
         XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 500)", of: "s", at: url))
         let gate = OpenGate()
+        defer { gate.open() }
+        let retryGate = OpenGate()
+        defer { retryGate.open() }
+        let trashGate = LookupGate()
+        defer { trashGate.open() }
+        effects.trashGate = trashGate
         let delays = DelayLog()
         await coordinator.close()
         coordinator = makeCoordinator(
             checkmarkDuration: .seconds(5),
             sleep: { duration in
                 delays.append(duration)
-                if duration == .seconds(500) { await gate.wait() } else { try await Task.sleep(for: .seconds(3600)) }
+                if duration == .seconds(500) {
+                    await gate.wait()
+                } else if duration == .seconds(60) {
+                    await retryGate.wait()
+                } else {
+                    try await Task.sleep(for: .seconds(3600))
+                }
             })
         await coordinator.start()
-        let started = ContinuousClock.now + .seconds(5)
-        while !delays.values.contains(.seconds(500)), ContinuousClock.now < started {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        // The store now owes the trash of photo B, while the coordinator still knows photo A.
+        try await pollWhileFalse { delays.values.contains(.seconds(500)) }
+        XCTAssertTrue(delays.values.contains(.seconds(500)), "the initial retry is held before the fault")
+        // The store now owes photo B. Its queue completion must succeed before the read fault starts.
         XCTAssertTrue(
             Self.setColumns("remote_link_id='b', next_attempt_at=\(date.timeIntervalSince1970)", of: "s", at: url))
+        gate.open()
+        guard await trashGate.entered(within: .seconds(5)) else {
+            XCTFail("photo B never reached the trash gate")
+            await coordinator.close()
+            return
+        }
+        let beforeTrash = try XCTUnwrap(store.sourceState(for: key("s")))
+        XCTAssertFalse(beforeTrash.needsQueueSync, "queue completion is durable before the fault")
         let failure = KeyedReadFailure()
         try failure.install(on: store)
         defer { failure.remove(from: store) }
-
-        gate.open()
-
-        let deadline = ContinuousClock.now + .seconds(5)
-        while !delays.values.contains(.seconds(60)), ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
+        trashGate.open()
+        try await pollWhileFalse { delays.values.contains(.seconds(60)) }
+        XCTAssertTrue(delays.values.contains(.seconds(60)), "the rejected trash completion starts the backoff")
+        retryGate.open()
+        try await pollWhileFalse { delays.values.contains(.seconds(120)) }
+        XCTAssertTrue(
+            delays.values.contains(.seconds(120)), "the next pass retries persistence and doubles the backoff")
         XCTAssertGreaterThan(failure.count, 0)
         XCTAssertEqual(effects.trashed.joined().filter { $0.nodeID == "b" }.count, 1, "photo B is sent once per pass")
         XCTAssertTrue(delays.values.contains(.seconds(60)), "the source waits for the backoff")
@@ -1966,7 +2842,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         while !effects.trashed.joined().contains(where: { $0.nodeID == "link-kept" }), ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
-        let failure = SourceListFailure()
+        let failure = SourceListFailure(transient: true)
         try failure.install(on: store)
         defer { failure.remove(from: store) }
 
@@ -1979,9 +2855,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(failure.denied, "the second load must fail")
         failure.remove(from: store)
         await coordinator.restoreSources(ofRemote: [PhotoUID(volumeID: "vol", nodeID: "link-kept")])
+        XCTAssertTrue(effects.restored.isEmpty, "Proton already restored the photo")
         XCTAssertEqual(
-            effects.returned.joined().map(\.identifier), ["kept"], "the last known state finds the deleted source")
-        XCTAssertTrue(effects.restored.isEmpty, "the photo is out of the Proton trash already")
+            effects.returned, [[key("kept")]], "the last known state returns the deleted source to backup")
     }
 
     func testAZeroRetryDelayStillWaitsASecond() {
@@ -2031,6 +2907,541 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         while delays.values.count < 3, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertEqual(
             delays.values, [.seconds(60), .seconds(120), .seconds(60)], "a new episode starts at one minute")
+    }
+
+    // MARK: - Rejected result writes (#770 D3)
+
+    func testAConfirmedTrashWhoseCompletionCannotBeWrittenIsSentOnce() async throws {
+        try await rejectedWrite(.trashCompletion, repeatedWaits: true)
+    }
+
+    func testADoneFavoriteWhoseCompletionCannotBeWrittenIsSentOnce() async throws {
+        try await rejectedWrite(.actionCompletion, repeatedWaits: true)
+    }
+
+    func testAFailedFavoriteWhoseFailureCannotBeWrittenIsNotSentAgain() async throws {
+        try await rejectedWrite(.actionFailure)
+    }
+
+    func testARetryOfAnActionThatCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.actionRetry)
+    }
+
+    func testAnUnansweredTrashWhoseRetryCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.trashRetry)
+    }
+
+    func testADeferWithoutAVolumeThatCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.noVolume)
+    }
+
+    func testABeginThatCannotBeWrittenSendsNothing() async throws {
+        try await rejectedWrite(.begin)
+    }
+
+    func testAQueueRemovalWhoseCompletionCannotBeWrittenRunsOnce() async throws {
+        try await rejectedWrite(.queueCompletion)
+    }
+
+    func testAQueueRemovalWhoseRetryCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.queueRetry)
+    }
+
+    func testAnActionDeferWithoutAVolumeThatCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.actionNoVolume)
+    }
+
+    func testAQueueCompletionSurvivesRepeatedRejectedWrites() async throws {
+        try await rejectedWrite(.queueCompletion, repeatedWaits: true)
+    }
+
+    func testASavedQueueCompletionEndsTheWriteBackoff() async throws {
+        try await savedCompletionEndsBackoff(.queueCompletion)
+    }
+
+    func testASavedFavoriteCompletionEndsTheWriteBackoff() async throws {
+        try await savedCompletionEndsBackoff(.actionCompletion)
+    }
+
+    private func savedCompletionEndsBackoff(_ rejected: RejectedWrite) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(rejected)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        if rejected.isQueue {
+            failure.remove(from: store)
+            includedLater("later")
+            try failure.install(on: store)
+        }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(clock.waits, [.seconds(60)])
+        failure.remove(from: store)
+        clock.advance(by: .seconds(60))
+        try await pollWhileFalse { clock.waits.count >= 2 }
+        try await settle()
+        XCTAssertEqual(clock.waits, [.seconds(60), .seconds(4940)], "a saved result leaves only ordinary future work")
+        if rejected.isQueue {
+            XCTAssertEqual(store.sourceState(for: key("write"))?.needsQueueSync, false)
+            XCTAssertEqual(effects.removed, [["write"]])
+        } else {
+            XCTAssertTrue(store.actions().isEmpty)
+            XCTAssertEqual(effects.favorites.count, 1)
+        }
+    }
+
+    func testASavedTrashRetryDispatchesOnlyAtItsPersistedDate() async throws {
+        try await savedRetryDispatchesAtItsDate(.trashRetry)
+    }
+
+    func testASavedFavoriteRetryDispatchesOnlyAtItsPersistedDate() async throws {
+        try await savedRetryDispatchesAtItsDate(.actionRetry)
+    }
+
+    private func savedRetryDispatchesAtItsDate(_ rejected: RejectedWrite) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(rejected)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(clock.waits, [.seconds(60)])
+        failure.remove(from: store)
+        clock.advance(by: .seconds(60))
+        try await pollWhileFalse {
+            rejected.isAction
+                ? store.actions().first?.attempts == 1
+                : store.sourceState(for: key("write"))?.attempts == 1
+        }
+        try await settle()
+        let next =
+            rejected.isAction
+            ? store.actions().first?.nextAttemptAt
+            : store.sourceState(for: key("write"))?.nextAttemptAt
+        XCTAssertEqual(next, date.addingTimeInterval(120))
+        XCTAssertEqual(rejected.isAction ? effects.favorites.count : effects.trashed.joined().count, 1)
+        XCTAssertTrue(clock.waits.dropFirst().contains(.seconds(60)), "the persisted date registers an ordinary retry")
+        effects.favoriteResult = .done
+        effects.trashRetry = []
+        clock.advance(by: .seconds(59))
+        try await settle()
+        XCTAssertEqual(rejected.isAction ? effects.favorites.count : effects.trashed.joined().count, 1)
+        clock.advance(by: .seconds(1))
+        try await pollWhileFalse {
+            rejected.isAction ? effects.favorites.count == 2 : effects.trashed.joined().count == 2
+        }
+        try await settle()
+        XCTAssertEqual(rejected.isAction ? effects.favorites.count : effects.trashed.joined().count, 2)
+        if rejected.isAction {
+            XCTAssertTrue(store.actions().isEmpty)
+        } else {
+            XCTAssertEqual(store.sourceState(for: key("write"))?.needsRemoteTrash, false)
+        }
+    }
+
+    func testAnOlderPendingQueueCompletionKeepsTheNewGenerationOwed() async throws {
+        try await newerEffectSurvivesPendingCompletion(.queueCompletion)
+    }
+
+    func testAnOlderPendingTrashCompletionKeepsTheNewRemoteOwed() async throws {
+        try await newerEffectSurvivesPendingCompletion(.trashCompletion)
+    }
+
+    private func newerEffectSurvivesPendingCompletion(_ rejected: RejectedWrite) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(rejected)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(clock.waits, [.seconds(60)])
+        let original = try XCTUnwrap(store.sourceState(for: key("write")))
+        failure.remove(from: store)
+        let laterRemote = rejected.isQueue ? nil : PhotoUID(volumeID: "vol", nodeID: "new-link")
+        let newer = try XCTUnwrap(
+            store.exclude(
+                [PendingExclusionRequest(key: key("write"), presentation: nil, remote: laterRemote)],
+                at: date.addingTimeInterval(1))?.first)
+        XCTAssertEqual(newer.generation, original.generation + 1)
+        XCTAssertTrue(
+            Self.setColumns(
+                "next_attempt_at=\(date.timeIntervalSince1970 + 600)"
+                    + (rejected.isQueue ? "" : ", needs_queue_sync=0"),
+                of: "write", at: storeURL))
+        clock.advance(by: .seconds(60))
+        try await pollWhileFalse { clock.waits.count >= 2 }
+        try await settle()
+        let kept = try XCTUnwrap(store.sourceState(for: key("write")))
+        XCTAssertEqual(kept.generation, newer.generation)
+        XCTAssertEqual(kept.remote, laterRemote)
+        XCTAssertTrue(
+            rejected.isQueue ? kept.needsQueueSync : kept.needsRemoteTrash,
+            "the old completion cannot settle the newer decision")
+        XCTAssertEqual(kept.remoteTrashed, false)
+        XCTAssertNil(kept.remoteOperation)
+        XCTAssertEqual(clock.waits, [.seconds(60), .seconds(540)])
+        XCTAssertEqual(rejected.isQueue ? effects.removed.count : effects.trashed.joined().count, 1)
+        clock.advance(by: .seconds(540))
+        try await pollWhileFalse {
+            rejected.isQueue ? effects.removed.count == 2 : effects.trashed.joined().count == 2
+        }
+        try await settle()
+        XCTAssertEqual(rejected.isQueue ? effects.removed.count : effects.trashed.joined().count, 2)
+        let finished = try XCTUnwrap(store.sourceState(for: key("write")))
+        XCTAssertEqual(rejected.isQueue ? finished.needsQueueSync : finished.needsRemoteTrash, false)
+        if !rejected.isQueue { XCTAssertEqual(effects.trashed.last, [try XCTUnwrap(laterRemote)]) }
+    }
+
+    func testANewerFavoriteValueCanRunWhileAnOlderCompletionWaits() async throws {
+        try await newerFavoriteSurvivesPendingCompletion(favorite: false, offset: 0)
+    }
+
+    func testANewerFavoriteDateCanRunWhileAnOlderCompletionWaits() async throws {
+        try await newerFavoriteSurvivesPendingCompletion(favorite: true, offset: 1)
+    }
+
+    private func newerFavoriteSurvivesPendingCompletion(favorite: Bool, offset: Int64) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(.actionCompletion)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(clock.waits, [.seconds(60)])
+        clock.advance(by: .seconds(offset))
+        let stored = await coordinator.setFavorite(
+            [PhotoUID(localPending: .photoLibrary, identifier: "write")], favorite: favorite)
+        XCTAssertTrue(stored)
+        try await settle()
+        XCTAssertEqual(effects.favoriteValues, [true, favorite], "a distinct newer SQL action identity can run")
+        let action = try XCTUnwrap(store.actions().first)
+        XCTAssertEqual(action.desired, favorite)
+        XCTAssertEqual(action.createdAt, date.addingTimeInterval(Double(offset)))
+        XCTAssertEqual(clock.waits, [.seconds(60)], "neither unsaved action registers a one-second timer")
+        failure.remove(from: store)
+        clock.advance(by: .seconds(60 - offset))
+        try await pollWhileFalse { store.actions().isEmpty && clock.waits.count >= 2 }
+        try await settle()
+        XCTAssertTrue(store.actions().isEmpty)
+        XCTAssertEqual(effects.favoriteValues, [true, favorite], "repair saves both results without another request")
+        XCTAssertEqual(clock.waits, [.seconds(60), .seconds(4940)])
+    }
+
+    func testAPendingFavoriteResultSuppressesAnotherDispatchAndShortTimer() async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(.actionCompletion)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        let accepted = await coordinator.setFavorite([], favorite: true)
+        XCTAssertTrue(accepted)
+        try await settle()
+        XCTAssertEqual(effects.favoriteValues, [true])
+        XCTAssertEqual(clock.waits, [.seconds(60)], "the owed action waits on reconcile, not a short action timer")
+    }
+
+    func testARejectedFavoriteResultOutsideReconcileStartsTheWriteBackoff() async throws {
+        includedLater("write")
+        _ = favoriteFixture("write")
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertEqual(clock.waits, [.seconds(5000)])
+        let failure = SourceListFailure(
+            table: "pending_action", untilRemoved: true, action: SQLITE_DELETE, transient: true)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        let stored = await coordinator.setFavorite(
+            [PhotoUID(localPending: .photoLibrary, identifier: "write")], favorite: true)
+        XCTAssertTrue(stored)
+        try await pollWhileFalse { clock.waits.count >= 2 }
+        try await settle()
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(effects.favoriteValues, [true])
+        XCTAssertEqual(store.actions().count, 1)
+        XCTAssertEqual(
+            clock.waits, [.seconds(5000), .seconds(60)],
+            "a rejected action result outside reconcile starts the degraded retry")
+    }
+
+    func testAFutureDateOfAnUnsavedKeyCannotShortenItsBackoff() async throws {
+        try await pendingFutureDateKeepsItsBackoff(healthyOther: false)
+    }
+
+    func testAHealthyOtherKeyKeepsItsEarlierRetryBesideAnUnsavedResult() async throws {
+        try await pendingFutureDateKeepsItsBackoff(healthyOther: true)
+    }
+
+    private func pendingFutureDateKeepsItsBackoff(healthyOther: Bool) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(.queueCompletion)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        effects.onRemove = { [storeURL, date] in
+            XCTAssertTrue(
+                Self.setColumns(
+                    "next_attempt_at=\(date.timeIntervalSince1970 + 10)", of: "write", at: storeURL))
+        }
+        let healthyRemote = PhotoUID(volumeID: "vol", nodeID: "healthy-link")
+        if healthyOther {
+            failure.remove(from: store)
+            XCTAssertNotNil(
+                store.exclude(
+                    [PendingExclusionRequest(key: key("healthy"), presentation: nil, remote: healthyRemote)], at: date))
+            XCTAssertTrue(
+                Self.setColumns(
+                    "needs_queue_sync=0, next_attempt_at=\(date.timeIntervalSince1970 + 30)",
+                    of: "healthy", at: storeURL))
+            try failure.install(on: store)
+        }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(store.sourceState(for: key("write"))?.nextAttemptAt, date.addingTimeInterval(10))
+        XCTAssertEqual(effects.removed, [["write"]])
+        XCTAssertEqual(
+            clock.waits, [healthyOther ? .seconds(30) : .seconds(60)],
+            "only another readable key may shorten the degraded backoff")
+        if healthyOther {
+            clock.advance(by: .seconds(30))
+            try await pollWhileFalse { effects.trashed.joined().contains(healthyRemote) && clock.waits.count >= 2 }
+            try await settle()
+            XCTAssertEqual(Array(effects.trashed.joined()), [healthyRemote])
+            XCTAssertEqual(effects.removed, [["write"]], "the unsaved key does not dispatch again")
+            XCTAssertEqual(clock.waits, [.seconds(30), .seconds(120)])
+        }
+    }
+
+    private func startRejectedWriteClock(_ clock: ResultWriteClock) async throws {
+        await coordinator.close()
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        try await pollWhileFalse { !clock.waits.isEmpty }
+        try await settle()
+        XCTAssertFalse(clock.waits.isEmpty, "a real timer must register before its delay is checked")
+    }
+
+    private enum RejectedWrite {
+        case trashCompletion, actionCompletion, actionFailure, actionRetry, trashRetry, noVolume, begin
+        case queueCompletion, queueRetry, actionNoVolume
+
+        var isAction: Bool {
+            switch self {
+            case .actionCompletion, .actionFailure, .actionRetry, .actionNoVolume: true
+            default: false
+            }
+        }
+
+        var isQueue: Bool { self == .queueCompletion || self == .queueRetry }
+
+        var deniedAction: Int32 { self == .actionCompletion ? SQLITE_DELETE : SQLITE_UPDATE }
+
+        var deniedColumn: String? {
+            switch self {
+            case .queueCompletion: "needs_queue_sync"
+            case .trashCompletion: "remote_trashed"
+            case .actionCompletion: nil
+            case .actionFailure: "failed"
+            case .actionRetry, .trashRetry, .noVolume, .queueRetry, .actionNoVolume: "attempts"
+            case .begin: "remote_op"
+            }
+        }
+    }
+
+    private func prepareRejectedWrite(
+        _ rejected: RejectedWrite
+    ) throws -> (SourceListFailure, ResultWriteClock, PhotoUID) {
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-write")
+        if rejected.isAction {
+            includedLater("write")
+            XCTAssertNotEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: key("write"), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+                .failed)
+            XCTAssertTrue(store.setFavoriteIntent(key("write"), favorite: true, at: date))
+        } else {
+            XCTAssertNotNil(
+                store.exclude(
+                    [
+                        PendingExclusionRequest(
+                            key: key("write"), presentation: nil, remote: rejected.isQueue ? nil : remote)
+                    ], at: date))
+            if !rejected.isQueue {
+                XCTAssertTrue(Self.setColumns("needs_queue_sync=0", of: "write", at: storeURL))
+            }
+        }
+        if rejected == .trashRetry { effects.trashRetry = [remote] }
+        if rejected == .noVolume || rejected == .actionNoVolume { effects.volumeID = nil }
+        if rejected == .queueRetry { effects.removeSucceeds = false }
+        if rejected == .actionFailure { effects.favoriteResult = .permanentFailure }
+        if rejected == .actionRetry { effects.favoriteResult = .retry }
+        let failure = SourceListFailure(
+            table: rejected.isAction ? "pending_action" : "source_state", untilRemoved: true,
+            action: rejected.deniedAction, column: rejected.deniedColumn, transient: true)
+        try failure.install(on: store)
+        return (failure, ResultWriteClock(date), remote)
+    }
+
+    private func rejectedWrite(
+        _ rejected: RejectedWrite, repeatedWaits: Bool = false,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(rejected)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        await coordinator.close()
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        try await pollWhileFalse { !clock.waits.isEmpty }
+        XCTAssertTrue(failure.denied, "the real result write must be rejected", file: file, line: line)
+
+        let expected: [Duration] =
+            repeatedWaits
+            ? [
+                .seconds(60), .seconds(120), .seconds(240), .seconds(480), .seconds(960), .seconds(1800),
+                // An unsaved action result keeps its source_state, so the key's real next effect date stays
+                // visible (#909): the fixture parks it at +5000, and the ladder above consumed 3660 of that.
+                rejected == .actionCompletion ? .seconds(1340) : .seconds(1800),
+            ]
+            : [.seconds(60)]
+        for (index, delay) in expected.enumerated() {
+            try await pollWhileFalse { clock.waits.count > index }
+            XCTAssertEqual(
+                Array(clock.waits.prefix(index + 1)), Array(expected.prefix(index + 1)),
+                "a rejected result waits for the degraded backoff", file: file, line: line)
+            guard clock.waits.count > index, clock.waits[index] == delay else { return }
+            let sent =
+                rejected.isAction
+                ? effects.favorites.count
+                : rejected.isQueue ? effects.removed.count : effects.trashed.joined().count
+            XCTAssertEqual(
+                sent, rejected == .noVolume || rejected == .begin || rejected == .actionNoVolume ? 0 : 1,
+                "an unsaved result is not sent again", file: file, line: line)
+            if index + 1 < expected.count { clock.advance(by: delay) }
+        }
+
+        failure.remove(from: store)
+        effects.volumeID = "photos-volume"
+        clock.advance(by: expected.last!)
+        try await pollWhileFalse {
+            if rejected.isAction {
+                let actions = store.actions()
+                switch rejected {
+                case .actionCompletion: return actions.isEmpty
+                case .actionFailure: return actions.first?.failed == true
+                default: return actions.first?.attempts == 1
+                }
+            }
+            let state = store.sourceState(for: key("write"))
+            if rejected == .trashRetry || rejected == .noVolume || rejected == .queueRetry {
+                return state?.attempts == 1
+            }
+            return rejected.isQueue ? state?.needsQueueSync == false : state?.needsRemoteTrash == false
+        }
+        if rejected.isAction {
+            let actions = store.actions()
+            switch rejected {
+            case .actionCompletion:
+                XCTAssertTrue(actions.isEmpty, "the saved completion removes the action", file: file, line: line)
+            case .actionFailure:
+                XCTAssertEqual(actions.first?.failed, true, "the saved failure stays final", file: file, line: line)
+            default:
+                XCTAssertEqual(actions.first?.attempts, 1, "the retry time is saved", file: file, line: line)
+            }
+            XCTAssertEqual(
+                effects.favorites.count, rejected == .actionNoVolume ? 0 : 1,
+                "repair saves the result without another request", file: file, line: line)
+        } else {
+            let state = store.sourceState(for: key("write"))
+            if rejected == .trashRetry || rejected == .noVolume || rejected == .queueRetry {
+                XCTAssertEqual(state?.attempts, 1, "the retry time is saved", file: file, line: line)
+                XCTAssertGreaterThan(state?.nextAttemptAt ?? .distantPast, clock.now, file: file, line: line)
+            } else {
+                XCTAssertEqual(
+                    rejected.isQueue ? state?.needsQueueSync : state?.needsRemoteTrash, false,
+                    "the completion is saved", file: file, line: line)
+            }
+            XCTAssertEqual(
+                rejected.isQueue ? effects.removed.count : effects.trashed.joined().count,
+                rejected == .noVolume ? 0 : 1,
+                "repair saves the result before another request", file: file, line: line)
+        }
+        await coordinator.close()
+    }
+
+    /// Advances only when the test requests it. Every registered wait has its own gate.
+    private final class ResultWriteClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Date
+        private enum WaitState { case live, fired, cancelled }
+        private var recorded: [(duration: Duration, state: WaitState)] = []
+        private var sleeping: [(due: Date, gate: OpenGate, index: Int)] = []
+        private var registrationWaiters: [(duration: Duration, gate: OpenGate)] = []
+        var now: Date { lock.withLock { value } }
+        var waits: [Duration] { lock.withLock { recorded.map(\.duration) } }
+        /// Only the waits that can still fire: neither cancelled by their timer task nor already
+        /// released by `advance` or `releaseAll`.
+        var liveWaits: [Duration] {
+            lock.withLock { recorded.filter { $0.state == .live }.map(\.duration) }
+        }
+
+        init(_ date: Date) { value = date }
+
+        /// Returns once a live wait of `duration` exists: at once when one is already live, otherwise when `sleep`
+        /// registers it. A timer task registers its wait only when it starts, after the call that scheduled it.
+        func waitForLiveWait(_ duration: Duration) async {
+            let gate = OpenGate()
+            let live = lock.withLock { () -> Bool in
+                if recorded.contains(where: { $0.duration == duration && $0.state == .live }) { return true }
+                registrationWaiters.append((duration, gate))
+                return false
+            }
+            if !live { await gate.wait() }
+        }
+
+        func sleep(_ duration: Duration) async throws {
+            let gate = OpenGate()
+            let (index, registered) = lock.withLock { () -> (Int, [OpenGate]) in
+                recorded.append((duration, .live))
+                let parts = duration.components
+                let seconds = Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+                sleeping.append((value.addingTimeInterval(seconds), gate, recorded.count - 1))
+                let registered = registrationWaiters.filter { $0.duration == duration }.map(\.gate)
+                registrationWaiters.removeAll { $0.duration == duration }
+                return (recorded.count - 1, registered)
+            }
+            registered.forEach { $0.open() }
+            await withTaskCancellationHandler {
+                await gate.wait()
+            } onCancel: {
+                lock.withLock {
+                    if recorded[index].state == .live { recorded[index].state = .cancelled }
+                    sleeping.removeAll { $0.index == index }
+                }
+                gate.open()
+            }
+            try Task.checkCancellation()
+        }
+
+        func advance(by duration: Duration, wakingTimers: Bool = true) {
+            let due = lock.withLock { () -> [OpenGate] in
+                let parts = duration.components
+                value = value.addingTimeInterval(Double(parts.seconds) + Double(parts.attoseconds) / 1e18)
+                guard wakingTimers else { return [] }
+                let due = sleeping.filter { $0.due <= value }
+                sleeping.removeAll { $0.due <= value }
+                due.forEach { recorded[$0.index].state = .fired }
+                return due.map(\.gate)
+            }
+            due.forEach { $0.open() }
+        }
+
+        func releaseAll() {
+            let gates = lock.withLock {
+                defer {
+                    sleeping.removeAll()
+                    registrationWaiters.removeAll()
+                }
+                sleeping.forEach { recorded[$0.index].state = .fired }
+                return sleeping.map(\.gate) + registrationWaiters.map(\.gate)
+            }
+            gates.forEach { $0.open() }
+        }
     }
 
     // MARK: - Unreadable source states, round 2 (#770)
@@ -2469,11 +3880,6 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             delays.values.contains { $0 < .seconds(60) }, "short waits: \(delays.values)", file: file, line: line)
     }
 
-    private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
-        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-    }
-
     /// How long exact and negative checks of the recorded waits give a timer task to record. A timer records its wait
     /// when its task starts, after the call that scheduled it returned. A negative check observes only this bounded
     /// window: a wrong timer that registers later is missed (a false pass, never a false failure).
@@ -2500,7 +3906,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         _ = await coordinator.setFavorite([uid], favorite: true)
         _ = await coordinator.setFavorite([uid], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertGreaterThan(failure.count, 0)
         XCTAssertTrue(effects.favorites.isEmpty, "an unreadable handoff is no Proton photo to act on")
@@ -2512,7 +3918,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(owed.first?.failed, false, "the action is not failed")
         failure.remove(from: store)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote], "the retry reads the handoff and runs the owed action")
         _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
         try await settle()
@@ -2531,14 +3937,14 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertTrue(effects.favorites.isEmpty)
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "an undecodable handoff is retried after a minute")
         assertNoShortWait(delays)
         XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='k';"))
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
     }
 
@@ -2558,7 +3964,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(effects.favorites.isEmpty)
         let remote = PhotoUID(volumeID: "vol", nodeID: "link-k")
         recorder.recordHandoff(source: source("k"), revision: revision, remote: remote, kind: .uploaded)
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote], "the handoff event starts the action")
         retry.open()
     }
@@ -2569,7 +3975,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         includedLater("k")
         let remote = favoriteFixture("k")
         XCTAssertTrue(store.setFavoriteIntent(key("k"), favorite: true, at: date))
-        let failure = SourceListFailure(table: "pending_action", untilRemoved: true)
+        let failure = SourceListFailure(table: "pending_action", untilRemoved: true, transient: true)
         try failure.install(on: store)
         defer { failure.remove(from: store) }
         let delays = DelayLog()
@@ -2577,7 +3983,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         await restartWithBackoffLog(delays, firstRetry: retry)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertTrue(failure.denied)
         XCTAssertTrue(effects.favorites.isEmpty)
@@ -2585,7 +3991,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         assertNoShortWait(delays)
         failure.remove(from: store)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
         _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
         try await settle()
@@ -2617,7 +4023,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         await coordinator.start()
 
-        try await waitUntil { delays.values.count >= 2 }
+        try await pollWhileFalse { delays.values.count >= 2 }
         XCTAssertEqual(effects.favorites, [remote], "the healthy action runs in the same pass")
         XCTAssertEqual(delays.values.prefix(2), [.seconds(60), .seconds(120)], "the retries back off")
         XCTAssertFalse(delays.values.contains(.seconds(1)), "an undecodable action row never retries every second")
@@ -2684,7 +4090,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertGreaterThan(failure.count, 0)
         XCTAssertTrue(effects.favorites.isEmpty)
@@ -2692,7 +4098,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         assertNoShortWait(delays)
         failure.remove(from: store)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
     }
 
@@ -2710,7 +4116,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         failure.remove(from: store)
         XCTAssertEqual(failure.count, 1, "only the dispatch read failed")
@@ -2718,7 +4124,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)])
         assertNoShortWait(delays)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
     }
 
@@ -2736,7 +4142,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try failure.install(on: store)
         defer { failure.remove(from: store) }
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         failure.remove(from: store)
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k2")], favorite: true)
@@ -2745,7 +4151,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try again.install(on: store)
         defer { again.remove(from: store) }
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k3")], favorite: true)
-        try await waitUntil { Self.backoffs(delays.values).count >= 2 }
+        try await pollWhileFalse { Self.backoffs(delays.values).count >= 2 }
         try await settle()
         again.remove(from: store)
 
@@ -2782,6 +4188,324 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(state.desired, .excluded, "the delete is stored")
         XCTAssertFalse(state.needsRemoteTrash)
         XCTAssertNil(state.remote)
+    }
+
+    // MARK: - Delete of an edit whose handoff could not be read (#989)
+
+    /// The delete of an unfinished edit cannot read the handoff, so it names no photo. Once a backoff pass reads the
+    /// handoff, the rules of the delete prove the earlier upload, and it goes to the trash.
+    func testADeleteWithAnUnreadableHandoffTrashesTheEarlierUploadOnceTheHandoffReads() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        let passes = BackoffPasses()
+        try await startPendingEditWithoutHandoff(identities: identities, sleep: passes.sleep)
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        await coordinator.exclude([key("p").localUID])
+        XCTAssertEqual(failure.count, 1, "the delete could not read the handoff")
+        XCTAssertTrue(effects.trashed.isEmpty, "no photo chosen on an unreadable handoff goes to the trash")
+        XCTAssertNil(store.sourceState(for: key("p"))?.remote)
+
+        try await pollWhileFalse { passes.waiting > 0 }
+        XCTAssertTrue(effects.trashed.isEmpty, "the read waits for the unreadable backoff")
+        passes.allow()
+
+        try await pollWhileFalse { !effects.trashed.isEmpty }
+        XCTAssertEqual(effects.trashed, [[earlier]], "the photo the person deleted is the earlier upload")
+        let state = try XCTUnwrap(store.sourceState(for: key("p")))
+        XCTAssertEqual(state.desired, .excluded)
+        XCTAssertEqual(state.remote, earlier)
+        XCTAssertNil(
+            identities.record(for: source("p"))?.remoteLinkID,
+            "a return to the backup must not count the trashed photo as the backup of the source")
+    }
+
+    private func startEarlierUploadRetryBatch(
+        _ ids: [String], plain: [String] = [], relations: FakeChecker,
+        sleep: @Sendable @escaping (Duration) async throws -> Void
+    ) async throws -> [String: PhotoUID] {
+        await coordinator.close()
+        let identities = FakeIdentityStore()
+        let journal = try makeJournalCoordinator(identities: identities, relations: relations, sleep: sleep)
+        var targets: [String: PhotoUID] = [:]
+        for id in ids {
+            let remote = PhotoUID(volumeID: "vol", nodeID: "earlier-\(id)")
+            targets[id] = remote
+            identities.upsert(identityRow(id, linkID: remote.nodeID))
+            try journal.addSuperseded(remote, for: source(id))
+            enqueue(id, state: .completed)
+            enqueueEdit(id, state: .uploading)
+            recorder.recordUploadEvidence(source: source(id), revision: edit, replaces: [remote])
+        }
+        for id in plain { enqueue(id, state: .uploading) }
+        await coordinator.start()
+        let count = ids.count + plain.count
+        await waitForSnapshot("the batch is pending") { $0.tiles.count == count }
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        let deleted = await coordinator.exclude((ids + plain).map { key($0).localUID })
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(failure.count, ids.count, "each edit had an unreadable handoff")
+        XCTAssertTrue(relations.relatedLookups.isEmpty)
+        XCTAssertTrue(effects.trashed.isEmpty)
+        return targets
+    }
+
+    func testARetrySnapshotDoesNotRemoveANewerDeletion() async throws {
+        let ids = ["retry-a", "retry-b"]
+        let relations = FakeChecker()
+        let passes = BackoffPasses()
+        let targets = try await startEarlierUploadRetryBatch(ids, relations: relations, sleep: passes.sleep)
+        let gate = LookupGate()
+        defer {
+            gate.open()
+            passes.allow()
+        }
+        relations.relatedLookupGate = { await gate.pass() }
+        try await pollWhileFalse { passes.waiting > 0 }
+        passes.allow()
+        guard await gate.entered(within: .seconds(5)) else { return XCTFail("the first retry lookup must wait") }
+        let first = try XCTUnwrap(relations.relatedLookups.first)
+        XCTAssertTrue(targets.values.contains { $0.nodeID == first })
+        let other = try XCTUnwrap(ids.first { targets[$0]?.nodeID != first })
+        let restored = await coordinator.restore([key(other).localUID])
+        XCTAssertTrue(restored)
+        await waitForSnapshot("the restored edit is pending again") { $0.tiles.contains { $0.key.identifier == other } }
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        let deleted = await coordinator.exclude([key(other).localUID])
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(failure.count, 1)
+        XCTAssertEqual(store.sourceState(for: key(other))?.generation, 3)
+        failure.remove(from: store)
+        gate.open()
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.contains { $0.nodeID == first } }
+        try await settle()
+        passes.allow()
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.count == 2 }
+
+        XCTAssertEqual(
+            Set(effects.trashed.flatMap { $0 }), Set(targets.values), "the newer deletion keeps its own retry")
+        XCTAssertEqual(store.sourceState(for: key(other))?.remote, targets[other])
+        await coordinator.close()
+    }
+
+    func testARestoreRunsBetweenEarlierUploadLookups() async throws {
+        let relations = FakeChecker()
+        let passes = BackoffPasses()
+        let targets = try await startEarlierUploadRetryBatch(
+            ["latency-a", "latency-b"], plain: ["restore-me"], relations: relations, sleep: passes.sleep)
+        let first = LookupGate()
+        let second = LookupGate()
+        let lookups = AppliedTrashReadCount()
+        defer {
+            first.open()
+            second.open()
+            passes.allow()
+        }
+        relations.relatedLookupGate = {
+            switch lookups.next() {
+            case 1: await first.pass()
+            case 2: await second.pass()
+            default: break
+            }
+        }
+        try await pollWhileFalse { passes.waiting > 0 }
+        passes.allow()
+        guard await first.entered(within: .seconds(5)) else { return XCTFail("the first lookup must wait") }
+        let restored = await coordinator.restore([key("restore-me").localUID])
+        XCTAssertTrue(restored)
+        first.open()
+        guard await second.entered(within: .seconds(5)) else { return XCTFail("the second lookup must wait") }
+
+        XCTAssertTrue(
+            effects.returned.flatMap { $0 }.contains(key("restore-me")),
+            "the restore must reach the backup before another earlier-upload lookup starts")
+        second.open()
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.count == 2 }
+        XCTAssertEqual(Set(effects.trashed.flatMap { $0 }), Set(targets.values), "both deletions stay eligible")
+        await coordinator.close()
+    }
+
+    func testAFailedRepeatDeleteKeepsTheStoredDeletionsRetry() async throws {
+        let relations = FakeChecker()
+        let passes = BackoffPasses()
+        let targets = try await startEarlierUploadRetryBatch(["repeat"], relations: relations, sleep: passes.sleep)
+        defer { passes.allow() }
+        let generation = try XCTUnwrap(store.sourceState(for: key("repeat"))).generation
+        let failure = KeyedReadFailure(matching: "INSERT INTO source_state(", limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        let deleted = await coordinator.exclude([key("repeat").localUID])
+        XCTAssertFalse(deleted, "the repeat delete was not stored")
+        XCTAssertEqual(failure.count, 1)
+        failure.remove(from: store)
+        XCTAssertEqual(store.sourceState(for: key("repeat"))?.generation, generation)
+        try await pollWhileFalse { passes.waiting > 0 }
+        passes.allow()
+        try await pollWhileFalse { !effects.trashed.isEmpty }
+
+        XCTAssertEqual(
+            effects.trashed.flatMap { $0 }, [try XCTUnwrap(targets["repeat"])],
+            "a failed later write cannot cancel the stored deletion's retry")
+        await coordinator.close()
+    }
+
+    func testUnrelatedHandoffsDoNotPostponeAnEarlierUploadRetry() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        let deadlines = RetryDeadlineSleeps()
+        defer { deadlines.releaseAll() }
+        try await startPendingEditWithoutHandoff(identities: identities, sleep: deadlines.sleep)
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        let deleted = await coordinator.exclude([key("p").localUID])
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(failure.count, 1)
+        failure.remove(from: store)
+        try await pollWhileFalse { deadlines.waits.contains(.seconds(60)) }
+        XCTAssertTrue(deadlines.waits.contains(.seconds(60)), "the first retry has a 60-second deadline")
+
+        for index in 1...8 {
+            let id = "other-upload-\(index)"
+            let remote = PhotoUID(volumeID: "vol", nodeID: id)
+            enqueue(id, state: .uploading)
+            await waitForSnapshot("the other upload is pending") { $0.tiles.contains { $0.key.identifier == id } }
+            recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+            await waitForSnapshot("the real handoff event was processed") {
+                $0.tiles.contains { $0.key.identifier == id && $0.handoff == remote }
+            }
+            try await settle()
+            deadlines.advance(by: .seconds(10))
+            try await settle()
+            if index == 6 {
+                try await pollWhileFalse { !effects.trashed.isEmpty }
+                XCTAssertEqual(effects.trashed, [[earlier]], "the original deadline fires during the event stream")
+            }
+        }
+
+        XCTAssertFalse(deadlines.waits.contains { $0 > .seconds(60) }, "clean handoffs must not double the retry wait")
+        XCTAssertEqual(effects.trashed, [[earlier]], "the earlier upload settles while other uploads continue")
+        await coordinator.close()
+    }
+
+    /// A failed guarded write keeps the deletion eligible for the next backoff pass.
+    func testAFailedEarlierUploadWriteKeepsTheRetryUntilTheWriteSucceeds() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        let passes = BackoffPasses()
+        try await startPendingEditWithoutHandoff(identities: identities, sleep: passes.sleep)
+        let handoffFailure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
+        try handoffFailure.install(on: store)
+        defer { handoffFailure.remove(from: store) }
+        let deleted = await coordinator.exclude([key("p").localUID])
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(handoffFailure.count, 1)
+        handoffFailure.remove(from: store)
+        try await pollWhileFalse { passes.waiting > 0 }
+
+        let writeFailure = KeyedReadFailure(
+            matching:
+                "SET needs_remote_trash=1, remote_volume_id=?, remote_link_id=?, remote_trashed=0, listed_in_trash=0",
+            limit: 1)
+        try writeFailure.install(on: store)
+        defer { writeFailure.remove(from: store) }
+        passes.allow()
+        try await pollWhileFalse { writeFailure.count == 1 }
+        XCTAssertEqual(writeFailure.count, 1, "the guarded write really failed")
+        XCTAssertTrue(effects.trashed.isEmpty)
+        XCTAssertNil(store.sourceState(for: key("p"))?.remote)
+        writeFailure.remove(from: store)
+        try await pollWhileFalse { passes.waiting > 0 }
+        XCTAssertGreaterThan(passes.waiting, 0, "the failed write keeps a later retry")
+
+        passes.allow()
+        try await pollWhileFalse { !effects.trashed.isEmpty }
+
+        XCTAssertEqual(effects.trashed, [[earlier]], "the same deletion settles after the write recovers")
+        XCTAssertEqual(store.sourceState(for: key("p"))?.remote, earlier)
+    }
+
+    /// The read handoff names a photo of another upload. The retry applies the same rule as the delete: the photo
+    /// stays, and the retry ends.
+    func testARetriedDeleteKeepsAnEarlierPhotoThatAnotherUploadOwns() async throws {
+        let passes = BackoffPasses()
+        try await startPendingEdit(earlierKind: .deduplicated, identities: FakeIdentityStore(), sleep: passes.sleep)
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        await coordinator.exclude([key("p").localUID])
+        XCTAssertEqual(failure.count, 1, "the delete could not read the handoff")
+
+        try await pollWhileFalse { passes.waiting > 0 }
+        passes.allow()
+        try await settle()
+
+        XCTAssertTrue(effects.trashed.isEmpty, "a mapped photo can belong to another photo of the library")
+        XCTAssertNil(store.sourceState(for: key("p"))?.remote)
+        XCTAssertEqual(passes.waiting, 0, "a read handoff ends the retry")
+    }
+
+    /// The person restores the photo before the handoff reads. The restore ends the retry: no backoff waits for it.
+    func testARestoreEndsTheRetryOfAnEarlierUpload() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        let passes = BackoffPasses()
+        try await startPendingEditWithoutHandoff(identities: identities, sleep: passes.sleep)
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        await coordinator.exclude([key("p").localUID])
+        XCTAssertEqual(failure.count, 1, "the delete could not read the handoff")
+        try await pollWhileFalse { passes.waiting > 0 }
+        let waitsBefore = passes.waits.count
+
+        await coordinator.restore([key("p").localUID])
+        try await settle()
+
+        XCTAssertEqual(passes.waits.count, waitsBefore, "the restored photo waits for no further read: \(passes.waits)")
+        XCTAssertTrue(effects.trashed.isEmpty)
+    }
+
+    /// Every unresolved delete stays eligible for a retry, including the 101st delete in the session.
+    func testAll101DeletesWithUnreadableHandoffsGetAnotherCheck() async throws {
+        await coordinator.close()
+        let identities = FakeIdentityStore()
+        let relations = FakeChecker()
+        let passes = BackoffPasses()
+        let journal = try makeJournalCoordinator(identities: identities, relations: relations, sleep: passes.sleep)
+        let ids = (1...101).map { "unreadable-edit-\($0)" }
+        let remotes = ids.map { PhotoUID(volumeID: "vol", nodeID: "earlier-\($0)") }
+        for (id, remote) in zip(ids, remotes) {
+            identities.upsert(identityRow(id, linkID: remote.nodeID))
+            try journal.addSuperseded(remote, for: source(id))
+            enqueue(id, state: .completed)
+            enqueueEdit(id, state: .uploading)
+            recorder.recordUploadEvidence(source: source(id), revision: edit, replaces: [remote])
+        }
+        await coordinator.start()
+        await waitForSnapshot("all 101 edits hide their earlier uploads") { $0.tiles.count == 101 }
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        let deleted = await coordinator.exclude(ids.map { key($0).localUID })
+        XCTAssertTrue(deleted)
+        XCTAssertGreaterThanOrEqual(failure.count, 101, "each delete reached its unreadable handoff")
+        XCTAssertTrue(effects.trashed.isEmpty, "an unreadable handoff proves no ownership")
+        XCTAssertTrue(relations.relatedLookups.isEmpty, "unreadable handoffs cause no server lookups")
+        failure.remove(from: store)
+        try await pollWhileFalse { passes.waiting > 0 }
+        passes.allow()
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.count == 101 }
+
+        XCTAssertEqual(Set(effects.trashed.flatMap { $0 }), Set(remotes), "no delete is dropped at 100")
+        XCTAssertEqual(store.sourceState(for: key(ids[100]))?.remote, remotes[100], "the 101st delete is retried")
+        XCTAssertEqual(Set(relations.relatedLookups), Set(remotes.map(\.nodeID)))
     }
 
     /// Counter-test: with a readable handoff, the same delete trashes the hidden earlier upload, not the photo that
@@ -2834,20 +4558,20 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(failure.count, 0, "the pass reads the due actions once")
     }
 
-    /// The read of the latest handoff cannot even be prepared. The favorite is retried by the backoff.
-    func testAHandoffReadThatCannotBePreparedIsRetried() async throws {
+    /// A transient failure of the latest handoff read retries the favorite through the backoff.
+    func testATransientHandoffReadFailureIsRetried() async throws {
         includedLater("k")
         let remote = favoriteFixture("k")
         let delays = DelayLog()
         let retry = OpenGate()
         await restartWithBackoffLog(delays, firstRetry: retry)
-        let failure = SourceListFailure(table: "handoff", untilRemoved: true)
+        let failure = SourceListFailure(table: "handoff", untilRemoved: true, transient: true)
         try failure.install(on: store)
         defer { failure.remove(from: store) }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertTrue(failure.denied)
         XCTAssertTrue(effects.favorites.isEmpty)
@@ -2855,7 +4579,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         assertNoShortWait(delays)
         failure.remove(from: store)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
     }
 
@@ -2877,7 +4601,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         // A pass with no due action: only the read that schedules the timer reads the handoff.
         _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
 
         failure.remove(from: store)
@@ -2900,7 +4624,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         await restartWithBackoffLog(delays, firstRetry: retry)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the incomplete list starts the backoff")
         assertNoShortWait(delays)
@@ -2919,7 +4643,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let delays = DelayLog()
         let retry = OpenGate()
         await restartWithBackoffLog(delays, firstRetry: retry)
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
@@ -2968,7 +4692,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             XCTAssertTrue(self.change("UPDATE handoff SET kind='uploaded' WHERE source_id='a';"))
         }
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertEqual(Set(effects.favorites.map(\.nodeID)), ["link-a", "link-b"], "the second pass runs the favorite")
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the failed read of the first pass counts")
@@ -2993,7 +4717,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             XCTAssertTrue(self.change("UPDATE pending_action SET kind='favorite' WHERE source_id='a';"))
         }
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertEqual(Set(effects.favorites.map(\.nodeID)), ["link-a", "link-b"])
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the incomplete read of the first pass counts")
@@ -3008,7 +4732,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let delays = DelayLog()
         let retry = OpenGate()
         await restartWithBackoffLog(delays, firstRetry: retry)
-        try await waitUntil { delays.values.contains(.seconds(5000)) }
+        try await pollWhileFalse { delays.values.contains(.seconds(5000)) }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
         try await settle()
@@ -3091,6 +4815,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         private let lock = NSLock()
         private var interrupted = 0
         private let fragment: String
+        private let armAfter: String?
+        private var armed: Bool
         private var skip: Int
         private var limit: Int
         var count: Int { lock.withLock { interrupted } }
@@ -3098,9 +4824,11 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         /// Lets the first `skip` matching reads pass, then interrupts at most `limit` of them.
         init(
             matching fragment: String = "FROM source_state WHERE source_kind=? AND source_id=?", skip: Int = 0,
-            limit: Int = .max
+            limit: Int = .max, armAfter: String? = nil
         ) {
             self.fragment = fragment
+            self.armAfter = armAfter
+            self.armed = armAfter == nil
             self.skip = skip
             self.limit = limit
         }
@@ -3114,10 +4842,13 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                         guard let context, let pointer else { return 0 }
                         let statement = OpaquePointer(pointer)
                         let failure = Unmanaged<KeyedReadFailure>.fromOpaque(context).takeUnretainedValue()
-                        guard let sql = sqlite3_sql(statement).map({ String(cString: $0) }),
-                            sql.contains(failure.fragment)
-                        else { return 0 }
+                        guard let sql = sqlite3_sql(statement).map({ String(cString: $0) }) else { return 0 }
+                        if let armAfter = failure.armAfter, sql.contains(armAfter) {
+                            failure.lock.withLock { failure.armed = true }
+                        }
+                        guard sql.contains(failure.fragment) else { return 0 }
                         let interrupts = failure.lock.withLock { () -> Bool in
+                            guard failure.armed else { return false }
                             if failure.skip > 0 {
                                 failure.skip -= 1
                                 return false
@@ -3138,6 +4869,12 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             connection.withLock { _ = sqlite3_trace_v2(connection.database, 0, nil, nil) }
         }
 
+        /// Matching reads answer again from now on, as a recovered disk would: the remaining
+        /// budget drops to zero, so no read is interrupted again.
+        func recover() {
+            lock.withLock { limit = 0 }
+        }
+
         static func connection(of store: PendingBackupManifestStore) throws -> SQLiteStoreConnection {
             try XCTUnwrap(
                 Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value
@@ -3145,31 +4882,61 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
     }
 
-    /// Denies the next read of `table` on the store's own connection, or every read until `remove` when `untilRemoved`.
-    /// The default is the next full read of the source states.
+    /// Fails the selected SQL operation, once or until removal. Transient recovery tests use SQLITE_INTERRUPT;
+    /// the default SQLITE_AUTH is a lasting failure and never claims that removing the fault recovers the connection.
     private final class SourceListFailure: @unchecked Sendable {
         private let lock = NSLock()
         private var done = false
         private let table: String
         private let untilRemoved: Bool
+        private let action: Int32
+        private let column: String?
+        private let transient: Bool
+        private var interruptNextOperation = false
         var denied: Bool { lock.withLock { done } }
 
-        init(table: String = "source_state", untilRemoved: Bool = false) {
+        init(
+            table: String = "source_state", untilRemoved: Bool = false,
+            action: Int32 = SQLITE_READ, column: String? = nil, transient: Bool = false
+        ) {
             self.table = table
             self.untilRemoved = untilRemoved
+            self.action = action
+            self.column = column
+            self.transient = transient
         }
 
         func install(on store: PendingBackupManifestStore) throws {
             let connection = try KeyedReadFailure.connection(of: store)
             connection.withLock {
+                if transient {
+                    sqlite3_progress_handler(
+                        connection.database, 1,
+                        { context in
+                            guard let context else { return 0 }
+                            let failure = Unmanaged<SourceListFailure>.fromOpaque(context).takeUnretainedValue()
+                            return failure.lock.withLock {
+                                guard failure.interruptNextOperation else { return 0 }
+                                failure.interruptNextOperation = false
+                                failure.done = true
+                                return 1
+                            }
+                        }, Unmanaged.passUnretained(self).toOpaque())
+                }
                 _ = sqlite3_set_authorizer(
                     connection.database,
-                    { context, action, table, _, _, _ in
-                        guard let context, action == SQLITE_READ, let table else { return SQLITE_OK }
+                    { context, action, table, column, _, _ in
+                        guard let context, let table else { return SQLITE_OK }
                         let failure = Unmanaged<SourceListFailure>.fromOpaque(context).takeUnretainedValue()
-                        guard String(cString: table) == failure.table else { return SQLITE_OK }
+                        guard action == failure.action, String(cString: table) == failure.table,
+                            failure.column == nil || column.map({ String(cString: $0) }) == failure.column
+                        else { return SQLITE_OK }
                         return failure.lock.withLock {
                             guard !failure.done || failure.untilRemoved else { return SQLITE_OK }
+                            if failure.transient {
+                                failure.interruptNextOperation = true
+                                return SQLITE_OK
+                            }
                             failure.done = true
                             return SQLITE_DENY
                         }
@@ -3179,7 +4946,14 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         func remove(from store: PendingBackupManifestStore) {
             guard let connection = try? KeyedReadFailure.connection(of: store) else { return }
-            connection.withLock { _ = sqlite3_set_authorizer(connection.database, nil, nil) }
+            connection.withLock {
+                _ = sqlite3_set_authorizer(connection.database, nil, nil)
+                if transient {
+                    sqlite3_progress_handler(connection.database, 0, nil, nil)
+                    XCTAssertTrue(
+                        connection.failuresAreTransient, "the recovery fixture must not inject lasting errors")
+                }
+            }
         }
     }
 
@@ -3238,8 +5012,11 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     private var _trashed: [[PhotoUID]] = []
     private var _restored: [[PhotoUID]] = []
     private var _favorites: [PhotoUID] = []
+    private var _favoriteValues: [Bool] = []
     private var _removeSucceeds = true
     private var _albumResult = PendingEffectResult.done
+    private var _favoriteResult = PendingEffectResult.done
+    private var _volumeID: String? = "photos-volume"
     private var _trashRetry = Set<PhotoUID>()
     private var _order: [String] = []
 
@@ -3250,6 +5027,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     var trashed: [[PhotoUID]] { lock.withLock { _trashed } }
     var restored: [[PhotoUID]] { lock.withLock { _restored } }
     var favorites: [PhotoUID] { lock.withLock { _favorites } }
+    var favoriteValues: [Bool] { lock.withLock { _favoriteValues } }
     var removeSucceeds: Bool {
         get { lock.withLock { _removeSucceeds } }
         set { lock.withLock { _removeSucceeds = newValue } }
@@ -3257,6 +5035,14 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     var albumResult: PendingEffectResult {
         get { lock.withLock { _albumResult } }
         set { lock.withLock { _albumResult = newValue } }
+    }
+    var favoriteResult: PendingEffectResult {
+        get { lock.withLock { _favoriteResult } }
+        set { lock.withLock { _favoriteResult = newValue } }
+    }
+    var volumeID: String? {
+        get { lock.withLock { _volumeID } }
+        set { lock.withLock { _volumeID = newValue } }
     }
     /// Photos that the fake Proton trash leaves without an answer.
     var trashRetry: Set<PhotoUID> {
@@ -3288,7 +5074,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     }
     private var _onReturn: (@Sendable () -> Void)?
 
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> {
         let hook = lock.withLock {
             _returned.append(keys.sorted())
             _order.append("return")
@@ -3296,7 +5082,20 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
             return _onReturn
         }
         hook?()
-        return true
+        return Set(keys)
+    }
+
+    var typedReturnOverride: [PendingSourceKey: PendingBackupReturnOutcome]? {
+        get { lock.withLock { _typedReturnOverride } }
+        set { lock.withLock { _typedReturnOverride = newValue } }
+    }
+    private var _typedReturnOverride: [PendingSourceKey: PendingBackupReturnOutcome]?
+
+    func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
+        let returned = await returnToBackup(states.map(\.key))
+        if let override = typedReturnOverride { return override }
+        return Dictionary(
+            uniqueKeysWithValues: states.map { ($0.key, returned.contains($0.key) ? .completed : .unreadable) })
     }
 
     /// Runs once at the next volume lookup, which comes after a delete is stored and before its trash is sent.
@@ -3312,7 +5111,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
             return _onVolumeLookup
         }
         hook?()
-        return "photos-volume"
+        return volumeID
     }
 
     /// Holds the next trash request until the gate opens.
@@ -3322,13 +5121,22 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     }
     private var _trashGate: LookupGate?
 
+    /// Holds only the acknowledgement after the fake remote records its applied trash.
+    var trashCompletionGate: LookupGate? {
+        get { lock.withLock { _trashCompletionGate } }
+        set { lock.withLock { _trashCompletionGate = newValue } }
+    }
+    private var _trashCompletionGate: LookupGate?
+
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
         await trashGate?.pass()
-        return lock.withLock {
+        let answer = lock.withLock {
             _trashed.append(uids)
             _order.append("trash")
             return PendingBatchEffectResult(retry: _trashRetry.intersection(uids))
         }
+        await trashCompletionGate?.pass()
+        return answer
     }
 
     func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
@@ -3348,8 +5156,11 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
 
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult {
         await favoriteGate?.pass()
-        lock.withLock { _favorites.append(uid) }
-        return .done
+        return lock.withLock {
+            _favorites.append(uid)
+            _favoriteValues.append(favorite)
+            return _favoriteResult
+        }
     }
 
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult {
@@ -3367,6 +5178,87 @@ private final class MutableClock: @unchecked Sendable {
 
     func advance(by seconds: TimeInterval) {
         lock.withLock { value = value.addingTimeInterval(seconds) }
+    }
+}
+
+/// Advances only long waits by their deadlines. Cancelled timers do not become runnable early.
+private final class RetryDeadlineSleeps: @unchecked Sendable {
+    private let lock = NSLock()
+    private var elapsed = Duration.zero
+    private var recorded: [Duration] = []
+    private var pending: [(deadline: Duration, continuation: CheckedContinuation<Void, Never>)] = []
+    var waits: [Duration] { lock.withLock { recorded } }
+
+    var sleep: @Sendable (Duration) async throws -> Void {
+        { [self] duration in
+            guard duration >= .seconds(60) else { return try await Task.sleep(for: duration) }
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    recorded.append(duration)
+                    pending.append((elapsed + duration, continuation))
+                }
+            }
+        }
+    }
+
+    func advance(by duration: Duration) {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            elapsed += duration
+            let ready = pending.filter { $0.deadline <= elapsed }.map(\.continuation)
+            pending.removeAll { $0.deadline <= elapsed }
+            return ready
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    func releaseAll() {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            defer { pending.removeAll() }
+            return pending.map(\.continuation)
+        }
+        ready.forEach { $0.resume() }
+    }
+}
+
+/// Holds every backoff wait (60 s or more) until `allow()` lets one pass; shorter waits sleep for real.
+private final class BackoffPasses: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [Duration] = []
+    private var permits = 0
+    private var parked: [CheckedContinuation<Void, Never>] = []
+    var waits: [Duration] { lock.withLock { recorded } }
+    var waiting: Int { lock.withLock { parked.count } }
+
+    var sleep: @Sendable (Duration) async throws -> Void {
+        { [self] duration in
+            guard duration >= .seconds(60) else { return try await Task.sleep(for: duration) }
+            await withCheckedContinuation { continuation in
+                let resume = lock.withLock { () -> Bool in
+                    recorded.append(duration)
+                    guard permits > 0 else {
+                        parked.append(continuation)
+                        return false
+                    }
+                    permits -= 1
+                    return true
+                }
+                if resume { continuation.resume() }
+            }
+        }
+    }
+
+    /// Releases every parked wait; a timer that the coordinator replaced meanwhile ends without a pass. Without a
+    /// parked wait, the next one passes.
+    func allow() {
+        let released = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !parked.isEmpty else {
+                permits += 1
+                return []
+            }
+            defer { parked.removeAll() }
+            return parked
+        }
+        released.forEach { $0.resume() }
     }
 }
 
@@ -3413,7 +5305,7 @@ private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unche
         let callback = lock.withLock { observer }
         callback?(.all)
     }
-    func unsettledRows() -> [UploadBackupQueueRowState] {
+    func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] {
         lock.withLock { unsettled += 1 }
         return pending
     }
@@ -3421,7 +5313,9 @@ private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unche
         lock.withLock { aggregates += 1 }
         return [:]
     }
-    func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
+    func decisionRows(
+        kind: UploadSourceIdentity.Kind, identifiers: Set<String>
+    ) throws -> [UploadBackupQueueRowState] {
         lock.withLock { reads += identifiers.count }
         return pending.filter { identifiers.contains($0.source.identifier) }
     }
@@ -3499,6 +5393,10 @@ private final class CountingPendingJournal: EditReplacementJournaling, @unchecke
     func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws {}
     func clearDeletionCheck(for source: UploadSourceIdentity) throws {}
     func clearDeletionChoice(for source: UploadSourceIdentity) throws {}
+    func restoreDeletionChoice(
+        _ previous: EditReplacementDeletionChoice, ifStill written: EditReplacementDeletionChoice,
+        for source: UploadSourceIdentity
+    ) throws {}
     func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {}
     func addRemoteSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {}
     func addProven(_ nodeID: String, inherited: [String], for source: UploadSourceIdentity) throws {}
@@ -3508,4 +5406,1020 @@ private final class CountingPendingJournal: EditReplacementJournaling, @unchecke
     func settleGone(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
     func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws {}
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
+    func supersededSourceIdentifiers() -> Set<String> { [] }
+    func namesAnyLink(_ linkIDs: Set<String>) -> Bool { true }
+}
+
+extension PendingBackupCoordinatorTests {
+    func testIncompleteRestoreChecksBackOffAndStopUntilRestartOrAnExplicitRestore() async throws {
+        for resume in ["restart", "explicit restore"] {
+            await coordinator.close()
+            let id = "bounded-compound-\(resume)"
+            let sourceKey = key(id)
+            let remote = PhotoUID(volumeID: "vol", nodeID: id)
+            let clock = ResultWriteClock(date)
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+                ),
+                .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: sourceKey, generation: excluded.generation,
+                    remoteLinkID: remote.nodeID, at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+            let relations = FakeChecker()
+            relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+            effects = FakePendingEffects()
+            effects.typedReturnOverride = [sourceKey: .waiting(until: date)]
+            coordinator = makeCoordinator(relations: relations, clock: clock)
+            await coordinator.start()
+            _ = await coordinator.restoreSources(ofRemote: [remote])
+
+            for (index, delay) in [60, 300, 900].enumerated() {
+                XCTAssertEqual(effects.returned.filter { $0 == [sourceKey] }.count, index + 1)
+                let retained = try XCTUnwrap(store.sourceState(for: sourceKey))
+                XCTAssertTrue(retained.needsQueueSync)
+                XCTAssertEqual(retained.remote, remote)
+                XCTAssertEqual(retained.attempts, 0)
+                XCTAssertEqual(retained.nextAttemptAt, clock.now.addingTimeInterval(Double(delay)))
+                clock.advance(by: .seconds(delay))
+                if index < 2 {
+                    // An unrelated trigger joins a real reconcile but must not reset this source's ceiling.
+                    _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+                }
+            }
+            let reads = relations.linkVisibilityCallCount
+            _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+            XCTAssertEqual(
+                effects.returned.filter { $0 == [sourceKey] }.count, 3, "The session ceiling stops effect calls")
+            XCTAssertEqual(relations.linkVisibilityCallCount, reads, "The ceiling stops even the preceding fresh read")
+            let paused = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertTrue(paused.needsQueueSync)
+            XCTAssertEqual(paused.remote, remote)
+            XCTAssertEqual(paused.attempts, 0)
+            XCTAssertTrue(effects.restored.isEmpty)
+            XCTAssertTrue(effects.trashed.isEmpty)
+
+            effects.typedReturnOverride = [sourceKey: .completed]
+            clock.advance(by: .seconds(1))
+            if resume == "restart" {
+                await coordinator.close()
+                coordinator = makeCoordinator(relations: relations, clock: clock)
+                await coordinator.start()
+            } else {
+                let completed = await coordinator.restoreSources(ofRemote: [remote])
+                XCTAssertEqual(completed.outcomes[sourceKey], .completed)
+            }
+            XCTAssertNil(store.sourceState(for: sourceKey), "Fresh successful proof can retire the retained duty")
+            XCTAssertEqual(effects.returned.filter { $0 == [sourceKey] }.count, 4)
+        }
+    }
+
+    func testFailedRestoreReadsUseTheSameGrowingWaitsBeforeTheCeiling() async throws {
+        await coordinator.close()
+        let id = "offline-restore-check"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: id)
+        let clock = ResultWriteClock(date)
+        enqueue(id, state: .completed)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        let excluded = try XCTUnwrap(
+            store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: sourceKey, generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+        // No visibility entry: every fresh read fails, as it does offline.
+        let relations = FakeChecker()
+        effects = FakePendingEffects()
+        coordinator = makeCoordinator(relations: relations, clock: clock)
+        await coordinator.start()
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+
+        for (index, delay) in [60, 300, 900].enumerated() {
+            XCTAssertEqual(relations.linkVisibilityCallCount, index + 1, "One fresh read per automatic check")
+            let retained = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertTrue(retained.needsQueueSync)
+            XCTAssertEqual(retained.remote, remote)
+            XCTAssertEqual(retained.attempts, 0)
+            XCTAssertEqual(
+                retained.nextAttemptAt, clock.now.addingTimeInterval(Double(delay)),
+                "Check \(index + 1) waits \(delay) seconds")
+            clock.advance(by: .seconds(delay))
+            _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+        }
+        XCTAssertEqual(relations.linkVisibilityCallCount, 3, "The ceiling stops a fourth automatic read")
+        XCTAssertTrue(effects.returned.isEmpty, "A failed read never reaches the typed effect")
+        XCTAssertTrue(effects.restored.isEmpty)
+    }
+
+    func testARestoreCheckTreatsTheTrashOfAPhotoAnEditReplacedAsDone() async throws {
+        for replacement in [
+            "none", "unretired", "retired", "retire intent", "intent during the read", "intent during the final read",
+        ] {
+            await coordinator.close()
+            let id = "edit-replaced-restore-\(replacement.replacingOccurrences(of: " ", with: "-"))"
+            let sourceKey = key(id)
+            let remote = PhotoUID(volumeID: "vol", nodeID: id)
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+                ),
+                .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: sourceKey, generation: excluded.generation, remoteLinkID: remote.nodeID,
+                    at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+            // After the Restore the photo is in the Proton trash again.
+            let relations = FakeChecker()
+            relations.linkVisibilityByID[remote.nodeID] = .init(
+                isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_001)
+            let journal = try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: directory))
+            let photo = source(id)
+            switch replacement {
+            case "retired", "retire intent", "unretired":
+                try journal.addSuperseded(remote, for: photo)
+                try journal.prepareToRetire([remote.nodeID: []], for: photo)
+                if replacement != "retire intent" {
+                    try journal.settle([remote.nodeID], related: [], trashed: true, for: photo)
+                }
+                // The person restored the replaced photo: it is in the library again by choice.
+                if replacement == "unretired" { try journal.unretire([remote.nodeID], for: photo) }
+            case "intent during the read":
+                // The edit replacement writes its intent and trashes the photo while the fresh read runs.
+                relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+                relations.onVisibilityLookup = { [relations] in
+                    try? journal.addSuperseded(remote, for: photo)
+                    try? journal.prepareToRetire([remote.nodeID: []], for: photo)
+                    relations.linkVisibilityByID[remote.nodeID] = .init(
+                        isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_002)
+                }
+            case "intent during the final read":
+                // The compound is complete at the first read; the replacement trashes the photo before the final read.
+                relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+                let reads = AppliedTrashReadCount()
+                relations.onVisibilityLookup = { [relations] in
+                    guard reads.next() == 2 else { return }
+                    try? journal.addSuperseded(remote, for: photo)
+                    try? journal.prepareToRetire([remote.nodeID: []], for: photo)
+                    relations.linkVisibilityByID[remote.nodeID] = .init(
+                        isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_002)
+                }
+            default: break
+            }
+            effects = FakePendingEffects()
+            if replacement == "intent during the final read" { effects.typedReturnOverride = [sourceKey: .completed] }
+            coordinator = makeCoordinator(replacementJournal: journal, relations: relations)
+            await coordinator.start()
+
+            let result = await coordinator.restoreSources(ofRemote: [remote])
+
+            relations.onVisibilityLookup = nil
+            if replacement == "none" || replacement == "unretired" {
+                XCTAssertEqual(effects.restored, [[remote]], "\(replacement): a late trash gets its compensation")
+                XCTAssertNotNil(store.sourceState(for: sourceKey))
+                continue
+            }
+            XCTAssertTrue(effects.restored.isEmpty, "\(replacement): the edit's trash of the old photo stands")
+            if replacement == "intent during the final read" {
+                XCTAssertEqual(
+                    effects.returned, [[sourceKey]], "The race reached the final read after a complete compound")
+            } else {
+                XCTAssertTrue(effects.returned.isEmpty, "\(replacement): the newer version already backed up")
+            }
+            XCTAssertEqual(result.outcomes[sourceKey], .completed, replacement)
+            XCTAssertNil(store.sourceState(for: sourceKey), "\(replacement): the Restore duty is done")
+        }
+    }
+
+    private struct LookupArmedRestoreResolver: BackupResourceResolving {
+        let resource: BackupResolvedResource
+        let arm: @Sendable () async -> Void
+
+        func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+            await arm()
+            return resource
+        }
+    }
+
+    func testRevokedRestoreAdoptionCannotCreateARunnerHandoffOrRemoteTrash() async throws {
+        for exactFallback in [false, true] {
+            await coordinator.close()
+            let id = exactFallback ? "revoked-exact" : "revoked-manifest"
+            let target = source(id)
+            let targetKey = key(id)
+            let date = self.date
+            let pending = try XCTUnwrap(store)
+            let manifest = try XCTUnwrap(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("\(id)-identities.sqlite")))
+            defer { manifest.close() }
+            let state = try XCTUnwrap(
+                UploadBackupStateManifestStore(url: directory.appendingPathComponent("\(id)-backup.sqlite")))
+            defer { state.close() }
+            let checker = FakeChecker()
+            let pipeline = UploadDedupePipeline(store: manifest, checker: checker, now: { date })
+            let digest = Data(repeating: 0xCA, count: 20)
+            let hex = UploadContentSHA1.hexString(digest: digest)
+            let descriptor = UploadResourceDescriptor(
+                source: target, fileURL: directory.appendingPathComponent(id), filename: "\(id).heic",
+                fileSize: 20, modificationDate: date, precomputedSHA1Digest: digest, backupRevision: revision)
+            let before = UploadIdentityRecord(
+                source: target, filename: descriptor.filename, correctedName: descriptor.filename,
+                fileSize: 20, modificationDate: date, sha1Hex: hex,
+                nameHash: "nh(\(descriptor.filename))", contentHash: "ch(\(hex))", hashKeyEpoch: "epoch-1",
+                updatedAt: date)
+            XCTAssertTrue(manifest.upsert(before))
+            if exactFallback {
+                checker.exactActiveDuplicates = [.init(volumeID: "vol", nodeID: "foreign-donor")]
+            } else {
+                var donor = before
+                donor.source = source("donor-\(id)")
+                donor.remoteVolumeID = "vol"
+                donor.remoteLinkID = "foreign-donor"
+                donor.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+                XCTAssertTrue(manifest.upsert(donor))
+            }
+            checker.linkVisibilityByID["foreign-donor"] = .init(isActive: true, mainPhotoLinkID: nil)
+            let context = UploadRestoredCompoundContext(
+                source: target, revision: revision, generation: 2,
+                confirmedRemote: .init(volumeID: "vol", nodeID: "confirmed"))
+            try await pipeline.prepareRestoredCompound(context, isCurrent: { true })
+            let reached = AppliedTrashReadCount()
+            let revoke: @Sendable () async -> Void = {
+                _ = reached.next()
+                XCTAssertNotNil(pending.exclude([.init(key: targetKey, presentation: nil, remote: nil)], at: date))
+                await pipeline.endRestoredCompound(context)
+            }
+            let candidate = UploadBackupAssetCandidate(
+                snapshot: .init(source: target, revision: revision, resourceCount: 1),
+                originalFilename: descriptor.filename, byteCount: 20)
+            let resolver = LookupArmedRestoreResolver(
+                resource: .init(
+                    candidate: candidate, descriptor: descriptor, mediaType: "image/heic", captureDate: date),
+                arm: {
+                    // Arm after the real runner primes, so the suspended lookup belongs to resolve itself.
+                    await pipeline.invalidateCachedRemoteState()
+                    if exactFallback {
+                        checker.findError = UploadError.backend("Detailed lookup unavailable")
+                        checker.exactLookupGate = revoke
+                    } else {
+                        checker.nameLookupGate = revoke
+                    }
+                })
+            enqueue(id, state: .queuedForUpload)
+            let uploader = MockUploader()
+            let clock = BackupTestClock(start: date)
+            let runner = BackupSyncRunner(
+                queue: queue, preflight: UploadBackupPreflightIndex(store: state), resolver: resolver,
+                identityResolver: pipeline, uploader: uploader,
+                configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
+                events: recorder, now: { clock.now })
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            await runner.stop()
+
+            XCTAssertEqual(reached.count, 1, "The real runner must reach exactly the gated adoption lookup")
+            XCTAssertEqual(manifest.record(for: target), before, "Revocation cannot write a donor identity")
+            XCTAssertTrue(
+                store.latestHandoffs(for: [targetKey]).isEmpty, "No donor handoff may reach the pending store")
+            let excluded = try XCTUnwrap(store.sourceState(for: targetKey))
+            XCTAssertEqual(excluded.desired, .excluded)
+            XCTAssertNil(excluded.remote)
+            XCTAssertFalse(excluded.needsRemoteTrash)
+            XCTAssertTrue(uploader.requests.isEmpty)
+            let interrupted = try XCTUnwrap(queue.entry(for: target, revision: revision))
+            XCTAssertEqual(interrupted.attempts, 0)
+            XCTAssertFalse(interrupted.state.isTerminalSuccess)
+            effects = FakePendingEffects()
+            coordinator = makeCoordinator()
+            await coordinator.start()
+            XCTAssertTrue(
+                effects.trashed.isEmpty, "A revoked adoption cannot schedule remote trash through reconciliation")
+        }
+    }
+
+    func testPersistentRestoreRefusalDefersCompensationWithoutBurningAttempts() async throws {
+        await coordinator.close()
+        let id = "persistently-refused-restore"
+        let remote = PhotoUID(volumeID: "vol", nodeID: "refused-main")
+        let clock = ResultWriteClock(date)
+        enqueue(id, state: .completed)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key(id), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        let excluded = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: key(id), generation: excluded.generation,
+                remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+        let relations = FakeChecker()
+        let refused = try XCTUnwrap(effects)
+        // A permanent per-item refusal is settled by the batch adapter, but the fresh read stays trashed.
+        // After three requests the fixture reports an unavailable read, so a broken loop ends on data,
+        // not a timeout. More than one request before the persisted due time is the direct failure.
+        relations.onVisibilityLookup = {
+            relations.linkVisibilityByID[remote.nodeID] = .init(
+                isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_000)
+            if refused.restored.count >= 3 {
+                relations.linkVisibilityError = UploadError.backend("Bounded refusal fixture exhausted")
+            }
+        }
+        coordinator = makeCoordinator(relations: relations, clock: clock)
+        await coordinator.start()
+
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertEqual(effects.restored, [[remote]], "One refusal must defer the next remote compensation")
+        let retained = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertTrue(retained.needsRemoteRestore, "A refused restore still owes its exact photo")
+        XCTAssertTrue(retained.needsQueueSync)
+        XCTAssertEqual(retained.remote, remote)
+        XCTAssertEqual(retained.attempts, 0, "An unsuccessful recheck cannot burn the effect budget")
+        XCTAssertEqual(retained.nextAttemptAt, date.addingTimeInterval(60))
+        clock.advance(by: .seconds(59))
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+        XCTAssertEqual(effects.restored, [[remote]], "The persisted delay must also gate a new reconcile call")
+        clock.advance(by: .seconds(1))
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+        XCTAssertEqual(effects.restored, [[remote], [remote]], "Exactly one retry becomes due after the delay")
+        let retried = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertTrue(retried.needsRemoteRestore)
+        XCTAssertEqual(retried.remote, remote)
+        XCTAssertEqual(retried.attempts, 0)
+        XCTAssertEqual(retried.nextAttemptAt, clock.now.addingTimeInterval(60))
+        XCTAssertTrue(effects.returned.isEmpty, "A still-trashed main cannot enter the compound recheck")
+    }
+
+    func testMissingTypedRestoreOutcomeIsUnreadableAndKeepsItsUIDOwed() async throws {
+        await coordinator.close()
+        let id = "missing-typed-outcome"
+        enqueue(id, state: .completed)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "missing-typed-target")
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key(id), revision: revision,
+                    remote: remote, kind: .uploaded, createdAt: date)), .recorded)
+        let excluded = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: key(id), generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+        effects.typedReturnOverride = [:]
+        coordinator = makeCoordinator()
+        await coordinator.start()
+
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertEqual(result.outcomes[key(id)], .unreadable)
+        let retained = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertEqual(retained.remote, remote)
+        XCTAssertTrue(retained.needsQueueSync)
+        XCTAssertEqual(retained.nextAttemptAt, date.addingTimeInterval(60))
+        XCTAssertEqual(retained.attempts, 0)
+        XCTAssertTrue(effects.restored.isEmpty)
+    }
+
+    func testUnreadableDiscoveredRestoreKeyReportsTheWholeBatchWithoutReturningAHealthySubset() async throws {
+        await coordinator.close()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "two-source-restore")
+        for id in ["readable-key", "unreadable-key"] {
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: key(id), revision: revision,
+                        remote: remote, kind: .uploaded, createdAt: date)), .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?
+                    .first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: key(id), generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+        }
+        coordinator = makeCoordinator()
+        await coordinator.start()
+        // Startup recovery may read the same keys. Arm only at this restore's reverse query;
+        // its discovery reads follow without an actor suspension.
+        let failure = KeyedReadFailure(limit: 1, armAfter: "FROM handoff WHERE remote_link_id=?")
+        try failure.install(on: store)
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+        failure.remove(from: store)
+        XCTAssertEqual(failure.count, 1, "The keyed discovery read really failed")
+        XCTAssertEqual(result.outcomes, [key("readable-key"): .unreadable, key("unreadable-key"): .unreadable])
+        XCTAssertTrue(effects.returned.isEmpty, "A complete reverse query does not permit a partial source-state read")
+        XCTAssertTrue(effects.restored.isEmpty)
+    }
+}
+
+extension PendingBackupCoordinatorTests {
+    func testConfirmedRestoreRequiresAnExplicitActiveMainBeforeCallingTheTypedEffect() async throws {
+        for kind in ["missing", "inferred", "inactive", "related"] {
+            await coordinator.close()
+            let id = "fresh-coordinator-\(kind)"
+            let remote = PhotoUID(volumeID: "vol", nodeID: "main-\(kind)")
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: key(id), revision: revision, remote: remote,
+                        kind: .uploaded, createdAt: date)), .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?
+                    .first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: key(id), generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+            let relations = FakeChecker()
+            if kind != "missing" {
+                relations.linkVisibilityByID[remote.nodeID] = .init(
+                    isActive: kind != "inactive",
+                    mainPhotoLinkID: kind == "related" ? "foreign" : nil, hasExplicitPhotoState: kind != "inferred")
+            }
+            effects = FakePendingEffects()
+            coordinator = makeCoordinator(relations: relations)
+            await coordinator.start()
+            let result = await coordinator.restoreSources(ofRemote: [remote])
+            XCTAssertEqual(result.outcomes[key(id)], .unreadable, kind)
+            XCTAssertTrue(effects.returned.isEmpty, "No active proof means no controller admission: \(kind)")
+            XCTAssertTrue(try XCTUnwrap(store.sourceState(for: key(id))).needsQueueSync)
+            XCTAssertEqual(store.sourceState(for: key(id))?.remote, remote)
+        }
+    }
+}
+
+extension PendingBackupCoordinatorTests {
+    func testPendingReconcileRefusesAnOpenTransaction() async throws {
+        try await pendingReconcileRefuses(.openTransaction)
+    }
+
+    func testPendingReconcileRefusesALastingFailure() async throws {
+        try await pendingReconcileRefuses(.lastingFailure)
+    }
+
+    func testPendingReconcileRefusesAFailedRollback() async throws {
+        try await pendingReconcileRefuses(.failedRollback)
+    }
+
+    private func pendingReconcileRefuses(_ fault: PendingStoreTransactionFault) async throws {
+        await coordinator.close()
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: clock.sleep)
+        let id = "unavailable-deletion"
+        let sourceKey = key(id)
+        enqueue(id, state: .uploading)
+        XCTAssertTrue(store.recordUploadEvidence(sourceKey, revision: revision, at: date))
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: sourceKey, presentation: nil, remote: nil)], at: date))
+        XCTAssertTrue(store.deferEffects(for: sourceKey, at: date))
+        let backingQueue = try XCTUnwrap(queue)
+        let futureID = id + "-future"
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key(futureID), presentation: nil, remote: nil)], at: date))
+        XCTAssertTrue(
+            Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 61)", of: futureID, at: storeURL))
+        effects.onRemove = {
+            _ = backingQueue.removeSources(kind: .photoLibraryAsset, identifiers: [id])
+        }
+        await coordinator.start()
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
+        XCTAssertTrue(effects.removed.isEmpty)
+        let connection = try fault.install(on: store, key: sourceKey)
+        defer { PendingStoreTransactionFault.remove(from: connection) }
+
+        clock.advance(by: .seconds(60))
+        try await pollWhileFalse { clock.waits.filter { $0 >= .seconds(60) }.count >= 2 }
+
+        XCTAssertTrue(effects.removed.isEmpty, "an unavailable decision must not remove a photo from backup")
+        XCTAssertNotNil(
+            try queue.entry(for: source(id), revision: revision), "the real queue row must survive the refused pass")
+        XCTAssertTrue(effects.trashed.isEmpty)
+        XCTAssertGreaterThanOrEqual(clock.waits.filter { $0 >= .seconds(60) }.count, 2, "refusal must arm a retry")
+        try await settle()
+        XCTAssertEqual(clock.waits, [.seconds(60), .seconds(60)], "one existing backoff, without a short retry loop")
+        if fault == .openTransaction {
+            PendingStoreTransactionFault.remove(from: connection)
+            XCTAssertTrue(store.isOperational())
+            clock.advance(by: .seconds(60))
+            try await pollWhileFalse {
+                queueEntryForTesting(in: backingQueue, source: self.source(id), revision: self.revision) == nil
+            }
+            XCTAssertEqual(
+                effects.removed, [[id, futureID].sorted()], "the next check settles committed deletes after recovery")
+            XCTAssertNil(try queue.entry(for: source(id), revision: revision))
+        }
+        await coordinator.close()
+    }
+
+    func testPendingReconcileRefusalInvalidatesEarlierActionEligibility() async throws {
+        await coordinator.close()
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: clock.sleep)
+        let id = "unavailable-delete"
+        let sourceKey = key(id)
+        enqueue(id, state: .uploading)
+        XCTAssertTrue(store.recordUploadEvidence(sourceKey, revision: revision, at: date))
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: sourceKey, presentation: nil, remote: nil)], at: date))
+        XCTAssertTrue(store.deferEffects(for: sourceKey, at: date))
+        let favoriteKey = key("earlier-eligibility")
+        let remote = PhotoUID(volumeID: "vol", nodeID: "favorite-photo")
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: favoriteKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        XCTAssertTrue(store.setFavoriteIntent(favoriteKey, favorite: true, at: date.addingTimeInterval(120)))
+        await coordinator.start()
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
+        let connection = try PendingStoreTransactionFault.openTransaction.install(on: store, key: sourceKey)
+        defer { PendingStoreTransactionFault.remove(from: connection) }
+
+        clock.advance(by: .seconds(60))
+        func refusalWaitCount() -> Int {
+            clock.waits.filter { $0 == .seconds(60) || $0 == .seconds(1) }.count
+        }
+        try await pollWhileFalse { refusalWaitCount() >= 2 }
+        XCTAssertGreaterThanOrEqual(refusalWaitCount(), 2, "the refused reconcile must finish before the event")
+        // The foreground event runs before the already scheduled action timer, so this await observes the whole
+        // dispatch. Waking both at once can return here while another runDueActions call still awaits its effect.
+        clock.advance(by: .seconds(60), wakingTimers: false)
+        await coordinator.noteRemotePresence([favoriteKey])
+
+        XCTAssertTrue(effects.favorites.isEmpty, "an earlier complete read grants no action while the store is unknown")
+        XCTAssertEqual(store.actions().count, 1, "the favorite stays owed until the decision is readable")
+        await coordinator.close()
+    }
+}
+
+extension PendingBackupCoordinatorTests {
+    // MARK: - Degraded retry after a failed keyed reload (#913)
+
+    private static let trashTilePresentation = PendingPresentationMetadata(
+        captureTime: Date(timeIntervalSince1970: 1_750_000_000),
+        mediaType: "photo",
+        displayName: "Deleted photo"
+    )
+
+    /// Reads the first column of the first row as text, on its own read-only connection.
+    private func sqlScalar(_ sql: String) -> String? {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = handle
+        else {
+            sqlite3_close(handle)
+            return nil
+        }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            sqlite3_finalize(statement)
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else {
+            return nil
+        }
+        return String(cString: text)
+    }
+
+    /// An excluded source whose remote trash is complete. `newerHandoff` inserts a handoff with a newer
+    /// remote node ID than the state, so startup recovery reschedules the remote trash (`.scheduled`)
+    /// and reconciles; a matching handoff keeps recovery at `.unchanged`. `tile` also lists the source
+    /// in "Zuletzt gelöscht" and provides its presentation metadata, so it appears as a trash tile.
+    private func excludedAndRemoteTracked(_ id: String, tile: Bool = false, newerHandoff: Bool = true) throws {
+        let stateRemote = PhotoUID(volumeID: "vol", nodeID: "old-\(id)")
+        XCTAssertNotNil(
+            store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: key(id), presentation: tile ? Self.trashTilePresentation : nil, remote: stateRemote)
+                ],
+                at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: 1, at: date))
+        // The commit of a newer revision arrived before the process ended, after the old photo was
+        // chosen for the trash: `recordHandoff` registers the durable duty, and the acknowledged row
+        // leaves no event for the new coordinator.
+        let handoffRemote = PhotoUID(volumeID: "vol", nodeID: "\(newerHandoff ? "new" : "old")-\(id)")
+        let revision = UploadBackupRevision(rawValue: 9)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key(id), revision: revision, remote: handoffRemote, kind: .uploaded, createdAt: date)),
+            .excludedRemoteNeedsTrash)
+        XCTAssertTrue(store.acknowledgeHandoffs([(key(id), revision)]))
+        if newerHandoff {
+            // The newer handoff stays unreadable while the old photo's trash completes, so the
+            // completion's move-on cannot reschedule the newer duty at seed time: startup recovery
+            // resumes it instead, as after a crash between the completion and the reschedule.
+            XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='\(id)';"))
+            XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
+            XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='\(id)';"))
+        } else {
+            // The record repeats the trashed photo, so it is a receipt replay that must not re-arm a duty.
+            XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
+        }
+        if tile {
+            XCTAssertTrue(Self.setColumns("listed_in_trash=1", of: id, at: storeURL))
+            metadata.set(key(id), Self.trashTilePresentation)
+        }
+    }
+
+    /// Startup recovery rescheduled the remote trash of a newer handoff (`.scheduled`), then the keyed
+    /// reload of that source failed. The safe baseline for issue #913: the degraded regime schedules the
+    /// 60 s backoff, and firing that timer retries the interrupted keyed read. While the read stays
+    /// unreadable no remote trash dispatch runs, and the readable wait of the control source is also
+    /// scheduled; the single reconcile timer alternates between that long wait and the backoff.
+    func testStartupRecoveryInterruptedReloadSchedulesDegradedRetry() async throws {
+        try excludedAndRemoteTracked("k")
+        includedLater("ctrl")
+
+        // Arms after the reschedule UPDATE of `resumeLaterTrash`, so that read itself stays readable and
+        // only the recovery reload afterwards is interrupted.
+        let failure = KeyedReadFailure(limit: 5, armAfter: "needs_remote_trash=1")
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        try await pollWhileFalse { failure.count >= 1 }
+        XCTAssertGreaterThanOrEqual(failure.count, 1, "the reload keyed read must be genuinely interrupted")
+
+        // The safe baseline: the degraded 60 s backoff is scheduled, no action runs while the read fails,
+        // and the control source keeps its readable long wait in the schedule alongside the backoff.
+        let backoffDelay = Duration.seconds(60)
+        try await pollWhileFalse { clock.waits.contains(backoffDelay) }
+        XCTAssertTrue(
+            effects.trashed.isEmpty,
+            "while the keyed read fails, no remote trash dispatch may run; the handoff stays unconsumed")
+        XCTAssertTrue(
+            clock.waits.contains(backoffDelay),
+            "issue #913 safety baseline: after the failed keyed reload, startup recovery schedules the "
+                + "degraded 60 s backoff")
+        XCTAssertTrue(
+            clock.waits.contains { $0 > Duration.seconds(4000) && $0 < Duration.seconds(5500) },
+            "the readable ~5000 s wait of the control source is also recorded; the backoff does not erase it")
+
+        // The retry is real: firing the fake clock by the backoff makes the coordinator re-attempt the
+        // interrupted keyed read (a fresh interrupt beyond the settled startup count).
+        let settledCount = failure.count
+        clock.advance(by: .seconds(60))
+        try await pollWhileFalse { failure.count > settledCount }
+        XCTAssertGreaterThan(
+            failure.count, settledCount,
+            "the 60 s backoff timer must fire and retry the interrupted keyed read")
+
+        // The interrupts never corrupted the durable decision: the handoff row stays as written.
+        XCTAssertEqual(
+            sqlScalar("SELECT remote_link_id FROM handoff WHERE source_id='k' AND revision_us=9;"),
+            "new-k",
+            "the interrupted reads must not change the handoff row")
+
+        failure.remove(from: store)
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// The same recovery scenario with healthy reads: the remote trash of the newer handoff is dispatched,
+    /// the readable schedule (~5000 s) carries the timer, and no degraded backoff is ever scheduled.
+    func testStartupRecoveryHealthyReadControlSchedulesReadableWait() async throws {
+        try excludedAndRemoteTracked("k")
+        includedLater("ctrl")
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+
+        let resumedRemote = PhotoUID(volumeID: "vol", nodeID: "new-k")
+        try await pollWhileFalse { effects.trashed.count >= 1 }
+        XCTAssertEqual(effects.trashed, [[resumedRemote]], "healthy reads must dispatch the rescheduled remote trash")
+
+        try await pollWhileFalse {
+            clock.waits.contains { $0 > Duration.seconds(4000) && $0 < Duration.seconds(5500) }
+        }
+        XCTAssertTrue(
+            clock.waits.contains { $0 > Duration.seconds(4000) && $0 < Duration.seconds(5500) },
+            "the healthy path must schedule the long readable wait of the included source")
+        XCTAssertFalse(
+            clock.waits.contains(Duration.seconds(60)),
+            "the healthy path must not schedule the degraded backoff wait")
+        XCTAssertEqual(
+            clock.waits.filter { $0 < Duration.seconds(130) }, [],
+            "the healthy path must not record any degraded backoff wait")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// The `removeFromTrashList` failure route for issue #913: the unlist commits, the keyed reload
+    /// after it fails, and the last known state is stale, so the tile stays in the trash list. The
+    /// degraded 60 s retry must be scheduled, as startup recovery does, and firing it must repair
+    /// the stale tile once the read answers again.
+    func testRemoveFromTrashListFailedReloadSchedulesDegradedRetry() async throws {
+        try excludedAndRemoteTracked("t", tile: true, newerHandoff: false)
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        let trashKey = self.key("t")
+        _ = await waitForSnapshot("the fixture must first show the source in the trash list") {
+            $0.trashTiles.contains { $0.key == trashKey }
+        }
+
+        // Arms after the unlist UPDATE, so the keyed read inside `unlistFromTrash` itself stays readable.
+        // Without a limit, every later keyed read also fails until `recover()`: a pass that startup or
+        // another route still has in flight cannot repair the stale tile before the retry fires.
+        let failure = KeyedReadFailure(armAfter: "listed_in_trash=0")
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        let result = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t")
+        ])
+        XCTAssertTrue(
+            result,
+            "removeFromTrashList must return true when the unlist succeeds despite the reload failure")
+        XCTAssertGreaterThanOrEqual(failure.count, 1, "the reload keyed read after the unlist must be interrupted")
+        XCTAssertEqual(
+            sqlScalar("SELECT listed_in_trash FROM source_state WHERE source_id='t';"), "0",
+            "the unlist must be committed in the store")
+
+        // The observable symptom: the last known state is stale, so the tile stays in the trash list.
+        try await settle()
+        let staleSnapshot = await coordinator.currentSnapshot()
+        XCTAssertTrue(
+            staleSnapshot.trashTiles.contains { $0.key == key("t") },
+            "the failed reload must leave the stale trash tile until a read succeeds")
+
+        // The repair (#913): the degraded 60 s retry is scheduled, as startup recovery does in the same
+        // situation, so the stale tile repairs itself instead of staying until another trigger.
+        let backoffDelay = Duration.seconds(60)
+        await waitForLiveWait(backoffDelay, on: clock, "the degraded 60 s retry must register its wait")
+        XCTAssertTrue(
+            clock.liveWaits.contains(backoffDelay),
+            "issue #913: removeFromTrashList must schedule the degraded 60 s retry after its reload failed, "
+                + "as startup recovery does")
+
+        // Firing the retry repairs the tile: the reads recover first, so the keyed read of the fired
+        // pass answers, and the trash list drops the stale tile.
+        failure.recover()
+
+        // The membership interval is zero, so the publish after the fired timer needs no further
+        // clock step; the wait ends on the published repair instead of a guessed delay.
+        let repairedSnapshot = try await publishedSnapshot(
+            "the fired 60 s retry must repair the stale trash tile",
+            after: { clock.advance(by: backoffDelay) },
+            where: { $0.trashTiles.allSatisfy { $0.key != trashKey } })
+        XCTAssertTrue(
+            repairedSnapshot.excludedTiles.contains { $0.key == key("t") },
+            "the source stays excluded and keeps its settings tile after the repair")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// The healthy control of the same route: without the read failure, the tile leaves the trash list
+    /// and stays in the excluded list, and no degraded backoff is ever scheduled.
+    func testRemoveFromTrashListHealthyReadControlRemovesTile() async throws {
+        try excludedAndRemoteTracked("t", tile: true, newerHandoff: false)
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        let trashKey = self.key("t")
+        _ = await waitForSnapshot("the fixture must first show the source in the trash list") {
+            $0.trashTiles.contains { $0.key == trashKey }
+        }
+
+        let result = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t")
+        ])
+        XCTAssertTrue(result, "removeFromTrashList must succeed with healthy reads")
+        XCTAssertEqual(
+            sqlScalar("SELECT listed_in_trash FROM source_state WHERE source_id='t';"), "0",
+            "the unlist must be committed in the store")
+
+        let removedSnapshot = await waitForSnapshot("the tile must leave the trash list") {
+            $0.trashTiles.allSatisfy { $0.key != trashKey }
+        }
+        XCTAssertTrue(
+            removedSnapshot.excludedTiles.contains { $0.key == key("t") },
+            "the source stays excluded and keeps its settings tile")
+        XCTAssertFalse(
+            clock.waits.contains(Duration.seconds(60)),
+            "the healthy route must not schedule the degraded backoff wait")
+        XCTAssertEqual(
+            clock.waits.filter { $0 < Duration.seconds(130) }, [],
+            "the healthy route must not record any degraded backoff wait")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// A recovery-path heal must publish the shown lists: the source stayed unreadable in the
+    /// later-trash set, so its duty is retried by `resumeLaterTrash`, whose keyed reload then
+    /// succeeds while the generic heal block's read stays interrupted. Without the publish of
+    /// that heal the stale trash tile survives the fired retry that read the source.
+    func testRecoveryHealOfUnreadableLaterTrashPublishesMembership() async throws {
+        try excludedAndRemoteTracked("k", tile: true, newerHandoff: false)
+
+        // Startup recovery's handoff read fails, so the source enters the unreadable later-trash
+        // set while its keyed state reads stay readable. The read can also be retried by the
+        // startup reconcile, so the fault budget covers both passes.
+        let handoffFailure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 2)
+        try handoffFailure.install(on: store)
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        let trashKey = self.key("k")
+        _ = await waitForSnapshot("the fixture must first show the source in the trash list") {
+            $0.trashTiles.contains { $0.key == trashKey }
+        }
+        try await pollWhileFalse { handoffFailure.count >= 1 }
+        XCTAssertGreaterThanOrEqual(
+            handoffFailure.count, 1, "startup recovery must read the source's handoff")
+        try await settle()
+        handoffFailure.remove(from: store)
+
+        // The unlist commits and its keyed reload fails, so the shown list keeps the stale tile
+        // and the source state degrades, while the unreadable later-trash duty keeps its retry.
+        let reloadFailure = KeyedReadFailure(limit: 2, armAfter: "listed_in_trash=0")
+        try reloadFailure.install(on: store)
+        defer { reloadFailure.remove(from: store) }
+
+        let result = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "k")
+        ])
+        XCTAssertTrue(
+            result, "removeFromTrashList must return true when the unlist succeeds despite the reload failure")
+        XCTAssertEqual(
+            sqlScalar("SELECT listed_in_trash FROM source_state WHERE source_id='k';"), "0",
+            "the unlist must be committed in the store")
+
+        try await settle()
+        let staleSnapshot = await coordinator.currentSnapshot()
+        XCTAssertTrue(
+            staleSnapshot.trashTiles.contains { $0.key == trashKey },
+            "the failed reload must keep the stale trash tile")
+
+        // Fire the single live degraded retry timer. Its reconcile must heal the source in the
+        // recovery reload, because the generic heal block's keyed read stays interrupted.
+        let retryDelay = Duration.seconds(60)
+        await waitForLiveWait(retryDelay, on: clock, "the degraded 60 s retry must register its wait")
+        XCTAssertEqual(
+            clock.liveWaits, [retryDelay], "the degraded regime must keep exactly one live timer: the 60 s retry")
+
+        let repairedSnapshot = try await publishedSnapshot(
+            "the recovery-path heal must publish the membership and drop the stale trash tile",
+            after: { clock.advance(by: retryDelay) },
+            where: { $0.trashTiles.allSatisfy { $0.key != trashKey } })
+        XCTAssertTrue(
+            repairedSnapshot.excludedTiles.contains { $0.key == trashKey },
+            "the source stays excluded and keeps its settings tile after the recovery heal")
+        XCTAssertEqual(
+            reloadFailure.count, 2,
+            "the generic heal block's keyed read must stay interrupted, so only the recovery reload can heal")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// The second failed unlist of the same degraded episode must keep the first countdown (#913, review
+    /// round 1): `scheduleReconcileTimer` restarts its timer, so re-arming after a later failed reload
+    /// would delay the pending retry by another full wait. A second 60 s wait must never be recorded.
+    func testRemoveFromTrashListKeepsAnExistingDegradedCountdown() async throws {
+        try excludedAndRemoteTracked("t1", tile: true, newerHandoff: false)
+        try excludedAndRemoteTracked("t2", tile: true, newerHandoff: false)
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        let firstKey = self.key("t1")
+        let secondKey = self.key("t2")
+        _ = await waitForSnapshot("both sources must first appear in the trash list") {
+            $0.trashTiles.contains { $0.key == firstKey }
+                && $0.trashTiles.contains { $0.key == secondKey }
+        }
+
+        // Two separate fault episodes: the first failure interrupts the reload after the first unlist.
+        // The second failure stays unarmed until the second unlist UPDATE commits, so the read before
+        // that write passes (#982) and only the reload after it fails.
+        let firstFailure = KeyedReadFailure(limit: 1, armAfter: "listed_in_trash=0")
+        try firstFailure.install(on: store)
+
+        let first = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t1")
+        ])
+        XCTAssertTrue(first, "the first unlist must commit and arm the degraded countdown")
+        try await pollWhileFalse { clock.waits.contains(Duration.seconds(60)) }
+        XCTAssertEqual(firstFailure.count, 1, "the first failed reload must be interrupted")
+        firstFailure.remove(from: store)
+
+        let secondFailure = KeyedReadFailure(limit: 1, armAfter: "listed_in_trash=0")
+        try secondFailure.install(on: store)
+        defer { secondFailure.remove(from: store) }
+
+        let second = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t2")
+        ])
+        XCTAssertTrue(second, "the second unlist must commit too")
+        try await pollWhileFalse { secondFailure.count == 1 }
+        XCTAssertEqual(
+            secondFailure.count, 1,
+            "the second reload must fail as well, entering the same degraded episode")
+
+        try await settle()
+        XCTAssertEqual(
+            clock.waits.filter { $0 == Duration.seconds(60) }.count, 1,
+            "a later failed unlist must not restart the already pending degraded countdown")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// Review round 2 of #913: the `!reconcileRunning` leg of the degraded-retry guard. While a
+    /// reconcile pass awaits the remote trash dispatch of another source, a `removeFromTrashList`
+    /// whose keyed reload fails must not arm the degraded countdown itself; the pass-end
+    /// `scheduleReconcileTimer` arms it once. Arming mid-pass would restart that countdown when the
+    /// pass ends and so double the wait.
+    func testRemoveFromTrashListDuringReconcilePassDoesNotDoubleDegradedWait() async throws {
+        // "d" owes the remote trash of a newer handoff, so the recovery pass awaits its dispatch.
+        try excludedAndRemoteTracked("d")
+        // "t" is only shown in the trash list; the keyed reload after its unlist is the one that fails.
+        try excludedAndRemoteTracked("t", tile: true, newerHandoff: false)
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        // Holds the remote trash of "d", so the reconcile pass stays suspended mid-flight and
+        // `reconcileRunning` stays true for the whole unlist below.
+        let trashGate = LookupGate()
+        effects.trashGate = trashGate
+        defer { trashGate.open() }
+
+        await coordinator.start()
+        let reached = await trashGate.entered(within: .seconds(5))
+        XCTAssertTrue(
+            reached,
+            "the reconcile pass must reach and hold the remote trash dispatch of \"d\"")
+
+        // Arms after the unlist UPDATE, so the keyed read before that write stays readable (#982).
+        let failure = KeyedReadFailure(limit: 1, armAfter: "listed_in_trash=0")
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        let result = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t")
+        ])
+        XCTAssertTrue(
+            result,
+            "removeFromTrashList must return true when the unlist succeeds despite the reload failure")
+        XCTAssertEqual(failure.count, 1, "the reload keyed read after the unlist must be interrupted")
+
+        // Mid-pass, no countdown may be armed: the running pass owns the end-of-pass scheduling.
+        try await settle()
+        XCTAssertFalse(
+            clock.waits.contains { $0 >= .seconds(30) && $0 <= .seconds(130) },
+            "while the pass runs, the failed unlist must not arm the degraded countdown itself")
+
+        // Releasing the trash ends the pass; its end-of-pass scheduling arms the countdown once.
+        trashGate.open()
+        try await pollWhileFalse { !effects.trashed.isEmpty }
+        XCTAssertEqual(
+            effects.trashed, [[PhotoUID(volumeID: "vol", nodeID: "new-d")]],
+            "the held pass must finish its remote trash dispatch")
+        try await pollWhileFalse { clock.waits.contains(Duration.seconds(60)) }
+        XCTAssertEqual(
+            clock.waits.filter { $0 == Duration.seconds(60) }.count, 1,
+            "the pass-end scheduling must arm exactly one degraded 60 s countdown")
+        XCTAssertFalse(
+            clock.waits.contains { $0 > Duration.seconds(60) && $0 <= .seconds(130) },
+            "no doubled degraded wait may follow the pass-end countdown")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
 }

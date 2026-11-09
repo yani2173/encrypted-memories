@@ -1,8 +1,9 @@
 import AlbumSyncCore
 import Foundation
 import PhotoLibraryBackupAdapter
-import UploadCore
 import XCTest
+
+@testable import UploadCore
 
 final class AlbumRemoteProofLookupTests: XCTestCase {
     private func candidate(
@@ -67,6 +68,27 @@ final class AlbumRemoteProofLookupTests: XCTestCase {
             XCTAssertEqual(Set(links.keys), ["valid"])
             XCTAssertEqual(resolver.requests.flatMap { $0 }.map(\.identifier), ["cloud-valid"])
             XCTAssertNil(links["valid"]?.sha1Hex)
+        }
+    }
+
+    /// A queue row that could not be read is no admission: the lookup fails instead of skipping the photo, also after
+    /// the store forgot the transient failure (#1004 B2).
+    func testAnUnreadQueueRowStopsTheLookupAfterRecovery() async throws {
+        try await withQueue { queue in
+            let asset = self.candidate("asset")
+            self.seed(asset, in: queue)
+            let fault = try SQLiteReadInterrupt(in: queue, matching: "SELECT original_filename, byte_count, state")
+            defer { fault.stop() }
+            let resolver = ScriptedAlbumProofResolver()
+            do {
+                let links = try await AlbumSyncRemoteProofLookup.remoteLinks(
+                    for: ["asset"], catalog: ProofTestCatalog(assets: [asset]), queue: queue, resolver: resolver)
+                XCTFail("an unread queue row must stop the lookup, got \(links.keys.sorted())")
+            } catch {
+                XCTAssertEqual(error as? AlbumSyncError, .mappingStoreUnavailable)
+            }
+            XCTAssertTrue(fault.fired)
+            XCTAssertTrue(resolver.requests.isEmpty, "no proof request without an admitted row")
         }
     }
 

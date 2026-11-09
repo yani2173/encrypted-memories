@@ -15,6 +15,8 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
     public static let defaultLeaseInterval: TimeInterval = 120
 
     private static let schemaVersion = 1
+    private static let schemaVersionRow = SQLiteInfoTableVersion(
+        table: "backup_execution_lock_info", version: schemaVersion, stampReplacesExistingRow: true)
     private let connection: SQLiteStoreConnection
     private var db: OpaquePointer? { connection.database }
     private let lockName: String
@@ -310,33 +312,9 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
             at: url,
             schemaSQL: schema,
             policy: policy,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
+            verifyVersion: schemaVersionRow.verify,
+            stampVersion: schemaVersionRow.stamp
         )
-    }
-
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
-        var stmt: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(
-                handle, "SELECT value FROM backup_execution_lock_info WHERE key='schema';", -1, &stmt, nil) == SQLITE_OK
-        else {
-            return false
-        }
-        var onDisk: Int?
-        let result = sqlite3_step(stmt)
-        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
-        sqlite3_finalize(stmt)
-        return result == SQLITE_ROW && onDisk == schemaVersion
-    }
-
-    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
-        return sqlite3_exec(
-            handle,
-            "INSERT INTO backup_execution_lock_info(key, value) VALUES('schema', \(schemaVersion)) "
-                + "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-            nil, nil, nil
-        ) == SQLITE_OK
     }
 
     private static func parseProcessContext(_ raw: String?) -> (platform: String, pid: Int32)? {

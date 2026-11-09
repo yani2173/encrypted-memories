@@ -43,20 +43,6 @@ public enum ExactDuplicateRelatedFileTransferError: Error, Sendable, Equatable {
     }
 }
 
-extension ExactDuplicateRemote {
-    /// Fails before any file or remote operation until the backend implements related-file downloads.
-    public func downloadRelatedFile(
-        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
-    ) async throws -> SeriesMemberSource {
-        throw ExactDuplicateRelatedFileTransferError.unavailable
-    }
-
-    /// Fails before any file or remote operation until the backend implements related-file uploads.
-    public func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
-        throw ExactDuplicateRelatedFileTransferError.unavailable
-    }
-}
-
 /// What one node read tells about a photo.
 public struct ExactDuplicateNodeFacts: Sendable, Equatable {
     /// The person shares the photo with other people or by a link.
@@ -282,6 +268,9 @@ public struct ExactDuplicateFinder: Sendable {
     let albums: any SeriesAlbumCarryOver
     /// Receives the duration and the request count of each phase, never an identifier.
     let log: @Sendable (String) -> Void
+    /// The metadata of earlier rankings, valid while the content index stands at the same cursor. Nil: every
+    /// launch reads the nodes of all candidate groups again.
+    let fingerprintCache: ExactDuplicateFingerprintCache?
     /// Re-read before each transfer phase; production shares the backup's existing saved preference.
     var copyNetwork: @Sendable () -> BackupThrottleInputs = {
         BackupThrottleInputs(
@@ -308,6 +297,7 @@ public struct ExactDuplicateFinder: Sendable {
         mergeJournal: any ExactDuplicateMergeJournaling,
         remote: any ExactDuplicateRemote,
         albums: any SeriesAlbumCarryOver,
+        fingerprintCache: ExactDuplicateFingerprintCache? = nil,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.checker = checker
@@ -318,6 +308,7 @@ public struct ExactDuplicateFinder: Sendable {
         self.mergeJournal = mergeJournal
         self.remote = remote
         self.albums = albums
+        self.fingerprintCache = fingerprintCache
         self.log = log
     }
 
@@ -333,17 +324,15 @@ public struct ExactDuplicateFinder: Sendable {
     /// The groups of the current key epoch, largest first. The scan reads the index as it is: `prepareIndex` builds
     /// it, and the scan reports `.indexing` until a build has finished. The coverage comes from the local index, so a
     /// running build never holds the scan. A merge that waits for the check of its kept photo is checked first.
-    public func duplicateGroups() async throws -> ExactDuplicateScan {
-        try await duplicateGroups(progress: { _ in })
-    }
-
-    /// `duplicateGroups()` that reports how many candidate photos the visibility read has covered.
+    /// `progress` receives how many candidate photos the visibility read has covered.
     public func duplicateGroups(
-        progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
+        progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void = { _ in }
     ) async throws -> ExactDuplicateScan {
         await resolvePendingMerges()
         let start = ContinuousClock.now
         let epoch = try await checker.hashKeyEpoch()
+        // The cursor of the content index comes before every read of this scan: saved details belong to it.
+        let cursor = index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID
         let coverage = coverage(hashKeyEpoch: epoch)
         // Known related files, such as Live Photo videos and originals, never are members.
         guard let candidates = index.remoteContentDuplicateGroups(hashKeyEpoch: epoch) else {
@@ -351,6 +340,7 @@ public struct ExactDuplicateFinder: Sendable {
         }
         guard !candidates.isEmpty else { return ExactDuplicateScan(groups: [], coverage: coverage) }
         let volumeID = try await remote.ownPhotosVolumeID()
+        fingerprintCache?.begin(volumeID: volumeID, hashKeyEpoch: epoch, eventID: cursor)
         let links = Set(candidates.values.joined()).sorted()
         let (visibility, requests) = try await visibility(of: links, progress: progress)
         log(
@@ -387,7 +377,7 @@ public struct ExactDuplicateFinder: Sendable {
         let reads = try await BoundedConcurrency.throwingMap(
             batches, limit: Self.visibilityConcurrency, progress: report
         ) {
-            try await checker.linkVisibility(of: $0)
+            try await checker.linkVisibility(of: $0, requiresCompleteResponse: false)
         }
         let visibility = reads.reduce(into: [String: RemoteLinkVisibility]()) { $0.merge($1) { _, new in new } }
         return (visibility, batches.count)
@@ -420,6 +410,12 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
+    /// The metadata that earlier rankings read for the members of `groups`, for each group whose members all have
+    /// current details. The screen splits those groups by them before it reads any node.
+    public func storedFingerprints(of groups: [ExactDuplicateGroup]) async -> [PhotoUID: ExactDuplicateFingerprint] {
+        fingerprintCache?.details(of: groups) ?? [:]
+    }
+
     /// The members of each group in an order that needs no request: the earliest capture date that the device knows,
     /// then the smallest link ID. The screens show it until the ranking has read the facts of the group.
     public func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
@@ -439,14 +435,6 @@ public struct ExactDuplicateFinder: Sendable {
         await remote.captureDates(of: members)
     }
 
-    /// The members of each group by group ID, the photo to keep first. A group whose facts could not be read is left
-    /// out, so it keeps its fallback order.
-    public func rankedMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
-        let collected = RankingCollector()
-        await rankMembers(of: groups) { await collected.add($0.members) }
-        return await collected.members
-    }
-
     /// Ranks the members of each group, page by page, and hands each page to `ranked`. One favorites listing, one
     /// local date read, and one manifest scan serve all groups; each group reads the albums and the sharing state of
     /// its own members, `rankingConcurrency` groups at once. A failed read leaves only its group in the fallback
@@ -456,6 +444,8 @@ public struct ExactDuplicateFinder: Sendable {
     ) async {
         guard !groups.isEmpty else { return }
         let start = ContinuousClock.now
+        // The details of the scan that this ranking belongs to, taken before the first node read.
+        let snapshot = fingerprintCache?.currentSnapshot()
         let members = groups.flatMap(\.members)
         let context: (volumeID: String, favorites: Set<PhotoUID>)
         do {
@@ -505,6 +495,12 @@ public struct ExactDuplicateFinder: Sendable {
                 pageFacts[group.id] = memberFacts
             }
             guard !Task.isCancelled else { return }
+            // Details of a successful read only, and only while the index still stands at the cursor of the scan.
+            if let cache = fingerprintCache, let epoch = page.first?.hashKeyEpoch {
+                cache.record(
+                    fingerprints.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } }, for: snapshot,
+                    currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
+            }
             await ranked(
                 ExactDuplicateRankingPage(
                     members: order, groupCount: page.count, byteSizes: sizes, shared: sharedMembers,
@@ -1583,15 +1579,6 @@ public struct ExactDuplicateFinder: Sendable {
                 try await Task.sleep(for: keptReadRetryDelay)
             }
         }
-    }
-}
-
-/// Collects the pages of a ranking.
-private actor RankingCollector {
-    private(set) var members: [String: [PhotoUID]] = [:]
-
-    func add(_ page: [String: [PhotoUID]]) {
-        members.merge(page) { _, new in new }
     }
 }
 

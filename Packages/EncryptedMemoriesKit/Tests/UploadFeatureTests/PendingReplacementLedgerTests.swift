@@ -34,7 +34,7 @@ final class PendingReplacementLedgerTests: XCTestCase {
         return sqlite3_column_int(stmt, 0)
     }
 
-    func testReplacementActivityKeepsSchemaOneAndReopensThroughTheExistingStore() throws {
+    func testReplacementActivityKeepsSchemaTwoAndReopensThroughTheExistingStore() throws {
         let recorder = PendingBackupEventRecorder(store: store)
         recorder.recordUploadEvidence(source: source, revision: revision, replaces: [main])
         recorder.recordHandoff(source: source, revision: revision, remote: remote, kind: .uploaded)
@@ -45,7 +45,7 @@ final class PendingReplacementLedgerTests: XCTestCase {
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
         defer { sqlite3_close(db) }
-        XCTAssertEqual(try scalar("SELECT value FROM pending_info WHERE key='schema';", db: db), 1)
+        XCTAssertEqual(try scalar("SELECT value FROM pending_info WHERE key='schema';", db: db), 2)
         XCTAssertEqual(try scalar("SELECT COUNT(*) FROM pragma_table_info('upload_evidence');", db: db), 4)
         store = try XCTUnwrap(PendingBackupManifestStore(url: url))
         XCTAssertTrue(store.isOperational())

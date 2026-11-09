@@ -161,6 +161,8 @@
 
     /// Finds the given groups at once and checks nothing else.
     private final class RowFinder: ExactDuplicateMerging, @unchecked Sendable {
+        func confirmNoPendingMerges() async -> Bool { true }
+        func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
         let groups: [ExactDuplicateGroup]
 
         init(groups: [ExactDuplicateGroup]) { self.groups = groups }

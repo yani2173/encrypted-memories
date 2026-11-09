@@ -49,8 +49,12 @@ struct MobileSettingsScreen: View {
             .observesStoragePressure($storagePressure)
             .toolbar {
                 if showsDismissButton {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button(L10n.string("action.done")) { dismiss() }
+                    ProminentToolbarItem(placement: .confirmationAction) {
+                        Button {
+                            dismiss()
+                        } label: {
+                            Label(L10n.string("action.done"), systemImage: "checkmark").textBarItem()
+                        }
                     }
                     .mobileVisibilityPriority(.high)
                 }
@@ -61,14 +65,14 @@ struct MobileSettingsScreen: View {
             }
             .task(id: scenePhase) {
                 guard scenePhase == .active else { return }
-                await libraryModel.refreshAccountInfo()
+                await refreshAccountInfo()
                 while !Task.isCancelled {
                     do {
                         try await Task.sleep(for: .seconds(300))
                     } catch {
                         return
                     }
-                    await libraryModel.refreshAccountInfo()
+                    await refreshAccountInfo()
                 }
             }
             .signOutConfirmation(isPresented: $confirmSignOut) { sessionModel.signOut() }
@@ -288,6 +292,12 @@ struct MobileSettingsScreen: View {
 
     // MARK: - Actions
 
+    private func refreshAccountInfo() async {
+        await ProtonAccountInfoRequestCause.visibleSettings.run {
+            await libraryModel.refreshAccountInfo()
+        }
+    }
+
     private func refreshCacheSize() async {
         cacheSize = await libraryModel.diskCaches.diskSizeBytes()
     }
@@ -358,8 +368,12 @@ private struct MobileBugReportSheet: View {
             }
             .mobileNavigationTitle(L10n.string("settings.bug_report_title"))
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.string("action.done")) { dismiss() }
+                ProminentToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label(L10n.string("action.done"), systemImage: "checkmark").textBarItem()
+                    }
                 }
                 .mobileVisibilityPriority(.high)
             }

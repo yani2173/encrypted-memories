@@ -592,27 +592,29 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
         XCTAssertEqual(reason, .some(.executionSuspended))
     }
 
-    func testNextYieldWakesWhenABackupItemWaitsForThePermit() async throws {
-        let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
-        let coordinator = LibraryResourceCoordinator(runtimeState: state)
-        let backupRan = AsyncTestSignal()
-        let (reason, backup) = try await coordinator.withHeavyPermit(LibraryBackgroundWorkTuning.orderPass) {
-            lease in
-            let waiting = Task { await lease.nextYield() }
-            // The backup item arrives only after the wait checked the lease once, so only the preemption can wake it.
-            let checked = await waitFor { lease.yieldWaitEvaluations >= 1 }
-            XCTAssertTrue(checked, "the wait checked the lease")
-            let backup = Task {
-                _ = try? await coordinator.withHeavyPermit(
-                    LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
-                ) { _ in backupRan.fire() }
+    #if DEBUG
+        func testNextYieldWakesWhenABackupItemWaitsForThePermit() async throws {
+            let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+            let coordinator = LibraryResourceCoordinator(runtimeState: state)
+            let backupRan = AsyncTestSignal()
+            let (reason, backup) = try await coordinator.withHeavyPermit(LibraryBackgroundWorkTuning.orderPass) {
+                lease in
+                let waiting = Task { await lease.nextYield() }
+                // The backup item arrives only after the wait checked the lease once, so only the preemption can wake it.
+                let checked = await waitFor { lease.yieldWaitEvaluations >= 1 }
+                XCTAssertTrue(checked, "the wait checked the lease")
+                let backup = Task {
+                    _ = try? await coordinator.withHeavyPermit(
+                        LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+                    ) { _ in backupRan.fire() }
+                }
+                return (await boundedValue(of: waiting), backup)
             }
-            return (await boundedValue(of: waiting), backup)
+            XCTAssertEqual(reason, .some(.higherPriorityWork), "backup outranks background work")
+            await awaitWindowEvent(backupRan, "the backup item after the release")
+            await backup.value
         }
-        XCTAssertEqual(reason, .some(.higherPriorityWork), "backup outranks background work")
-        await awaitWindowEvent(backupRan, "the backup item after the release")
-        await backup.value
-    }
+    #endif
 
     func testNextYieldWakesAtTheEndOfTheTimeSlice() async throws {
         let coordinator = LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())

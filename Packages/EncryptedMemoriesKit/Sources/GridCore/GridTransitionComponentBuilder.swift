@@ -1,10 +1,8 @@
 // GridTransitionComponentBuilder.swift
 //
-// Consumes the engine's settled source/target GridFramePlan (no engine mutation) and derives the
-// single presentation lattice: anchor-relative keys, per-key source/target occupants + rects, and
-// the relocation components (union-find linking each relocating identity's source key to its target key).
-// Only the anchor (0,0) is stable by construction; the rest of the focus row relocates when the column
-// count changes between levels (its keys form a side == .focus relocation component), as do other rows.
+// Builds presentation keys for settled frame plans and joins the source/target positions of relocating
+// identities. Columns and rows are relative to the anchor. The schedules own occupant crossfades for
+// each component.
 
 import CoreGraphics
 
@@ -209,13 +207,14 @@ package enum GridTransitionComponentBuilder {
             cid += 1
         }
 
-        // Synthesize endpoints for entries and exits so they move with the grid. Abort if no stable transform
-        // can be fit from keys that exist in both frame plans.
+        let presSource: [RelativeSlotKey: CGRect]
+        let presTarget: [RelativeSlotKey: CGRect]
+        // Preserve the affine presentation for entries and exits.
         guard
             let transform = GridTransitionPresentationTransform.fit(
                 keys: keys, sourceRect: sourceRect, targetRect: targetRect)
         else { return nil }
-        let (presSource, presTarget) = transform.endpoints(keys: keys, sourceRect: sourceRect, targetRect: targetRect)
+        (presSource, presTarget) = transform.endpoints(keys: keys, sourceRect: sourceRect, targetRect: targetRect)
 
         return GridTransitionLattice(
             keys: keys, sourceOcc: sourceOcc, targetOcc: targetOcc,

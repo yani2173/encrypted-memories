@@ -23,7 +23,7 @@ final class PhotoLibraryBackupHeartbeatTests: XCTestCase {
             }
 
             controller.syncNow()
-            let running = await waitUntil { passStarted.isSet }
+            let running = await pollUntil { passStarted.isSet }
             XCTAssertTrue(running)
             let owner = try XCTUnwrap(fixture.lockStore(now: Date()).currentLock()?.runID)
             let successor = try fixture.lockStore(now: Date().addingTimeInterval(600))
@@ -31,7 +31,7 @@ final class PhotoLibraryBackupHeartbeatTests: XCTestCase {
             XCTAssertEqual(successor.recoverStaleLocks(olderThan: Date().addingTimeInterval(300)).map(\.runID), [owner])
             XCTAssertTrue(successor.acquire(owner: .background, runID: "successor").didAcquire)
 
-            let stopped = await waitUntil { !controller.isSyncing }
+            let stopped = await pollUntil { !controller.isSyncing }
             XCTAssertTrue(stopped, "a pass whose lock another run took must stop")
             XCTAssertEqual(successor.currentLock()?.runID, "successor", "the stopped pass leaves the new owner alone")
             await controller.shutdown()
@@ -52,7 +52,7 @@ final class PhotoLibraryBackupHeartbeatTests: XCTestCase {
             }
 
             controller.syncNow()
-            let running = await waitUntil { passStarted.isSet }
+            let running = await pollUntil { passStarted.isSet }
             XCTAssertTrue(running)
             let observer = try fixture.lockStore(now: Date())
             defer { observer.close() }
@@ -69,14 +69,14 @@ final class PhotoLibraryBackupHeartbeatTests: XCTestCase {
             XCTAssertEqual(observer.currentLock()?.heartbeatAt, started.heartbeatAt)
             XCTAssertEqual(sqlite3_exec(writer, "COMMIT;", nil, nil, nil), SQLITE_OK)
 
-            let renewed = await waitUntil {
+            let renewed = await pollUntil {
                 (observer.currentLock()?.heartbeatAt ?? .distantPast) > started.heartbeatAt
             }
             XCTAssertTrue(renewed, "the next interval renews the lock")
             XCTAssertEqual(observer.currentLock()?.runID, started.runID)
             XCTAssertTrue(controller.isSyncing)
             release.set()
-            let finished = await waitUntil { !controller.isSyncing }
+            let finished = await pollUntil { !controller.isSyncing }
             XCTAssertTrue(finished)
             await controller.shutdown()
         }
@@ -115,15 +115,6 @@ final class PhotoLibraryBackupHeartbeatTests: XCTestCase {
             return Fixture(
                 controller: controller, directory: directory, defaults: defaults, suite: suite,
                 lockURL: directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName))
-        }
-
-        private func waitUntil(timeout: Duration = .seconds(5), _ condition: () -> Bool) async -> Bool {
-            let deadline = ContinuousClock.now + timeout
-            while !condition() {
-                guard ContinuousClock.now < deadline else { return false }
-                try? await Task.sleep(for: .milliseconds(5))
-            }
-            return true
         }
 
         private final class Flag: @unchecked Sendable {

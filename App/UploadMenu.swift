@@ -5,6 +5,13 @@ enum UploadUITrigger: String {
     case menu
 }
 
+/// What `MainView` does when an upload command arrives. The raw values are the words of the debug log line.
+enum UploadUIAction: String {
+    case uploadPhotos
+    case uploadFolder
+    case showQueue
+}
+
 /// Notifications posted by the File-menu / toolbar upload commands (which live in the App scene) and
 /// observed by `MainView` (which owns the upload coordinator + can present panels).
 extension Notification.Name {

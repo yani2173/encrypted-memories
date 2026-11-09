@@ -4,6 +4,8 @@ import LibraryRuntimeAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import Observation
 import PhotosCore
+import ProtonDriveBackend
+import TimelineCore
 import UIKit
 
 /// The process-wide owner of the signed-in account: one session model, one library model, one runtime.
@@ -26,24 +28,39 @@ final class MobileAccountRuntime {
     private(set) var isStarted = false
     private var sessionSubscription: AnyCancellable?
     private var sceneObservers: [NSObjectProtocol] = []
-    private var uploadedLibraryMutationRevision: UInt64?
-    private var completedUploadRevision: Int?
+    private var uploadSignals = UploadRefreshSignalTracker(
+        backupRevision: nil, manualRevision: nil, passIsRunning: false)
     private var wasSigningOut = false
+    private let connectedScenes: @MainActor () -> Set<UIScene>
+    private let smartSearchForegroundChanged: @MainActor (Bool) -> Void
 
     private init() {
         sessionModel = MobileSessionModel()
         libraryModel = MobileLibraryModel()
+        connectedScenes = { UIApplication.shared.connectedScenes }
+        smartSearchForegroundChanged = {
+            AppleSmartSearchBackgroundCoordinator.shared.applicationStateChanged(isForeground: $0)
+        }
     }
 
-    /// Test seam: an isolated runtime around injected models. It never touches UIKit scene notifications.
-    init(sessionModel: MobileSessionModel, libraryModel: MobileLibraryModel) {
+    /// An isolated runtime around injected models. `start()` installs scene observers just as the shared runtime does.
+    init(
+        sessionModel: MobileSessionModel, libraryModel: MobileLibraryModel,
+        connectedScenes: @escaping @MainActor () -> Set<UIScene> = { UIApplication.shared.connectedScenes },
+        smartSearchForegroundChanged: @escaping @MainActor (Bool) -> Void = {
+            AppleSmartSearchBackgroundCoordinator.shared.applicationStateChanged(isForeground: $0)
+        }
+    ) {
         self.sessionModel = sessionModel
         self.libraryModel = libraryModel
+        self.connectedScenes = connectedScenes
+        self.smartSearchForegroundChanged = smartSearchForegroundChanged
     }
 
     /// Idempotent. The first scene root starts the account; later scenes (including simultaneous state
     /// restoration of several windows) attach to the already running runtime.
     func start() {
+        logAccountStart(wasRunning: isStarted)
         guard !isStarted else { return }
         isStarted = true
         libraryModel.configure(session: sessionModel.session, store: sessionModel.sessionStore)
@@ -55,10 +72,29 @@ final class MobileAccountRuntime {
                 self.libraryModel.configure(session: session, store: self.sessionModel.sessionStore)
             }
         wasSigningOut = libraryModel.isSigningOut
-        uploadedLibraryMutationRevision = libraryModel.photoBackup?.uploadedLibraryMutationRevision
-        completedUploadRevision = libraryModel.facade?.uploadCoordinator.completedUploadRevision
+        uploadSignals = UploadRefreshSignalTracker(
+            backupRevision: libraryModel.photoBackup?.uploadedLibraryMutationRevision,
+            manualRevision: libraryModel.facade?.uploadCoordinator.completedUploadRevision,
+            passIsRunning: libraryModel.photoBackup?.isSyncing ?? false)
         observeLibrarySignals()
         installSceneObservers()
+    }
+
+    /// The device log of each start call: a scene or a background window, with the scenes that iOS has connected.
+    private func logAccountStart(wasRunning: Bool) {
+        let state: BackgroundWorkLog.Value =
+            switch UIApplication.shared.applicationState {
+            case .active: .word("active")
+            case .inactive: .word("inactive")
+            case .background: .word("background")
+            @unknown default: .word("unknown")
+            }
+        BackgroundWorkLog.system.notice(
+            .launch, "account.start",
+            [
+                (.init("result"), wasRunning ? .word("alreadyRunning") : .word("started")),
+                (.init("scenes"), .count(connectedScenes().count)), (.init("appState"), state),
+            ])
     }
 
     // MARK: - Scene activity aggregation
@@ -92,19 +128,33 @@ final class MobileAccountRuntime {
             DuplicatesMergeBackgroundGrace.shared.applicationDidBecomeActive(model: libraryModel.duplicates)
             // Foregrounding reopens the background-indexing gate promptly.
             libraryModel.smartSearch?.noteConditionsChanged()
-            Task { await libraryModel.refreshAccountInfo() }
+            Task {
+                await ProtonAccountInfoRequestCause.foregroundActivation.run {
+                    await libraryModel.refreshAccountInfo()
+                }
+            }
         case .foregroundInactive:
             break
         }
         libraryModel.setApplicationActive(opportunity == .foregroundActive)
     }
 
+    /// The scene observers that `start()` installed, so a test can tell that a second start installs none.
+    var sceneObserverCount: Int { sceneObservers.count }
+
     private func installSceneObservers() {
         let center = NotificationCenter.default
-        for scene in UIApplication.shared.connectedScenes {
+        for scene in connectedScenes() {
             sceneLedger.update(sceneID: Self.sceneID(scene), phase: Self.phase(of: scene.activationState))
         }
-        if !sceneLedger.isEmpty { apply(sceneLedger.opportunity) }
+        if !sceneLedger.isEmpty {
+            apply(sceneLedger.opportunity)
+        } else {
+            // A start without a scene, from a background window, is not foreground activity: no source refresh or
+            // library polling as if the app were open. The first scene that connects applies its phase.
+            libraryModel.setApplicationActive(false)
+            smartSearchForegroundChanged(false)
+        }
 
         let phaseEvents: [(Notification.Name, LibrarySceneActivityLedger.ScenePhase)] = [
             (UIScene.didActivateNotification, .active),
@@ -159,6 +209,7 @@ final class MobileAccountRuntime {
         withObservationTracking {
             _ = libraryModel.isSigningOut
             _ = libraryModel.photoBackup?.uploadedLibraryMutationRevision
+            _ = libraryModel.photoBackup?.isSyncing
             _ = libraryModel.facade?.uploadCoordinator.completedUploadRevision
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
@@ -176,12 +227,15 @@ final class MobileAccountRuntime {
         }
         wasSigningOut = signingOut
 
-        let uploaded = libraryModel.photoBackup?.uploadedLibraryMutationRevision
-        let completed = libraryModel.facade?.uploadCoordinator.completedUploadRevision
-        if uploaded != uploadedLibraryMutationRevision || completed != completedUploadRevision {
-            uploadedLibraryMutationRevision = uploaded
-            completedUploadRevision = completed
-            libraryModel.refreshAfterLocalUpload()
+        let outcome = uploadSignals.observe(
+            backupRevision: libraryModel.photoBackup?.uploadedLibraryMutationRevision,
+            manualRevision: libraryModel.facade?.uploadCoordinator.completedUploadRevision,
+            passIsRunning: libraryModel.photoBackup?.isSyncing ?? false)
+        switch outcome.refresh {
+        case .manualUpload: libraryModel.refreshAfterLocalUpload()
+        case .backupUpload(let passIsRunning): libraryModel.refreshAfterBackupUpload(passIsRunning: passIsRunning)
+        case nil: break
         }
+        if outcome.passEnded { libraryModel.backupPassDidEnd() }
     }
 }

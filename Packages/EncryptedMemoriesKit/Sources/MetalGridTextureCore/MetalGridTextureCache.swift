@@ -75,7 +75,6 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
     package var residentBytes: Int { lru.residentCost }
     package var residentByteBudget: Int { budget.maxResidentBytes }
     package var uploadByteBudgetPerFrame: Int { budget.maxUploadBytesPerFrame }
-    package var uploadTimeBudgetPerFrame: Double { budget.maxUploadMillisecondsPerFrame }
     /// True when resident bytes exceed the budget - transiently possible inside a frame (uploads land
     /// before `evictToBudget`), never after eviction ran. Persistent `true` in logs signals a bug.
     package var byteBudgetOverflow: Bool { lru.residentCost > budget.maxResidentBytes }

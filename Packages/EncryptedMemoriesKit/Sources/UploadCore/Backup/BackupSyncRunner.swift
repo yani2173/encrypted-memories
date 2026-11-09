@@ -103,6 +103,13 @@ public actor BackupSyncRunner {
     private var drainMode: DrainMode = .waitForScheduledRetries
     private var deletionStateInvalidated = false
     private var stopRequested = false
+    /// A queue read, or the requeue of stale active rows, of this pass could not run completely. The pass ends as
+    /// unknown, never as drained, until the next pass reads the queue again (#1004 B2).
+    private var queueReadUnknown = false
+    /// The queue's failure count when this pass started. Any failure recorded during the pass, a failed write as well
+    /// as a failed read, ends it as unknown: the queue's health check forgets a transient failure once the database
+    /// answers again, so it cannot show that the pass stopped early (#1004).
+    private var failuresBeforePass: UInt64 = 0
     /// Transport cancellation can arrive without cancelling the Swift task. Keep it until the next pass.
     private var runCancellationError: (any Error)?
     /// Consecutive items that could not even reserve disk space since the last one that did.
@@ -120,6 +127,10 @@ public actor BackupSyncRunner {
     /// Keyed by `sourceKey`. A claim never takes rows of these sources: a running item can leave its row runnable
     /// for a moment, for example `needsRemoteReconciliation` while the paired video of its photo uploads.
     private var runningSources: [String: RunningSource] = [:]
+    /// An interrupted source waits for the next drain, even when a concurrent scan makes it due again.
+    private var deferredSources: [String: UploadSourceIdentity] = [:]
+    /// At most 128 deferred-source SQL parameters, plus the current upload pool, before the next drain.
+    private static let maxDeferredSourcesPerDrain = 64
     /// Wakes the scheduling loop when a row is enqueued, an item settles, the runtime changes, or a waiting row
     /// becomes runnable.
     private var schedulerWaiter: CheckedContinuation<Void, Never>?
@@ -232,7 +243,7 @@ public actor BackupSyncRunner {
     /// Queue health is part of the runner contract: callers must never treat an empty result from a
     /// failed SQLite read as a drained backup.
     public func isQueueOperational() -> Bool {
-        queue.isOperational()
+        !queueReadUnknown && queue.recordedFailureCount() == failuresBeforePass && queue.isOperational()
     }
 
     /// User-initiated retry contract. Eligibility changes and remote-cache invalidation stay together
@@ -240,7 +251,13 @@ public actor BackupSyncRunner {
     @discardableResult
     public func makeRetryableWorkEligibleNow() async -> Int {
         let changed = queue.makeRetryableWorkEligible(updatedAt: now())
-        let hadRemoteIndexIssue = queue.runtimeIssue(for: .remoteIndexPreparation) != nil
+        let hadRemoteIndexIssue: Bool
+        do {
+            hadRemoteIndexIssue = try queue.decisionRuntimeIssue(for: .remoteIndexPreparation) != nil
+        } catch {
+            // Unknown: clear it anyway. Clearing a missing issue changes nothing.
+            hadRemoteIndexIssue = true
+        }
         let clearedRemoteIndexIssue =
             !hadRemoteIndexIssue
             || queue.setRuntimeIssue(nil, for: .remoteIndexPreparation)
@@ -314,12 +331,17 @@ public actor BackupSyncRunner {
     ) async -> BackupSyncProgress {
         guard !isRunning else { return progress }
         runCancellationError = nil
+        queueReadUnknown = false
+        // Only this pass may claim that no upload work is left; a pass that stops early must not return the claim of
+        // an earlier one (#1004 B2).
+        progress.leavesNoUploadWork = false
         guard queue.isOperational() else {
             progress.isRunning = false
             progress.currentItemName = nil
             emitProgress()
             return progress
         }
+        failuresBeforePass = queue.recordedFailureCount()
         isRunning = true
         deletionStateInvalidated = false
         drainMode = mode
@@ -332,6 +354,7 @@ public actor BackupSyncRunner {
         resourcePressureStreak = 0
         claimedItemCount = 0
         runningSources = [:]
+        deferredSources = [:]
         schedulerWakePending = false
         defer {
             remoteIndexPreparationGeneration = nil
@@ -352,26 +375,47 @@ public actor BackupSyncRunner {
 
         // Crash recovery first: anything still marked active predates this run and must become
         // runnable again before this runner atomically claims new work.
-        queue.requeueStaleActive(before: now().addingTimeInterval(-configuration.staleActiveGrace), updatedAt: now())
-        guard queue.isOperational() else { return progress }
+        // A failed requeue changed nothing. A later health check can pass again, so only the write's own result shows
+        // it; the pass ends as unknown and never reports that no upload work is left (#1004). The pass count guard would
+        // also end the pass; this guard stays so the result of the call itself is never taken as empty.
+        guard
+            queue.requeueStaleActive(
+                before: now().addingTimeInterval(-configuration.staleActiveGrace), updatedAt: now())
+                != nil
+        else {
+            queueReadUnknown = true
+            return progress
+        }
+        guard isQueueOperational() else { return progress }
         await requeueDueBlockedRows()
-        guard queue.isOperational() else { return progress }
+        guard isQueueOperational() else { return progress }
 
         // The last known index health stays visible until this pass reads it again.
         let previousIndexHealth = progress.remoteContentIndexHealth
-        progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
+        guard let summary = queue.summary() else { return progress }
+        progress = BackupSyncProgress(summary: summary, isRunning: true)
         progress.remoteContentIndexHealth = previousIndexHealth
         progress.remoteIndexPreparationIssue = queue.runtimeIssue(for: .remoteIndexPreparation)
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
-        guard queue.isOperational() else { return progress }
+        guard isQueueOperational() else { return progress }
         emitProgress()
 
         if mode == .eligibleOnly {
-            guard let nextRunnableDate = queue.nextRunnableDate() else {
+            let nextRunnableDate: Date?
+            do {
+                nextRunnableDate = try queue.decisionNextRunnableDate(excludingSourcesOf: [])
+            } catch {
+                // An unknown date proves neither due work nor an empty queue.
+                queueReadUnknown = true
+                progress.isRunning = false
+                return progress
+            }
+            guard let nextRunnableDate else {
                 // Nothing is due now or later. A parked draft whose re-check is due later can still start an index
                 // build, and a failed read proves nothing. The controller reports the rest once its scan has finished.
                 progress.isRunning = false
-                progress.leavesNoUploadWork = !queue.containsAny(in: [.blockedByDraft]) && queue.isOperational()
+                progress.leavesNoUploadWork =
+                    (try? queue.containsAny(in: [.blockedByDraft])) == false && isQueueOperational()
                 return progress
             }
             guard nextRunnableDate <= now() else {
@@ -411,10 +455,19 @@ public actor BackupSyncRunner {
             cancelRemoteIndexPreparation(generation: remoteIndexGeneration)
             if recordCancellation(error) { return progress }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let previous: BackupIssueRecord?
+            do {
+                previous = try queue.decisionRuntimeIssue(for: .remoteIndexPreparation)
+            } catch {
+                // Without the stored ordinal the backoff would restart at its first, shortest step.
+                queueReadUnknown = true
+                stopRequested = true
+                return progress
+            }
             let issue = automaticRetryIssue(
                 kind: Self.issueKind(for: error),
                 detail: message,
-                previous: queue.runtimeIssue(for: .remoteIndexPreparation)
+                previous: previous
             )
             guard queue.setRuntimeIssue(issue, for: .remoteIndexPreparation) else {
                 stopRequested = true
@@ -430,7 +483,7 @@ public actor BackupSyncRunner {
         // Warm the dedup pipeline's remote cache for the first batch so per-item resolves are cache
         // hits (see primeRunnableLookahead). Re-warmed periodically as the queue drains.
         await primeRunnableLookahead()
-        guard queue.isOperational() else { return progress }
+        guard isQueueOperational() else { return progress }
         var startsSincePrime = 0
         var storeFailed = false
 
@@ -439,6 +492,14 @@ public actor BackupSyncRunner {
         // hold back new starts.
         await withDiscardingTaskGroup { group in
             while true {
+                if deferredSources.count >= Self.maxDeferredSourcesPerDrain {
+                    guard claimedItemCount > 0 else {
+                        stopRequested = true
+                        break
+                    }
+                    await waitForSchedulerWake()
+                    continue
+                }
                 let mayStart =
                     !stopRequested && !Task.isCancelled && !storeFailed
                     && resourcePressureStreak < configuration.batchSize
@@ -450,12 +511,12 @@ public actor BackupSyncRunner {
                     await waitForSchedulerWake()
                     continue
                 }
-                guard queue.isOperational() else {
+                guard isQueueOperational() else {
                     storeFailed = true
                     continue
                 }
                 await requeueDueBlockedRows()
-                guard queue.isOperational() else {
+                guard isQueueOperational() else {
                     storeFailed = true
                     continue
                 }
@@ -496,7 +557,15 @@ public actor BackupSyncRunner {
                 }
 
                 if runningSources.count < limit {
-                    let claimed = claimEligible(limit: limit - runningSources.count)
+                    // A failed claim changed nothing. A later health check can pass again, so only the claim's own
+                    // result shows it; the pass ends as unknown instead of retrying the claim at once (#1004). The pass
+                    // count guard would also end the pass; this guard stays so the result of the call itself is never
+                    // taken as empty.
+                    guard let claimed = claimEligible(limit: limit - runningSources.count) else {
+                        queueReadUnknown = true
+                        storeFailed = true
+                        continue
+                    }
                     startsSincePrime += claimed.count
                     for entry in claimed {
                         claimedItemCount += 1
@@ -520,12 +589,21 @@ public actor BackupSyncRunner {
                 }
 
                 if claimedItemCount == 0 {
-                    guard queue.isOperational() else {
+                    guard isQueueOperational() else {
                         storeFailed = true
                         continue
                     }
-                    guard let wait = shortestPendingWait(policy: .idleScheduledRetries) else {
-                        if !queue.isOperational() { storeFailed = true }
+                    let idleWait: TimeInterval?
+                    do {
+                        idleWait = try shortestPendingWait(policy: .idleScheduledRetries)
+                    } catch {
+                        // An unknown date ends the pass as unknown: it is not drained.
+                        queueReadUnknown = true
+                        storeFailed = true
+                        continue
+                    }
+                    guard let wait = idleWait else {
+                        if !isQueueOperational() { storeFailed = true }
                         break
                     }
                     if mode == .eligibleOnly { break }
@@ -537,10 +615,11 @@ public actor BackupSyncRunner {
                     continue
                 }
                 // Free slots that the claim could not fill also wait for the earliest row that becomes runnable.
+                // An unknown date waits without a timer: the settlement of a running item wakes the loop.
                 let wait =
                     runningSources.count < limit
-                    ? shortestPendingWait(
-                        policy: .freeUploadSlots, excludingSourcesOf: runningSources.values.map(\.source))
+                    ? (try? shortestPendingWait(
+                        policy: .freeUploadSlots, excludingSourcesOf: runningSources.values.map(\.source))) ?? nil
                     : nil
                 await waitForSchedulerWake(orAfter: wait)
             }
@@ -549,11 +628,12 @@ public actor BackupSyncRunner {
 
         // Truth re-sync from the store: incremental counters were exact (single writer), but the
         // final snapshot should come from the durable state regardless.
-        if queue.isOperational() {
+        if queue.isOperational(), let summary = queue.summary() {
             let wasPausedByPolicy = progress.isPausedByPolicy
             let wasWaitingForWiFi = progress.isWaitingForWiFi
             let indexHealth = progress.remoteContentIndexHealth
-            progress = BackupSyncProgress(summary: queue.summary(), isRunning: false)
+            progress = BackupSyncProgress(
+                summary: summary, isRunning: false)
             progress.isPausedByPolicy = wasPausedByPolicy
             progress.isWaitingForWiFi = wasWaitingForWiFi
             progress.remoteContentIndexHealth = indexHealth
@@ -642,13 +722,14 @@ public actor BackupSyncRunner {
         publishActiveExecutionProgress(emit: false)
     }
 
-    private func claimEligible(limit: Int) -> [UploadBackupSyncQueueEntry] {
+    private func claimEligible(limit: Int) -> [UploadBackupSyncQueueEntry]? {
         let claimLimit = min(configuration.batchSize, max(1, limit))
         // Eligibility is persisted in `updatedAt` and enforced inside the same transaction that
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker
         // and would remain falsely active until crash recovery.
         return queue.claimRunnable(
-            limit: claimLimit, claimedAt: now(), excludingSourcesOf: runningSources.values.map(\.source))
+            limit: claimLimit, claimedAt: now(),
+            excludingSourcesOf: runningSources.values.map(\.source) + Array(deferredSources.values))
     }
 
     /// Processes a claimed row, then the other revisions of its source that the same claim returned. Each settled
@@ -757,11 +838,13 @@ public actor BackupSyncRunner {
     private func shortestPendingWait(
         policy: PendingWaitPolicy,
         excludingSourcesOf excludedSources: [UploadSourceIdentity] = []
-    ) -> TimeInterval? {
+    ) throws -> TimeInterval? {
         let currentTime = now()
-        var dates = [queue.nextRunnableDate(excludingSourcesOf: excludedSources)]
+        var dates = [
+            try queue.decisionNextRunnableDate(excludingSourcesOf: excludedSources + Array(deferredSources.values))
+        ]
         if policy == .freeUploadSlots {
-            dates.append(queue.earliestEntry(in: .blockedByDraft)?.updatedAt)
+            dates.append(try queue.decisionEarliestEntry(in: .blockedByDraft)?.updatedAt)
         }
         let eligibleDates = dates.compactMap { $0 }.filter {
             policy == .idleScheduledRetries || $0 > currentTime
@@ -781,7 +864,16 @@ public actor BackupSyncRunner {
     /// that never clears is re-checked at most once per cap window: visible, never hot-looping.
     private func requeueDueBlockedRows() async {
         let currentTime = now()
-        let blocked = queue.entries(in: .blockedByDraft, updatedBefore: currentTime, limit: configuration.batchSize)
+        let blocked: [UploadBackupSyncQueueEntry]
+        do {
+            blocked = try queue.decisionEntries(
+                in: .blockedByDraft, updatedBefore: currentTime, limit: configuration.batchSize)
+        } catch {
+            // The due re-check did not run; the pass must not end as if it had.
+            queueReadUnknown = true
+            stopRequested = true
+            return
+        }
         var requeued = false
         for entry in blocked {
             let issue = BackupIssueRecord.decode(entry.lastError)
@@ -825,7 +917,13 @@ public actor BackupSyncRunner {
         if peek.count < Self.primeBatch {
             peek += queue.entries(in: .queuedForUpload, updatedBefore: cutoff, limit: Self.primeBatch - peek.count)
         }
-        peek.removeAll { $0.isDismissedSourceRecheck }
+        peek.removeAll {
+            $0.isDismissedSourceRecheck
+                || deferredSources[Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)] != nil
+        }
+        // A photo whose pending row this build cannot read waits at its claim; its name goes to Proton only once its
+        // row reads again (#982).
+        if let events { peek.removeAll { events.exclusion(of: $0.source) == .unreadable } }
         guard !peek.isEmpty else { return }
         let descriptors = peek.map { entry in
             UploadResourceDescriptor(
@@ -833,8 +931,7 @@ public actor BackupSyncRunner {
                 fileURL: Self.primePlaceholderURL,
                 filename: entry.originalFilename,
                 fileSize: entry.byteCount ?? 0,
-                modificationDate: entry.updatedAt,
-                mainResource: nil
+                modificationDate: entry.updatedAt
             )
         }
         await identityResolver.prime(descriptors)
@@ -878,6 +975,41 @@ public actor BackupSyncRunner {
         if !isSourceRecheck { adjustProgress(from: checkingEntry.state, to: .checking) }
         emitProgress()
 
+        // A photo with a pending row that this build cannot read waits before its file is exported or hashed: a newer
+        // build may have excluded it. A dismissed photo keeps its check, and a saved upload receipt stays. Every
+        // revision of the photo waits like this, without a problem. The check before each transfer stays (#982).
+        if events?.exclusion(of: checkingEntry.source) == .unreadable {
+            if isSourceRecheck {
+                rememberDeferredSource(checkingEntry)
+                preserveDismissedSourceRecheck(checkingEntry)
+            } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
+                parkRemoteReconciliation(
+                    checkingEntry, reconciliation: reconciliation, from: persistedState,
+                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
+                        ?? L10n.string("error.upload_cancelled"))
+            } else {
+                retryOrPark(checkingEntry, from: persistedState, error: PendingSourceUnreadableError())
+            }
+            return
+        }
+
+        // Another revision of this source can already belong to the same claim. Release it without another read.
+        if deferredSources[Self.sourceKey(kind: checkingEntry.source.kind, identifier: checkingEntry.source.identifier)]
+            != nil
+        {
+            if isSourceRecheck {
+                preserveDismissedSourceRecheck(checkingEntry)
+            } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
+                parkRemoteReconciliation(
+                    checkingEntry, reconciliation: reconciliation, from: persistedState,
+                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
+                        ?? L10n.string("error.upload_cancelled"))
+            } else {
+                deferInterruptedSource(checkingEntry, from: persistedState)
+            }
+            return
+        }
+
         let resolved: BackupResolvedResource?
         do {
             let resolvingEntry = checkingEntry
@@ -914,14 +1046,6 @@ public actor BackupSyncRunner {
                 revert(checkingEntry, from: persistedState)
             }
             return
-        } catch is CancellationError {
-            _ = recordCancellation(CancellationError(), for: checkingEntry)
-            if isSourceRecheck {
-                preserveDismissedSourceRecheck(checkingEntry)
-                return
-            }
-            revert(checkingEntry, from: persistedState)
-            return
         } catch {
             if recordCancellation(error, for: checkingEntry) {
                 if isSourceRecheck {
@@ -932,6 +1056,7 @@ public actor BackupSyncRunner {
                 return
             }
             if isSourceRecheck {
+                if UploadError.isCancellation(error) { rememberDeferredSource(checkingEntry) }
                 let definitiveMissing: Bool
                 switch error as? UploadError {
                 case .sourceReportedMissing, .fileMissing: definitiveMissing = true
@@ -943,7 +1068,8 @@ public actor BackupSyncRunner {
                     retainDismissedSourceRecheck(checkingEntry)
                 } else {
                     let failedRead =
-                        !definitiveMissing && !stopRequested && !Task.isCancelled
+                        !definitiveMissing && !UploadError.isCancellation(error)
+                        && !stopRequested && !Task.isCancelled
                         && configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
                     let readyAt: Date?
                     if case .sourceNotReady(_, let until) = error as? UploadError {
@@ -1065,6 +1191,13 @@ public actor BackupSyncRunner {
                             updatedAt: now()
                         )
                     else {
+                        // The row is gone, for example after a deletion or an exclusion. The handoff above keeps
+                        // the photo and, for an exclusion, schedules its trash. Settlement ends as cancelled; the
+                        // runner ends the pass unless it removed this source itself.
+                        // A failed read is no removal: it ends settlement as a store failure, which stops the pass.
+                        if try queue.entry(for: entry.source, revision: entry.revision) == nil {
+                            throw CancellationError()
+                        }
                         throw UploadError.backend("Remote commit reconciliation could not be persisted")
                     }
                 },
@@ -1073,7 +1206,7 @@ public actor BackupSyncRunner {
                     if await self.stopWasRequested() { throw CancellationError() }
                     switch preflightResult.decision {
                     case .upload, .uploadReplacingDraft:
-                        guard await self.admitsTransfer(for: entry.source) else { throw CancellationError() }
+                        guard try await self.admitsTransfer(for: entry.source) else { throw CancellationError() }
                         await self.recordUploadEvidence(entry)
                         return try await self.performPrimaryUpload(
                             entry,
@@ -1089,28 +1222,23 @@ public actor BackupSyncRunner {
                 }
             )
         } catch is BackupWorkDeferredError {
-            let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
-            revert(entry, from: current)
-            return
-        } catch is CancellationError {
-            _ = recordCancellation(CancellationError(), for: entry)
-            let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
+            guard let current = currentState(of: entry, fallback: persistedState) else { return }
             revert(entry, from: current)
             return
         } catch let settlement as UploadRemoteCommitSettlementError {
             if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
             if settlement.reconciliationPersisted {
-                adjustProgress(from: .uploading, to: .needsRemoteReconciliation)
-                emitProgress()
-            } else if sourceWasRemoved(entry) {
-                // A deletion or exclusion removed the row while the commit settled: only the work of this photo ends.
-                revert(entry, from: persistedState)
+                parkPersistedRemoteCommit(entry, from: .uploading, message: settlement.settlementMessage)
+            } else if settlement.cancellation != nil, sourceWasRemoved(entry) {
+                // Only this source's work ends. A failed write for a source that is still queued means the local store
+                // failed, and that ends the pass.
+                revert(entry, from: .uploading)
             } else {
                 stopRequested = true
             }
             return
         } catch {
-            let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
+            guard let current = currentState(of: entry, fallback: persistedState) else { return }
             if recordCancellation(error, for: entry) || stopRequested || failedWhileWaitingForWiFi() {
                 revert(entry, from: current)
             } else {
@@ -1249,20 +1377,26 @@ public actor BackupSyncRunner {
 
     private func stopWasRequested() -> Bool { stopRequested }
 
+    /// A source whose pending row this build cannot read, for example one that a newer build wrote.
+    private struct PendingSourceUnreadableError: Error {}
+
     /// Checked right before every resource transfer, primary and secondary. A source that the person
-    /// excluded is removed like a local deletion. An unknown answer ends the pass without removing anything,
-    /// so no photo uploads while its exclusion cannot be read.
-    private func admitsTransfer(for source: UploadSourceIdentity) async -> Bool {
+    /// excluded is removed like a local deletion. A source with a pending row that this build cannot read waits,
+    /// and its rows stay: `PendingSourceUnreadableError`. An unknown answer ends the pass without removing
+    /// anything, so no photo uploads while its exclusion cannot be read.
+    private func admitsTransfer(for source: UploadSourceIdentity) async throws -> Bool {
         guard !removedSources.contains(Self.sourceKey(kind: source.kind, identifier: source.identifier)) else {
             return false
         }
         guard let events else { return true }
-        switch events.isExcluded(source: source) {
-        case false?:
+        switch events.exclusion(of: source) {
+        case .included?:
             return true
-        case true?:
+        case .excluded?:
             await removeSources(kind: source.kind, identifiers: [source.identifier])
             return false
+        case .unreadable?:
+            throw PendingSourceUnreadableError()
         case nil:
             stopRequested = true
             return false
@@ -1306,7 +1440,11 @@ public actor BackupSyncRunner {
                 kind: .deduplicated
             ) == .failed
         else { return true }
-        retryOrPark(entry, from: state, error: UploadError.backend("Pending handoff could not be persisted"))
+        // The store refuses the record of a photo whose pending row it cannot read; that photo waits (#982).
+        let error: Error =
+            events?.exclusion(of: entry.source) == .unreadable
+            ? PendingSourceUnreadableError() : UploadError.backend("Pending handoff could not be persisted")
+        retryOrPark(entry, from: state, error: error)
         return false
     }
 
@@ -1344,7 +1482,7 @@ public actor BackupSyncRunner {
             throw BackupWorkDeferredError()
         }
         // Materialization can take a while; an exclusion saved meanwhile must still stop the transfer.
-        guard await admitsTransfer(for: entry.source) else { throw CancellationError() }
+        guard try await admitsTransfer(for: entry.source) else { throw CancellationError() }
         let network = try transferNetwork()
         let key = Self.key(entry)
         guard transition(entry, from: state, to: .uploading) != nil else {
@@ -1519,15 +1657,15 @@ public actor BackupSyncRunner {
         from state: UploadBackupSyncQueueState,
         message: String
     ) {
-        let nextAttempt = now().addingTimeInterval(
-            max(1, configuration.retry.delay(afterAttempts: entry.attempts + 1))
-        )
+        rememberDeferredSource(entry)
+        let issue = boundedDeferralIssue(detail: message, previous: BackupIssueRecord.decode(entry.lastError))
+        let nextAttempt = issue.nextAttemptAt ?? now().addingTimeInterval(30)
         guard
             queue.markNeedsRemoteReconciliation(
                 source: entry.source,
                 revision: entry.revision,
                 reconciliation: reconciliation,
-                lastError: message,
+                lastError: issue.persistedValue,
                 updatedAt: nextAttempt
             )
         else {
@@ -1538,12 +1676,44 @@ public actor BackupSyncRunner {
         emitProgress()
     }
 
+    /// The first local settlement failure uses the same backoff as a later reconciliation failure.
+    private func parkPersistedRemoteCommit(
+        _ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState, message: String
+    ) {
+        if sourceWasRemoved(entry) { return }
+        guard let persisted = (try? queue.entry(for: entry.source, revision: entry.revision)),
+            let reconciliation = persisted.remoteCommitReconciliation
+        else {
+            PhotoDiagnostics.shared.increment("backup.remoteCommitReconciliationUnavailable")
+            PhotoDiagnostics.shared.emitDebug(
+                "BackupSync", ["kind": BackupIssueKind.localState.rawValue, "error": "Committed receipt unavailable"])
+            stopRequested = true
+            return
+        }
+        parkRemoteReconciliation(
+            entry, reconciliation: reconciliation, from: state,
+            message: message)
+    }
+
     // MARK: - Compound settlement (secondaries after the primary)
+
+    private final class QueueReadFailure: @unchecked Sendable {
+        private let lock = NSLock()
+        private var failed = false
+        var occurred: Bool { lock.withLock { failed } }
+        func read<Value>(_ operation: () throws -> Value) rethrows -> Value {
+            do { return try operation() } catch {
+                lock.withLock { failed = true }
+                throw error
+            }
+        }
+    }
 
     private enum SecondaryOutcome {
         case allSettled
         case failed(remaining: Int, error: any Error)
         case reconciliationPending
+        case storeUnavailable
         case blockedByDraft
         case skippedRemoteDeletion
         case cancelled
@@ -1619,9 +1789,7 @@ public actor BackupSyncRunner {
                 // consume the compound's permanent retry budget.
                 retryOrPark(entry, from: persistedState, error: error)
                 return
-            case .reconciliationPending:
-                adjustProgress(from: persistedState, to: .needsRemoteReconciliation)
-                emitProgress()
+            case .reconciliationPending, .storeUnavailable:
                 return
             case .blockedByDraft:
                 do {
@@ -1711,6 +1879,23 @@ public actor BackupSyncRunner {
                     return
                 }
             }
+            // A Live Photo earns tag 3 only when its video is proven backed up. Both parts upload untagged;
+            // if the video never settles, the still shows no indicator. A failed tag add retries the whole
+            // row - the parts are already remote, so only the tag call repeats - until the tag is confirmed.
+            if resolved.secondaries.contains(where: { $0.descriptor.source.resource == .livePairedVideo }) {
+                // Without a tag adder the tag can never be confirmed, so the row fails visibly instead of
+                // silently uploading the pair without the Live Photo indicator.
+                guard let tagAdder else {
+                    retryOrPark(entry, from: persistedState, error: UploadError.tagAdderUnavailable)
+                    return
+                }
+                do {
+                    try await tagAdder.addTags([PhotoTag.livePhotos.rawValue], to: primaryUID)
+                } catch {
+                    retryOrPark(entry, from: persistedState, error: error)
+                    return
+                }
+            }
         }
         if let editReplacement, let primaryUID {
             do {
@@ -1771,10 +1956,6 @@ public actor BackupSyncRunner {
                     source: entry.source, revision: entry.revision,
                     retired: Set(editReplacement.journal.entry(for: entry.source).retired)
                 )
-            } catch is CancellationError {
-                _ = recordCancellation(CancellationError(), for: entry)
-                revert(entry, from: persistedState)
-                return
             } catch {
                 if stopRequested {
                     revert(entry, from: persistedState)
@@ -1876,9 +2057,10 @@ public actor BackupSyncRunner {
         let totalResourceCount = 1 + secondaries.count
         for secondary in secondaries {
             if stopRequested { return .cancelled }
+            let queueReadFailure = QueueReadFailure()
             do {
                 let outcome: SecondaryScopedOutcome = try await identityResolver.withUploadDecision(
-                    secondary.descriptor.withWorkIntent(workIntent).relatedTo(
+                    secondary.descriptor.withWorkIntent(workIntent).withBackupRevision(uploadedRevision).relatedTo(
                         mainRemoteLinkID: primaryUID.nodeID, requiresRelatedMatch: requiresRelatedMatch),
                     onRemoteCommit: { [queue, now] identity, receipt in
                         let reconciliation = UploadRemoteCommitReconciliation(
@@ -1901,6 +2083,12 @@ public actor BackupSyncRunner {
                                 updatedAt: now()
                             )
                         else {
+                            // The row is gone, for example after a deletion or an exclusion.
+                            if try queueReadFailure.read({
+                                try queue.entry(for: entry.source, revision: entry.revision)
+                            }) == nil {
+                                throw CancellationError()
+                            }
                             throw UploadError.backend("Secondary reconciliation could not be persisted")
                         }
                     },
@@ -1967,7 +2155,9 @@ public actor BackupSyncRunner {
                 )
                 switch outcome {
                 case .settled:
-                    if queue.entry(for: entry.source, revision: entry.revision)?.state == .needsRemoteReconciliation {
+                    if try queue.entry(for: entry.source, revision: entry.revision)?.state
+                        == .needsRemoteReconciliation
+                    {
                         guard
                             queue.updateState(
                                 source: entry.source,
@@ -1994,25 +2184,30 @@ public actor BackupSyncRunner {
                         error: UploadError.backend(L10n.string("upload.error_remote_inconsistent"))
                     )
                 }
+            } catch is SQLiteStoreUnknownReadError {
+                stopRequested = true
+                return .storeUnavailable
             } catch is SecondarySourceChangedError {
                 return .sourceChanged
             } catch let settlement as UploadRemoteCommitSettlementError {
                 if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
                 if settlement.reconciliationPersisted {
+                    parkPersistedRemoteCommit(entry, from: .uploading, message: settlement.settlementMessage)
                     return .reconciliationPending
                 }
-                // A row that a deletion or exclusion removed while the video settled ends only the work of this photo.
-                if !sourceWasRemoved(entry) { stopRequested = true }
+                if queueReadFailure.occurred {
+                    stopRequested = true
+                    return .storeUnavailable
+                }
+                if settlement.cancellation == nil || !sourceWasRemoved(entry) { stopRequested = true }
                 return .cancelled
             } catch is BackupWorkDeferredError {
-                return .cancelled
-            } catch is CancellationError {
-                _ = recordCancellation(CancellationError(), for: entry)
                 return .cancelled
             } catch {
                 if recordCancellation(error, for: entry) || stopRequested || failedWhileWaitingForWiFi() {
                     return .cancelled
                 }
+                if UploadError.isCancellation(error) { return .failed(remaining: remaining, error: error) }
                 lastError = error
             }
         }
@@ -2024,13 +2219,10 @@ public actor BackupSyncRunner {
             )
     }
 
-    /// Proton tags of a compound's main photo: the source's own tags, plus tag 3 for a Live Photo and tag 7 for a
-    /// series, which the compound needs at creation.
+    /// Proton tags of a compound's main photo at creation time: the source's own tags, and tag 7 for a series.
+    /// Live Photos do NOT carry tag 3 at creation; the tag is added only after both parts settle.
     static func primaryTags(for secondaries: [BackupSecondaryResource], sourceTags: [Int] = []) -> [Int] {
         var tags = Set(sourceTags)
-        if secondaries.contains(where: { $0.descriptor.source.resource == .livePairedVideo }) {
-            tags.insert(PhotoTag.livePhotos.rawValue)
-        }
         if secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember }) {
             tags.insert(PhotoTag.bursts.rawValue)
         }
@@ -2038,7 +2230,6 @@ public actor BackupSyncRunner {
     }
 
     static func secondaryTags(for resource: UploadSourceIdentity.Resource) -> [Int] {
-        if resource == .livePairedVideo { return [PhotoTag.livePhotos.rawValue] }
         if resource.isBurstMember { return [PhotoTag.bursts.rawValue] }
         return []
     }
@@ -2062,7 +2253,7 @@ public actor BackupSyncRunner {
         completedSecondaries: Int,
         totalResourceCount: Int
     ) async throws -> PhotoUID {
-        guard await admitsTransfer(for: descriptor.source) else { throw CancellationError() }
+        guard try await admitsTransfer(for: descriptor.source) else { throw CancellationError() }
         let network = try transferNetwork()
         let token = UUID()
         let tokenKey = "\(entryKey)#\(descriptor.source.resource.rawValue)"
@@ -2297,10 +2488,34 @@ public actor BackupSyncRunner {
     /// A policy or source snapshot changed during preparation. Requeue without cancelling the operation.
     private struct BackupWorkDeferredError: Error {}
 
-    /// Cancellation of a removed source belongs only to that source. Other transport cancellation ends the pass.
+    private func rememberDeferredSource(_ entry: UploadBackupSyncQueueEntry) {
+        deferredSources[Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier)] = entry.source
+    }
+
+    /// Environmental waits use a separate persisted ordinal, never the item's finite failure budget.
+    private func boundedDeferralIssue(detail: String, previous: BackupIssueRecord?) -> BackupIssueRecord {
+        var issue = automaticRetryIssue(kind: .unknown, detail: detail, previous: previous)
+        let delay = min(900, max(30, configuration.retry.delay(afterAttempts: issue.automaticRetryAttempt)))
+        let due = now().addingTimeInterval(delay)
+        issue.nextAttemptAt = max(previous?.nextAttemptAt ?? due, due)
+        return issue
+    }
+
+    private func deferInterruptedSource(_ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState) {
+        rememberDeferredSource(entry)
+        let detail = L10n.string("error.upload_cancelled")
+        let previous = BackupIssueRecord.decode(entry.lastError)
+        let issue = boundedDeferralIssue(detail: detail, previous: previous?.detail == detail ? previous : nil)
+        deferSource(entry, from: state, until: issue.nextAttemptAt ?? now().addingTimeInterval(30), issue: issue)
+    }
+
+    /// An item cancellation retries only that item. Stop, task cancellation and setup cancellation end the pass.
     private func recordCancellation(_ error: any Error, for entry: UploadBackupSyncQueueEntry? = nil) -> Bool {
         guard UploadError.isCancellation(error) else { return false }
-        if let entry, sourceWasRemoved(entry) { return true }
+        if let entry {
+            if sourceWasRemoved(entry) { return true }
+            guard stopRequested || Task.isCancelled else { return false }
+        }
         if runCancellationError == nil { runCancellationError = error }
         stopRequested = true
         return true
@@ -2313,8 +2528,19 @@ public actor BackupSyncRunner {
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }
+        // Not a failure of this photo: this build cannot read its pending row. It waits without an attempt and
+        // without a problem; its rows stay (#982).
+        if error is PendingSourceUnreadableError {
+            rememberDeferredSource(entry)
+            deferSource(entry, from: oldState, until: now().addingTimeInterval(longestRegularRetryWait))
+            return
+        }
         if error is BackupWorkDeferredError || recordCancellation(error, for: entry) {
             revert(entry, from: oldState)
+            return
+        }
+        if UploadError.isCancellation(error) {
+            deferInterruptedSource(entry, from: oldState)
             return
         }
         if case UploadError.fileMissing = error {
@@ -2568,7 +2794,9 @@ public actor BackupSyncRunner {
         // write keeps the earlier behavior too.
         if sourceIsUnavailable { _ = markSourceUnavailable?(entry.source) }
         guard queue.removeMissingSource(source: entry.source, revision: entry.revision) else {
-            if queue.entry(for: entry.source, revision: entry.revision) != nil {
+            do {
+                if try queue.entry(for: entry.source, revision: entry.revision) != nil { stopRequested = true }
+            } catch {
                 stopRequested = true
             }
             return
@@ -2586,10 +2814,22 @@ public actor BackupSyncRunner {
         removedSources.contains(Self.sourceKey(kind: source.kind, identifier: source.identifier))
     }
 
+    private func currentState(
+        of entry: UploadBackupSyncQueueEntry, fallback: UploadBackupSyncQueueState
+    ) -> UploadBackupSyncQueueState? {
+        do {
+            return try queue.entry(for: entry.source, revision: entry.revision)?.state ?? fallback
+        } catch {
+            stopRequested = true
+            return nil
+        }
+    }
+
     private func refreshProgressFromQueue() {
+        guard let summary = queue.summary() else { return }
         let previous = progress
         progress = BackupSyncProgress(
-            summary: queue.summary(),
+            summary: summary,
             currentItemName: previous.currentItemName,
             isRunning: previous.isRunning
         )
@@ -2711,6 +2951,8 @@ public actor BackupSyncRunner {
             return .network
         case UploadError.retryableBackend, UploadError.backend, UploadError.albumStep:
             return .remoteService
+        case UploadError.tagAdderUnavailable:
+            return .localState
         case UploadError.accountStorageFull:
             return .accountStorage
         default:
@@ -2781,7 +3023,7 @@ public actor BackupSyncRunner {
         // left Wi-Fi while the backup must wait for it does not start. The reservation has the kind that the setting
         // had before the wait: if the setting changed meanwhile, the transfer would run with the wrong kind of access.
         // In each case the row returns to the queue without an attempt and the next claim reserves again.
-        guard await admitsTransfer(for: source) else { throw CancellationError() }
+        guard try await admitsTransfer(for: source) else { throw CancellationError() }
         let network = try transferNetwork()
         guard network.usesMobileData == request.allowsExpensiveNetwork else { throw BackupWorkDeferredError() }
         var reservedRequest = request
@@ -2870,15 +3112,15 @@ public actor BackupSyncRunner {
             }
             throw error
         // The upload can return its uid after a timeout or cancellation decided the race: Proton has the file then, and
-        // the normal settlement records it. A source that a deletion or exclusion removed keeps the cancellation.
+        // the normal settlement records it before a removed queue row ends settlement as cancelled.
         case .timedOut:
-            if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
+            if let uid = await join.cancelAndJoin() { return uid }
             throw UploadError.transport(
                 code: NSURLErrorTimedOut,
                 message: URLError(.timedOut).localizedDescription
             )
         case .cancelled:
-            if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
+            if let uid = await join.cancelAndJoin() { return uid }
             if policyCancelledTransfers.contains(request.cancellationToken) { throw BackupWorkDeferredError() }
             throw CancellationError()
         }

@@ -34,6 +34,35 @@ final class PhotoMetadataLoadStateTests: XCTestCase {
     }
 
     @MainActor
+    func testKnownLocationKeepsThePlaceNameLineWhileMetadataResolvesAndFollowsTheIndex() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("metadata-known-\(UUID().uuidString)", isDirectory: true)
+        let item = PhotoItem(
+            uid: PhotoUID(volumeID: "v", nodeID: "located"),
+            captureTime: Date(timeIntervalSince1970: 1),
+            mediaType: "image/jpeg"
+        )
+        var indexKnowsTheLocation = false
+        let model = PhotoViewerModel(
+            items: [item],
+            index: 0,
+            feed: ThumbnailFeed(
+                cache: ThumbnailCache(namespace: "metadata-known-\(UUID().uuidString)", rootDirectory: root),
+                loader: MetadataEmptyThumbnailLoader()
+            ),
+            media: MetadataFailingMediaProvider(),
+            metadataProvider: SuspendedMetadataProvider(),
+            hasKnownLocation: { $0 == item.uid && indexKnowsTheLocation }
+        )
+
+        XCTAssertEqual(model.titleMetadataState, .resolving)
+        XCTAssertFalse(model.isPlaceNameResolving, "an unknown location shows the date at once")
+        indexKnowsTheLocation = true
+        XCTAssertTrue(model.isPlaceNameResolving, "a location that the index learns later reserves the line")
+        model.stop()
+    }
+
+    @MainActor
     func testFailureCanRetryToLoadedMetadata() async {
         let provider = RetryMetadataProvider()
         let root = FileManager.default.temporaryDirectory
@@ -136,22 +165,4 @@ private actor SuspendedMetadataProvider: PhotoMetadataProvider {
         try await Task.sleep(for: .seconds(10))
         return PhotoMetadata()
     }
-}
-
-private struct MetadataEmptyThumbnailLoader: ThumbnailBatchLoader {
-    func loadThumbnails(
-        for uids: [PhotoUID],
-        onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
-    ) async -> ThumbnailBatchLoadResult { .delivered }
-}
-
-private struct MetadataFailingMediaProvider: FullMediaProvider {
-    func preview(for uid: PhotoUID) async throws -> Data { throw MetadataTestError.unavailable }
-    func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
-        throw MetadataTestError.unavailable
-    }
-}
-
-private enum MetadataTestError: Error {
-    case unavailable
 }

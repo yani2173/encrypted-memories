@@ -136,24 +136,16 @@ public final class PhotoLocationStore: @unchecked Sendable {
         }
     }
 
-    /// Persist a full coordinate set. This remains the compatibility API used by reconciliation and tests.
+    /// Persist a full coordinate set for the current session. Only tests call this; the index saves
+    /// through `save(_:with:)`.
     public func save(_ coordinates: [PhotoCoordinate]) {
         guard let lease = captureSessionLease() else { return }
-        save(PhotoLocationSnapshot(coordinates: coordinates), ifCurrent: lease)
+        save(coordinates, ifCurrent: lease)
     }
 
     public func save(_ coordinates: [PhotoCoordinate], ifCurrent lease: SessionLease) {
-        save(PhotoLocationSnapshot(coordinates: coordinates), ifCurrent: lease)
-    }
-
-    public func save(_ snapshot: PhotoLocationSnapshot) {
-        guard let lease = captureSessionLease() else { return }
-        save(snapshot, ifCurrent: lease)
-    }
-
-    func save(_ snapshot: PhotoLocationSnapshot, ifCurrent lease: SessionLease) {
         guard let writeLease = captureWriteLease(ifCurrent: lease) else { return }
-        save(snapshot, with: writeLease)
+        save(PhotoLocationSnapshot(coordinates: coordinates), with: writeLease)
     }
 
     @discardableResult

@@ -54,6 +54,78 @@ import Testing
         #expect(store?.search(normalizedTokens: ["secret"], in: key, limit: 10).map(\.uid) == [uid])
     }
 
+    @Test func textIndexReportsNoEntryBeforeAnyOutputIsCommitted() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x41)
+        )
+        defer { store.close() }
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        let asset = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "1"), sourceRevision: "source-v1")
+
+        // The asset is queued but no OCR output has been committed yet, so the scope stays hidden.
+        #expect(store.enqueue([asset], for: key))
+        #expect(!store.hasIndexedEntries(for: key))
+    }
+
+    @Test func textIndexReportsAnEntryAfterOneCommittedOutput() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x42)
+        )
+        defer { store.close() }
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        let uid = PhotoUID(volumeID: "volume", nodeID: "1")
+        let asset = try MLPipelineAssetRevision(uid: uid, sourceRevision: "source-v1")
+
+        #expect(store.enqueue([asset], for: key))
+        let executor = SQLiteRecordingExecutor { plan in
+            plan.workItems.map {
+                .init(
+                    workItem: $0,
+                    outcome: .completed(
+                        .init(
+                            payload: Data("Secret Receipt 42".utf8),
+                            normalizedSearchTokens: ["secret", "receipt", "42"]
+                        )))
+            }
+        }
+        let outcome = await MLIndexRunner.runDerivedPass(key: key, store: store, executor: executor)
+        #expect(outcome.progress.completed == 1)
+        #expect(store.hasIndexedEntries(for: key))
+    }
+
+    /// A key of another library or schema has no entries in this store; that unknown state reports
+    /// no index instead of publishing a scope that cannot answer.
+    @Test func textIndexReportsNoEntryForAForeignKey() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x43)
+        )
+        defer { store.close() }
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        #expect(!store.hasIndexedEntries(for: key))
+
+        let otherAccount = try makeKey(account: "other-account", artifacts: [artifact])
+        let otherRevision = try makeArtifact(stage: "ocr", revision: "revision4")
+        let otherSchema = try makeKey(account: "account", artifacts: [otherRevision])
+        #expect(!store.hasIndexedEntries(for: otherAccount))
+        #expect(!store.hasIndexedEntries(for: otherSchema))
+    }
+
     /// Another connection holds the file exclusively longer than the busy timeout. The derived index is never
     /// deleted for that, and it opens again with its progress once the lock is gone.
     @Test func aFileThatAnotherConnectionHoldsIsKeptAndOpensAgainWithItsProgress() throws {

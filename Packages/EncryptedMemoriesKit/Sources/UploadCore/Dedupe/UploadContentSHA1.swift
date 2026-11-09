@@ -45,12 +45,6 @@ public enum UploadContentSHA1 {
         return Data(hasher.finalize())
     }
 
-    /// Lowercase hex of `digest(ofFileAt:)` - the exact string form Proton feeds to the content
-    /// hash HMAC.
-    public static func hexDigest(ofFileAt url: URL, bufferSize: Int = defaultBufferSize) throws -> String {
-        hexString(digest: try digest(ofFileAt: url, bufferSize: bufferSize))
-    }
-
     /// Lowercase hex encoding shared by every identity consumer (one formatting truth: a stray
     /// uppercase hex would silently change every content hash).
     public static func hexString(digest: Data) -> String {
@@ -95,10 +89,5 @@ public final class UploadSHA1Accumulator {
     /// Consumes the accumulator; the 20-byte digest.
     public func finalizeDigest() -> Data {
         Data(hasher.finalize())
-    }
-
-    /// Consumes the accumulator; lowercase hex, same formatting as `UploadContentSHA1.hexString`.
-    public func finalizeHexDigest() -> String {
-        UploadContentSHA1.hexString(digest: finalizeDigest())
     }
 }

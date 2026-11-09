@@ -151,6 +151,11 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
     /// Set when the file uploaded to the library but a later step (album add / cover) failed - the
     /// photo is not lost. Retry only the album step to recover from the failure.
     public var partialSuccess: Bool
+    /// True when Retry cannot work for the item in this session: its manual-settlement record is
+    /// proven terminal; or the record is not proven terminal or its receipt row was never written,
+    /// while the settlement store cannot work again before a relaunch; or Retry would upload bytes
+    /// while the byte gate refuses every byte upload before a relaunch.
+    public var hasTerminalSettlement: Bool
 
     public init(
         id: UploadQueueItemID,
@@ -161,7 +166,8 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
         byteCount: Int64,
         state: UploadItemState = .queued,
         uploadedUID: PhotoUID? = nil,
-        partialSuccess: Bool = false
+        partialSuccess: Bool = false,
+        hasTerminalSettlement: Bool = false
     ) {
         self.id = id
         self.ordinal = ordinal
@@ -172,6 +178,7 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
         self.state = state
         self.uploadedUID = uploadedUID
         self.partialSuccess = partialSuccess
+        self.hasTerminalSettlement = hasTerminalSettlement
     }
 }
 
@@ -185,22 +192,19 @@ public struct UploadCompletedEvent: Identifiable, Sendable, Equatable {
     public let displayName: String
     public let destination: UploadDestination
     public let resolvedAlbumID: String?
-    public let completedAt: Date
 
     public init(
         id: UploadQueueItemID,
         uploadedUID: PhotoUID,
         displayName: String,
         destination: UploadDestination,
-        resolvedAlbumID: String?,
-        completedAt: Date
+        resolvedAlbumID: String?
     ) {
         self.id = id
         self.uploadedUID = uploadedUID
         self.displayName = displayName
         self.destination = destination
         self.resolvedAlbumID = resolvedAlbumID
-        self.completedAt = completedAt
     }
 }
 
@@ -218,7 +222,6 @@ public struct UploadQueueStats: Sendable, Equatable {
     public var failed = 0
     public var cancelled = 0
     public var paused = 0
-    public var concurrency = 0
     /// Durable upload state could not be opened. The queue must not present this as an empty history.
     public var persistenceUnavailable = false
 
@@ -246,11 +249,9 @@ public struct UploadPreparationStatus: Sendable, Equatable {
     public var total = 0
     public var waiting = 0
     public var checking = 0
-    public var checked = 0
     public var skippedDuplicates = 0
     public var skippedRemoteDeletions = 0
     public var failed = 0
-    public var cancelled = 0
     public var paused = 0
 
     public init() {}
@@ -263,10 +264,9 @@ public struct UploadPreparationStatus: Sendable, Equatable {
                 waiting += 1
             case .hashing:
                 checking += 1
-            case .uploading, .finalizing, .completed:
-                checked += 1
+            case .uploading, .finalizing, .completed, .cancelled:
+                break
             case .skipped(let reason):
-                checked += 1
                 if reason.countsAsBackedUp {
                     skippedDuplicates += 1
                 } else {
@@ -274,8 +274,6 @@ public struct UploadPreparationStatus: Sendable, Equatable {
                 }
             case .failed:
                 failed += 1
-            case .cancelled:
-                cancelled += 1
             case .paused:
                 paused += 1
             }
@@ -296,10 +294,6 @@ public struct UploadPreparationStatus: Sendable, Equatable {
         guard total > 0 else { return 0 }
         return Double(resolved) / Double(total)
     }
-
-    public var needsAttention: Int {
-        failed + cancelled + paused
-    }
 }
 
 // MARK: - Queue presentation
@@ -316,6 +310,10 @@ public enum UploadQueuePresentation {
         for item: UploadItem, capabilities: UploadBackendCapabilities
     ) -> [UploadQueueRowAction] {
         switch item.state {
+        case .failed where item.hasTerminalSettlement, .cancelled where item.hasTerminalSettlement:
+            return []
+        case .failed where item.uploadedUID == nil && !SupportedMedia.isSupported(item.fileURL):
+            return []
         case .failed, .cancelled:
             return [.retry]
         case .queued, .preparing, .hashing, .uploading:
@@ -604,6 +602,9 @@ public enum UploadError: LocalizedError, Equatable {
     /// The account's remaining Proton storage cannot hold the file. The item waits; freeing space or a larger plan
     /// and Back Up Now take it up again.
     case accountStorageFull(String, requiredBytes: Int64, availableBytes: Int64)
+    /// A tag adder was required to confirm settlement but was not provided. The row fails visibly instead of
+    /// uploading without the required Live Photo indicator.
+    case tagAdderUnavailable
 
     /// Cancellation can cross the transport boundary without cancelling the enclosing Swift task.
     public static func isCancellation(_ error: any Error) -> Bool {
@@ -628,6 +629,7 @@ public enum UploadError: LocalizedError, Equatable {
         case .cancelled: L10n.string("error.upload_cancelled")
         case .sourceNotReady(let name, _): L10n.string("error.upload_source_not_ready \(name)")
         case .sourceUnavailable, .sourceReportedMissing: L10n.string("backup.issue_source_unavailable")
+        case .tagAdderUnavailable: L10n.string("backup.error_local_state_unavailable")
         case .accountStorageFull(let name, let required, let available):
             L10n.string(
                 "error.upload_account_storage_full \(name) \(L10n.fileSize(required)) \(L10n.fileSize(available))")

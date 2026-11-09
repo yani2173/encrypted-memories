@@ -78,7 +78,8 @@ public struct AccountBackupStack {
             configuration: albumConfiguration,
             identityResolver: identityResolver,
             uploader: uploader,
-            remoteOps: albumOperations
+            remoteOps: albumOperations,
+            tagAdder: tagAdder
         )
     }
 

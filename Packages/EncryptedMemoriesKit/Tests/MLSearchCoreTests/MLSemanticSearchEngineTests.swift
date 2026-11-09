@@ -106,7 +106,7 @@ import Testing
         let encoded = await encoder.count
         _ = try await engine.searchBatch(queries)
         #expect(await encoder.count == encoded)
-        await engine.purgeCachedBlocks()
+        await engine.purgePromptEmbeddings()
         _ = try await engine.searchBatch(queries)
         #expect(await encoder.count == encoded + queries.count)
     }
@@ -212,14 +212,9 @@ import Testing
 
         var blockLoads: Int { lock.withLock { loads } }
         func upsert(_ records: [MLEmbeddingRecord]) -> MLIndexBatchReport { backing.upsert(records) }
-        func contains(uid: PhotoUID, descriptor: MLModelDescriptor) throws -> Bool {
-            backing.contains(uid: uid, descriptor: descriptor)
-        }
         func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) throws -> Set<PhotoUID> {
             backing.indexedUIDs(for: descriptor, from: uids)
         }
-        func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allIndexedUIDs(for: descriptor) }
-        func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allTrackedUIDs(for: descriptor) }
         func reconcileTrackedUIDs(
             currentAuthoritativeUIDs: [PhotoUID],
             previousAuthoritativeUIDs: [PhotoUID]?,
@@ -231,27 +226,20 @@ import Testing
                 descriptor: descriptor
             )
         }
-        func allRecords(for descriptor: MLModelDescriptor) -> [MLEmbeddingRecord] {
-            backing.allRecords(for: descriptor)
-        }
-        func vectorBlock(for descriptor: MLModelDescriptor) -> MLVectorBlock {
+        func forEachVectorBlock(
+            for descriptor: MLModelDescriptor,
+            maximumRows: Int,
+            _ body: (MLVectorBlock) throws -> Void
+        ) throws {
             let shouldHeal = lock.withLock {
                 loads += 1
                 if didHeal { return false }
                 didHeal = true
                 return true
             }
-            if shouldHeal { backing.remove(uid: invalidUID, descriptor: descriptor) }
-            return backing.vectorBlock(for: descriptor)
+            if shouldHeal { backing.remove(uids: [invalidUID], descriptor: descriptor) }
+            try body(backing.vectorBlock(for: descriptor))
         }
-        func forEachVectorBlock(
-            for descriptor: MLModelDescriptor,
-            maximumRows: Int,
-            _ body: (MLVectorBlock) throws -> Void
-        ) throws {
-            try body(vectorBlock(for: descriptor))
-        }
-        func remove(uid: PhotoUID, descriptor: MLModelDescriptor) { backing.remove(uid: uid, descriptor: descriptor) }
         func remove(uids: [PhotoUID], descriptor: MLModelDescriptor) {
             backing.remove(uids: uids, descriptor: descriptor)
         }
@@ -547,7 +535,9 @@ import Testing
 
         _ = await service.indexQuantum(
             [uid("tree"), uid("water")],
+            libraryGeneration: 1,
             maximumAssets: 1,
+            shouldContinue: { true },
             observer: MLIndexPassObserver()
         )
         #expect(releases.value == 0)
@@ -570,7 +560,9 @@ import Testing
 
         let outcome = await service.indexQuantum(
             [uid("tree")],
+            libraryGeneration: 1,
             maximumAssets: 1,
+            shouldContinue: { true },
             observer: MLIndexPassObserver()
         )
 

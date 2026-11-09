@@ -571,7 +571,7 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         _ = store.recoverStaleLocks(olderThan: clock.now.addingTimeInterval(-120))
         XCTAssertTrue(store.acquire(owner: .foreground, runID: "fg").didAcquire)
         XCTAssertEqual(queue.requeueStaleActive(before: clock.now, updatedAt: clock.now), 1)
-        XCTAssertEqual(queue.nextRunnable(limit: 10).map(\.source.identifier), ["/p/a.jpg"])
+        XCTAssertEqual(queue.runnableEntries().map(\.source.identifier), ["/p/a.jpg"])
         queue.close()
     }
 

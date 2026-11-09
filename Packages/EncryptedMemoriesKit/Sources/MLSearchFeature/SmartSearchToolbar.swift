@@ -174,14 +174,12 @@ private struct SmartSearchScopesModifier: ViewModifier {
                 }
             }
             .onChange(of: availableScopes) { _, scopes in
-                if !scopes.contains(scope) {
-                    scope = .all
-                }
+                scope = SmartSearchToolbarPresentationPolicy.scopeFallback(
+                    scope, availableScopes: scopes)
             }
             .onChange(of: scope) { _, selectedScope in
-                if !availableScopes.contains(selectedScope) {
-                    scope = .all
-                }
+                scope = SmartSearchToolbarPresentationPolicy.scopeFallback(
+                    selectedScope, availableScopes: availableScopes)
             }
     }
 }
@@ -199,6 +197,15 @@ enum SmartSearchToolbarPresentationPolicy {
         let hadQuery = !oldQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasQuery = !newQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return hadQuery && !hasQuery ? .dismiss(clearText: false) : .retain
+    }
+
+    /// A scope that leaves the available list (for example the OCR scope when the text index is
+    /// rebuilt empty) never stays selected. The search falls back to the widest scope.
+    static func scopeFallback(
+        _ scope: MLSearchScope,
+        availableScopes: [MLSearchScope]
+    ) -> MLSearchScope {
+        availableScopes.contains(scope) ? scope : .all
     }
 }
 

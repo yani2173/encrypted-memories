@@ -231,14 +231,14 @@ final class PhotoBackupPlannerTests: XCTestCase {
             "an edit keeps the paired video as an original")
     }
 
-    func testALivePhotoWithItsLiveEffectOnKeepsTheLiveTag() throws {
+    func testALivePhotoWithItsLiveEffectOnUploadsNoLiveTagAtCreation() throws {
         let asset = livePhoto(off: false)
         let video = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset)?.secondaries.first)
 
         XCTAssertEqual(video.sourceResource, .livePairedVideo)
         let tags = try tags(of: asset)
-        XCTAssertEqual(tags.main, [PhotoTag.livePhotos.rawValue])
-        XCTAssertEqual(tags.video, [PhotoTag.livePhotos.rawValue])
+        XCTAssertEqual(tags.main, [], "the still gets tag 3 only after both parts settle")
+        XCTAssertEqual(tags.video, [])
     }
 
     func testTheLiveEffectLeavesTheRevisionAndTheEditEvidenceOfAnUnchangedPhotoAlone() throws {

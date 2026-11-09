@@ -140,18 +140,6 @@ public final class MLAssetUniverse: @unchecked Sendable {
 /// or purge can never leak the previous epoch's memory.
 public protocol MLSmartSearchSession: Sendable {
     var descriptor: MLModelDescriptor { get }
-    func index(_ assets: [PhotoUID], observer: MLIndexPassObserver) async -> MLIndexPassOutcome
-    func indexQuantum(
-        _ assets: [PhotoUID],
-        maximumAssets: Int,
-        observer: MLIndexPassObserver
-    ) async -> MLIndexPassOutcome
-    func indexQuantum(
-        _ assets: [PhotoUID],
-        libraryGeneration: UInt64,
-        maximumAssets: Int,
-        observer: MLIndexPassObserver
-    ) async -> MLIndexPassOutcome
     func indexQuantum(
         _ assets: [PhotoUID],
         libraryGeneration: UInt64,
@@ -192,54 +180,6 @@ public extension MLSmartSearchSession {
         try Task.checkCancellation()
         guard shouldContinue() else { throw CancellationError() }
         return results
-    }
-
-    func indexQuantum(
-        _ assets: [PhotoUID],
-        maximumAssets: Int,
-        observer: MLIndexPassObserver
-    ) async -> MLIndexPassOutcome {
-        await index(assets, observer: observer)
-    }
-
-    func indexQuantum(
-        _ assets: [PhotoUID],
-        libraryGeneration: UInt64,
-        maximumAssets: Int,
-        observer: MLIndexPassObserver
-    ) async -> MLIndexPassOutcome {
-        await indexQuantum(
-            assets,
-            maximumAssets: maximumAssets,
-            observer: observer
-        )
-    }
-
-    func indexQuantum(
-        _ assets: [PhotoUID],
-        libraryGeneration: UInt64,
-        maximumAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLIndexPassObserver
-    ) async -> MLIndexPassOutcome {
-        guard shouldContinue() else {
-            return MLIndexPassOutcome(
-                report: MLIndexBatchReport(),
-                ranToCompletion: false,
-                newPermanentFailures: [],
-                progress: MLIndexProgress(
-                    phase: .idle,
-                    descriptor: descriptor,
-                    totalAssets: assets.count
-                )
-            )
-        }
-        return await indexQuantum(
-            assets,
-            libraryGeneration: libraryGeneration,
-            maximumAssets: maximumAssets,
-            observer: observer
-        )
     }
 
     func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async -> Set<PhotoUID> { [] }

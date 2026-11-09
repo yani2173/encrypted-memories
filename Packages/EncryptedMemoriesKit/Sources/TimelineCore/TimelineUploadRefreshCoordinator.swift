@@ -21,8 +21,11 @@ public struct TimelineUploadRefreshAttempt: Sendable, Equatable {
 /// - Explicit requests stay immediate: an explicit request wakes a pending wait of an automatic cycle and runs next.
 ///   It never cancels a refresh or an observer that is running, so it waits for that one load at most. It runs before
 ///   the next retry of the automatic cycle. A newer explicit request replaces an older one that has not started.
-/// - The 60-second interval gates new automatic cycles only. A newer automatic request inside a running cycle adds no
-///   load of its own: the next retry of that cycle uses its closure. Retries follow the convergence schedule.
+/// - The interval of the policy (60 seconds by default) gates new automatic cycles only. A newer automatic request
+///   inside a running cycle adds no load of its own: the next retry of that cycle uses its closure. Retries follow
+///   the convergence schedule. A cycle that succeeded without content change skips the next interval tick.
+///   A newer automatic request that arrived during that cycle keeps its usual admission. A newer automatic request
+///   that arrives after the cycle waits for the moved tick. A forced end and an explicit request never wait for it.
 /// - A flush ends the wait for the interval. It keeps a pending convergence delay: a retry before the library has
 ///   caught up cannot find the upload sooner. A cancelled flush stops waiting; the automatic work goes on.
 public actor TimelineUploadRefreshCoordinator {
@@ -53,6 +56,7 @@ public actor TimelineUploadRefreshCoordinator {
 
     private let clock: TimelineRefreshClock
     private let policy: TimelineRefreshConvergencePolicy
+    private nonisolated let submissions = OrderedSubmissionChain()
     private var generation: UInt64 = 0
     private var nextWorkerID: UInt64 = 0
     private var activeWorkerID: UInt64?
@@ -87,6 +91,11 @@ public actor TimelineUploadRefreshCoordinator {
         func testingAutomaticState() -> (flushCount: Int, workerActive: Bool) {
             (flushWaiters.count, worker != nil)
         }
+
+        /// Returns when the coordinator has accepted everything that the host submitted before this call.
+        nonisolated func testingDrainSubmissions() async {
+            await submissions.drain()
+        }
     #endif
 
     public func request(
@@ -110,20 +119,52 @@ public actor TimelineUploadRefreshCoordinator {
         startWorkerIfNeeded()
     }
 
-    /// Flushes accepted automatic work without adding a signal. Call at the whole operation's end,
-    /// outside this coordinator's refresh and observer closures, which belong to the joined work.
-    public func flushAutomaticUploads() async {
+    /// Submits an upload signal of the automatic backup from synchronous host code. While a pass runs, the interval
+    /// spaces the refresh cycles and `submitBackupPassEnd()` publishes the one that waits. A signal that arrives after
+    /// the pass ended publishes itself, because no later end of a pass will. Submissions run in order and never wait
+    /// for a refresh. Manual uploads use `request`.
+    public nonisolated func submitBackupUpload(
+        passIsRunning: Bool,
+        refresh: @escaping Refresh,
+        observer: @escaping Observer = { _ in }
+    ) {
+        submissions.append {
+            await self.acceptBackupUpload(passIsRunning: passIsRunning, refresh: refresh, observer: observer)
+        }
+    }
+
+    /// Submits the end of a backup pass: the refresh that the interval holds back runs now.
+    public nonisolated func submitBackupPassEnd() {
+        submissions.append { await self.forceAcceptedAutomaticWork() }
+    }
+
+    private func acceptBackupUpload(passIsRunning: Bool, refresh: @escaping Refresh, observer: @escaping Observer) {
+        requestAutomaticUpload(refresh: refresh, observer: observer)
+        if !passIsRunning { forceAcceptedAutomaticWork() }
+    }
+
+    /// Ends the wait for the interval of the accepted automatic work. Returns the generation to wait for, or nil when
+    /// no accepted work is pending.
+    @discardableResult
+    private func forceAcceptedAutomaticWork() -> UInt64? {
         guard let request = latestAutomaticRequest,
             completedAutomaticGeneration != request.generation
-        else { return }
+        else { return nil }
         forcedAutomaticGeneration = max(forcedAutomaticGeneration ?? request.generation, request.generation)
         if automaticWaitIsAdmission { automaticWait?.cancel() }
         startWorkerIfNeeded()
+        return request.generation
+    }
+
+    /// Flushes accepted automatic work without adding a signal. Call at the whole operation's end,
+    /// outside this coordinator's refresh and observer closures, which belong to the joined work.
+    public func flushAutomaticUploads() async {
+        guard let awaited = forceAcceptedAutomaticWork() else { return }
         nextFlushWaiterID &+= 1
         let id = nextFlushWaiterID
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                flushWaiters.append(.init(id: id, generation: request.generation, continuation: continuation))
+                flushWaiters.append(.init(id: id, generation: awaited, continuation: continuation))
             }
         } onCancel: {
             Task { await self.stopWaitingForFlush(id: id) }
@@ -197,6 +238,7 @@ public actor TimelineUploadRefreshCoordinator {
                     automaticCycle = cycle
                 } else {
                     complete(cycle.request)
+                    deferNextAutomaticCycleAfterUnchangedLoad(observation, of: cycle.request)
                     automaticCycle = nil
                 }
                 continue
@@ -267,11 +309,27 @@ public actor TimelineUploadRefreshCoordinator {
                     continue
                 }
                 automaticCycle = AutomaticCycle(request: automatic)
-                nextAutomaticCycleAt = clock.now() + .seconds(60)
+                nextAutomaticCycleAt = clock.now() + policy.automaticInterval
             } else {
                 break
             }
         }
+    }
+
+    /// A cycle that succeeded without new content, whose next wait is the interval, skips the next interval tick:
+    /// an unchanged library gains nothing from repeating that load. A newer automatic signal that has not completed
+    /// carries content this load could not have seen, so it must load at its usual admission. A forced end or an
+    /// explicit request cancels the interval wait anyway and never waits for the moved tick.
+    private func deferNextAutomaticCycleAfterUnchangedLoad(
+        _ observation: TimelineUploadRefreshAttempt,
+        of request: Request
+    ) {
+        guard case .automatic = request.cause,
+            observation.failureReason == .unchanged,
+            let scheduled = nextAutomaticCycleAt
+        else { return }
+        guard request.generation == latestAutomaticRequest?.generation else { return }
+        nextAutomaticCycleAt = scheduled + policy.automaticInterval
     }
 
     private func runCycle(_ request: Request, workerID: UInt64) async -> Bool {

@@ -49,6 +49,76 @@ import Testing
         return presenter.current
     }
 
+    /// A backed-up photo shows at once through its local tile; the later listing only swaps the tile (#971).
+    @Test func anUploadedTileKeepsItsPositionAndStaysOpenableUntilTheProtonPhotoIsListed() async {
+        let presenter = PendingTimelinePresenter()
+        let older = remote("older", second: 10)
+        let newer = remote("newer", second: 30)
+        let uploaded = remote("uploaded", second: 20)
+        let uploadedTile = tile("uploaded", second: 20, handoff: uploaded.uid, badge: .done)
+        presenter.setRemote(TimelineSnapshot(orderedItems: [older, newer]))
+        presenter.setPending(pending([uploadedTile], membership: 1), enabled: true)
+        let shown = await settle(presenter)
+        #expect(shown.items.map(\.uid) == [older.uid, uploadedTile.item.uid, newer.uid])
+        #expect(shown.snapshot.index(of: uploadedTile.item.uid) == 1, "The viewer opens the local tile")
+        #expect(shown.localUIDs == [uploadedTile.item.uid])
+        #expect(shown.uploadBadges[uploadedTile.item.uid] == .done)
+        #expect(shown.uploadBadges.handovers.isEmpty, "No Proton photo took over yet")
+    }
+
+    @Test func theHandoverKeepsThePositionAndTheBadgeStateWithoutRestartingTheUpload() async {
+        let presenter = PendingTimelinePresenter()
+        let older = remote("older", second: 10)
+        let newer = remote("newer", second: 30)
+        let uploaded = remote("uploaded", second: 20)
+        let uploadedTile = tile("uploaded", second: 20, handoff: uploaded.uid, badge: .done)
+        presenter.setRemote(TimelineSnapshot(orderedItems: [older, newer]))
+        presenter.setPending(pending([uploadedTile], membership: 1), enabled: true)
+        let before = await settle(presenter)
+
+        presenter.setRemote(TimelineSnapshot(orderedItems: [older, uploaded, newer]))
+        let after = await settle(presenter)
+        #expect(
+            after.items.map(\.uid) == [older.uid, uploaded.uid, newer.uid], "The Proton photo takes the tile's place")
+        #expect(
+            after.uploadBadges.handovers == [uploaded.uid: uploadedTile.item.uid], "The grid reuses the tile's image")
+        #expect(
+            after.uploadBadges[uploaded.uid] == before.uploadBadges[uploadedTile.item.uid],
+            "The badge continues where the tile stood: no waiting or uploading state, no new animation")
+        #expect(after.uploadBadges[uploaded.uid] != .waiting)
+        #expect(
+            after.items.count == before.items.count && after.snapshot.index(of: older.uid) == 0
+                && after.snapshot.index(of: newer.uid) == 2,
+            "No photo moves, so a scroll anchor on any neighbour keeps its place")
+        var tracker = PendingHandoverTracker()
+        #expect(tracker.newHandovers(in: after.uploadBadges.handovers).count == 1)
+        #expect(tracker.newHandovers(in: after.uploadBadges.handovers).isEmpty, "A handover is reported once")
+    }
+
+    /// A deferred refresh lists the uploads of a whole interval at once.
+    @Test func aDeferredListingHandsSeveralTilesOverTogetherWithoutMovingAnyPhoto() async {
+        let presenter = PendingTimelinePresenter()
+        let top = remote("top", second: 100)
+        let bottom = remote("bottom", second: 1)
+        let uploads = (0..<5).map { remote("up\($0)", second: TimeInterval(20 + $0 * 10)) }
+        let tiles = uploads.map {
+            tile($0.uid.nodeID, second: $0.captureTime.timeIntervalSince(base), handoff: $0.uid, badge: .done)
+        }
+        presenter.setRemote(TimelineSnapshot(orderedItems: [bottom, top]))
+        presenter.setPending(pending(tiles, membership: 1), enabled: true)
+        let before = await settle(presenter)
+        #expect(before.items.map(\.uid) == [bottom.uid] + tiles.map(\.item.uid) + [top.uid])
+
+        presenter.setRemote(TimelineSnapshot(orderedItems: [bottom] + uploads + [top]))
+        let after = await settle(presenter)
+        #expect(after.items.map(\.uid) == [bottom.uid] + uploads.map(\.uid) + [top.uid])
+        #expect(
+            after.uploadBadges.handovers
+                == Dictionary(uniqueKeysWithValues: zip(uploads.map(\.uid), tiles.map(\.item.uid))),
+            "Every tile's image moves to its Proton photo in the same publication")
+        #expect(after.snapshot.index(of: bottom.uid) == 0 && after.snapshot.index(of: top.uid) == 6)
+    }
+
     @Test(arguments: [false, true])
     func remoteEditBeforePendingMetadataNeverShowsBothPhotos(stalePending: Bool) async throws {
         let harness = try EditPendingHarness(date: base)
@@ -1478,7 +1548,7 @@ private struct EditPendingMetadata: PendingSourceMetadataProviding {
 
 private struct EditPendingEffects: PendingBackupEffects {
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool { true }
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool { true }
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> { Set(keys) }
     func photosVolumeID() async -> String? { "vol" }
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
     func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }

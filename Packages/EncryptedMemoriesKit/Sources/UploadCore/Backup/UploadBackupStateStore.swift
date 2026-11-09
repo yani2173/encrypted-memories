@@ -8,6 +8,8 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
     public static let databaseFileName = "upload-backup-state-v1.sqlite"
 
     private static let schemaVersion = 1
+    private static let schemaVersionRow = SQLiteInfoTableVersion(
+        table: "backup_state_info", version: schemaVersion, stampReplacesExistingRow: true)
     private let connection: SQLiteStoreConnection
     private var db: OpaquePointer? { connection.database }
 
@@ -327,33 +329,9 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
             at: url,
             schemaSQL: schema,
             policy: policy,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
+            verifyVersion: schemaVersionRow.verify,
+            stampVersion: schemaVersionRow.stamp
         )
-    }
-
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
-        var stmt: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(handle, "SELECT value FROM backup_state_info WHERE key='schema';", -1, &stmt, nil)
-                == SQLITE_OK
-        else {
-            return false
-        }
-        var onDisk: Int?
-        let result = sqlite3_step(stmt)
-        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
-        sqlite3_finalize(stmt)
-        return result == SQLITE_ROW && onDisk == schemaVersion
-    }
-
-    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
-        return sqlite3_exec(
-            handle,
-            "INSERT INTO backup_state_info(key, value) VALUES('schema', \(schemaVersion)) "
-                + "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-            nil, nil, nil
-        ) == SQLITE_OK
     }
 
     private let transient = SQLiteStoreSchemaGate.transientDestructor

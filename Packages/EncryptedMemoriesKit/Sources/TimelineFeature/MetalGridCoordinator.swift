@@ -19,17 +19,38 @@ import simd
 @MainActor
 final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     private let renderer: MetalGridRenderer
-    private let cache: MetalGridTextureCache<PhotoUID>
+    let cache: MetalGridTextureCache<PhotoUID>
     private var memoryPressureRegistration: MemoryPressureRegistration?
     private var dataSource: MetalGridDataSource
     private let budget: MetalGridBudget
     private(set) var gridProfile: GridLevelProfile
+    /// The level each grid profile last showed, so window resizes across a profile width keep the density.
+    private var profileLevelMemory = GridProfileLevelMemory()
     private var fillOrder: GridFillOrder = .newestBottomTrailing
 
-    /// Fired once for each installed data source when its first visible frame is fully populated.
+    /// Fired once for each installed data source when a frame draws its first resident visible thumbnail.
     var onContentReady: (() -> Void)?
+    var onContentInvalidated: (() -> Void)?
+    private weak var connectedReadinessProxy: GridProxy<PhotoUID>?
+    func connectReadinessProxy(_ proxy: GridProxy<PhotoUID>?, revision: UInt64) {
+        if connectedReadinessProxy !== proxy {
+            connectedReadinessProxy?.invalidatePendingContentReady()
+            connectedReadinessProxy = proxy
+            contentReadyReported = false
+            if proxy != nil { requestRedraw() }
+        }
+        onContentReady = { [weak proxy] in proxy?.reportContentReady(revision: revision) }
+        onContentInvalidated = { [weak proxy] in proxy?.invalidatePendingContentReady() }
+    }
+
     private var contentReadyReported = false
+    var allowsPlaceholderContentReady = false {
+        didSet { if oldValue != allowsPlaceholderContentReady { requestRedraw() } }
+    }
     private var firstContentReadyLogged = false
+    private var placeholderPulse = MetalGridPlaceholderPulse(
+        reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+    private var placeholderScroll = MetalGridPlaceholderScrollTracker<PhotoUID>()
     /// Notifies the shell while the grid is presenting a live resize.
     var liveResizeChanged: ((Bool) -> Void)?
     /// One-shot cold-start `[FirstContent]` trace state for the first on-screen frame with real visible cells.
@@ -38,6 +59,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
 
     var onRequestRedraw: (() -> Void)?
     private(set) var lastRenderOutcome: GridRenderOutcome = .skippedNoSurface
+    private var frameEncodingFailed = false
 
     weak var clipView: NSClipView?
     weak var metalView: MTKView?
@@ -194,14 +216,13 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             preferredNormalLevelContentMode == .squareFillCrop ? .aspectFitInsideSquare : .squareFillCrop)
     }
 
-    /// Pushed (throttled) so the SwiftUI HUD can mirror live stats.
-    var onHUD: ((MetalGridHUD) -> Void)?
     /// Called when the content size changes (level / width) so the host can resize the document view.
     var onContentSizeChange: ((CGSize) -> Void)?
 
     // Diagnostics state
-    private var lastHUDPushDetent: CFTimeInterval = 0
-    private var lastPerfDiagnosticsLog: CFTimeInterval = 0
+    #if DEBUG
+        private var lastPerfDiagnosticsLog: CFTimeInterval = 0
+    #endif
     private var lastCommitFrameLog: CFTimeInterval = 0
 
     /// True when some visible cell still lacks a real texture - the host keeps ticking redraws while this
@@ -288,12 +309,18 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
 
     func setDataSource(_ newSource: MetalGridDataSource, preservingColumnPhase: Bool = false) {
-        contentReadyReported = false
+        invalidateContentReadiness()
+        if dataSource !== newSource { placeholderScroll.reset() }
         dataSource = newSource
         newSource.updateUploadBadges(uploadBadges)
         rebuildIndex(preservingColumnPhase: preservingColumnPhase)
         onContentSizeChange?(contentSize())
         requestRedraw()
+    }
+
+    func invalidateContentReadiness() {
+        contentReadyReported = false
+        onContentInvalidated?()
     }
 
     func setFillOrder(_ newFillOrder: GridFillOrder) {
@@ -323,6 +350,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         levelMapping: GridProfileRebaseLevelMapping = .closestVisualMatch
     ) -> GridProfileRebaseResult? {
         guard newProfile.id != gridProfile.id else { return nil }
+        // The size match picks the level only when the memory has none; another mapping is the caller's decision.
+        let remembered =
+            levelMapping == .closestVisualMatch
+            ? profileLevelMemory.remembered(leaving: gridProfile.id, at: level, entering: newProfile.id) : nil
+        let mapping = remembered.map { GridProfileRebaseLevelMapping.explicit($0) } ?? levelMapping
         var targetEngine = SquareTileGridEngine(
             sectionCounts: dataSource.sectionCounts, profile: newProfile,
             fillOrder: fillOrder)
@@ -337,8 +369,9 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 sourceCommittedPhase: currentPhase(),
                 targetCommittedPhase: targetCommittedPhase,
                 wasBottomPinned: wasBottomPinned,
-                levelMapping: levelMapping
+                levelMapping: mapping
             ))
+        if levelMapping == .closestVisualMatch { profileLevelMemory.arrived(in: newProfile.id, at: result.targetLevel) }
 
         gridProfile = newProfile
         engine = targetEngine
@@ -392,6 +425,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         }
         let changed = contentEpochs.changes(in: badges.contentEpochs)
         if !changed.isEmpty {
+            invalidateContentReadiness()
             cache.markStale(changed)
             requestRedraw()
         }
@@ -604,9 +638,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// Override the bridge's settled scroll Y (e.g. when the host pins to the bottom instead of the rebased Y).
     func setCommitBridgeScrollY(_ y: CGFloat) { bridgeScrollY = y }
 
+    #if DEBUG
+        private var lastResizeDiagTime: Date = .distantPast
+    #endif
     /// Rebase the viewport after a resize. Level, phase, mode, columns, and gap remain unchanged; slot size and
     /// content height use the new width. The host applies the returned scroll before the next frame.
-    private var lastResizeDiagTime: Date = .distantPast
     /// Rebase using old and new screen-space viewport frames so the engine can preserve the moved-edge anchor.
     func rebaseForViewportChange(
         oldFrame: CGRect, newFrame: CGRect, oldScrollY: CGFloat,
@@ -623,60 +659,78 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             level: lvl, committedPhase: phase, itemCount: count,
             wasBottomPinned: wasBottomPinned,
             anchorFractionY: anchorFractionY)
-        let t0 = Date()
+        #if DEBUG
+            let t0 = Date()
+        #endif
         let r = engine.rebasedScrollOffsetForViewportChange(input)  // cheap: 1 anchorItem + 1 slotRect
-        let layoutMs = Date().timeIntervalSince(t0) * 1000
-        // Throttle diagnostics during live drags because layout runs once per frame.
-        let now = Date()
-        if now.timeIntervalSince(lastResizeDiagTime) > 0.33 {
-            lastResizeDiagTime = now
-            let reason: String =
-                wasBottomPinned
-                ? "bottomPinned"
-                : (delta.widthChanged && delta.movedLeftEdge && !delta.heightChanged)
-                    ? "sidebarWidth"
-                    : (delta.heightChanged && delta.movedTopEdge && !delta.movedBottomEdge)
-                        ? "windowHeightTopEdge"
-                        : (delta.heightChanged && delta.movedBottomEdge && !delta.movedTopEdge)
-                            ? "windowHeightBottomEdge"
-                            : (delta.widthChanged && !delta.heightChanged)
-                                ? "windowWidth"
-                                : delta.heightChanged ? "windowResizeUnknownEdge" : "unknown"
-            let oldVP = CGSize(width: max(oldFrame.width, 1), height: max(oldFrame.height, 0))
-            let newVP = CGSize(width: max(newFrame.width, 1), height: max(newFrame.height, 0))
-            let mOld = engine.resolvedMetrics(level: lvl, width: oldVP.width)
-            let mNew = engine.resolvedMetrics(level: lvl, width: newVP.width)
-            let oldContent = engine.contentSize(level: lvl, width: oldVP.width, columnPhase: phase)
-            let visBefore = Set(
-                engine.framePlan(
-                    level: lvl, viewportSize: oldVP, scrollOffset: CGPoint(x: 0, y: oldScrollY), overscan: 0,
-                    columnPhase: phase
-                ).visibleSlots.map(\.index))
-            let visAfter = Set(
-                engine.framePlan(
-                    level: lvl, viewportSize: newVP, scrollOffset: CGPoint(x: 0, y: r.newScrollY), overscan: 0,
-                    columnPhase: phase
-                ).visibleSlots.map(\.index))
-            let anchorVY: CGFloat = newVP.height * r.anchorFractionY  // the normalized anchor's viewport y
-            GridResizeLog.begin(
-                reason: reason, oldFrame: oldFrame, newFrame: newFrame, delta: delta, level: lvl, phase: phase,
-                wasBottomPinned: wasBottomPinned, result: r, anchorViewportY: anchorVY,
-                oldScrollY: oldScrollY, oldContentSize: oldContent)
-            GridResizeLog.end(result: r, anchorViewportYAfter: anchorVY)
-            GridResizeLog.validation(
-                visibleBefore: visBefore.count, visibleAfter: visAfter.count,
-                visibleOverlap: visBefore.intersection(visAfter).count,
-                columnsBefore: mOld.columns, columnsAfter: mNew.columns,
-                slotSideBefore: mOld.slotSide, slotSideAfter: mNew.slotSide, gapBefore: mOld.gap, gapAfter: mNew.gap)
-            // Metrics and content size are recomputed only when the width changes.
-            MetalGridPerfLog.resizeFrame(
-                layoutMs: layoutMs, visibleSlotCount: visAfter.count, renderQuadCount: visAfter.count,
-                textureUploadCount: cache.uploadsThisFrame, widthChanged: delta.widthChanged,
-                heightChanged: delta.heightChanged, metricsRecomputed: delta.widthChanged,
-                contentSizeRecomputed: delta.widthChanged)
-        }
+        #if DEBUG
+            logResizeDiagnostics(
+                result: r, delta: delta, oldFrame: oldFrame, newFrame: newFrame, oldScrollY: oldScrollY,
+                level: lvl, phase: phase, wasBottomPinned: wasBottomPinned,
+                layoutMs: Date().timeIntervalSince(t0) * 1000)
+        #endif
         return r
     }
+
+    #if DEBUG
+        /// Throttled `[GridResize]` and `[MetalGridPerf]` lines for a live resize. Only the DEBUG console prints
+        /// them; the support export does not list these events.
+        private func logResizeDiagnostics(
+            result r: GridViewportResizeResult, delta: GridViewportResizeDelta, oldFrame: CGRect, newFrame: CGRect,
+            oldScrollY: CGFloat, level lvl: Int, phase: Int?, wasBottomPinned: Bool, layoutMs: Double
+        ) {
+            // Throttle diagnostics during live drags because layout runs once per frame.
+            let now = Date()
+            if now.timeIntervalSince(lastResizeDiagTime) > 0.33 {
+                lastResizeDiagTime = now
+                let reason: String =
+                    wasBottomPinned
+                    ? "bottomPinned"
+                    : (delta.widthChanged && delta.movedLeftEdge && !delta.heightChanged)
+                        ? "sidebarWidth"
+                        : (delta.heightChanged && delta.movedTopEdge && !delta.movedBottomEdge)
+                            ? "windowHeightTopEdge"
+                            : (delta.heightChanged && delta.movedBottomEdge && !delta.movedTopEdge)
+                                ? "windowHeightBottomEdge"
+                                : (delta.widthChanged && !delta.heightChanged)
+                                    ? "windowWidth"
+                                    : delta.heightChanged ? "windowResizeUnknownEdge" : "unknown"
+                let oldVP = CGSize(width: max(oldFrame.width, 1), height: max(oldFrame.height, 0))
+                let newVP = CGSize(width: max(newFrame.width, 1), height: max(newFrame.height, 0))
+                let mOld = engine.resolvedMetrics(level: lvl, width: oldVP.width)
+                let mNew = engine.resolvedMetrics(level: lvl, width: newVP.width)
+                let oldContent = engine.contentSize(level: lvl, width: oldVP.width, columnPhase: phase)
+                let visBefore = Set(
+                    engine.framePlan(
+                        level: lvl, viewportSize: oldVP, scrollOffset: CGPoint(x: 0, y: oldScrollY), overscan: 0,
+                        columnPhase: phase
+                    ).visibleSlots.map(\.index))
+                let visAfter = Set(
+                    engine.framePlan(
+                        level: lvl, viewportSize: newVP, scrollOffset: CGPoint(x: 0, y: r.newScrollY), overscan: 0,
+                        columnPhase: phase
+                    ).visibleSlots.map(\.index))
+                let anchorVY: CGFloat = newVP.height * r.anchorFractionY  // the normalized anchor's viewport y
+                GridResizeLog.begin(
+                    reason: reason, oldFrame: oldFrame, newFrame: newFrame, delta: delta, level: lvl, phase: phase,
+                    wasBottomPinned: wasBottomPinned, result: r, anchorViewportY: anchorVY,
+                    oldScrollY: oldScrollY, oldContentSize: oldContent)
+                GridResizeLog.end(result: r, anchorViewportYAfter: anchorVY)
+                GridResizeLog.validation(
+                    visibleBefore: visBefore.count, visibleAfter: visAfter.count,
+                    visibleOverlap: visBefore.intersection(visAfter).count,
+                    columnsBefore: mOld.columns, columnsAfter: mNew.columns,
+                    slotSideBefore: mOld.slotSide, slotSideAfter: mNew.slotSide, gapBefore: mOld.gap, gapAfter: mNew.gap
+                )
+                // Metrics and content size are recomputed only when the width changes.
+                MetalGridPerfLog.resizeFrame(
+                    layoutMs: layoutMs, visibleSlotCount: visAfter.count, renderQuadCount: visAfter.count,
+                    textureUploadCount: cache.uploadsThisFrame, widthChanged: delta.widthChanged,
+                    heightChanged: delta.heightChanged, metricsRecomputed: delta.widthChanged,
+                    contentSizeRecomputed: delta.widthChanged)
+            }
+        }
+    #endif
 
     /// Runtime policy for resize/sidebar animation: hold the stationary vertical edge when one is obvious.
     /// Width-only changes (window side drag / sidebar reveal) preserve the viewport top so resizing clips or
@@ -808,7 +862,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
     /// The constant outer gutter (points) for the normal photo levels - see `gridHorizontalMargin` for why it must
     /// not vary by level.
-    static let standardOuterMargin: CGFloat = 12
+    static let standardOuterMargin = SquareTileGridEngine.standardOuterMargin
     /// Render/layout bounds for one level. The source of the insets stays adapter-owned; the mapping itself is a
     /// pure GridCore value so overview boundaries can resolve source and target independently.
     func renderBounds(forLevel lvl: Int) -> GridRenderBounds {
@@ -860,20 +914,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             level: level, viewportSize: layoutViewportSize, scrollOffset: clip.bounds.origin, overscan: 0,
             columnPhase: currentPhase())
         return plan.visibleSlots.map { ($0.index, $0.slotRect) }
-    }
-
-    /// The first visible cell + how far its top sits below the viewport top - captured before a level
-    /// change so the same photo can be re-pinned afterward (anchor preservation).
-    func anchorAtViewportTop() -> (uid: PhotoUID, offset: CGFloat)? {
-        guard let clip = clipView, metalView != nil, layoutWidth > 1 else { return nil }
-        let origin = clip.bounds.origin
-        let plan = engine.framePlan(
-            level: level, viewportSize: layoutViewportSize, scrollOffset: origin, overscan: 0,
-            columnPhase: currentPhase())
-        guard let top = plan.visibleSlots.min(by: { $0.slotRect.minY < $1.slotRect.minY }),
-            let uid = uid(atFlatIndex: top.index)
-        else { return nil }
-        return (uid, top.slotRect.minY - origin.y)
     }
 
     func contentSize() -> CGSize {
@@ -1263,18 +1303,22 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             allowUpgrade: true,
             now: now
         )
+        updatePlaceholderPulse(visibleUIDs: sourceVisible, now: now)
         let (groups, _) = buildRealGroups(
             slots: scaled,
             flatUIDs: flatUIDs,
             viewportSize: viewportSize,
             displayMode: presentationSnapshotDisplayMode
         )
-        renderer.render(to: target, viewportSize: viewportSize, groups: groups)
+        if renderer.render(to: target, viewportSize: viewportSize, groups: groups) {
+            didRenderVisible(sourceVisible)
+        } else {
+            frameEncodingFailed = true
+        }
         let activeReveal = hasActiveAnimation(in: admission.visible, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
-            || (!cache.residencySaturatedThisFrame
-                && (pendingVisibleQualityUpgrade || hasRetryableMissingVisibleTexture(admission.visible)))
+            || (!cache.residencySaturatedThisFrame && pendingVisibleQualityUpgrade)
     }
 
     /// Presents the window-resize snapshot geometry while keeping thumbnail streaming live.
@@ -1292,9 +1336,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             allowUpgrade: true,
             now: now
         )
+        updatePlaceholderPulse(visibleUIDs: visibleUIDs, now: now)
         let realCount = renderRealSlots(
             to: target,
             slots: Self.viewportDrawSlots(scaled, viewportSize: viewportSize),
+            visibleUIDs: visibleUIDs,
             flatUIDs: flatUIDs,
             viewportSize: viewportSize,
             now: now
@@ -1302,16 +1348,13 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
-            || (!cache.residencySaturatedThisFrame
-                && (pendingVisibleQualityUpgrade || hasRetryableMissingVisibleTexture(visibleUIDs)))
+            || (!cache.residencySaturatedThisFrame && pendingVisibleQualityUpgrade)
         publishLightDiagnostics(
             phase: "liveResize",
             visibleCount: visibleUIDs.count,
             overscanCount: overscanUIDs.count,
             realCount: realCount,
             cellCount: scaled.count,
-            visibleRect: CGRect(origin: CGPoint(x: 0, y: presentationStartScrollY), size: viewportSize),
-            contentSize: contentSize(),
             now: now
         )
     }
@@ -1502,11 +1545,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             }
         }
         streamTextures(visibleUIDs: visibleUIDs, overscanUIDs: overscanUIDs, now: now)
-        _ = renderRealSlots(to: target, slots: slots, flatUIDs: flatUIDs, viewportSize: viewportSize)
+        updatePlaceholderPulse(visibleUIDs: visibleUIDs, now: now)
+        _ = renderRealSlots(
+            to: target, slots: slots, visibleUIDs: visibleUIDs, flatUIDs: flatUIDs, viewportSize: viewportSize)
         let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
-        hasPendingVisibleThumbnails =
-            activeReveal
-            || (!cache.residencySaturatedThisFrame && hasRetryableMissingVisibleTexture(visibleUIDs))
+        hasPendingVisibleThumbnails = activeReveal
     }
 
     /// Max per-item rect delta (L1 of origin + size) between two index-keyed slot sets - 0 when every shared item
@@ -1554,7 +1597,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             lastRenderOutcome = .noDrawable
             return
         }
-        defer { lastRenderOutcome = .drawn(hasPendingWork: hasPendingVisibleThumbnails) }
+        frameEncodingFailed = false
+        defer {
+            lastRenderOutcome =
+                frameEncodingFailed ? .encodingFailed : .drawn(hasPendingWork: hasPendingVisibleThumbnails)
+        }
         // Refresh the display backing scale from the live drawable (invariant to window size - the ratio is the
         // Retina factor). Set before any early-returning branch so every path that reaches `streamTextures`
         // sizes uploads against the current display.
@@ -1624,7 +1671,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     // MARK: - Single-lattice transition render
 
     /// Try to start a click transition
-    /// for a toolbar/keyboard +/- to `newLevel`, pinning `anchorIndex` at `viewportPoint`. Commits the
+    /// for a toolbar +/- to `newLevel`, pinning `anchorIndex` at `viewportPoint`. Commits the
     /// settled level/phase (so the post-settle frame is the target) and overlays the crossfade for the
     /// duration. Returns the target scroll position or `nil` when the caller must snap.
     func tryBeginClickTransition(
@@ -1900,6 +1947,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         let srcResidentBefore = residentSlotCount(srcSlots, flatUIDs: flatUIDs)
         let tgtResidentBefore = residentSlotCount(tgtSlots, flatUIDs: flatUIDs)
         streamTextures(visibleUIDs: uids, overscanUIDs: [], now: now)
+        placeholderPulse.update(
+            loadingCount: MetalGridFrameComposer.visibleLoadingCount(
+                source: srcSlots, target: tgtSlots, targetOpacity: plan.targetOpacity,
+                flatUIDs: flatUIDs, viewportSize: viewportSize, isLoading: isLoadingPlaceholder),
+            now: now)
         let srcResidentAfter = residentSlotCount(srcSlots, flatUIDs: flatUIDs)
         let tgtResidentAfter = residentSlotCount(tgtSlots, flatUIDs: flatUIDs)
         let activeReveal = hasActiveAnimation(in: uids, now: now)
@@ -1907,8 +1959,10 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         PhotoPerformanceSignposts.grid.interval("dissolve.layerPass") {
             renderer.renderLayerDissolve(
                 to: target, viewportSize: viewportSize,
-                redrawSource: srcResidentAfter != srcResidentBefore || activeReveal,
-                redrawTarget: tgtResidentAfter != tgtResidentBefore || activeReveal,
+                redrawSource: srcResidentAfter != srcResidentBefore || activeReveal
+                    || placeholderPulse.needsLayerRedraw,
+                redrawTarget: tgtResidentAfter != tgtResidentBefore || activeReveal
+                    || placeholderPulse.needsLayerRedraw,
                 sourceGroups: {
                     PhotoPerformanceSignposts.grid.interval("buildRealGroups") {
                         buildRealGroups(
@@ -1927,17 +1981,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 },
                 t: Float(plan.targetOpacity))
         }
-        hasPendingVisibleThumbnails =
-            activeReveal
-            || (!cache.residencySaturatedThisFrame && hasRetryableMissingVisibleTexture(uids))
+        hasPendingVisibleThumbnails = activeReveal
         publishLightDiagnostics(
             phase: "overviewDissolve", visibleCount: uids.count, overscanCount: 0,
             realCount: srcResidentAfter + tgtResidentAfter,
-            cellCount: srcSlots.count + tgtSlots.count,
-            visibleRect: CGRect(origin: .zero, size: viewportSize),
-            contentSize: engine.contentSize(
-                level: plan.targetLevel, width: layoutWidth,
-                columnPhase: plan.targetColumnPhase), now: now)
+            cellCount: srcSlots.count + tgtSlots.count, now: now)
     }
 
     private func drawTransition(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
@@ -1947,14 +1995,17 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         var uids: [PhotoUID] = []
         for d in draws where d.index < flatUIDs.count { uids.append(flatUIDs[d.index]) }
         streamTextures(visibleUIDs: uids, overscanUIDs: [], now: now)
+        placeholderPulse.update(
+            loadingCount: MetalGridFrameComposer.visibleLoadingCount(
+                draws: draws, flatUIDs: flatUIDs, viewportSize: viewportSize,
+                inset: leadingObstructionInset, isLoading: isLoadingPlaceholder),
+            now: now)
         let realCount = renderTransitionDraws(
             to: target, draws: draws, flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
+        hasPendingVisibleThumbnails = hasActiveAnimation(in: uids, now: now)
         publishLightDiagnostics(
             phase: "transition", visibleCount: uids.count, overscanCount: 0,
-            realCount: realCount, cellCount: draws.count,
-            visibleRect: CGRect(origin: .zero, size: viewportSize),
-            contentSize: engine.contentSize(level: level, width: layoutWidth, columnPhase: currentPhase()),
-            now: now)
+            realCount: realCount, cellCount: draws.count, now: now)
     }
 
     /// Renders transition draws with the premultiplied source-over blend. Mixed draws use an opaque source
@@ -1974,10 +2025,20 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             rectTransform: { [leadingObstructionInset] in
                 $0.offsetBy(dx: leadingObstructionInset, dy: 0)
             },
-            now: now
+            now: now,
+            placeholderPulse: placeholderPulse,
+            canRetryPlaceholder: dataSource.canRetryThumbnail
         )
         evictTexturesToBudget()
-        renderer.render(to: target, viewportSize: viewportSize, groups: output.groups)
+        guard renderer.render(to: target, viewportSize: viewportSize, groups: output.groups) else {
+            frameEncodingFailed = true
+            return output.realCount
+        }
+        if !contentReadyReported {
+            didRenderVisible(
+                MetalGridFrameComposer.visibleIDs(
+                    draws: draws, flatUIDs: flatUIDs, viewportSize: viewportSize, inset: leadingObstructionInset))
+        }
         return output.realCount
     }
 
@@ -1988,7 +2049,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     private func drawCommitBridge(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
         guard let tx = bridgeTransaction else { return }
         let overscan = budget.overscanFraction * viewportSize.height
-        let scrollOffset = CGPoint(x: 0, y: bridgeScrollY)
         // One source of truth for the bridge geometry (also what the tests assert against): per-globalIndex
         // viewport rects eased from the transaction-final frame to the settled (phased) `GridFramePlan`.
         // Built in layout space (engine), then translated +inset to render space (the bridge draw chokepoint).
@@ -1997,23 +2057,19 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 transaction: tx, engine: engine, targetLevel: bridgeLevel,
                 viewportSize: layoutViewportSize, scrollY: bridgeScrollY,
                 overscan: overscan, progress: commitBridgeProgress, columnPhase: currentPhase()))
-        let settledContentSize = engine.contentSize(level: bridgeLevel, width: layoutWidth, columnPhase: currentPhase())
         let flatUIDs = dataSource.flatUIDs
         let (visibleUIDs, overscanUIDs) = MetalGridFrameComposer.classifyVisibility(
             slots: slots, flatUIDs: flatUIDs, viewportSize: viewportSize)
         streamTextures(visibleUIDs: visibleUIDs, overscanUIDs: overscanUIDs, now: now)
+        updatePlaceholderPulse(visibleUIDs: visibleUIDs, now: now)
         let realCount = renderRealSlots(
             to: target, slots: Self.viewportDrawSlots(slots, viewportSize: viewportSize),
-            flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
+            visibleUIDs: visibleUIDs, flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
         let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
-        hasPendingVisibleThumbnails =
-            activeReveal
-            || (!cache.residencySaturatedThisFrame && hasRetryableMissingVisibleTexture(visibleUIDs))
+        hasPendingVisibleThumbnails = activeReveal
         publishLightDiagnostics(
             phase: "commitBridge", visibleCount: visibleUIDs.count,
-            overscanCount: overscanUIDs.count, realCount: realCount, cellCount: slots.count,
-            visibleRect: CGRect(origin: scrollOffset, size: viewportSize),
-            contentSize: settledContentSize, now: now)
+            overscanCount: overscanUIDs.count, realCount: realCount, cellCount: slots.count, now: now)
     }
 
     // MARK: - Engine render
@@ -2026,14 +2082,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         // Render in viewport space. Both paths produce `GridRenderSlot` (viewport-space); the engine's
         // content-space `GridSlot.slotRect` is mapped to a viewport rect here, never reused with a live rect.
         let slots: [GridRenderSlot]
-        let contentSizeForDiag: CGSize
         if let tx = zoomTransaction {
             // Live zoom uses the engine-owned transaction so the focus row stays stable while the level changes.
             let frame = tx.frame(
                 continuousLevel: zoomTransactionLevel, viewportSize: layoutViewportSize, overscan: overscan)
             slots = renderTranslate(frame.visibleSlots)  // Translate layout once at the render boundary.
-            contentSizeForDiag = CGSize(
-                width: layoutWidth, height: frame.pitch * CGFloat(max(1, slots.count / max(frame.columns, 1))))
             #if DEBUG
                 if now - lastCommitFrameLog > 0.1 {  // ~10 Hz: trace the live focus row + anchor rect (DEBUG only;
                     lastCommitFrameLog = now  // the diagnostic builds a payload string, so keep it out of release)
@@ -2067,7 +2120,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 plan.visibleSlots.map {
                     GridRenderSlot(index: $0.index, column: $0.column, row: $0.row, rect: $0.viewportRect)
                 })
-            contentSizeForDiag = plan.contentSize
         }
 
         let flatUIDs = dataSource.flatUIDs
@@ -2077,22 +2129,19 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         let pendingVisibleQualityUpgrade = streamTextures(
             visibleUIDs: visibleUIDs, overscanUIDs: overscanUIDs,
             allowUpgrade: zoomTransaction == nil, now: now)
+        updatePlaceholderPulse(visibleUIDs: visibleUIDs, now: now)
         let realCount = renderRealSlots(
             to: target, slots: Self.viewportDrawSlots(slots, viewportSize: viewportSize),
-            flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
-        // Keep ticking while visible placeholders or quality upgrades can still complete.
-        // Residency saturation waits for a later viewport change.
+            visibleUIDs: visibleUIDs, flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
+        // Missing images wake the host when they arrive. Quality upgrades can still need a later frame.
         let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
-            || (!cache.residencySaturatedThisFrame
-                && (pendingVisibleQualityUpgrade || hasRetryableMissingVisibleTexture(visibleUIDs)))
+            || (!cache.residencySaturatedThisFrame && pendingVisibleQualityUpgrade)
         publishLightDiagnostics(
             phase: zoomTransaction == nil ? "settled" : "liveZoom",
             visibleCount: visibleUIDs.count, overscanCount: overscanUIDs.count,
-            realCount: realCount, cellCount: slots.count,
-            visibleRect: CGRect(origin: clip.bounds.origin, size: viewportSize),
-            contentSize: contentSizeForDiag, now: now)
+            realCount: realCount, cellCount: slots.count, now: now)
     }
 
     /// Resident images are cover-filled inside square slots. Missing thumbnails leave the uniform clear surface.
@@ -2104,6 +2153,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     private func renderRealSlots(
         to target: MetalGridDrawableTarget,
         slots: [GridRenderSlot],
+        visibleUIDs: [PhotoUID],
         flatUIDs: [PhotoUID],
         viewportSize: CGSize,
         now: TimeInterval = CACurrentMediaTime()
@@ -2115,7 +2165,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 displayMode: effectiveDisplayMode, contentTransition: transition, now: now)
         }
         evictTexturesToBudget()
-        renderer.render(to: target, viewportSize: viewportSize, groups: groups)
+        guard renderer.render(to: target, viewportSize: viewportSize, groups: groups) else {
+            frameEncodingFailed = true
+            return realCount
+        }
+        didRenderVisible(visibleUIDs)
         if transition != nil { requestRedraw() }
         return realCount
     }
@@ -2146,13 +2200,84 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         return MetalGridFrameComposer.buildGroups(
             slots: slots, flatUIDs: flatUIDs, cache: cache,
             displayMode: displayMode, cornerRadius: GridVisualConstants.thumbnailCornerRadius,
-            decorations: productionDecorations(), contentTransition: contentTransition, now: now
+            decorations: productionDecorations(), contentTransition: contentTransition, now: now,
+            placeholderPulse: placeholderPulse,
+            canRetryPlaceholder: dataSource.canRetryThumbnail
         )
     }
 
-    /// A thumbnail fading in or an upload badge moving keeps the grid drawing frames.
-    private func hasActiveAnimation(in uids: [PhotoUID], now: CFTimeInterval) -> Bool {
-        cache.hasActiveThumbnailReveal(in: uids, now: now) || uploadBadgeAnimator.isAnimating(uids, now: now)
+    func setPlaceholderReduceMotion(_ enabled: Bool) {
+        if placeholderPulse.setReduceMotion(enabled) { requestRedraw() }
+    }
+
+    func beginPlaceholderScroll() {
+        placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
+    }
+
+    func endPlaceholderScroll(isVisible: Bool) {
+        if placeholderScroll.ended(
+            visibleIDs: visiblePlaceholderUIDs(), isVisible: isVisible, reduceMotion: placeholderPulse.reduceMotion,
+            isLoading: isLoadingPlaceholder, pulse: &placeholderPulse)
+        {
+            requestRedraw()
+        }
+    }
+
+    private func visiblePlaceholderUIDs() -> [PhotoUID] {
+        let ids = dataSource.flatUIDs
+        return visibleCells().compactMap { cell in
+            ids.indices.contains(cell.flatIndex) ? ids[cell.flatIndex] : nil
+        }
+    }
+
+    /// The grid is hidden or detached: pending readiness is void and the next loading tile starts a new sweep.
+    func presentationSuspended() {
+        invalidateContentReadiness()
+        placeholderScroll.reset()
+        placeholderPulse.restart()
+    }
+
+    /// A known-photo placeholder may reveal fresh metadata. Other callers retain the resident-thumbnail gate.
+    func didRenderVisible(_ uids: [PhotoUID]) {
+        guard !contentReadyReported,
+            MetalGridFrameComposer.hasPresentableFirstContent(
+                visibleIDs: uids, allowsPlaceholders: allowsPlaceholderContentReady,
+                isKnown: { self.indexByUID[$0] != nil }, isResident: cache.isResident)
+        else { return }
+        var resident = 0
+        for uid in uids where cache.isResident(uid) { resident += 1 }
+        contentReadyReported = true
+        if !firstContentReadyLogged {
+            firstContentReadyLogged = true
+            let elapsedMs = firstGridFrameAt > 0 ? (CACurrentMediaTime() - firstGridFrameAt) * 1000 : 0
+            PhotoDiagnostics.shared.emit(
+                "FirstContent",
+                [
+                    "event": "ready", "visible": "\(uids.count)", "resident": "\(resident)",
+                    "elapsedMs": String(format: "%.0f", elapsedMs), "level": "\(level)", "phase": "coldStart",
+                ])
+        }
+        onContentReady?()
+    }
+
+    /// A thumbnail fading in, an upload badge moving, a progressing upload or the placeholder sweep keeps the
+    /// grid drawing frames.
+    func hasActiveAnimation(in uids: [PhotoUID], now: CFTimeInterval) -> Bool {
+        let ramReadyMissing = uids.reduce(into: 0) { count, uid in
+            if !cache.isResident(uid), dataSource.hasImage(for: uid) { count += 1 }
+        }
+        return cache.hasActiveThumbnailReveal(in: uids, now: now)
+            || uploadBadgeAnimator.isAnimating(uids, now: now)
+            || placeholderPulse.isAnimating
+            || MetalGridFrameComposer.hasProgressingVisibleUploads(cache: cache, ramReadyMissing: ramReadyMissing)
+    }
+
+    private func isLoadingPlaceholder(_ uid: PhotoUID) -> Bool {
+        indexByUID[uid] != nil && !cache.isResident(uid) && dataSource.canRetryThumbnail(for: uid)
+    }
+
+    func updatePlaceholderPulse(visibleUIDs: [PhotoUID], now: CFTimeInterval) {
+        placeholderPulse.update(visible: visibleUIDs, now: now, isLoading: isLoadingPlaceholder)
     }
 
     private func productionDecorations() -> MetalGridDecorations<PhotoUID>? {
@@ -2187,10 +2312,6 @@ extension MetalGridCoordinator {
     }
 
     // MARK: Texture streaming (visible-first upload + off-main warm)
-
-    private func hasRetryableMissingVisibleTexture(_ uids: [PhotoUID]) -> Bool {
-        uids.contains { !cache.isResident($0) && dataSource.canRetryThumbnail(for: $0) }
-    }
 
     @discardableResult
     private func streamTextures(
@@ -2263,25 +2384,6 @@ extension MetalGridCoordinator {
                     "resident": "\(visibleUIDs.count - missing)", "level": "\(level)", "phase": "coldStart",
                 ])
         }
-        // Notify the shell after the first visible thumbnail for this data source. Remaining thumbnails continue
-        // loading behind the presented grid. A later revision resets `contentReadyReported` for the next cycle.
-        if !contentReadyReported, !visibleUIDs.isEmpty,
-            visibleUIDs.contains(where: { cache.isResident($0) })
-        {
-            contentReadyReported = true
-            if !firstContentReadyLogged {
-                firstContentReadyLogged = true
-                let elapsedMs = firstGridFrameAt > 0 ? (CACurrentMediaTime() - firstGridFrameAt) * 1000 : 0
-                let resident = visibleUIDs.reduce(into: 0) { $0 += cache.isResident($1) ? 1 : 0 }
-                PhotoDiagnostics.shared.emit(
-                    "FirstContent",
-                    [
-                        "event": "ready", "visible": "\(visibleUIDs.count)", "resident": "\(resident)",
-                        "elapsedMs": String(format: "%.0f", elapsedMs), "level": "\(level)", "phase": "coldStart",
-                    ])
-            }
-            onContentReady?()
-        }
         return pendingVisibleQualityUpgrade
     }
 
@@ -2293,78 +2395,72 @@ extension MetalGridCoordinator {
 
     private func publishLightDiagnostics(
         phase: String, visibleCount: Int, overscanCount: Int, realCount: Int,
-        cellCount: Int, visibleRect: CGRect, contentSize: CGSize, now: CFTimeInterval
+        cellCount: Int, now: CFTimeInterval
     ) {
-        guard now - lastHUDPushDetent > 0.1 else { return }
-        lastHUDPushDetent = now
-        let stats = MetalGridStats.frame(
-            visibleCount: visibleCount,
-            overscanCount: overscanCount,
-            realCount: realCount,
-            cellCount: cellCount,
-            textureUploads: cache.uploadsThisFrame,
-            textureUploadBytes: cache.uploadBytesThisFrame,
-            deferredTextureUploads: cache.deferredUploadsThisFrame,
-            textureUploadMs: cache.uploadMsThisFrame,
-            evictions: cache.evictionsThisFrame,
-            evictMs: cache.evictMsThisFrame,
-            residentBytes: cache.residentBytes,
-            residentTextureCount: cache.residentCount,
-            pinnedTextureCount: cache.pinnedCount,
-            textureCapacity: cache.residencyCapacity,
-            pinnedTextureOverflow: cache.pinnedOverflow,
-            residentByteBudget: cache.residentByteBudget,
-            uploadByteBudget: cache.uploadByteBudgetPerFrame,
-            byteBudgetOverflow: cache.byteBudgetOverflow,
-            residencySaturated: cache.residencySaturatedThisFrame,
-            drawCalls: renderer.lastDrawCalls,
-            textureBinds: renderer.lastTextureBinds,
-            instanceCount: renderer.lastInstanceCount,
-            drawMs: renderer.lastEncodeMs,
-            gpuMs: renderer.lastGpuMs
-        )
-        var hud = MetalGridHUD()
-        hud.stats = stats
-        hud.level = level
-        hud.totalItems = totalItems
-        hud.dataSource = dataSource.label
-        onHUD?(hud)
-        guard now - lastPerfDiagnosticsLog >= 0.5 else { return }
-        lastPerfDiagnosticsLog = now
-        PhotoDiagnostics.shared.emit(
-            "MetalGridPerf",
-            [
-                "phase": phase,
-                "level": "\(level)",
-                "visible": "\(stats.visibleItems)",
-                "overscan": "\(stats.overscanItems)",
-                "real": "\(stats.realTextureItems)",
-                "placeholder": "\(stats.placeholderItems)",
-                "drawCalls": "\(stats.drawCalls)",
-                "textureBinds": "\(stats.textureBinds)",
-                "instances": "\(stats.instanceCount)",
-                "drawMs": String(format: "%.2f", stats.drawMs),
-                "gpuMs": String(format: "%.2f", stats.gpuMs),
-                "uploads": "\(stats.textureUploads)",
-                "uploadBytes": "\(stats.textureUploadBytes)",
-                "deferredUploads": "\(stats.deferredTextureUploads)",
-                "uploadMs": String(format: "%.2f", stats.textureUploadMs),
-                "evictions": "\(stats.evictions)",
-                "evictMs": String(format: "%.2f", stats.evictMs),
-                "residentTextures": "\(stats.residentTextureCount)",
-                "pinnedTextures": "\(stats.pinnedTextureCount)",
-                "textureCapacity": "\(stats.textureCapacity)",
-                "pinnedOverflow": "\(stats.pinnedTextureOverflow)",
-                "encodedSlots": "\(stats.encodedSlotItems)",
-                "residentMB": String(format: "%.2f", Double(stats.memoryEstimateBytes) / 1_048_576),
-                "residentBudgetMB": String(format: "%.0f", Double(stats.residentByteBudget) / 1_048_576),
-                "uploadBudgetBytes": "\(stats.uploadByteBudget)",
-                "byteBudgetOverflow": "\(stats.byteBudgetOverflow)",
-                "residencySaturated": "\(stats.residencySaturated)",
-                "effectivePixels": "\(cache.effectiveMaxTexturePixels)",
-                "upgrades": "\(cache.upgradesThisFrame)",
-                "directUploads": "\(cache.directUploadsThisFrame)",
-                "normalizedUploads": "\(cache.normalizedUploadsThisFrame)",
-            ])
+        #if DEBUG
+            guard now - lastPerfDiagnosticsLog >= 0.5 else { return }
+            lastPerfDiagnosticsLog = now
+            let stats = MetalGridStats.frame(
+                visibleCount: visibleCount,
+                overscanCount: overscanCount,
+                realCount: realCount,
+                cellCount: cellCount,
+                textureUploads: cache.uploadsThisFrame,
+                textureUploadBytes: cache.uploadBytesThisFrame,
+                deferredTextureUploads: cache.deferredUploadsThisFrame,
+                textureUploadMs: cache.uploadMsThisFrame,
+                evictions: cache.evictionsThisFrame,
+                evictMs: cache.evictMsThisFrame,
+                residentBytes: cache.residentBytes,
+                residentTextureCount: cache.residentCount,
+                pinnedTextureCount: cache.pinnedCount,
+                textureCapacity: cache.residencyCapacity,
+                pinnedTextureOverflow: cache.pinnedOverflow,
+                residentByteBudget: cache.residentByteBudget,
+                uploadByteBudget: cache.uploadByteBudgetPerFrame,
+                byteBudgetOverflow: cache.byteBudgetOverflow,
+                residencySaturated: cache.residencySaturatedThisFrame,
+                drawCalls: renderer.lastDrawCalls,
+                textureBinds: renderer.lastTextureBinds,
+                instanceCount: renderer.lastInstanceCount,
+                drawMs: renderer.lastEncodeMs,
+                gpuMs: renderer.lastGpuMs
+            )
+            PhotoDiagnostics.shared.emit(
+                "MetalGridPerf",
+                [
+                    "phase": phase,
+                    "level": "\(level)",
+                    "visible": "\(stats.visibleItems)",
+                    "overscan": "\(stats.overscanItems)",
+                    "real": "\(stats.realTextureItems)",
+                    "placeholder": "\(stats.placeholderItems)",
+                    "drawCalls": "\(stats.drawCalls)",
+                    "textureBinds": "\(stats.textureBinds)",
+                    "instances": "\(stats.instanceCount)",
+                    "drawMs": String(format: "%.2f", stats.drawMs),
+                    "gpuMs": String(format: "%.2f", stats.gpuMs),
+                    "uploads": "\(stats.textureUploads)",
+                    "uploadBytes": "\(stats.textureUploadBytes)",
+                    "deferredUploads": "\(stats.deferredTextureUploads)",
+                    "uploadMs": String(format: "%.2f", stats.textureUploadMs),
+                    "evictions": "\(stats.evictions)",
+                    "evictMs": String(format: "%.2f", stats.evictMs),
+                    "residentTextures": "\(stats.residentTextureCount)",
+                    "pinnedTextures": "\(stats.pinnedTextureCount)",
+                    "textureCapacity": "\(stats.textureCapacity)",
+                    "pinnedOverflow": "\(stats.pinnedTextureOverflow)",
+                    "encodedSlots": "\(stats.encodedSlotItems)",
+                    "residentMB": String(format: "%.2f", Double(stats.memoryEstimateBytes) / 1_048_576),
+                    "residentBudgetMB": String(format: "%.0f", Double(stats.residentByteBudget) / 1_048_576),
+                    "uploadBudgetBytes": "\(stats.uploadByteBudget)",
+                    "byteBudgetOverflow": "\(stats.byteBudgetOverflow)",
+                    "residencySaturated": "\(stats.residencySaturated)",
+                    "effectivePixels": "\(cache.effectiveMaxTexturePixels)",
+                    "upgrades": "\(cache.upgradesThisFrame)",
+                    "directUploads": "\(cache.directUploadsThisFrame)",
+                    "normalizedUploads": "\(cache.normalizedUploadsThisFrame)",
+                ])
+        #endif
     }
 }

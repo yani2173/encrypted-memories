@@ -13,7 +13,7 @@ public protocol AlbumManaging: AlbumOperations {
 
 /// Default implementation over separate catalog and write backends. This split makes the SDK the
 /// only owned/shared catalog and membership reader while preserving the narrow HTTP write surface
-/// for operations the Swift API of SDK 0.32.1 does not expose.
+/// for operations the Swift API of SDK 0.33.0 does not expose.
 public actor AlbumsRepository: AlbumManaging {
     public nonisolated let capabilities: AlbumCapabilities
     private let catalogBackend: any AlbumCatalogBackend
@@ -121,7 +121,7 @@ public actor AlbumsRepository: AlbumManaging {
                 gap: "the wired album catalog does not expose photo membership metadata"
             )
         }
-        let uniqueUIDs = Self.unique(photoUIDs)
+        let uniqueUIDs = photoUIDs.uniqued()
         // Local pending photos are in no Proton album yet.
         let missing = uniqueUIDs.filter { membershipCache[$0] == nil && !$0.isLocalPending }
         if !missing.isEmpty {
@@ -149,11 +149,11 @@ public actor AlbumsRepository: AlbumManaging {
                 gap: "the wired album catalog does not expose photo membership metadata"
             )
         }
-        let uniqueUIDs = Self.unique(photoUIDs)
+        let uniqueUIDs = photoUIDs.uniqued()
         let remote = uniqueUIDs.filter { !$0.isLocalPending }
         if !remote.isEmpty {
             do {
-                let loaded = try await catalogBackend.albumMemberships(for: remote)
+                let loaded = try await catalogBackend.currentAlbumMemberships(for: remote)
                 for uid in remote {
                     cacheMemberships(loaded[uid] ?? [], for: uid)
                 }
@@ -238,7 +238,8 @@ public actor AlbumsRepository: AlbumManaging {
                 albumName: trimmed,
                 message: (error as? AlbumError)?.diagnosticDescription
                     ?? (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
+                    ?? error.localizedDescription,
+                cause: (error as? AlbumError)?.writeCause ?? AlbumWriteCause(error)
             )
         }
         return albumID
@@ -263,7 +264,7 @@ public actor AlbumsRepository: AlbumManaging {
     }
 
     public func addPhotos(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async throws {
-        let uniqueUIDs = Self.unique(photoUIDs)
+        let uniqueUIDs = photoUIDs.uniqued()
         guard !uniqueUIDs.isEmpty else { return }
         guard capabilities.canAddPhotos else {
             throw AlbumError.unsupported(
@@ -285,7 +286,7 @@ public actor AlbumsRepository: AlbumManaging {
     }
 
     public func removePhotos(_ photoUIDs: [PhotoUID], from albumID: AlbumID) async throws {
-        let uniqueUIDs = Self.unique(photoUIDs)
+        let uniqueUIDs = photoUIDs.uniqued()
         guard !uniqueUIDs.isEmpty else { return }
         guard capabilities.canRemovePhotos else {
             throw AlbumError.unsupported(
@@ -332,14 +333,10 @@ public actor AlbumsRepository: AlbumManaging {
         )
     }
 
-    private static func normalized(_ error: Error) -> AlbumError {
+    private static func normalized(_ error: Error) -> any Error {
+        if error is CancellationError { return error }
         if let albumError = error as? AlbumError { return albumError }
-        return .backend((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-    }
-
-    private static func unique(_ photoUIDs: [PhotoUID]) -> [PhotoUID] {
-        var seen = Set<PhotoUID>()
-        return photoUIDs.filter { seen.insert($0).inserted }
+        return AlbumError.requestFailed(AlbumWriteCause(error))
     }
 
     private func noteAdded(_ photoUIDs: [PhotoUID], to albumID: AlbumID) {

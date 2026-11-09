@@ -36,7 +36,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         headers: [(String, [String])]
     ) async -> Result<HttpClientResponse, NSError> {
         let url = Self.driveURL(relativePath, makeURL: driveSession.makeURL)
-        guard Self.isTrustedDriveAPIURL(url, baseURL: driveSession.config.baseURL) else {
+        guard driveSession.isTrustedAPIURL(url) else {
             return .failure(Self.invalidURL("Refusing Drive API request outside trusted Proton API host"))
         }
         var req = URLRequest(url: url)
@@ -47,7 +47,6 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
         let result = await perform(
             req,
-            scope: .api,
             credentialGeneration: credentialGeneration,
             retryOn401: true,
             retryOn429: Self.canRetryAfterRateLimit(method: method)
@@ -131,7 +130,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
     // MARK: Small upload (absolute url, buffered)
 
-    /// Sends one complete multipart upload to the Drive API. SDK 0.32.1 buffers a small file from byte
+    /// Sends one complete multipart upload to the Drive API. SDK 0.33.0 buffers a small file from byte
     /// zero and hands us the opaque multipart body plus its metadata JSON as a side channel. The body
     /// goes out unchanged with session auth; `metadata` may contain plaintext, so it is neither logged
     /// nor reconstructed from `content`. The SDK forbids resending after a timeout, lost connection or
@@ -144,7 +143,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         headers: [(String, [String])]
     ) async -> Result<HttpClientResponse, NSError> {
         let requestURL = Self.driveURL(url, makeURL: driveSession.makeURL)
-        guard Self.isTrustedDriveAPIURL(requestURL, baseURL: driveSession.config.baseURL) else {
+        guard driveSession.isTrustedAPIURL(requestURL) else {
             return .failure(Self.invalidURL("Refusing small upload outside trusted Proton API host"))
         }
         var req = URLRequest(url: requestURL)
@@ -157,7 +156,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         // Redirects are refused: following one would replay the authenticated body against a
         // Location the trusted-host check above never saw. The 3xx status reaches the SDK unchanged.
         let result = await perform(
-            req, scope: .api, credentialGeneration: credentialGeneration, retryOn401: true, retryOn429: false,
+            req, credentialGeneration: credentialGeneration, retryOn401: true, retryOn429: false,
             taskDelegate: RedirectRefusingTaskDelegate.shared)
         switch result {
         case .success(let resp) where resp.statusCode >= 400:
@@ -225,61 +224,33 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
     private func perform(
         _ request: URLRequest,
-        scope: ProtonRequestScope,
         credentialGeneration: UInt64,
         retryOn401: Bool,
         retryOn429: Bool,
         taskDelegate: URLSessionTaskDelegate? = nil
     ) async -> Result<HttpClientResponse, NSError> {
-        let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: scope, label: Self.label(for: request, scope: scope))
-        } catch {
-            return .failure(error as NSError)
-        }
-        do {
-            let (data, response) = try await urlSession.data(for: request, delegate: taskDelegate)
-            guard let http = response as? HTTPURLResponse else {
-                await requestGovernor.finish(permit, statusCode: nil)
-                return .failure(NSError(domain: "EncryptedMemories.SDKHttpClient", code: -1))
-            }
-            await requestGovernor.finish(
-                permit,
-                statusCode: http.statusCode,
-                retryAfter: ProtonRetryAfter.seconds(from: http)
-            )
-            if http.statusCode == 429 {
-                if retryOn429 {
-                    return await perform(
-                        request,
-                        scope: scope,
-                        credentialGeneration: credentialGeneration,
-                        retryOn401: retryOn401,
-                        retryOn429: false,
-                        taskDelegate: taskDelegate
-                    )
-                }
-            }
-            if http.statusCode == 401, retryOn401, await driveSession.refreshToken(after: credentialGeneration) {
-                var retry = request
-                let auth = driveSession.authorization()
-                for (k, v) in auth.headers { retry.setValue(v, forHTTPHeaderField: k) }
-                return await perform(
-                    retry,
-                    scope: scope,
-                    credentialGeneration: auth.generation,
-                    retryOn401: false,
-                    retryOn429: retryOn429,
-                    taskDelegate: taskDelegate
-                )
-            }
+            let result = try await BufferedHTTPExecutor.perform(
+                .init(request: request, credentialGeneration: credentialGeneration),
+                urlSession: urlSession, governor: requestGovernor,
+                label: Self.label(for: request, scope: .api),
+                retryOn401: retryOn401, retryOn429: retryOn429, taskDelegate: taskDelegate,
+                retryAfterRateLimit: { $0 },
+                refreshAfterUnauthorized: { attempt in
+                    guard await self.driveSession.refreshToken(after: attempt.credentialGeneration) else { return nil }
+                    var retry = attempt.request
+                    let auth = self.driveSession.authorization()
+                    for (key, value) in auth.headers { retry.setValue(value, forHTTPHeaderField: key) }
+                    return .init(request: retry, credentialGeneration: auth.generation)
+                })
             return .success(
                 HttpClientResponse(
-                    data: data, headers: Self.headerPairs(http), statusCode: http.statusCode
+                    data: result.data, headers: Self.headerPairs(result.response),
+                    statusCode: result.response.statusCode
                 ))
+        } catch BufferedHTTPExecutor.Failure.invalidResponse {
+            return .failure(NSError(domain: "EncryptedMemories.SDKHttpClient", code: -1))
         } catch {
-            await requestGovernor.finish(
-                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             return .failure(error as NSError)
         }
     }
@@ -350,14 +321,6 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         combined += embedded.path.hasPrefix("/") ? embedded.path : "/\(embedded.path)"
         if let query = embedded.query, !query.isEmpty { combined += "?\(query)" }
         return URL(string: combined) ?? makeURL(relativePath)
-    }
-
-    private static func isTrustedDriveAPIURL(_ url: URL, baseURL: URL) -> Bool {
-        guard url.scheme == "https",
-            let host = url.host?.lowercased(),
-            let expected = baseURL.host?.lowercased()
-        else { return false }
-        return host == expected
     }
 
     private static func httpsURL(_ raw: String) -> URL? {

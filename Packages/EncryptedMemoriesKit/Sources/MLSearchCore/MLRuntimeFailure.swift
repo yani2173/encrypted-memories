@@ -44,8 +44,6 @@ public enum MLRuntimeFailureDisposition: String, Codable, Equatable, Hashable, S
 
 /// A runtime failure with an explicit Core-owned retry disposition.
 public struct MLRuntimeFailure: Error, Equatable, Hashable, Sendable, CustomStringConvertible {
-    public typealias Disposition = MLRuntimeFailureDisposition
-
     public let category: MLRuntimeFailureCategory
     /// The category is authoritative. Callers cannot construct an internally inconsistent retry policy.
     public var disposition: MLRuntimeFailureDisposition { category.disposition }
@@ -57,13 +55,8 @@ public struct MLRuntimeFailure: Error, Equatable, Hashable, Sendable, CustomStri
         self.debugDescription = debugDescription
     }
 
-    public init(category: MLRuntimeFailureCategory, reason: String) {
-        self.init(category: category, debugDescription: reason)
-    }
-
     public var isRetryable: Bool { disposition.isRetryable }
     public var isPermanent: Bool { disposition == .permanent }
-    public var kind: MLRuntimeFailureCategory { category }
 
     public var description: String {
         if debugDescription.isEmpty { return category.rawValue }

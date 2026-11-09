@@ -124,12 +124,12 @@ public struct TimelineView: View {
             case .empty:
                 emptyState
                     .padding(.leading, leadingInset)
-            case .failed(let message):
+            case .failed(let message, let retryable):
                 if isOffline {
                     OfflineContentUnavailableView()
                         .padding(.leading, leadingInset)
                 } else {
-                    errorState(message)
+                    errorState(message, retryable: retryable)
                         .padding(.leading, leadingInset)
                 }
             case .loaded:
@@ -155,6 +155,9 @@ public struct TimelineView: View {
                             onOpen: onOpen,
                             proxy: proxy,
                             selectionMode: selectionMode,
+                            allowsPhotoActions: !model.isProvisionalPresentation,
+                            isProvisionalPresentation: model.isProvisionalPresentation,
+                            allowsPlaceholderContentReady: model.initialLibraryLoadState.allowsPlaceholderContentReady,
                             onSelectionChange: onSelectionChange,
                             favoriteUIDs: favoriteUIDs,
                             uploadBadges: hasSearchQuery ? .empty : model.pendingUploadBadges,
@@ -210,14 +213,18 @@ public struct TimelineView: View {
             .background(timelineSurfaceBackground)
     }
 
-    private func errorState(_ message: String) -> some View {
+    /// The library-load error screen. The Retry affordance appears only when a retry can help
+    /// (`retryable`); both platforms read the same flag from the load failure.
+    private func errorState(_ message: String, retryable: Bool) -> some View {
         ContentUnavailableView {
             Label(L10n.string("error.load_library_title"), systemImage: "exclamationmark.triangle")
         } description: {
             Text(message)
                 .textSelection(.enabled)
         } actions: {
-            RetryButton(.prominent) { Task { await model.retry() } }
+            if retryable {
+                RetryButton(.prominent) { Task { await model.retry() } }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()

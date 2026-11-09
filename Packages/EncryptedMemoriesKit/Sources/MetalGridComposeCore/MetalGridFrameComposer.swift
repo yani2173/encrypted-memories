@@ -14,6 +14,21 @@ import simd
 /// It is data-in / data-out. It never retains AppKit/UIKit objects, imports no platform view framework, and
 /// mutates only the injected texture cache (which is itself platform-neutral).
 package enum MetalGridFrameComposer {
+    /// The host calls this after encoding a frame. Placeholder readiness never establishes inventory authority.
+    package static func hasPresentableFirstContent<ID>(
+        visibleIDs: [ID], allowsPlaceholders: Bool, isKnown: (ID) -> Bool, isResident: (ID) -> Bool
+    ) -> Bool {
+        visibleIDs.contains { isKnown($0) && (allowsPlaceholders || isResident($0)) }
+    }
+
+    @MainActor
+    package static func hasProgressingVisibleUploads<ID: Hashable & Sendable>(
+        cache: MetalGridTextureCache<ID>, ramReadyMissing: Int
+    ) -> Bool {
+        ramReadyMissing > 0 && cache.uploadsThisFrame > 0 && cache.deferredUploadsThisFrame > 0
+            && !cache.residencySaturatedThisFrame
+    }
+
     // MARK: - Visible / overscan classification
 
     /// Split render slots into the viewport-visible and overscan-only UID lists (visible first, source order).
@@ -37,8 +52,55 @@ package enum MetalGridFrameComposer {
         return (visible, overscan)
     }
 
-    /// Keep only the slots that actually intersect the viewport - the draw set (overscan feeds streaming/pinning
-    /// only, never a draw). Missing thumbnails draw nothing, so the bottom-most clear surface stays continuous.
+    /// The id drawn by a transition draw when it is visible: opaque enough, inside the viewport, and in range.
+    private static func visibleID<ID>(
+        of draw: GridTransitionDraw, flatUIDs: [ID], viewport: CGRect, inset: CGFloat
+    ) -> ID? {
+        guard draw.alpha > 0, draw.rect.offsetBy(dx: inset, dy: 0).intersects(viewport),
+            flatUIDs.indices.contains(draw.index)
+        else { return nil }
+        return flatUIDs[draw.index]
+    }
+
+    package static func visibleIDs<ID>(
+        draws: [GridTransitionDraw], flatUIDs: [ID], viewportSize: CGSize, inset: CGFloat = 0
+    ) -> [ID] {
+        let viewport = CGRect(origin: .zero, size: viewportSize)
+        return draws.compactMap { visibleID(of: $0, flatUIDs: flatUIDs, viewport: viewport, inset: inset) }
+    }
+
+    /// Counts the visible transition tiles that are still loading, without building a list.
+    package static func visibleLoadingCount<ID>(
+        draws: [GridTransitionDraw], flatUIDs: [ID], viewportSize: CGSize, inset: CGFloat = 0,
+        isLoading: (ID) -> Bool
+    ) -> Int {
+        let viewport = CGRect(origin: .zero, size: viewportSize)
+        var count = 0
+        for draw in draws {
+            if let id = visibleID(of: draw, flatUIDs: flatUIDs, viewport: viewport, inset: inset), isLoading(id) {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /// Counts the loading tiles of the visible dissolve layers (a layer with zero opacity does not count).
+    package static func visibleLoadingCount<ID>(
+        source: [GridRenderSlot], target: [GridRenderSlot], targetOpacity: Double,
+        flatUIDs: [ID], viewportSize: CGSize, isLoading: (ID) -> Bool
+    ) -> Int {
+        let viewport = CGRect(origin: .zero, size: viewportSize)
+        func count(_ slots: [GridRenderSlot]) -> Int {
+            var count = 0
+            for slot in slots where flatUIDs.indices.contains(slot.index) && slot.rect.intersects(viewport) {
+                if isLoading(flatUIDs[slot.index]) { count += 1 }
+            }
+            return count
+        }
+        return (targetOpacity < 1 ? count(source) : 0) + (targetOpacity > 0 ? count(target) : 0)
+    }
+
+    /// Keep only the slots that actually intersect the viewport. Overscan feeds streaming, not drawing.
     package static func viewportDrawSlots(_ slots: [GridRenderSlot], viewportSize: CGSize) -> [GridRenderSlot] {
         let viewport = CGRect(origin: .zero, size: viewportSize)
         return slots.filter { $0.rect.intersects(viewport) }
@@ -92,7 +154,7 @@ package enum MetalGridFrameComposer {
             cache.uploadVisible(
                 wanted: wanted,
                 revealStartedAt: now,
-                revealIDs: Set(visibleIDs)
+                revealIDs: wanted.isEmpty ? [] : Set(visibleIDs)
             ) { provideImage($0) }
         }
         // A pending photo's new revision replaces its texture in place, also while scrolling.
@@ -142,9 +204,7 @@ package enum MetalGridFrameComposer {
     /// settled appearance: rounded thumbnail cover-fit on the uniform bg + optional production decorations).
     /// Pure builder - no eviction, no draw. Returns (groups, resident-texture count).
     ///
-    /// The image group is always the first (back-most) group even when empty (the renderer skips empty groups),
-    /// then, if `decorations` are supplied, the selection outline + badge groups in a fixed order. Missing
-    /// thumbnails draw nothing, so gaps + aspectFit letterbox reveal the same uniform surface.
+    /// Missing known tiles draw behind real images and their decorations.
     @MainActor
     package static func buildGroups<ID: Hashable & Sendable>(
         slots: [GridRenderSlot],
@@ -154,7 +214,9 @@ package enum MetalGridFrameComposer {
         cornerRadius: CGFloat,
         decorations: MetalGridDecorations<ID>?,
         contentTransition: TileContentDisplayTransition? = nil,
-        now: Double = .greatestFiniteMagnitude
+        now: Double = .greatestFiniteMagnitude,
+        placeholderPulse: MetalGridPlaceholderPulse = MetalGridPlaceholderPulse(),
+        canRetryPlaceholder: (ID) -> Bool = { _ in true }
     ) -> (groups: [MetalGridRenderGroup], realCount: Int) {
         buildGroups(
             compositionSlots: slots.map { CompositionSlot(index: $0.index, rect: $0.rect, alpha: 1) },
@@ -164,7 +226,9 @@ package enum MetalGridFrameComposer {
             cornerRadius: cornerRadius,
             decorations: decorations,
             contentTransition: contentTransition,
-            now: now
+            now: now,
+            placeholderPulse: placeholderPulse,
+            canRetryPlaceholder: canRetryPlaceholder
         )
     }
 
@@ -180,7 +244,9 @@ package enum MetalGridFrameComposer {
         cornerRadius: CGFloat,
         decorations: MetalGridDecorations<ID>?,
         rectTransform: (CGRect) -> CGRect = { $0 },
-        now: Double = .greatestFiniteMagnitude
+        now: Double = .greatestFiniteMagnitude,
+        placeholderPulse: MetalGridPlaceholderPulse = MetalGridPlaceholderPulse(),
+        canRetryPlaceholder: (ID) -> Bool = { _ in true }
     ) -> (groups: [MetalGridRenderGroup], realCount: Int) {
         buildGroups(
             compositionSlots: draws.map {
@@ -196,7 +262,9 @@ package enum MetalGridFrameComposer {
             cornerRadius: cornerRadius,
             decorations: decorations,
             contentTransition: nil,
-            now: now
+            now: now,
+            placeholderPulse: placeholderPulse,
+            canRetryPlaceholder: canRetryPlaceholder
         )
     }
 
@@ -209,10 +277,13 @@ package enum MetalGridFrameComposer {
         cornerRadius: CGFloat,
         decorations: MetalGridDecorations<ID>?,
         contentTransition: TileContentDisplayTransition?,
-        now: Double
+        now: Double,
+        placeholderPulse: MetalGridPlaceholderPulse,
+        canRetryPlaceholder: (ID) -> Bool
     ) -> (groups: [MetalGridRenderGroup], realCount: Int) {
         var images: [MetalGridQuad] = []
         var imageTextures: [MTLTexture] = []
+        var placeholders: [MetalGridQuad] = []
         var outlineQuads: [MetalGridQuad] = []
         var favoriteQuads: [MetalGridQuad] = []
         var checkFilledQuads: [MetalGridQuad] = []
@@ -221,6 +292,10 @@ package enum MetalGridFrameComposer {
         var metadataGlyphQuads: [MetalGridQuad] = []
         var metadataGlyphTextures: [MTLTexture] = []
         var realCount = 0
+        var pendingDecorations:
+            [(uid: ID, index: Int, slot: CGRect, frame: CGRect, resident: Bool, radius: Float, alpha: Float)] =
+                []
+        let sharedLight = placeholderPulse.lightPosition(now: now)
         for s in compositionSlots where s.index >= 0 && s.index < flatUIDs.count {
             let uid = flatUIDs[s.index]
             let cell = s.rect  // viewport-space, ALWAYS square (engine guarantee)
@@ -260,13 +335,40 @@ package enum MetalGridFrameComposer {
             } else {
                 drawAlpha = s.alpha
             }
-            if let decorations {
+            if !hasThumbnail || drawAlpha < s.alpha {
+                let placeholderAlpha = hasThumbnail ? max(0, s.alpha - drawAlpha) : s.alpha
+                let animate = placeholderPulse.isAnimating && canRetryPlaceholder(uid)
+                placeholders.append(
+                    MetalGridQuad(
+                        rect: cell, radius: r, alpha: placeholderAlpha,
+                        color: SIMD4(1, 1, 1, MetalGridPlaceholderPulse.beamOpacity), mode: .thumbnailPlaceholder,
+                        borderWidth: animate ? sharedLight : MetalGridPlaceholderPulse.staticLight
+                    ))
+            }
+            if decorations != nil {
+                pendingDecorations.append((uid, s.index, cell, displayed, hasThumbnail, r, drawAlpha))
+            }
+        }
+        if let decorations {
+            let neighboringTiles = pendingDecorations.map(\.frame)
+            if decorations.selectionMode {
+                decorations.selectionBadgeLayout.prepare(
+                    slots: pendingDecorations.map(\.slot), tiles: neighboringTiles,
+                    normalMarks: neighboringTiles.map { frame in
+                        let metrics = selectionMarkMetrics(in: frame)
+                        return ReservedRegionLayout.homeMarkRect(in: frame, side: metrics.side, inset: metrics.inset)
+                    }, regions: decorations.reservedRegions, scrollBucket: compositionSlots.first?.index ?? 0,
+                    indices: pendingDecorations.map(\.index))
+            }
+            for (index, pending) in pendingDecorations.enumerated() {
                 appendDecorations(
-                    uid: uid,
-                    displayed: displayed,
-                    hasThumbnail: hasThumbnail,
-                    cardRadius: r,
-                    drawAlpha: drawAlpha,
+                    uid: pending.uid,
+                    displayed: pending.frame,
+                    hasThumbnail: pending.resident,
+                    cardRadius: pending.radius,
+                    drawAlpha: pending.alpha,
+                    neighboringTiles: neighboringTiles,
+                    row: decorations.selectionBadgeLayout.row(at: index),
                     decorations: decorations,
                     cache: cache,
                     outline: &outlineQuads,
@@ -279,9 +381,11 @@ package enum MetalGridFrameComposer {
                 )
             }
         }
-        var groups: [MetalGridRenderGroup] = [
-            MetalGridRenderGroup(source: .perQuadTexture(imageTextures), quads: images)
-        ]
+        var groups: [MetalGridRenderGroup] = []
+        if !placeholders.isEmpty {
+            groups.append(MetalGridRenderGroup(source: .sharedTexture(cache.placeholderTexture), quads: placeholders))
+        }
+        groups.append(MetalGridRenderGroup(source: .perQuadTexture(imageTextures), quads: images))
         if !outlineQuads.isEmpty {
             groups.append(MetalGridRenderGroup(source: .sharedTexture(cache.placeholderTexture), quads: outlineQuads))
         }
@@ -341,6 +445,15 @@ package enum MetalGridFrameComposer {
         Float(GridCornerRadiusPolicy.radius(forSlotSidePoints: min(cell.width, cell.height), base: base))
     }
 
+    private static func selectionMarkMetrics(
+        in frame: CGRect
+    ) -> (side: CGFloat, preferredInset: CGFloat, inset: CGFloat) {
+        let extent = min(frame.width, frame.height)
+        let side = min(22, max(11, extent * 0.3))
+        let preferred = min(7, max(3, extent * 0.06))
+        return (side, preferred, ReservedRegionLayout.selectionMarkInset(in: frame, side: side, preferred: preferred))
+    }
+
     @MainActor
     private static func appendDecorations<ID: Hashable & Sendable>(
         uid: ID,
@@ -348,6 +461,8 @@ package enum MetalGridFrameComposer {
         hasThumbnail: Bool,
         cardRadius: Float,
         drawAlpha: Float,
+        neighboringTiles: [CGRect],
+        row: GridSelectionBadgeRow?,
         decorations: MetalGridDecorations<ID>,
         cache: MetalGridTextureCache<ID>,
         outline: inout [MetalGridQuad], favorite: inout [MetalGridQuad],
@@ -356,9 +471,9 @@ package enum MetalGridFrameComposer {
         metadataGlyphs: inout [MetalGridQuad],
         metadataGlyphTextures: inout [MTLTexture]
     ) {
-        let side = min(displayed.width, displayed.height)
-        let badge = min(22, max(11, side * 0.3))
-        let pad = min(7, max(3, side * 0.06))
+        let metrics = selectionMarkMetrics(in: displayed)
+        let badge = metrics.side
+        let pad = metrics.preferredInset
         let isSelected = decorations.selected.contains(uid)
         // Draw the selection outline without changing layout.
         if isSelected {
@@ -374,11 +489,11 @@ package enum MetalGridFrameComposer {
                 ))
         }
 
+        let overlay = decorations.overlay(uid)
         let bottomTrailingInset =
             decorations.selectionMode || decorations.favorites.contains(uid)
             ? badge + pad
             : 0
-        let overlay = decorations.overlay(uid)
         let overlayLayouts =
             hasThumbnail
             ? GridThumbnailOverlayPolicy.layouts(
@@ -387,6 +502,23 @@ package enum MetalGridFrameComposer {
                 bottomTrailingInset: bottomTrailingInset
             )
             : []
+        // The selection mark leaves the bottom-trailing corner when an active reserved region (the iPhone Duo fold)
+        // covers it, for the nearest free position of the tile; the labels keep their place.
+        let selectionInset = metrics.inset
+        let homeMark = ReservedRegionLayout.homeMarkRect(
+            in: displayed, side: badge, inset: decorations.selectionMode ? selectionInset : pad)
+        let selectionMark: CGRect
+        if decorations.selectionMode, let frame = decorations.selectionBadgeFrame {
+            selectionMark = frame(
+                uid, displayed, badge, selectionInset, decorations.reservedRegions,
+                overlayLayouts.map(\.backgroundRect), neighboringTiles, row, decorations.selectionBadgeLayout)
+        } else if decorations.selectionMode, !decorations.reservedRegions.isEmpty {
+            selectionMark = decorations.reservedRegions.selectionMarkRect(
+                in: displayed, side: badge, inset: selectionInset, avoiding: overlayLayouts.map(\.backgroundRect),
+                neighboringTiles: neighboringTiles, layout: decorations.selectionBadgeLayout)
+        } else {
+            selectionMark = homeMark
+        }
         // A photo on its way to Proton shows its upload state top-trailing; selection mode owns the corners.
         let badgeFrame =
             decorations.uploadBadgeFrame.map { $0(uid, overlay.uploadBadge) }
@@ -454,22 +586,17 @@ package enum MetalGridFrameComposer {
             }
         }
 
-        let bottomRight = CGRect(
-            x: displayed.maxX - badge - pad,
-            y: displayed.maxY - badge - pad,
-            width: badge,
-            height: badge
-        )
         // Reserve the bottom-trailing badge area when placing a duration label.
         if decorations.favorites.contains(uid), !decorations.selectionMode {
-            favorite.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
+            favorite.append(MetalGridQuad(rect: homeMark, radius: 0, alpha: drawAlpha))
         }
-        if decorations.selectionMode {
-            // Checkmark badge, bottom-right (filled+accent when selected, empty circle otherwise).
+        if decorations.selectionMode, !selectionMark.isNull {
+            // Checkmark badge, bottom-right unless a reserved region covers it (filled+accent when selected, empty
+            // circle otherwise).
             if isSelected {
-                checkFilled.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
+                checkFilled.append(MetalGridQuad(rect: selectionMark, radius: 0, alpha: drawAlpha))
             } else {
-                checkEmpty.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
+                checkEmpty.append(MetalGridQuad(rect: selectionMark, radius: 0, alpha: drawAlpha))
             }
         }
     }
@@ -488,6 +615,16 @@ package struct MetalGridDecorations<ID: Hashable> {
     package var overlay: @MainActor (ID) -> GridThumbnailOverlay
     /// The animated upload badge for a photo and the badge the backup reports; nil draws the badge as is.
     package var uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)?
+    /// The active reserved regions of the viewport (the iPhone Duo fold); selection marks move out of them.
+    package var reservedRegions: ReservedRegionLayout
+    package var selectionBadgeLayout: GridSelectionBadgeLayout
+    package var selectionBadgeFrame:
+        (
+            @MainActor (
+                ID, CGRect, CGFloat, CGFloat, ReservedRegionLayout, [CGRect], [CGRect], GridSelectionBadgeRow?,
+                GridSelectionBadgeLayout
+            ) -> CGRect
+        )?
 
     package init(
         accent: SIMD4<Float>,
@@ -496,7 +633,15 @@ package struct MetalGridDecorations<ID: Hashable> {
         selected: Set<ID>,
         favorites: Set<ID>,
         overlay: @escaping @MainActor (ID) -> GridThumbnailOverlay,
-        uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)? = nil
+        uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)? = nil,
+        reservedRegions: ReservedRegionLayout = .none,
+        selectionBadgeLayout: GridSelectionBadgeLayout = GridSelectionBadgeLayout(),
+        selectionBadgeFrame: (
+            @MainActor (
+                ID, CGRect, CGFloat, CGFloat, ReservedRegionLayout, [CGRect], [CGRect], GridSelectionBadgeRow?,
+                GridSelectionBadgeLayout
+            ) -> CGRect
+        )? = nil
     ) {
         self.accent = accent
         self.accentGlyphColor = accentGlyphColor
@@ -505,6 +650,9 @@ package struct MetalGridDecorations<ID: Hashable> {
         self.favorites = favorites
         self.overlay = overlay
         self.uploadBadgeFrame = uploadBadgeFrame
+        self.reservedRegions = reservedRegions
+        self.selectionBadgeLayout = selectionBadgeLayout
+        self.selectionBadgeFrame = selectionBadgeFrame
     }
 }
 

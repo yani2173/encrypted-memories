@@ -53,14 +53,14 @@ final class MobileDuplicatesUITests: XCTestCase {
         openDuplicates(fixture: "-EncryptedMemoriesDuplicatesCheckingFixture")
 
         XCTAssertTrue(app.staticTexts["Checking Your Library"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Duplicates appear here when it is done."].exists)
+        XCTAssertTrue(app.staticTexts["Duplicates appear here when it is done."].waitForExistence(timeout: 10))
         let progress = app.progressIndicators["duplicates.checkProgress"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 5), "the check shows its progress")
         XCTAssertGreaterThanOrEqual(progress.frame.width, 120)
         XCTAssertLessThanOrEqual(progress.frame.width, 320)
         XCTAssertTrue(
             app.staticTexts.matching(NSPredicate(format: "label CONTAINS '1,234 of 15,000 photos'"))
-                .firstMatch.exists
+                .firstMatch.waitForExistence(timeout: 10)
                 || (progress.value as? String)?.contains("1,234 of 15,000 photos") == true,
             "the progress counts the checked photos")
         XCTAssertFalse(app.staticTexts["No Duplicates"].exists)
@@ -121,16 +121,16 @@ final class MobileDuplicatesUITests: XCTestCase {
         app.buttons["duplicates.merge.0"].tap()
         let retry = app.buttons["Try again"].firstMatch
         XCTAssertTrue(retry.waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].exists)
+        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].waitForExistence(timeout: 10))
         XCTAssertFalse(group(0).exists, "invalidated rows stay hidden")
-        XCTAssertFalse(app.buttons["duplicates.mergeAll"].isEnabled)
+        waitUntil(app.buttons["duplicates.mergeAll"], "isEnabled == false", "Merge All stays off")
         keepScreenshot("duplicates-ios-reload-failed")
 
         retry.tap()
         XCTAssertTrue(group(1).waitForExistence(timeout: 10), "Retry restores the checked list")
-        XCTAssertTrue(app.buttons["duplicates.mergeAll"].isEnabled)
+        waitUntil(app.buttons["duplicates.mergeAll"], "isEnabled == true", "Retry turns Merge All on again")
         XCTAssertFalse(retry.exists)
-        XCTAssertTrue(app.staticTexts["4 identical copies"].exists)
+        XCTAssertTrue(app.staticTexts["4 identical copies"].waitForExistence(timeout: 10))
     }
 
     func testRetryRestartsTheLibraryCheckAfterTwoServiceInterruptions() {
@@ -139,13 +139,74 @@ final class MobileDuplicatesUITests: XCTestCase {
             extra: ["-EncryptedMemoriesDuplicatesInterruptedCheck"])
         let retry = app.buttons["Try again"].firstMatch
         XCTAssertTrue(retry.waitForExistence(timeout: 10), "two interruptions must end waiting")
-        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].exists)
+        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts["Duplicates appear here when it is done."].exists)
         keepScreenshot("duplicates-ios-interrupted-check")
 
         retry.tap()
         XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 10))
         XCTAssertFalse(retry.exists)
+    }
+
+    func testRetryMergesOnlyTheFailedGroupAfterPartialFailure() {
+        for language in ["en", "de"] {
+            openDuplicates(
+                fixture: "-EncryptedMemoriesDuplicatesFixture",
+                extra: ["-EncryptedMemoriesDuplicatesMergeFailure"], language: language)
+            XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+            app.buttons["duplicates.mergeAll"].tap()
+            let confirmation = app.alerts.firstMatch
+            XCTAssertTrue(confirmation.waitForExistence(timeout: 10))
+            let confirm = confirmation.buttons["duplicates.mergeAll.dialog"].firstMatch
+            XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+            waitUntil(confirm, "isHittable == true", "the alert is ready for a tap")
+            confirm.tap()
+            let title =
+                language == "de"
+                ? "Einige Duplikate wurden nicht zusammengeführt" : "Some duplicates were not merged"
+            let warning = app.alerts[title]
+            XCTAssertTrue(warning.waitForExistence(timeout: 15))
+            let message =
+                language == "de"
+                ? "1 von 2 Gruppen konnten nicht zusammengeführt werden."
+                : "1 of 2 groups could not be merged."
+            XCTAssertTrue(warning.staticTexts[message].exists)
+            let retry = warning.buttons["duplicates.retryMerge"].firstMatch
+            XCTAssertTrue(retry.exists)
+            XCTAssertEqual(retry.label, language == "de" ? "Erneut versuchen" : "Try Again")
+            keepScreenshot("duplicates-partial-retry-\(language)")
+            retry.tap()
+            XCTAssertTrue(
+                app.staticTexts[language == "de" ? "Keine Duplikate" : "No Duplicates"]
+                    .waitForExistence(timeout: 15))
+            XCTAssertFalse(warning.exists)
+            app.terminate()
+        }
+    }
+
+    func testPermanentPartialFailureHasAReasonAndOnlyOK() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture",
+            extra: ["-EncryptedMemoriesDuplicatesPermanentMergeFailure"])
+        XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+        app.buttons["duplicates.mergeAll"].tap()
+        let confirmation = app.alerts.firstMatch
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 10))
+        let confirm = confirmation.buttons["duplicates.mergeAll.dialog"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+        waitUntil(confirm, "isHittable == true", "the alert is ready for a tap")
+        confirm.tap()
+        let warning = app.alerts["Some duplicates were not merged"]
+        XCTAssertTrue(warning.waitForExistence(timeout: 15))
+        XCTAssertFalse(warning.buttons["duplicates.retryMerge"].exists)
+        XCTAssertTrue(
+            warning.staticTexts.matching(
+                NSPredicate(
+                    format: "label CONTAINS %@", "These groups could not be merged.")
+            ).firstMatch.exists)
+        keepScreenshot("duplicates-partial-permanent")
+        warning.buttons["OK"].firstMatch.tap()
+        XCTAssertTrue(group(0).waitForExistence(timeout: 5))
     }
 
     func testMergeRemovesTheGroupFromDuplicates() {
@@ -155,7 +216,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         merge.tap()
 
         waitUntilGone(group(1), "the merged group leaves the list")
-        XCTAssertTrue(group(0).exists, "the other group stays")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the other group stays")
     }
 
     func testTheInitialCheckHidesCandidatesAndDisablesMergeAll() {
@@ -163,7 +224,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowCheck"])
         let progress = app.progressIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].waitForExistence(timeout: 10))
         XCTAssertFalse(group(0).exists, "unchecked candidates have no rows or per-group merge")
         XCTAssertFalse(app.staticTexts["No Duplicates"].exists)
         XCTAssertFalse(app.staticTexts["duplicates.copyCount"].exists)
@@ -174,8 +235,8 @@ final class MobileDuplicatesUITests: XCTestCase {
             ).firstMatch.exists)
 
         let mergeAll = app.buttons["duplicates.mergeAll"]
-        XCTAssertTrue(mergeAll.exists, "the toolbar action stays visible")
-        XCTAssertFalse(mergeAll.isEnabled, "the final checked list must arrive first")
+        XCTAssertTrue(mergeAll.waitForExistence(timeout: 10), "the toolbar action stays visible")
+        waitUntil(mergeAll, "isEnabled == false", "the final checked list must arrive first")
         XCTAssertFalse(app.buttons["duplicates.mergeAll.dialog"].exists)
     }
 
@@ -198,16 +259,17 @@ final class MobileDuplicatesUITests: XCTestCase {
     private func assertWaitingLayout() {
         let progress = app.progressIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].waitForExistence(timeout: 10))
         XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == 'Checking duplicates'")).count, 1)
-        XCTAssertTrue(app.staticTexts["Looking for identical copies in your library."].exists)
+        XCTAssertTrue(
+            app.staticTexts["Looking for identical copies in your library."].waitForExistence(timeout: 10))
         XCTAssertGreaterThanOrEqual(progress.frame.width, 120)
         XCTAssertLessThanOrEqual(progress.frame.width, 320)
         XCTAssertLessThanOrEqual(
             progress.frame.width, app.staticTexts["Looking for identical copies in your library."].frame.width)
         XCTAssertEqual(progress.label, "Checking duplicates", "VoiceOver names the bar after the waiting state")
         let percent = app.staticTexts.matching(NSPredicate(format: "label ENDSWITH '%'")).firstMatch
-        XCTAssertTrue(percent.exists)
+        XCTAssertTrue(percent.waitForExistence(timeout: 10))
         XCTAssertEqual(percent.frame.midX, progress.frame.midX, accuracy: 1, "the percentage stays centered")
         print(
             "[Duplicates layout] window=\(app.windows.firstMatch.frame.width) bar=\(progress.frame.width) percentMidX=\(percent.frame.midX) barMidX=\(progress.frame.midX)"
@@ -220,9 +282,12 @@ final class MobileDuplicatesUITests: XCTestCase {
             fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowScan"])
         let progress = app.activityIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
-        XCTAssertTrue(app.staticTexts["Looking for identical copies in your library."].exists)
-        XCTAssertFalse(app.buttons["duplicates.mergeAll"].isEnabled)
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].waitForExistence(timeout: 10))
+        XCTAssertTrue(
+            app.staticTexts["Looking for identical copies in your library."].waitForExistence(timeout: 10))
+        let mergeAll = app.buttons["duplicates.mergeAll"]
+        XCTAssertTrue(mergeAll.waitForExistence(timeout: 10), "the toolbar action stays visible")
+        waitUntil(mergeAll, "isEnabled == false", "the final checked list must arrive first")
         XCTAssertFalse(group(0).exists)
         XCTAssertEqual(
             progress.frame.midX, app.staticTexts["Looking for identical copies in your library."].frame.midX,
@@ -230,10 +295,15 @@ final class MobileDuplicatesUITests: XCTestCase {
         keepScreenshot("duplicates-ios-slim-scan")
     }
 
-    func testMergeAllUsesAnAlertWithShortLocalizedActionsAndCancelKeepsTheGroups() {
+    func testMergeAllUsesAnAlertWithShortLocalizedActionsAndCancelKeepsTheGroups() throws {
         for language in ["en", "de"] {
             openDuplicates(fixture: "-EncryptedMemoriesDuplicatesFixture", language: language)
+            let tabTitles =
+                language == "de" ? ["Mediathek", "Sammlungen", "Suchen"] : ["Library", "Collections", "Search"]
+            let verticalColumn = try app.verticalTabColumn(titles: tabTitles)
             revealGroup(1)
+            // A vertical bar reserves space beside the list; horizontal bars keep the full-window centre.
+            let contentColumn = group(1).frame
             app.buttons["duplicates.mergeAll"].tap()
             let alert = app.alerts.firstMatch
             XCTAssertTrue(alert.waitForExistence(timeout: 10), "Merge All uses a native alert")
@@ -242,8 +312,8 @@ final class MobileDuplicatesUITests: XCTestCase {
             XCTAssertTrue(confirm.exists)
             XCTAssertEqual(confirm.label, language == "de" ? "Zusammenführen" : "Merge")
             XCTAssertTrue(confirm.isEnabled)
-            XCTAssertTrue(confirm.isHittable)
-            XCTAssertTrue(cancel.isHittable)
+            waitUntil(confirm, "isHittable == true", "the Merge action is ready for a tap")
+            waitUntil(cancel, "isHittable == true", "the Cancel action is ready for a tap")
             // SwiftUI exposes the Merge action and its same-frame child as two accessibility buttons.
             let visibleActions = Set(
                 alert.buttons.allElementsBoundByIndex.map { "\($0.label)|\($0.frame)" })
@@ -257,7 +327,18 @@ final class MobileDuplicatesUITests: XCTestCase {
                     : "The copies are identical. One photo of each group stays, with its favorites and albums. 2 photos move to Recently Deleted."
             ]
             XCTAssertTrue(message.exists)
-            XCTAssertEqual(alert.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 2)
+            let geometry = XCTAttachment(string: app.debugDescription)
+            geometry.name = "Duplicate alert content geometry"
+            geometry.lifetime = .keepAlways
+            add(geometry)
+            print(
+                "[Duplicates content] column=\(contentColumn) window=\(app.windows.firstMatch.frame) alert=\(alert.frame)"
+            )
+            if verticalColumn != nil {
+                XCTAssertEqual(alert.frame.midX, contentColumn.midX, accuracy: 2)
+            } else {
+                XCTAssertEqual(alert.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 2)
+            }
             print(
                 "[Duplicates alert] language=\(language) alert=\(alert.frame) confirm=\(confirm.frame) cancel=\(cancel.frame)"
             )
@@ -346,7 +427,8 @@ final class MobileDuplicatesUITests: XCTestCase {
         let ranked = member(0, 0)
         let other = member(0, 1)
         XCTAssertTrue(other.waitForExistence(timeout: 5))
-        XCTAssertTrue(ranked.isSelected, "the ranked photo is kept first")
+        XCTAssertTrue(ranked.waitForExistence(timeout: 10))
+        waitUntil(ranked, "isSelected == true", "the ranked photo is kept first")
         XCTAssertFalse(other.isSelected)
         XCTAssertTrue(other.label.hasPrefix("Copy 2 of 2"), "each copy says its position, got \(other.label)")
 
@@ -354,9 +436,12 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         let keep = app.buttons["duplicates.viewer.keep"]
         XCTAssertTrue(keep.waitForExistence(timeout: 10), "a tap opens the photo with the merge tools")
+        waitUntil(keep, "label == 'Keep This Copy'", "the Keep button names its action")
         XCTAssertEqual(keep.label, "Keep This Copy")
         for action in ["Favorite", "Info"] {
-            XCTAssertTrue(app.buttons[action].firstMatch.exists, "the viewer keeps the library action \(action)")
+            XCTAssertTrue(
+                app.buttons[action].firstMatch.waitForExistence(timeout: 10),
+                "the viewer keeps the library action \(action)")
         }
         keep.tap()
         waitUntil(keep, "label == 'Kept'", "the shown photo is kept")
@@ -365,6 +450,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(other.waitForExistence(timeout: 10))
         waitUntil(other, "isSelected == true", "the list keeps the photo chosen in the viewer")
         XCTAssertFalse(ranked.isSelected)
+        waitUntil(other, "label CONTAINS ', kept'", "the kept copy says so")
         XCTAssertTrue(other.label.contains(", kept"), "the kept copy says so, got \(other.label)")
     }
 
@@ -380,7 +466,7 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         waitUntilGone(merge, "the viewer closes")
         waitUntilGone(group(1), "the merged group leaves the list")
-        XCTAssertTrue(group(0).exists, "the other group stays")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the other group stays")
     }
 
     func testSwipingDownClosesTheViewerOfAGroupLikeTheLibraryViewer() {
@@ -473,6 +559,7 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         let copy = member(1, 0)
         XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        XCTAssertTrue(member(1, 1).waitForExistence(timeout: 10))
         XCTAssertTrue(isOnScreen(member(1, 1)), "both copies fit")
         let copyX = copy.frame.minX
         dragLeft(group(1))

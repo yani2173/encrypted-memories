@@ -78,6 +78,12 @@ public extension AlbumSyncBackupExecuting {
 /// Remote (Proton) album operations the sync engine needs. Implemented by the backend package;
 /// injected so this module remains independent of the concrete transport.
 public protocol AlbumSyncRemoteAlbumOps: Sendable {
+    func photoRecoveryContext() async throws -> AlbumSyncPhotoRecovery.Context?
+    func photoRecoveryState(for record: UploadIdentityRecord) async throws -> AlbumSyncPhotoRecovery.RemoteState
+    func restorePhoto(
+        _ uid: PhotoUID, context: AlbumSyncPhotoRecovery.Context,
+        validate: @Sendable () async throws -> Void
+    ) async throws
     /// The user's Proton albums with decrypted titles (for the same-name conflict pre-check).
     func listAlbums() async throws -> [AlbumSyncRemoteAlbum]
     /// Creates an album and returns its id. Must throw on failure - never a fake id.
@@ -96,6 +102,15 @@ public protocol AlbumSyncRemoteAlbumOps: Sendable {
 }
 
 public extension AlbumSyncRemoteAlbumOps {
+    func photoRecoveryContext() async throws -> AlbumSyncPhotoRecovery.Context? { nil }
+    func photoRecoveryState(for record: UploadIdentityRecord) async throws -> AlbumSyncPhotoRecovery.RemoteState {
+        .unavailable
+    }
+    func restorePhoto(
+        _ uid: PhotoUID, context: AlbumSyncPhotoRecovery.Context,
+        validate: @Sendable () async throws -> Void
+    ) async throws { throw AlbumSyncPhotoRecovery.Error.unavailable }
+
     func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState] {
         [:]
     }

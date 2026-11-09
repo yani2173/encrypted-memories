@@ -44,7 +44,7 @@ import TimelineCore
         #expect(touchCompact.defaultLevel == 1)
         #expect(touchCompact.levels.map(\.nominalColumns) == [2, 3, 5, 7, 12, 20])
         #expect(touchRegular.defaultLevel == 1)
-        #expect(touchRegular.levels.map(\.nominalColumns) == regular.levels.map(\.nominalColumns))
+        #expect(touchRegular.levels.map(\.nominalColumns) == [4, 6, 8, 10, 20, 30])
         #expect(
             config.resolver.profile(
                 for: TimelineGridViewport(layoutWidth: 820, inputAffinity: .touch)

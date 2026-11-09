@@ -112,6 +112,35 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertEqual(superseded(), [head.nodeID])
     }
 
+    func testAReplacementCopyThatTheReadOfThisCheckNamesRelatedIsNotAdopted() async throws {
+        try await assertScopeMainStateDoesNotAdopt { head in
+            RemoteLinkVisibility(isActive: true, mainPhotoLinkID: head.nodeID)
+        }
+    }
+
+    func testAReplacementCopyWithoutAPhotoRoleInTheReadOfThisCheckIsNotAdopted() async throws {
+        try await assertScopeMainStateDoesNotAdopt { _ in
+            RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+        }
+    }
+
+    /// The scope read named the copy an active main photo; the read of this check does not.
+    private func assertScopeMainStateDoesNotAdopt(
+        now: (PhotoUID) -> RemoteLinkVisibility, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let head = try seed("head")
+        let copy = try seed("next", filename: "Copy.JPG", cloudID: nil, includeOriginal: false)
+        server.setVisibilityAfterContentLookup(now(head), for: copy.nodeID)
+        let local = descriptor("next")
+
+        let result = try await pipeline.resolve(local)
+        await pipeline.uploadDidFail(local)
+
+        XCTAssertEqual(result.decision, .upload, file: file, line: line)
+        XCTAssertNil(identities.record(for: source)?.remoteLinkID, file: file, line: line)
+        XCTAssertEqual(superseded(), [head.nodeID], file: file, line: line)
+    }
+
     /// Another device's newer edit proves the photo live: the older edit uploads next to it and asks nothing.
     func testNewerHeadOfAnotherDeviceProvesThePhotoLiveWithoutBecomingATarget() async throws {
         let original = try seed("original", filename: "IMG_1.HEIC")
@@ -516,18 +545,33 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertEqual(server.links.first { $0.uid == replacement }?.state, .active)
     }
 
-    func testFailedVisibilityReadKeepsTodaysDuplicateDecision() async throws {
+    /// A failed visibility read starts no replacement. The name row of the duplicate needs a current state (#879), so
+    /// the check fails closed without a record; once the read works, it decides like a check that never failed.
+    func testFailedVisibilityReadStartsNoReplacementAndAdoptsNothing() async throws {
         _ = try seed("head")
         let duplicate = try seed("next", filename: "Render.JPG", cloudID: "other-asset")
         let baseline = UploadDedupePipeline(store: FakeIdentityStore(), checker: server)
         let today = try await baseline.resolve(descriptor("next"))
         server.configureOptionalReads(visibilityFails: true)
 
-        let result = try await pipeline.resolve(descriptor("next"))
+        let failed = try? await pipeline.resolve(descriptor("next"))
 
         XCTAssertEqual(today.decision, .skip(.activeDuplicate, remoteLinkID: duplicate.nodeID))
-        XCTAssertEqual(result.decision, today.decision)
+        XCTAssertNil(failed, "a failed state read must not settle the photo")
+        XCTAssertNil(identities.record(for: source)?.remoteLinkID)
         XCTAssertTrue(journal.entry(for: source).isEmpty)
+        server.configureOptionalReads(visibilityFails: false)
+        await pipeline.uploadDidFail(descriptor("next"))
+
+        let result = try await pipeline.resolve(descriptor("next"))
+
+        let otherDirectory = directory.appendingPathComponent("never-failed", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherDirectory, withIntermediateDirectories: true)
+        let otherJournal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: otherDirectory))
+        let neverFailed = try await UploadDedupePipeline(
+            store: FakeIdentityStore(), checker: server, replacementJournal: otherJournal
+        ).resolve(descriptor("next"))
+        XCTAssertEqual(result.decision, neverFailed.decision)
     }
 
     func testMissingLocalEditTimeKeepsTodaysScope() async throws {

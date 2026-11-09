@@ -243,6 +243,19 @@ struct UIKitTimelinePerformanceTests {
         #expect(setup.driver.installationCount == 1)
     }
 
+    @Test func repeatedEncodingFailuresStopTheLinkAfterABoundedRetry() throws {
+        let failing = makeTestHost(outcomes: Array(repeating: .encodingFailed, count: 10))
+        let link = try #require(failing.factory.links.first)
+        let base = CACurrentMediaTime()
+        var fired = 0
+        while failing.driver.isRunning, fired < 10 {
+            link.fire(timestamp: base + Double(fired) / 120.0, interval: 1.0 / 120.0)
+            fired += 1
+        }
+        #expect(!failing.driver.isRunning)
+        #expect(fired == GridFramePump.maximumEncodingRetries + 1)
+    }
+
     @Test func drawableRetryAndInvalidationDuringFrameKeepTheSameLink() throws {
         let retry = makeTestHost(outcomes: [.noDrawable, .drawn(hasPendingWork: false)])
         let retryLink = try #require(retry.factory.links.first)

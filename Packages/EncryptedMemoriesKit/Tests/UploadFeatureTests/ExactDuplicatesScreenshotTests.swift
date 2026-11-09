@@ -301,6 +301,8 @@
 
     /// Fixed answers for one state of the screen. A held ranking or build never finishes while the screen renders.
     private final class ScreenshotFinder: ExactDuplicateMerging, @unchecked Sendable {
+        func confirmNoPendingMerges() async -> Bool { true }
+        func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
         enum Build { case none, counted }
 
         let groups: [ExactDuplicateGroup]

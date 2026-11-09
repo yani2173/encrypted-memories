@@ -6,6 +6,7 @@
 	<array>
 		<string>at.oncloud.encryptedmemories.photo-backup.processing</string>
 		<string>at.oncloud.encryptedmemories.smart-search.processing</string>
+		<string>at.oncloud.encryptedmemories.photo-backup.refresh</string>
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
@@ -46,6 +47,7 @@
 	</dict>
 	<key>UIBackgroundModes</key>
 	<array>
+		<string>fetch</string>
 		<string>processing</string>
 	</array>
 	<key>UILaunchStoryboardName</key>

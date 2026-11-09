@@ -243,13 +243,6 @@ struct ThumbnailHealthTests {
         #expect(result.mainThreadDecodeCount == 0)
     }
 
-    @Test func noNPlusOneDBDuringPinchTest() {
-        Self.diagnostics.resetForTests()
-        Self.diagnostics.setActivePinch(true)
-        Self.diagnostics.setActivePinch(false)
-        #expect(Self.diagnostics.dbQueryCountDuringActivePinch() == 0)
-    }
-
     @Test func prefetchProgressTest() async throws {
         // Unique nodeID per run: the prefetch resume-checkpoint is persisted in UserDefaults keyed by
         // the uid list's (count-first-last) signature, so a fixed id would resume "at end" on reruns.
@@ -300,56 +293,6 @@ struct ThumbnailHealthTests {
         #expect(!decoded.gpuTexture)
     }
 
-    @Test func coldCacheClassifiesVisiblePlaceholderCause() {
-        Self.diagnostics.resetForTests()
-        let uid = PhotoUID(volumeID: "vol", nodeID: "cold")
-        Self.diagnostics.classifyThumbnail(
-            ThumbnailVisualClassification(
-                uid: uid,
-                rect: CGRect(x: 0, y: 0, width: 50, height: 50),
-                state: .diskMissing,
-                phase: "pinchChanged",
-                context: "synthetic.coldCache"
-            ))
-        let counters = Self.diagnostics.thumbHealthCounters()
-        #expect(counters.visibleCount == 1)
-        #expect(counters.diskMissing == 1)
-        #expect(counters.geometryHole == 0)
-        #expect(counters.unknownBug == 0)
-    }
-
-    @Test func ramHitGpuMissClassificationTest() {
-        Self.diagnostics.resetForTests()
-        Self.diagnostics.classifyThumbnail(
-            ThumbnailVisualClassification(
-                uid: PhotoUID(volumeID: "vol", nodeID: "gpu-miss"),
-                rect: CGRect(x: 1, y: 2, width: 30, height: 30),
-                state: .ramHitGpuMissing,
-                phase: "pinchChanged",
-                context: "synthetic.ramWithoutTexture"
-            ))
-        let counters = Self.diagnostics.thumbHealthCounters()
-        #expect(counters.visibleCount == 1)
-        #expect(counters.ramHitGpuMissing == 1)
-        #expect(counters.geometryHole == 0)
-    }
-
-    @Test func geometryHoleDetectionTest() {
-        Self.diagnostics.resetForTests()
-        Self.diagnostics.classifyThumbnail(
-            ThumbnailVisualClassification(
-                uid: nil,
-                rect: CGRect(x: 10, y: 10, width: 100, height: 100),
-                state: .geometryHole,
-                phase: "pinchChanged",
-                context: "synthetic.omittedSprite"
-            ))
-        let counters = Self.diagnostics.thumbHealthCounters()
-        #expect(counters.visibleCount == 1)
-        #expect(counters.geometryHole == 1)
-        #expect(counters.diskMissing == 0)
-    }
-
     @Test func decodeWarmupStatsAreObservable() async throws {
         Self.diagnostics.resetForTests()
         let uid = PhotoUID(volumeID: "vol", nodeID: "decode-stats")
@@ -361,11 +304,11 @@ struct ThumbnailHealthTests {
 
         _ = await feed.warmDecoded([ThumbnailRequest(uid: uid)], priority: .visibleNow, limit: 1)
 
-        let stats = Self.diagnostics.decodeStats()
-        #expect(stats.diskCacheHit >= 1)
-        #expect(stats.ramDecodeStarted >= 1)
-        #expect(stats.ramDecodeCompleted >= 1)
-        #expect(stats.ramDecodeFailed == 0)
+        #expect(Self.diagnostics.counter("thumb.diskCacheHit") >= 1)
+        #expect(Self.diagnostics.counter("thumb.ramDecodeStarted") >= 1)
+        #expect(Self.diagnostics.counter("thumb.ramDecodeCompleted") >= 1)
+        #expect(Self.diagnostics.counter("thumb.ramDecodeFailed") == 0)
+        #expect(Self.diagnostics.counter("thumb.diskDecodeFailed") == 0)
     }
 
     private static func makeFeed(

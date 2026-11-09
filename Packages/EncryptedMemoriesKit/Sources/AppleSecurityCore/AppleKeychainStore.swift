@@ -14,6 +14,13 @@ public enum AppleKeychainAccessibility: Sendable, Hashable {
             kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         }
     }
+
+    /// The class of a stored item, or nil for a class this app never writes.
+    fileprivate init?(securityValue: String) {
+        let known: [Self] = [.whenUnlockedThisDeviceOnly, .afterFirstUnlockThisDeviceOnly]
+        guard let match = known.first(where: { $0.securityValue as String == securityValue }) else { return nil }
+        self = match
+    }
 }
 
 /// Complete identity and protection policy for one generic-password item.
@@ -38,7 +45,6 @@ public enum AppleSecurityOperation: String, Sendable, Equatable {
     case add
     case update
     case delete
-    case randomBytes
 }
 
 /// Typed Security.framework failure. The OSStatus is retained for diagnostics without exposing item data.
@@ -64,11 +70,20 @@ public protocol AppleKeychainStoring: Sendable {
     func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data
     func removeData(for item: AppleKeychainItem) throws
     func removeAllData(service: String) throws
+    /// The class of the stored item, or nil when no item exists or the store cannot tell.
+    func accessibility(for item: AppleKeychainItem) throws -> AppleKeychainAccessibility?
+}
+
+extension AppleKeychainStoring {
+    /// A store that cannot report the class returns nil, so no migration ever writes through it.
+    public func accessibility(for item: AppleKeychainItem) throws -> AppleKeychainAccessibility? { nil }
 }
 
 struct SecurityItemCopyResult: Sendable {
     let status: OSStatus
     let data: Data?
+    /// The `kSecAttrAccessible` value of an attribute query.
+    var accessible: String? = nil
 }
 
 protocol SecurityItemCalling: Sendable {
@@ -82,7 +97,9 @@ private struct SystemSecurityItemClient: SecurityItemCalling {
     func copyMatching(_ query: [String: Any]) -> SecurityItemCopyResult {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        return SecurityItemCopyResult(status: status, data: result as? Data)
+        let attributes = result as? [String: Any]
+        return SecurityItemCopyResult(
+            status: status, data: result as? Data, accessible: attributes?[kSecAttrAccessible as String] as? String)
     }
 
     func add(_ attributes: [String: Any]) -> OSStatus {
@@ -111,7 +128,21 @@ public struct SystemAppleKeychainStore: AppleKeychainStoring {
     }
 
     public func data(for item: AppleKeychainItem) throws -> Data? {
-        try read(item)
+        var query = baseQuery(item)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        let result = security.copyMatching(query)
+        switch result.status {
+        case errSecSuccess:
+            guard let data = result.data else {
+                throw AppleSecurityError(operation: .read, status: errSecDecode)
+            }
+            return data
+        case errSecItemNotFound:
+            return nil
+        default:
+            throw AppleSecurityError(operation: .read, status: result.status)
+        }
     }
 
     public func setData(_ data: Data, for item: AppleKeychainItem) throws {
@@ -155,41 +186,15 @@ public struct SystemAppleKeychainStore: AppleKeychainStoring {
     }
 
     public func removeData(for item: AppleKeychainItem) throws {
-        try delete(item)
-    }
-
-    /// Removes every generic-password item in an app-owned service, regardless of account. Full logout
-    /// uses this to sweep keys left by older accounts as well as the currently authenticated one.
-    public func removeAllData(service: String) throws {
-        try deleteService(service)
-    }
-
-    private func read(_ item: AppleKeychainItem) throws -> Data? {
-        var query = baseQuery(item)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        let result = security.copyMatching(query)
-        switch result.status {
-        case errSecSuccess:
-            guard let data = result.data else {
-                throw AppleSecurityError(operation: .read, status: errSecDecode)
-            }
-            return data
-        case errSecItemNotFound:
-            return nil
-        default:
-            throw AppleSecurityError(operation: .read, status: result.status)
-        }
-    }
-
-    private func delete(_ item: AppleKeychainItem) throws {
         let status = security.delete(baseQuery(item))
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw AppleSecurityError(operation: .delete, status: status)
         }
     }
 
-    private func deleteService(_ service: String) throws {
+    /// Removes every generic-password item in an app-owned service, regardless of account. Full logout
+    /// uses this to sweep keys left by older accounts as well as the currently authenticated one.
+    public func removeAllData(service: String) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -202,6 +207,22 @@ public struct SystemAppleKeychainStore: AppleKeychainStoring {
         }
     }
 
+    /// Reads only the attributes of the item, never its data.
+    public func accessibility(for item: AppleKeychainItem) throws -> AppleKeychainAccessibility? {
+        var query = baseQuery(item)
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        let result = security.copyMatching(query)
+        switch result.status {
+        case errSecSuccess:
+            return result.accessible.flatMap(AppleKeychainAccessibility.init(securityValue:))
+        case errSecItemNotFound:
+            return nil
+        default:
+            throw AppleSecurityError(operation: .read, status: result.status)
+        }
+    }
+
     private func baseQuery(_ item: AppleKeychainItem) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
@@ -210,23 +231,5 @@ public struct SystemAppleKeychainStore: AppleKeychainStoring {
             kSecAttrSynchronizable as String: false,
             kSecUseDataProtectionKeychain as String: true,
         ]
-    }
-}
-
-/// System CSPRNG shared by security-backed stores so feature modules do not grow their own Security boundary.
-public enum AppleSecureRandom {
-    public static func data(count: Int) throws -> Data {
-        guard count >= 0 else {
-            throw AppleSecurityError(operation: .randomBytes, status: errSecParam)
-        }
-        var data = Data(count: count)
-        let status = data.withUnsafeMutableBytes { bytes in
-            guard count > 0 else { return errSecSuccess }
-            return SecRandomCopyBytes(kSecRandomDefault, count, bytes.baseAddress!)
-        }
-        guard status == errSecSuccess else {
-            throw AppleSecurityError(operation: .randomBytes, status: status)
-        }
-        return data
     }
 }

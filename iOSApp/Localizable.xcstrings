@@ -7,13 +7,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Foto-Backup ist nicht verfügbar, weil der Duplikatschutz nicht initialisiert werden konnte."
+            "value": "Das Backup ist auf diesem Gerät nicht verfügbar."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Photos backup is unavailable because duplicate protection could not be initialized."
+            "value": "Backup is unavailable on this device."
           }
         }
       }
@@ -42,13 +42,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Album-Synchronisierung ist nicht verfügbar, weil die lokale Datenbank nicht geöffnet werden konnte."
+            "value": "Die Album-Synchronisierung ist auf diesem Gerät nicht verfügbar."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Album sync is unavailable because its local database could not be opened."
+            "value": "Album sync is unavailable on this device."
           }
         }
       }
@@ -673,13 +673,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die ausgewählten Objekte konnten nicht in den Papierkorb verschoben werden."
+            "value": "Das Verschieben in den Papierkorb wurde nicht abgeschlossen."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Couldn’t move the selected items to Trash."
+            "value": "Moving to Trash did not finish."
           }
         }
       }
@@ -775,13 +775,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die ausgewählten Objekte konnten nicht wiederhergestellt werden. Sie befinden sich weiterhin im Papierkorb."
+            "value": "Die Wiederherstellung wurde nicht abgeschlossen."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The selected items couldn’t be restored. They are still in Recently Deleted."
+            "value": "Restoring did not finish."
           }
         }
       }
@@ -1462,13 +1462,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Das Objekt konnte nicht wiederhergestellt werden. Es befindet sich weiterhin im Papierkorb."
+            "value": "Dieses Objekt konnte nicht wiederhergestellt werden."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The item couldn’t be restored. It is still in Recently Deleted."
+            "value": "This item could not be restored."
           }
         }
       }
@@ -1507,19 +1507,70 @@
         }
       }
     },
+    "viewer.share_burst_load_failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Fotos der Serie konnten nicht zum Teilen geladen werden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The burst photos couldn’t be loaded for sharing."
+          }
+        }
+      }
+    },
     "viewer.share_failed": {
       "extractionState": "manual",
       "localizations": {
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Das Original konnte nicht zum Teilen geladen werden."
+            "value": "Das Foto konnte nicht zum Teilen vorbereitet werden."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The original couldn’t be loaded for sharing."
+            "value": "The photo couldn’t be prepared for sharing."
+          }
+        }
+      }
+    },
+    "viewer.share_failed_photos": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Fotos konnten nicht zum Teilen vorbereitet werden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The photos couldn’t be prepared for sharing."
+          }
+        }
+      }
+    },
+    "viewer.share_failed_video": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Das Video konnte nicht zum Teilen vorbereitet werden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The video couldn’t be prepared for sharing."
           }
         }
       }
@@ -1547,13 +1598,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Das Objekt konnte nicht in den Papierkorb verschoben werden."
+            "value": "Dieses Objekt konnte nicht in den Papierkorb verschoben werden."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The item couldn’t be moved to Trash."
+            "value": "This item could not be moved to Trash."
           }
         }
       }
@@ -1803,6 +1854,64 @@
                 "stringUnit": {
                   "state": "translated",
                   "value": "Keep Only %lld Favorites"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "series.kept_members_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Einige Fotos bleiben in deiner Mediathek"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Some Photos Stay in Your Library"
+          }
+        }
+      }
+    },
+    "series.kept_members_message %lld": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "1 Foto blieb in deiner Mediathek. Seine Rolle in der Serie ist unbekannt, daher wurde es nicht gelöscht."
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld Fotos blieben in deiner Mediathek. Ihre Rolle in der Serie ist unbekannt, daher wurden sie nicht gelöscht."
+                }
+              }
+            }
+          }
+        },
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "1 photo stayed in your library. Its role in the burst is unknown, so it was not deleted."
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld photos stayed in your library. Their role in the burst is unknown, so they were not deleted."
                 }
               }
             }

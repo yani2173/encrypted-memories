@@ -4,14 +4,25 @@ import VisionKit
 
 /// AppKit owns native event details. Core owns the direction lock, threshold, and one-page-per-gesture contract.
 enum AppKitViewerPageSwipeAdapter {
-    static func consume(
-        _ event: NSEvent,
-        with tracker: inout ViewerPageSwipeTracker
-    ) -> ViewerPageSwipeUpdate? {
+    /// What a scroll event did to the page swipe. The host delivers it after the tracker mutation ended, so a
+    /// callback never runs while the tracker property is under exclusive access.
+    struct Routing {
+        let direction: ViewerPageSwipeDirection?
+        let passesToSuper: Bool
+
+        /// Reports a completed swipe through `onPageSwipe`. Returns whether the view's superclass must handle the
+        /// event as well.
+        func deliver(to onPageSwipe: (ViewerPageSwipeDirection) -> Void) -> Bool {
+            if let direction { onPageSwipe(direction) }
+            return passesToSuper
+        }
+    }
+
+    static func route(_ event: NSEvent, with tracker: inout ViewerPageSwipeTracker) -> Routing {
         guard event.hasPreciseScrollingDeltas,
             event.momentumPhase.isEmpty,
             let phase = portablePhase(event.phase)
-        else { return nil }
+        else { return Routing(direction: nil, passesToSuper: true) }
 
         let x = ViewerPageSwipeTracker.deviceRelativeDelta(
             event.scrollingDeltaX,
@@ -21,7 +32,8 @@ enum AppKitViewerPageSwipeAdapter {
             event.scrollingDeltaY,
             directionWasInverted: event.isDirectionInvertedFromDevice
         )
-        return tracker.consume(deltaX: x, deltaY: y, phase: phase)
+        let update = tracker.consume(deltaX: x, deltaY: y, phase: phase)
+        return Routing(direction: update.direction, passesToSuper: !update.consumesEvent)
     }
 
     private static func portablePhase(_ phase: NSEvent.Phase) -> ViewerPageSwipePhase? {
@@ -31,6 +43,55 @@ enum AppKitViewerPageSwipeAdapter {
         if phase.contains(.began) { return .began }
         if phase.contains(.mayBegin) { return .mayBegin }
         return nil
+    }
+}
+
+/// Pinch-out-to-dismiss tracking of the image scroll view and the video view. It only reports progress
+/// (1 = fullscreen, 0 = collapsed into the grid cell); the host's zoom overlay renders the shrink.
+struct AppKitPinchDismissTracker {
+    /// A small or quick pinch is enough to fly the viewer closed.
+    static let closeProgress: CGFloat = 0.07
+
+    private(set) var isDismissing = false
+    private var progress: CGFloat = 0  // 0 = full size, grows as the user pinches out
+
+    /// True while a dismiss runs, or when a magnify event with this `magnification` starts one: only a pinch-OUT does.
+    func claims(magnification: CGFloat) -> Bool { isDismissing || magnification < 0 }
+
+    /// What a magnify event did to the dismiss. The host reports it after the tracker mutation ended, so a callback
+    /// never runs while the tracker property is under exclusive access.
+    enum Outcome: Equatable {
+        case none
+        case began
+        case changed(progress: CGFloat)  // 1 = fullscreen, 0 = the grid cell
+        case ended(shouldClose: Bool)
+
+        func report(began: () -> Void, changed: (CGFloat) -> Void, ended: (Bool) -> Void) {
+            switch self {
+            case .none: break
+            case .began: began()
+            case .changed(let progress): changed(progress)
+            case .ended(let shouldClose): ended(shouldClose)
+            }
+        }
+    }
+
+    mutating func handle(phase: NSEvent.Phase, magnification: CGFloat) -> Outcome {
+        switch phase {
+        case .began:
+            isDismissing = true
+            progress = 0
+            return .began
+        case .changed:
+            progress = max(0, progress - magnification)  // outward pinch = negative
+            return .changed(progress: max(0, min(1, 1 - progress)))
+        case .ended, .cancelled:
+            let shouldClose = phase == .ended && progress > Self.closeProgress
+            isDismissing = false
+            return .ended(shouldClose: shouldClose)
+        default:
+            return .none
+        }
     }
 }
 
@@ -228,8 +289,7 @@ final class ZoomScrollView: NSScrollView {
     /// Last reported photo rect - reports are de-duplicated so a steady frame never spams SwiftUI state.
     private var lastReportedPhotoFrame: CGRect = .null
 
-    private var dismissing = false
-    private var dismissProgress: CGFloat = 0  // 0 = full size, grows as the user pinches out
+    private var pinchDismiss = AppKitPinchDismissTracker()
     private var forceClickFired = false  // true between deep-press and release (drives hold-to-play)
     private var pageSwipeTracker = ViewerPageSwipeTracker()
     private var updatingZoomGeometry = false
@@ -311,7 +371,7 @@ final class ZoomScrollView: NSScrollView {
     /// Makes the native document's edges equal the actual media edges. `NSScrollView` then supplies the native
     /// magnification, pan, and rubber-band behavior without giving the aspect-fit letterbox its own scroll range.
     func updateZoomContentGeometry() {
-        guard !updatingZoomGeometry, !dismissing,
+        guard !updatingZoomGeometry, !pinchDismiss.isDismissing,
             let imageView = documentView as? NSImageView,
             let image = imageView.image,
             image.size.width > 0, image.size.height > 0
@@ -377,21 +437,18 @@ final class ZoomScrollView: NSScrollView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard magnification <= minMagnification + 0.001,
-            let update = AppKitViewerPageSwipeAdapter.consume(event, with: &pageSwipeTracker)
-        else {
+        guard magnification <= minMagnification + 0.001 else {
             super.scrollWheel(with: event)
             return
         }
-
-        if let direction = update.direction { onPageSwipe(direction) }
-        if !update.consumesEvent { super.scrollWheel(with: event) }
+        let routing = AppKitViewerPageSwipeAdapter.route(event, with: &pageSwipeTracker)
+        if routing.deliver(to: onPageSwipe) { super.scrollWheel(with: event) }
     }
 
     override func magnify(with event: NSEvent) {
         let atBase = magnification <= minMagnification + 0.001
         // Intercept only a pinch-OUT that starts at fit-scale - otherwise let the scroll view zoom.
-        guard atBase, dismissing || event.magnification < 0 else {
+        guard atBase, pinchDismiss.claims(magnification: event.magnification) else {
             super.magnify(with: event)
             onZoomChanged?(magnification)
             return
@@ -399,21 +456,7 @@ final class ZoomScrollView: NSScrollView {
         // This view does not animate itself; it only reports progress. The host renders the live shrink into the
         // exact grid cell plus the grid fade behind, via the shared zoom overlay (the gesture keeps being delivered
         // here while the host renders the viewer invisible).
-        switch event.phase {
-        case .began:
-            dismissing = true
-            dismissProgress = 0
-            onPinchDismissBegan()
-        case .changed:
-            dismissProgress = max(0, dismissProgress - event.magnification)  // outward pinch = negative
-            onPinchDismissChanged(max(0, min(1, 1 - dismissProgress)))  // 1 = fullscreen, 0 = the grid cell
-        case .ended, .cancelled:
-            // A small/quick pinch is enough to fly it home (low threshold).
-            let shouldClose = event.phase == .ended && dismissProgress > 0.07
-            dismissing = false
-            onPinchDismissEnded(shouldClose)
-        default:
-            break
-        }
+        let outcome = pinchDismiss.handle(phase: event.phase, magnification: event.magnification)
+        outcome.report(began: onPinchDismissBegan, changed: onPinchDismissChanged, ended: onPinchDismissEnded)
     }
 }

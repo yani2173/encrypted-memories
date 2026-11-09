@@ -19,7 +19,11 @@ final class AlbumSyncDeletedPhotoScenarioTests: XCTestCase {
         XCTAssertNil(reinstalled.identities.record(for: .init(kind: .photoLibraryAsset, identifier: "asset-1")))
 
         let trashReport = try await reinstalled.syncAlbum(
-            ["asset-1"], backup: EditScenarioAlbumBackup(device: reinstalled))
+            ["asset-1"], backup: EditScenarioAlbumBackup(device: reinstalled, waitsForScheduledRetries: true))
+        let trashRows = reinstalled.queue.entries(in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
+        XCTAssertEqual(trashRows.count, 1)
+        XCTAssertEqual(trashRows.first?.attempts, 0)
+        XCTAssertEqual(reinstalled.queue.summary()!.failed, 0)
         XCTAssertEqual(trashReport.trashedSkipped, 1)
         XCTAssertEqual(trashReport.problems.first?.issue, .remoteDeletion)
         XCTAssertFalse(trashReport.isFullySynced)
@@ -33,9 +37,16 @@ final class AlbumSyncDeletedPhotoScenarioTests: XCTestCase {
             let report = try await reinstalled.syncAlbum(
                 ["asset-1"], backup: EditScenarioAlbumBackup(device: reinstalled))
             XCTAssertFalse(report.isFullySynced)
-            XCTAssertEqual(report.problems.first?.issue, .remoteDeletion)
-            XCTAssertEqual(report.problems.first?.reason, L10n.string("backup.state_skipped_remote_deletion"))
+            XCTAssertEqual(report.problems.map(\.issue), [.remoteDeletion], "the photo stays deleted in Proton (#984)")
+            XCTAssertFalse(report.problems.isEmpty, "the deletion stays visible")
+            XCTAssertEqual(
+                report.problems.first?.reason, L10n.string("backup.state_skipped_remote_deletion"),
+                "the same words as the Backup list")
+            XCTAssertEqual(report.problems.first?.isRetryable, false, "no Try again")
             XCTAssertEqual(first.server.uploadRequestCount, 1, "ordinary retries and later runs create no consent")
+            let rows = reinstalled.queue.entries(in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
+            XCTAssertEqual(rows.map(\.attempts), [0], "the emptied trash spends no attempt")
+            XCTAssertEqual(reinstalled.queue.summary()!.failed, 0)
         }
     }
 

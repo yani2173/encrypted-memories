@@ -33,12 +33,12 @@ final class EditUpgradeScenarioTests: XCTestCase {
         harness = try EditScenarioHarness(v105: .unchanged)
         try harness.seedV105DroppedPhoto(pending: pending)
         let candidate = try harness.library.candidate("dropped-photo")
-        XCTAssertNil(harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertNil(try harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         let scan = try await harness.fullRescan()
         XCTAssertEqual(scan.changed, 0)
         XCTAssertEqual(scan.discovered, 0)
         let row = try XCTUnwrap(
-            harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+            try harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         XCTAssertTrue([.discovered, .queuedForUpload, .checking].contains(row.state))
         await harness.drain()
         XCTAssertEqual(harness.state(of: row), .completed)
@@ -60,7 +60,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         XCTAssertNotNil(harness.identities.record(for: candidate.snapshot.source))
         try harness.removeLocalBackupSettlement()
         _ = try await harness.fullRescan()
-        XCTAssertNotNil(harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertNotNil(try harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         await harness.drain()
         XCTAssertEqual(uploads, 0)
         XCTAssertTrue(trashed.isEmpty)
@@ -84,7 +84,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         XCTAssertEqual(scan.discovered, 0)
         XCTAssertEqual(scan.changed, 0, "An unchanged library must not re-open on upgrade")
         XCTAssertEqual(scan.removed, 0)
-        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try harness.queue.decisionUnsettledRows()).isEmpty)
         await harness.drain()
 
         XCTAssertEqual(uploads, 0)
@@ -119,30 +119,30 @@ final class EditUpgradeScenarioTests: XCTestCase {
         XCTAssertEqual(harness.server.links.first { $0.linkID == legacyMain }?.tags, [PhotoTag.livePhotos.rawValue])
         XCTAssertFalse(asset.info.isLivePhoto)
         XCTAssertTrue(asset.info.livePlaybackOff)
-        XCTAssertEqual(harness.catalog.entry(for: asset.identifier)?.livePlaybackOff, false)
+        XCTAssertEqual(try harness.catalog.entry(for: asset.identifier)?.livePlaybackOff, false)
         func serverState() -> [String] { harness.server.links.map { "\($0.linkID) \($0.state) \($0.tags.sorted())" } }
         let before = serverState()
 
         let scan = try await harness.fullRescan()
         XCTAssertEqual(scan.changed, 0, "the Live effect alone must not re-open a photo on upgrade")
         XCTAssertEqual(scan.discovered, 0)
-        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try harness.queue.decisionUnsettledRows()).isEmpty)
         // A v1.0.5 edit deduped the original and the video against the first main, so it fails the S3 drain check.
         await harness.pass()
 
-        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try harness.queue.decisionUnsettledRows()).isEmpty)
         XCTAssertEqual(uploads, 0)
         XCTAssertTrue(trashed.isEmpty)
         XCTAssertEqual(serverState(), before, "the Live Photo stays in Proton until the next edit")
         XCTAssertTrue(harness.library.resolutions.isEmpty, "No photo bytes should be requested")
         XCTAssertFalse(harness.journalFileExists)
-        XCTAssertEqual(harness.catalog.entry(for: asset.identifier)?.livePlaybackOff, true)
+        XCTAssertEqual(try harness.catalog.entry(for: asset.identifier)?.livePlaybackOff, true)
 
         // A metadata change, such as a favorite, moves the modification date. Only an edit replaces the photo.
         harness.library.changeModificationDate()
         _ = try await harness.fullRescan()
         await harness.pass()
-        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try harness.queue.decisionUnsettledRows()).isEmpty)
         XCTAssertTrue(trashed.isEmpty)
         if fixture == .edited {
             // v1.0.5 counted the video of the edited version as saved, because the same file already sat under the
@@ -259,8 +259,8 @@ final class EditUpgradeScenarioTests: XCTestCase {
         let asset = try XCTUnwrap(harness.library.snapshot.first)
         let oldRevision = UploadBackupRevision(date: asset.modificationDate)
         XCTAssertNotEqual(candidate.snapshot.revision, oldRevision)
-        XCTAssertEqual(harness.queue.entry(for: asset.source, revision: oldRevision)?.state, .completed)
-        XCTAssertNil(harness.queue.entry(for: asset.source, revision: candidate.snapshot.revision))
+        XCTAssertEqual(try harness.queue.entry(for: asset.source, revision: oldRevision)?.state, .completed)
+        XCTAssertNil(try harness.queue.entry(for: asset.source, revision: candidate.snapshot.revision))
         XCTAssertFalse(harness.journalFileExists)
         let before = activeMains
 
@@ -330,7 +330,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         let revision = UploadBackupRevision(date: asset.modificationDate)
         let earlierMains = activeMains
         harness.library.publishRender("late-render")
-        XCTAssertEqual(harness.queue.entry(for: asset.source, revision: revision)?.state, .completed)
+        XCTAssertEqual(try harness.queue.entry(for: asset.source, revision: revision)?.state, .completed)
 
         let scan = try await harness.fullRescan()
         XCTAssertEqual(scan.changed, 1)
@@ -363,7 +363,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
             L10n.string("backup.issue_deletion_check"))
         harness.clock.advance(by: 120)
         await harness.pass()
-        XCTAssertEqual(harness.queue.entry(for: asset.source, revision: revision)?.state, .discovered)
+        XCTAssertEqual(try harness.queue.entry(for: asset.source, revision: revision)?.state, .discovered)
         harness.clock.advance(by: 480)
         await harness.pass()
 
@@ -386,7 +386,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         await harness.drain()
         let uploadsAfterRender = uploads
         XCTAssertGreaterThan(uploadsAfterRender, 0)
-        XCTAssertEqual(harness.queue.entry(for: asset.source, revision: revision)?.state, .completed)
+        XCTAssertEqual(try harness.queue.entry(for: asset.source, revision: revision)?.state, .completed)
         let resolutions = harness.library.resolutions.count
 
         let scan = try await harness.fullRescan()
@@ -461,7 +461,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         XCTAssertEqual(scan.discovered, 0)
         XCTAssertTrue(deviceB.catalog.hasReconciledLateRenders())
         let row = try XCTUnwrap(
-            deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+            try deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         XCTAssertEqual(row.state, .alreadyBackedUp, "The remote proof still holds the rendered file")
         await deviceB.drain()
         XCTAssertEqual(deviceB.library.resolutions.count, resolutions, "No photo bytes should be requested")
@@ -486,14 +486,14 @@ final class EditUpgradeScenarioTests: XCTestCase {
         let candidate = try deviceB.library.candidate()
         let uploadsBefore = uploads
         let resolutions = deviceB.library.resolutions.count
-        func rowState() -> UploadBackupSyncQueueState? {
-            deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state
+        func rowState() throws -> UploadBackupSyncQueueState? {
+            try deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state
         }
 
         deviceB.index.setProofLookupsFail(true)
         _ = try await deviceB.fullRescan()
         XCTAssertFalse(deviceB.catalog.hasReconciledLateRenders(), "A later pass checks the photo again")
-        XCTAssertEqual(rowState(), .alreadyBackedUp, "An unreadable proof re-opens nothing")
+        XCTAssertEqual(try rowState(), .alreadyBackedUp, "An unreadable proof re-opens nothing")
         await deviceB.drain()
         XCTAssertEqual(deviceB.library.resolutions.count, resolutions, "No photo bytes should be requested")
 
@@ -501,7 +501,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         try deviceB.relaunch()
         _ = try await deviceB.fullRescan()
         XCTAssertTrue(deviceB.catalog.hasReconciledLateRenders())
-        XCTAssertEqual(rowState(), .alreadyBackedUp, "The remote proof still holds the rendered file")
+        XCTAssertEqual(try rowState(), .alreadyBackedUp, "The remote proof still holds the rendered file")
         await deviceB.drain()
         XCTAssertEqual(deviceB.library.resolutions.count, resolutions, "No photo bytes should be requested")
         XCTAssertEqual(uploads, uploadsBefore)
@@ -574,7 +574,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         XCTAssertTrue(deviceB.catalog.hasReconciledLateRenders())
         for candidate in [first, second] {
             XCTAssertEqual(
-                deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state,
+                try deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state,
                 .queuedForUpload, "\(candidate.snapshot.source.identifier) re-opens")
         }
     }
@@ -645,7 +645,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         let revision = UploadBackupRevision(date: asset.modificationDate)
         harness.library.publishRender("late-render")
         XCTAssertEqual(try harness.library.candidate().snapshot.revision, revision, file: file, line: line)
-        XCTAssertEqual(harness.queue.entry(for: asset.source, revision: revision)?.state, .completed)
+        XCTAssertEqual(try harness.queue.entry(for: asset.source, revision: revision)?.state, .completed)
 
         let scan = try await harness.fullRescan()
         XCTAssertEqual(scan.changed, 1, file: file, line: line)

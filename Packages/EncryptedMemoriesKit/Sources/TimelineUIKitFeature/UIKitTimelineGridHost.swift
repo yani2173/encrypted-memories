@@ -20,6 +20,7 @@
     /// This is intentionally thin: UIKit owns the scroll surface and drawable, while GridCore, MediaFeedCore,
     /// MetalGridTextureCore, and MetalRenderingCore still own layout, decoded thumbnails, residency, and drawing.
     public struct UIKitTimelineGrid: UIViewRepresentable {
+        @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
         private let items: [PhotoItem]
         /// A monotonic content identity supplied by the owning projection. When present, selection and chrome
         /// updates avoid re-comparing or re-mapping the complete library while preserving a full fallback for
@@ -40,6 +41,9 @@
         /// display link and cancels ahead-warm so a hidden grid never competes with menus/transitions on screen;
         /// defaults to true so a grid that is always visible (e.g. a pushed collection detail) behaves as before.
         private let isActive: Bool
+        /// Extra points reserved between the safe-area top and the first row while a search scope picker is
+        /// presented above the grid. Zero on every surface that has no scope picker.
+        private let scopeBarGap: CGFloat
         /// A monotonically-bumped signal from the shell: whenever it changes, the grid scrolls to the newest
         /// photos. Drives the active Fotos-tab retap gesture that jumps to the newest photos without leaking scroll math
         /// out of the host. Compared against a `Coordinator`-remembered last value so a steady stream of identical
@@ -59,6 +63,9 @@
         /// instead of making filtered items pop into their new topology during unrelated SwiftUI updates.
         private let contentTransitionSignal: Int
         private let prefersReducedMotion: Bool
+        private let allowsPhotoActions: Bool
+        private let isProvisionalPresentation: Bool
+        private let allowsPlaceholderContentReady: Bool
         private let onFirstContentReady: (() -> Void)?
         private let onVisibleDatesChanged: ((String?) -> Void)?
         private let onOpenPhoto: ((PhotoItem) -> Void)?
@@ -83,6 +90,10 @@
             selectedUIDs: Set<PhotoUID> = [],
             uploadBadges: PendingUploadBadges = .empty,
             isActive: Bool = true,
+            /// Extra points reserved between the safe-area top and the first row while a search scope picker is
+            /// presented above the grid. Pass `SquareTileGridEngine.standardOuterMargin` for the native gap; zero
+            /// (the default) keeps every other surface unchanged.
+            scopeBarGap: CGFloat = 0,
             scrollToLatestSignal: Int = 0,
             scrollToTopSignal: Int = 0,
             proxy: GridProxy<PhotoUID>? = nil,
@@ -92,6 +103,9 @@
             revealSignal: Int = 0,
             contentTransitionSignal: Int = 0,
             prefersReducedMotion: Bool = false,
+            allowsPhotoActions: Bool = true,
+            isProvisionalPresentation: Bool = false,
+            allowsPlaceholderContentReady: Bool = false,
             onFirstContentReady: (() -> Void)? = nil,
             onVisibleDatesChanged: ((String?) -> Void)? = nil,
             onOpenPhoto: ((PhotoItem) -> Void)? = nil,
@@ -115,6 +129,7 @@
             self.selectedUIDs = selectedUIDs
             self.uploadBadges = uploadBadges
             self.isActive = isActive
+            self.scopeBarGap = scopeBarGap
             self.scrollToLatestSignal = scrollToLatestSignal
             self.scrollToTopSignal = scrollToTopSignal
             self.proxy = proxy
@@ -124,6 +139,9 @@
             self.revealSignal = revealSignal
             self.contentTransitionSignal = contentTransitionSignal
             self.prefersReducedMotion = prefersReducedMotion
+            self.allowsPhotoActions = allowsPhotoActions
+            self.isProvisionalPresentation = isProvisionalPresentation
+            self.allowsPlaceholderContentReady = allowsPlaceholderContentReady
             self.onFirstContentReady = onFirstContentReady
             self.onVisibleDatesChanged = onVisibleDatesChanged
             self.onOpenPhoto = onOpenPhoto
@@ -167,17 +185,24 @@
         }
 
         @MainActor
+        private func configurePhotoActions(_ view: UIKitTimelineGridHostView) {
+            view.onOpenPhoto = allowsPhotoActions ? onOpenPhoto : nil
+            view.onToggleSelection = allowsPhotoActions ? onToggleSelection : nil
+            view.onSelectionChanged = allowsPhotoActions ? onSelectionChanged : nil
+            view.dragOutProvider = allowsPhotoActions ? dragOutProvider : nil
+            view.onDragOutFailed = onDragOutFailed
+            view.contextMenuActions = allowsPhotoActions ? contextMenuActions : nil
+            view.onContextMenuAction = allowsPhotoActions ? onContextMenuAction : nil
+        }
+
+        @MainActor
         public func makeUIView(context: Context) -> UIKitTimelineGridHostView {
             let view = UIKitTimelineGridHostView()
+            view.setPlaceholderReduceMotion(prefersReducedMotion || accessibilityReduceMotion)
             view.onFirstContentReady = onFirstContentReady
             view.onVisibleDatesChanged = onVisibleDatesChanged
-            view.onOpenPhoto = onOpenPhoto
-            view.onToggleSelection = onToggleSelection
-            view.onSelectionChanged = onSelectionChanged
-            view.dragOutProvider = dragOutProvider
-            view.onDragOutFailed = onDragOutFailed
-            view.contextMenuActions = contextMenuActions
-            view.onContextMenuAction = onContextMenuAction
+            view.allowsPlaceholderContentReady = allowsPlaceholderContentReady
+            configurePhotoActions(view)
             view.configure(
                 items: items, contentRevision: contentRevision,
                 thumbnailFeed: thumbnailFeed, metadataProvider: metadataProvider,
@@ -185,23 +210,21 @@
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
                 selectionMode: selectionMode, selectedUIDs: selectedUIDs,
-                uploadBadges: uploadBadges)
+                isProvisionalPresentation: isProvisionalPresentation, uploadBadges: uploadBadges)
             view.setActive(isActive)
+            view.setScopeBarGap(scopeBarGap)
             wireProxy(proxy, to: view)
             return view
         }
 
         @MainActor
         public func updateUIView(_ uiView: UIKitTimelineGridHostView, context: Context) {
+            uiView.setNeedsLayout()
+            uiView.setPlaceholderReduceMotion(prefersReducedMotion || accessibilityReduceMotion)
             uiView.onFirstContentReady = onFirstContentReady
             uiView.onVisibleDatesChanged = onVisibleDatesChanged
-            uiView.onOpenPhoto = onOpenPhoto
-            uiView.onToggleSelection = onToggleSelection
-            uiView.onSelectionChanged = onSelectionChanged
-            uiView.dragOutProvider = dragOutProvider
-            uiView.onDragOutFailed = onDragOutFailed
-            uiView.contextMenuActions = contextMenuActions
-            uiView.onContextMenuAction = onContextMenuAction
+            uiView.allowsPlaceholderContentReady = allowsPlaceholderContentReady
+            configurePhotoActions(uiView)
             let shouldDissolveContent = contentTransitionSignal != context.coordinator.lastContentTransitionSignal
             if shouldDissolveContent {
                 context.coordinator.lastContentTransitionSignal = contentTransitionSignal
@@ -214,11 +237,12 @@
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
                 selectionMode: selectionMode, selectedUIDs: selectedUIDs,
-                uploadBadges: uploadBadges)
+                isProvisionalPresentation: isProvisionalPresentation, uploadBadges: uploadBadges)
             if shouldDissolveContent {
                 uiView.completeContentReplacementTransition(prefersReducedMotion: prefersReducedMotion)
             }
             uiView.setActive(isActive)
+            uiView.setScopeBarGap(scopeBarGap)
             wireProxy(proxy, to: uiView)
             // A retap of the active Fotos tab bumps the signal and scrolls to the newest photos. Compare it with the
             // coordinator's last value so this fires once per retap, never on an unrelated update pass.
@@ -273,6 +297,26 @@
         private let renderFrameOverride: (() -> GridRenderOutcome)?
         private weak var contentReplacementSnapshot: UIView?
         private var contentReplacementUsesSurfaceFade = false
+        private struct InsetInputs: Equatable {
+            let safeArea: UIEdgeInsets
+            let viewport: CGRect
+            let windowBounds: CGRect
+            let tabBars: [GridBottomInsetPolicy.TabBar]
+        }
+        private var lastInsetInputs: InsetInputs?
+        private var lastInsetBounds: CGRect?
+        private var insetFollowUpScheduled = false
+        /// Extra points reserved between the safe-area top and the first row while a search scope picker is
+        /// presented above this grid. Zero on every surface that has no scope picker.
+        private var scopeBarGap: CGFloat = 0
+        /// Total extra top padding currently baked into the engine's layout origin: the scope bar's measured
+        /// overhang below the safe-area top plus `scopeBarGap`. Unlike the content inset, this one moves the
+        /// rendered rows; see `updateScopeBarClearanceIfNeeded`.
+        private var scopeBarClearance: CGFloat = 0
+        #if DEBUG
+            var insetFollowUpCount = 0
+            var insetFollowUpPending: Bool { insetFollowUpScheduled }
+        #endif
 
         private var device: MTLDevice?
         var renderer: MetalGridRenderer?
@@ -281,18 +325,25 @@
         private var pendingContentEpochs = PendingContentEpochTracker()
         private var pendingHandovers = PendingHandoverTracker()
         private let uploadBadgeAnimator = GridUploadBadgeAnimator<PhotoUID>()
+        private let selectionBadgeLayout = GridSelectionBadgeLayout()
+        private var selectionBadgeMotions: [PhotoUID: GridSelectionBadgeMotion] = [:]
+        private var selectionBadgeSeen: Set<PhotoUID> = []
+        private var selectionBadgeAnimationActive = false
         var texturePolicy: UIKitMetalGridTexturePolicy?
         private var texturePressureRegistration: MemoryPressureRegistration?
         var thumbnailFeed: UIKitThumbnailFeed?
         private var items: [PhotoItem] = []
         private var configuredContentRevision: UInt64?
-        private var deferredOrderUpdate: (items: [PhotoItem], revision: UInt64?)?
+        private var isProvisionalPresentation = false
+        private var deferredOrderUpdate: (items: [PhotoItem], revision: UInt64?, preservesVisibleAnchor: Bool)?
         private var hasConfiguredContent = false
         /// Flat UID order for the current items, cached so the per-frame composer input never re-maps the library.
         var itemUIDs: [PhotoUID] = []
         var itemIndexByUID: [PhotoUID: Int] = [:]
         private var levelOverride: Int?
         private var requestedProfile: GridLevelProfile?
+        /// The level each grid profile last showed, so a window resize or a rotation round trip keeps the density.
+        private var profileLevelMemory = GridProfileLevelMemory()
         /// The user-driven density level set by pinch. Takes precedence over the profile default so pinch survives
         /// item refreshes; cleared when an explicit external `level` arrives. Nil uses the data-driven profile default.
         var interactiveLevel: Int?
@@ -406,13 +457,82 @@
         /// The outline that briefly identifies a revealed photo. It lives in content coordinates, so it scrolls along.
         private var revealOutline: UIView?
         private var lastLaidOutSafeAreaInsets: UIEdgeInsets = .zero
+        /// The active reserved regions (the iPhone Duo fold, a camera) in viewport coordinates; selection marks move
+        /// out of them. Read on every layout; a hinge change asks for a layout.
+        private(set) var reservedRegionLayout: ReservedRegionLayout = .none
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
         var isApplyingProgrammaticScroll = false
-        /// One-shot per content set: fires once the first settled frame with a resident visible thumbnail is drawn,
-        /// mirroring the macOS coordinator. Reset when a new non-empty UID set lands.
+        /// One-shot after a settled frame encodes presentable known photos.
         private var firstContentReported = false
+        private var firstContentPending = false
+        public var allowsPlaceholderContentReady = false {
+            didSet { if oldValue != allowsPlaceholderContentReady { requestRender() } }
+        }
+
+        func reportFirstRenderedContent(
+            visibleUIDs: [PhotoUID], isResident: (PhotoUID) -> Bool, frameEncoded: Bool
+        ) {
+            guard frameEncoded, !firstContentReported, !firstContentPending,
+                MetalGridFrameComposer.hasPresentableFirstContent(
+                    visibleIDs: visibleUIDs, allowsPlaceholders: allowsPlaceholderContentReady,
+                    isKnown: { self.itemIndexByUID[$0] != nil }, isResident: isResident),
+                window != nil, framePump.isActive, !sceneIsBackgrounded
+            else { return }
+            firstContentPending = true
+            let generation = contentGeneration
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.contentGeneration == generation else { return }
+                self.firstContentPending = false
+                guard self.window != nil, self.framePump.isActive, !self.sceneIsBackgrounded else { return }
+                self.firstContentReported = true
+                self.onFirstContentReady?()
+            }
+        }
+
+        func invalidateFirstContentForSource() {
+            contentGeneration &+= 1
+            firstContentPending = false
+        }
+        private var placeholderPulse = MetalGridPlaceholderPulse(reduceMotion: UIAccessibility.isReduceMotionEnabled)
+        private var placeholderScroll = MetalGridPlaceholderScrollTracker<PhotoUID>()
+
+        func setPlaceholderReduceMotion(_ enabled: Bool) {
+            if placeholderPulse.setReduceMotion(enabled) { requestRender() }
+        }
+
+        var placeholderIsAnimating: Bool { placeholderPulse.isAnimating }
+
+        private func canRetryPlaceholder(_ uid: PhotoUID) -> Bool {
+            !(thumbnailFeed?.isKnownUnfetchable(uid) ?? false)
+        }
+
+        private func isLoadingPlaceholder(_ uid: PhotoUID, isResident: (PhotoUID) -> Bool) -> Bool {
+            itemIndexByUID[uid] != nil && !isResident(uid) && canRetryPlaceholder(uid)
+        }
+
+        func updatePlaceholderPulse(visibleUIDs: [PhotoUID], isResident: (PhotoUID) -> Bool, now: Double) {
+            placeholderPulse.update(visible: visibleUIDs, now: now) { isLoadingPlaceholder($0, isResident: isResident) }
+        }
+
+        private func visiblePlaceholderUIDs() -> [PhotoUID] {
+            accessibilityFramePlan()?.visibleSlots.compactMap { slot in
+                itemUIDs.indices.contains(slot.index) ? itemUIDs[slot.index] : nil
+            } ?? []
+        }
+
+        private func finishPlaceholderScroll() {
+            placeholderScroll.ended(
+                visibleIDs: visiblePlaceholderUIDs(),
+                isVisible: window != nil && framePump.isActive && !sceneIsBackgrounded,
+                reduceMotion: placeholderPulse.reduceMotion,
+                isLoading: {
+                    self.isLoadingPlaceholder($0, isResident: { self.textureCache?.isResident($0) ?? false })
+                },
+                pulse: &placeholderPulse)
+        }
+
         /// Guards the deferred main-queue readiness callback. A cached frame may finish on the same runloop turn
         /// that authoritative UIDs replace it; only the generation that actually rendered may acknowledge itself.
         private var contentGeneration: UInt64 = 0
@@ -427,6 +547,9 @@
         private var perf = RenderPerfWindow()
         /// Display-link ticks this host has run (diagnostics and hosted tests: a suspended grid must not tick).
         private(set) var renderTickCount: UInt64 = 0
+        #if DEBUG
+            private(set) var drawnFrameCount: UInt64 = 0
+        #endif
         private let presentationTiming = PresentationTimingAccumulator()
         private var activeDisplayFrame: UIKitTimelineDisplayFrame?
         /// True while the window scene that hosts this grid is in the background (or the whole app is). Set per
@@ -436,9 +559,9 @@
 
         public private(set) var isMetal3Capable = false
 
-        /// Called on the main actor the first time a visible thumbnail is drawn for the current content - the shell's
-        /// signal that the launch/loading UI can lift onto a real grid. The remaining thumbnails may still load.
-        /// One-shot per content set.
+        /// Called on the main actor after the first frame that encodes a resident visible thumbnail for the current
+        /// content source and revision - the shell's signal that the launch/loading UI can lift onto the grid.
+        /// The remaining thumbnails may still load. One-shot per content set: a changed item order re-arms it.
         public var onFirstContentReady: (() -> Void)?
 
         /// Called on the main actor with the localized date range of the photos on screen, for example
@@ -545,8 +668,11 @@
             displayMode: TileContentDisplayMode = .squareFillCrop,
             selectionMode: Bool = false,
             selectedUIDs: Set<PhotoUID> = [],
+            isProvisionalPresentation: Bool = false,
             uploadBadges: PendingUploadBadges = .empty
         ) {
+            let provisionalUpdate = isProvisionalPresentation || self.isProvisionalPresentation
+            self.isProvisionalPresentation = isProvisionalPresentation
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
             // Upload badges change with progress; they never rebuild the item overlays.
@@ -563,6 +689,7 @@
             }
             swipeSelection.updateEnabled()
             let feedChanged = wiredFeed !== thumbnailFeed
+            if feedChanged { placeholderScroll.reset() }
             var contentChanged: Bool
             if let contentRevision {
                 contentChanged =
@@ -586,10 +713,11 @@
                     let visible = Set(accessibilityFramePlan()?.visibleSlots.map(\.index) ?? [])
                     let decision = TimelineOrderRefinementPolicy.decision(
                         incoming: items, previousCount: self.items.count, visibleIndices: visible,
+                        preservingVisibleAnchor: provisionalUpdate,
                         previous: { uid in self.itemIndexByUID[uid].map { ($0, self.items[$0]) } })
                     isOrderCorrection = decision != .ordinaryUpdate
                     if decision == .deferVisibleCorrection || (isOrderCorrection && !canRefineOrder) {
-                        deferredOrderUpdate = (items, contentRevision)
+                        deferredOrderUpdate = (items, contentRevision, provisionalUpdate)
                         contentChanged = false
                     } else {
                         deferredOrderUpdate = nil
@@ -601,6 +729,7 @@
             }
             let newUIDs = contentChanged ? items.map(\.uid) : itemUIDs
             let uidsChanged = contentChanged && itemUIDs != newUIDs
+            if contentChanged || !revisedContent.isEmpty { invalidateFirstContentForSource() }
             if contentChanged {
                 self.items = items
                 configuredContentRevision = contentRevision
@@ -621,6 +750,7 @@
                 cachedEngine = nil
                 committedPhase = nil
                 interactiveLevel = nil
+                profileLevelMemory.reset()
             }
             if fillOrder != self.fillOrder {
                 self.fillOrder = fillOrder
@@ -653,6 +783,7 @@
                 interactiveLevel = nil
                 committedPhase = nil
                 cancelLiveZoomState()
+                profileLevelMemory.reset()
             }
             self.levelOverride = level
             self.displayMode = displayMode
@@ -661,7 +792,6 @@
                 swipeSelection.cancel()
                 removeRevealOutline()
                 resizeAnchorItemID = nil
-                contentGeneration &+= 1
                 if !isOrderCorrection { committedPhase = nil }
                 cancelLiveZoomState()
                 itemIndexByUID = Dictionary(
@@ -698,16 +828,20 @@
             guard let pending = deferredOrderUpdate, canRefineOrder, let thumbnailFeed else { return }
             let visible = Set(accessibilityFramePlan()?.visibleSlots.map(\.index) ?? [])
             guard
-                !TimelineOrderRefinementPolicy.movesVisiblePhoto(
-                    incoming: pending.items, visibleIndices: visible, previousUID: { self.itemUIDs[$0] })
+                pending.preservesVisibleAnchor
+                    || !TimelineOrderRefinementPolicy.movesVisiblePhoto(
+                        incoming: pending.items, visibleIndices: visible, previousUID: { self.itemUIDs[$0] })
             else { return }
             deferredOrderUpdate = nil
+            let currentPresentation = isProvisionalPresentation
+            if pending.preservesVisibleAnchor { isProvisionalPresentation = true }
             configure(
                 items: pending.items, contentRevision: pending.revision,
                 thumbnailFeed: thumbnailFeed, metadataProvider: metadataProvider,
                 level: levelOverride, gridProfile: requestedProfile, fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
-                selectionMode: selectionMode, selectedUIDs: selectedUIDs, uploadBadges: uploadBadges)
+                selectionMode: selectionMode, selectedUIDs: selectedUIDs,
+                isProvisionalPresentation: currentPresentation, uploadBadges: uploadBadges)
         }
 
         /// Captures the currently presented Metal surface before a projection replacement.
@@ -770,6 +904,11 @@
         }
 
         public override func layoutSubviews() {
+            updateScopeBarClearanceIfNeeded()
+            if lastInsetBounds != bounds {
+                lastInsetBounds = bounds
+                scheduleInsetFollowUp()
+            }
             let resizePosition = captureViewportResizePositionIfNeeded()
             super.layoutSubviews()
             metalView.frame = bounds
@@ -781,6 +920,7 @@
             restoreViewportResizePosition(resizePosition)
             lastLaidOutViewportSize = bounds.size
             lastLaidOutSafeAreaInsets = safeAreaInsets
+            reservedRegionLayout = currentReservedRegionLayout()
             requestRender()
             invalidateAccessibilityElements()
         }
@@ -788,10 +928,14 @@
         public override func safeAreaInsetsDidChange() {
             super.safeAreaInsetsDidChange()
             setNeedsLayout()
+            scheduleInsetFollowUp()
         }
 
         public override func didMoveToWindow() {
             super.didMoveToWindow()
+            lastInsetInputs = nil
+            setNeedsLayout()
+            scheduleInsetFollowUp()
             if window == nil {
                 suspendRenderLoop()
             } else {
@@ -801,6 +945,52 @@
                 if framePump.isActive, !sceneIsBackgrounded { resumeRenderLoop() }
             }
             invalidateAccessibilityElements()
+        }
+
+        public override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+            super.traitCollectionDidChange(previousTraitCollection)
+            setNeedsLayout()
+            scheduleInsetFollowUp()
+        }
+
+        private func scheduleInsetFollowUp() {
+            guard !insetFollowUpScheduled, canUpdateInset else { return }
+            insetFollowUpScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.insetFollowUpScheduled = false
+                guard self.canUpdateInset else { return }
+                #if DEBUG
+                    self.insetFollowUpCount += 1
+                #endif
+                self.setNeedsLayout()
+                self.layoutIfNeeded()
+            }
+        }
+
+        private var canUpdateInset: Bool {
+            guard window != nil, framePump.isActive, !sceneIsBackgrounded else { return false }
+            var view: UIView? = self
+            while let current = view {
+                guard !current.isHidden, current.alpha > 0 else { return false }
+                // A host that a clipping ancestor cuts off completely stays invisible until it moves
+                // back into the clip area, so a bounded layout pass cannot have a visible effect.
+                if isCutOffByClippingAncestor(current) { return false }
+                view = current.superview
+            }
+            return true
+        }
+
+        /// True when `ancestor` clips this host out of view completely. Cut off means: a positive-area host
+        /// frame whose intersection with the ancestor's bounds is null or has no area. A host without area
+        /// (still zero-size during its first layout) is never cut off, and a host that overlaps the clip
+        /// area by any amount is not cut off.
+        private func isCutOffByClippingAncestor(_ ancestor: UIView) -> Bool {
+            guard ancestor !== self, ancestor.clipsToBounds else { return false }
+            let hostFrame = ancestor.convert(bounds, from: self)
+            guard hostFrame.width > 0, hostFrame.height > 0 else { return false }
+            let overlap = hostFrame.intersection(ancestor.bounds)
+            return overlap.isNull || overlap.isEmpty
         }
 
         /// Tab/surface activation from the SwiftUI host. An inactive grid must not keep the display link alive
@@ -814,6 +1004,7 @@
                 // Resume only makes sense once we are in a window; otherwise `didMoveToWindow` will resume on
                 // attach (the pump is now active), so this is safe either way.
                 if window != nil { resumeRenderLoop() }
+                scheduleInsetFollowUp()
             } else {
                 suspendRenderLoop()
             }
@@ -823,9 +1014,89 @@
             invalidateAccessibilityElements()
         }
 
+        /// Reserves `gap` extra points between the search scope picker and the first row while the picker is
+        /// presented above this grid. Acts only on a real change, so the steady stream of `updateUIView` calls
+        /// is free; a change re-runs the layout pipeline (plus its follow-up pass), like a safe-area change
+        /// does. The anchor targets (`scrollToTop` and the initial viewport placement) still key off the safe
+        /// area, so appearing or disappearing never moves them; only the gap opens and closes.
+        public func setScopeBarGap(_ gap: CGFloat) {
+            guard scopeBarGap != gap else { return }
+            scopeBarGap = gap
+            setNeedsLayout()
+            scheduleInsetFollowUp()
+        }
+
+        /// Measures the presented scope bar and folds the result plus `scopeBarGap` into `scopeBarClearance`,
+        /// the extra top padding baked into the engine's layout origin. Runs on every layout pass while a
+        /// picker is present, but only acts on a real change. Because the origin shift moves every rendered
+        /// row, the scroll offset is compensated by the same delta whenever the grid is scrolled below the
+        /// top anchor, keeping the visible rows put; at the top anchor the shift IS the gap, so it stands.
+        /// A picker that cannot be measured (the search field sits outside the top bar) contributes no
+        /// clearance at all, keeping the pre-#944 position.
+        private func updateScopeBarClearanceIfNeeded() {
+            // An unmeasurable scope bar means no bar sits above this grid (the system placed the search
+            // field elsewhere, for example at the bottom). The steady state is no clearance at all: the
+            // pre-#944 position the grid held before any picker existed.
+            guard scopeBarGap > 0, let window else {
+                if scopeBarClearance != 0 { applyScopeBarClearance(0) }
+                return
+            }
+            guard let scopeBarBottom = searchScopeBarBottom(in: window) else {
+                if scopeBarClearance != 0 { applyScopeBarClearance(0) }
+                return
+            }
+            let overhang = max(0, scopeBarBottom - safeAreaInsets.top)
+            let clearance = overhang + scopeBarGap
+            if clearance != scopeBarClearance { applyScopeBarClearance(clearance) }
+        }
+
+        private func applyScopeBarClearance(_ clearance: CGFloat) {
+            let delta = clearance - scopeBarClearance
+            scopeBarClearance = clearance
+            // The cached engine bakes the clearance into its layout; drop it so the next render rebuilds.
+            cachedEngine = nil
+            if delta != 0, scrollView.contentOffset.y > -safeAreaInsets.top + 0.5 {
+                scrollView.contentOffset.y = max(-safeAreaInsets.top, scrollView.contentOffset.y + delta)
+            }
+        }
+
+        /// Bottom edge of a system search scope bar presented above this grid, in window coordinates. The
+        /// scope bar hangs below the navigation bar without extending the safe area, so the safe area alone
+        /// can't describe it. Like `visibleTabBarFrames` measures the real tab bar chrome, this measures the
+        /// scope picker's segmented control instead of hard-coding its height. Only the grid's own subtree
+        /// is skipped; views outside it that start just below the safe-area top and are wider than tall are
+        /// scope-picker segments.
+        private func searchScopeBarBottom(in window: UIWindow) -> CGFloat? {
+            let safeTop = safeAreaInsets.top
+            var result: CGFloat?
+            var views: [(UIView, Int)] = [(window, 0)]
+            var index = 0
+            while index < views.count && index < 400 {
+                let (view, depth) = views[index]
+                index += 1
+                guard depth <= 40, !view.isHidden, view.alpha > 0, view !== self else { continue }
+                if let control = view as? UISegmentedControl {
+                    let frame = control.convert(control.bounds, to: window)
+                    if frame.minY >= safeTop - 1, frame.minY < safeTop + 120,
+                        frame.width > frame.height, frame.height > 8
+                    {
+                        result = max(result ?? 0, frame.maxY)
+                    }
+                }
+                guard depth < 40, views.count < 400 else { continue }
+                for child in view.subviews {
+                    views.append((child, depth + 1))
+                }
+            }
+            return result
+        }
+
         /// Stop the render loop and drop all in-flight warm work - used both when the view leaves its window and
         /// when the tab deactivates. Visible cache/textures stay resident, so returning redraws immediately.
         private func suspendRenderLoop() {
+            if firstContentPending { invalidateFirstContentForSource() }
+            placeholderScroll.reset()
+            placeholderPulse.restart()
             displayLink.pause()
             perf.noteLoopPaused(reason: "suspended")
             presentationTiming.resetCadence()
@@ -874,6 +1145,7 @@
 
             metalView.translatesAutoresizingMaskIntoConstraints = true
             metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            observeHingeForReservedRegions()
             addSubview(metalView)
 
             scrollView.translatesAutoresizingMaskIntoConstraints = true
@@ -981,19 +1253,78 @@
             }
         }
 
-        /// Keeps the last row of content clear of the bottom bar / home indicator: the scroll surface extends
-        /// under the (translucent) bar for the full-bleed look, but the content range ends above it, so fully
-        /// scrolled to the newest photo every thumbnail of the final row stays visible and tappable. Safe-area
-        /// driven - tab bar, home indicator, orientation and iPad sidebar layouts all flow through the same inset.
-        /// Also adds a top inset equal to safeAreaInsets.top so the first row rests below the navigation bar
-        /// instead of being covered by it.
+        /// Keep the newest row clear of a horizontal bottom tab bar, and the first row below the navigation bar.
+        /// The scope-picker gap is deliberately NOT added here: the scope bar hangs below the safe-area top
+        /// without extending it, so a bigger `contentInset.top` never moves the rendered rows (it only moves the
+        /// rubber-band boundary). The gap lives in the engine's layout origin instead - see
+        /// `updateScopeBarClearanceIfNeeded` - while this inset keeps the rest position the min-content-offset,
+        /// exactly as before the picker appeared.
         private func applyContentInsets() {
             let top = safeAreaInsets.top
-            let bottom = safeAreaInsets.bottom
+            let bars = window.map { visibleTabBarFrames(in: $0) } ?? []
+            let viewport = window.map { convert(bounds, to: $0) } ?? .zero
+            let inputs = InsetInputs(
+                safeArea: safeAreaInsets, viewport: viewport, windowBounds: window?.bounds ?? .zero, tabBars: bars)
+            guard inputs != lastInsetInputs else { return }
+            lastInsetInputs = inputs
+            let bottom = GridBottomInsetPolicy.inset(
+                safeBottom: safeAreaInsets.bottom, viewport: viewport, tabBars: bars)
             if scrollView.contentInset.top != top || scrollView.contentInset.bottom != bottom {
                 scrollView.contentInset = UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
             }
             scrollView.verticalScrollIndicatorInsets = UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
+        }
+
+        func visibleTabBarFrames(in window: UIWindow) -> [GridBottomInsetPolicy.TabBar] {
+            var result: [GridBottomInsetPolicy.TabBar] = []
+            var seen: Set<ObjectIdentifier> = []
+            func add(_ bar: UITabBar) {
+                guard bar.window === window, seen.insert(ObjectIdentifier(bar)).inserted else { return }
+                let frame = bar.convert(bar.bounds, to: window)
+                var visible = frame.intersection(window.bounds)
+                var ancestor: UIView? = bar
+                var depth = 0
+                while let view = ancestor, depth <= 40 {
+                    guard !view.isHidden, view.alpha > 0 else { return }
+                    if view.clipsToBounds { visible = visible.intersection(view.convert(view.bounds, to: window)) }
+                    if view === window { break }
+                    ancestor = view.superview
+                    depth += 1
+                }
+                guard ancestor === window, !visible.isNull, !visible.isEmpty else { return }
+                result.append(.init(frame: frame, visibleFrame: visible))
+            }
+            var controllers: [(UIViewController, Int)] = window.rootViewController.map { [($0, 0)] } ?? []
+            var controllerIndex = 0
+            var seenControllers: Set<ObjectIdentifier> = []
+            while controllerIndex < controllers.count && controllerIndex < 400 {
+                let (controller, depth) = controllers[controllerIndex]
+                controllerIndex += 1
+                guard depth <= 40, seenControllers.insert(ObjectIdentifier(controller)).inserted else { continue }
+                if let tabs = controller as? UITabBarController, tabs.isViewLoaded { add(tabs.tabBar) }
+                guard depth < 40 else { continue }
+                for child in controller.children {
+                    guard controllers.count < 400 else { break }
+                    controllers.append((child, depth + 1))
+                }
+                if let presented = controller.presentedViewController, controllers.count < 400 {
+                    controllers.append((presented, depth + 1))
+                }
+            }
+            var views: [(UIView, Int)] = [(window, 0)]
+            var index = 0
+            while index < views.count && index < 400 {
+                let (view, depth) = views[index]
+                index += 1
+                guard depth <= 40, !view.isHidden, view.alpha > 0 else { continue }
+                if let bar = view as? UITabBar { add(bar) }
+                guard depth < 40 else { continue }
+                for child in view.subviews {
+                    guard views.count < 400 else { break }
+                    views.append((child, depth + 1))
+                }
+            }
+            return result
         }
 
         /// The largest valid vertical content offset given the current content size and bottom inset.
@@ -1057,9 +1388,11 @@
             guard window != nil, bounds.height > 0, !itemUIDs.isEmpty else { return }
             let target = maxContentOffsetY
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
+            placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
             isApplyingProgrammaticScroll = true
             scrollView.setContentOffset(CGPoint(x: 0, y: target), animated: animated)
             isApplyingProgrammaticScroll = false
+            if !animated { finishPlaceholderScroll() }
             requestRender()
         }
 
@@ -1071,9 +1404,11 @@
             resizeAnchorItemID = nil
             let target = -safeAreaInsets.top
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
+            placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
             isApplyingProgrammaticScroll = true
             scrollView.setContentOffset(CGPoint(x: 0, y: target), animated: animated)
             isApplyingProgrammaticScroll = false
+            if !animated { finishPlaceholderScroll() }
             needsInitialViewportPlacement = false
             userHasScrolledTimeline = false
             requestRender()
@@ -1254,9 +1589,10 @@
             }
 
             let level = activeLevel(profile: profile)
-            let engine = SquareTileGridEngine(
+            var engine = SquareTileGridEngine(
                 sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
             )
+            engine.topInset = scopeBarClearance
             let plan = engine.framePlan(
                 level: level,
                 viewportSize: lastLaidOutViewportSize,
@@ -1348,18 +1684,24 @@
                 previousLayoutSize.width > 0, layoutSize.width > 0
             {
                 let sourceLevel = activeLevel(profile: previousProfile)
-                let sourceEngine = SquareTileGridEngine(
-                    sectionCounts: [items.count], profile: previousProfile, fillOrder: fillOrder
-                )
+                let sourceEngine =
+                    cachedEngine
+                    ?? SquareTileGridEngine(
+                        sectionCounts: [items.count], profile: previousProfile, fillOrder: fillOrder
+                    )
                 let targetEngine = SquareTileGridEngine(
                     sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
                 )
-                interactiveLevel = sourceEngine.closestVisualLevel(
-                    sourceLevel: sourceLevel,
-                    sourceWidth: previousLayoutSize.width,
-                    in: targetEngine,
-                    targetWidth: layoutSize.width
-                )
+                interactiveLevel = profileLevelMemory.level(
+                    leaving: previousProfile.id, at: sourceLevel, entering: profile.id
+                ) {
+                    sourceEngine.closestVisualLevel(
+                        sourceLevel: sourceLevel,
+                        sourceWidth: previousLayoutSize.width,
+                        in: targetEngine,
+                        targetWidth: layoutSize.width
+                    )
+                }
             }
             cachedProfile = profile
             cachedProfileLayoutSize = layoutSize
@@ -1370,13 +1712,16 @@
 
         /// The canonical geometry engine for the current item count + profile, rebuilt only when either changes.
         /// A finger-scroll changes neither, so the engine (and its section arrays) is constructed once, not per frame.
+        /// `scopeBarClearance` participates in the cache key: a scope picker appearing or disappearing rebuilds
+        /// so the layout origin shift takes effect.
         func currentEngine(profile: GridLevelProfile) -> SquareTileGridEngine {
             if let cachedEngine, cachedEngineItemCount == items.count, cachedEngineProfileID == profile.id,
-                cachedEngineFillOrder == fillOrder
+                cachedEngineFillOrder == fillOrder, cachedEngine.topInset == scopeBarClearance
             {
                 return cachedEngine
             }
-            let engine = SquareTileGridEngine(sectionCounts: [items.count], profile: profile, fillOrder: fillOrder)
+            var engine = SquareTileGridEngine(sectionCounts: [items.count], profile: profile, fillOrder: fillOrder)
+            engine.topInset = scopeBarClearance
             cachedEngine = engine
             cachedEngineItemCount = items.count
             cachedEngineProfileID = profile.id
@@ -1425,7 +1770,12 @@
             var drawableFailed = false
             if case .noDrawable = outcome { drawableFailed = true }
             var drew = false
-            if case .drawn = outcome { drew = true }
+            if case .drawn = outcome {
+                drew = true
+                #if DEBUG
+                    drawnFrameCount &+= 1
+                #endif
+            }
             let completedAt = CACurrentMediaTime()
             perf.noteTick(
                 frame: frame,
@@ -1579,6 +1929,11 @@
                     draw.index >= 0 && draw.index < itemUIDs.count ? itemUIDs[draw.index] : nil
                 })
             streamTransitionTextures(uids: uids, slotSidePoints: slotSide, textureCache: textureCache)
+            placeholderPulse.update(
+                loadingCount: MetalGridFrameComposer.visibleLoadingCount(
+                    draws: draws, flatUIDs: itemUIDs, viewportSize: viewportSize
+                ) { isLoadingPlaceholder($0, isResident: textureCache.isResident) },
+                now: now)
             let groups = MetalGridFrameComposer.buildTransitionGroups(
                 draws: draws,
                 flatUIDs: itemUIDs,
@@ -1586,12 +1941,16 @@
                 displayMode: displayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
                 decorations: productionDecorations(),
-                now: now
+                now: now,
+                placeholderPulse: placeholderPulse,
+                canRetryPlaceholder: canRetryPlaceholder
             ).groups
             textureCache.evictToBudget()
             guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
-            renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups)
+            guard renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups) else {
+                return .encodingFailed
+            }
             return finishTransitionDraw(
                 uids: uids, slotSidePoints: slotSide, textureCache: textureCache, renderer: renderer,
                 cpuPreparationMs: cpuPreparationMs, drawableWaitMs: acquisition.waitMs, now: now)
@@ -1620,7 +1979,11 @@
             let activeReveal =
                 textureCache.hasActiveThumbnailReveal(in: uids, now: now)
                 || uploadBadgeAnimator.isAnimating(uids, now: now)
-            return .drawn(hasPendingWork: pinchSettling || warmInFlight || ramReadyMissing > 0 || activeReveal)
+                || selectionBadgeAnimationActive
+            let uploadsProgressing = MetalGridFrameComposer.hasProgressingVisibleUploads(
+                cache: textureCache, ramReadyMissing: ramReadyMissing)
+            return .drawn(
+                hasPendingWork: pinchSettling || activeReveal || placeholderPulse.isAnimating || uploadsProgressing)
         }
 
         private func renderOverviewDissolve(
@@ -1646,9 +2009,12 @@
             streamTransitionTextures(uids: uids, slotSidePoints: slotSide, textureCache: textureCache)
             let sourceResidentAfter = residentSlotCount(sourceSlots, textureCache: textureCache)
             let targetResidentAfter = residentSlotCount(targetSlots, textureCache: textureCache)
-            let activeReveal =
-                textureCache.hasActiveThumbnailReveal(in: uids, now: now)
-                || uploadBadgeAnimator.isAnimating(uids, now: now)
+            placeholderPulse.update(
+                loadingCount: MetalGridFrameComposer.visibleLoadingCount(
+                    source: sourceSlots, target: targetSlots, targetOpacity: plan.targetOpacity,
+                    flatUIDs: itemUIDs, viewportSize: viewportSize
+                ) { isLoadingPlaceholder($0, isResident: textureCache.isResident) },
+                now: now)
             textureCache.evictToBudget()
             let sourceGroups = MetalGridFrameComposer.buildGroups(
                 slots: MetalGridFrameComposer.viewportDrawSlots(sourceSlots, viewportSize: viewportSize),
@@ -1656,8 +2022,10 @@
                 cache: textureCache,
                 displayMode: plan.sourceDisplayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
-                decorations: productionDecorations(),
-                now: now
+                decorations: productionDecorations(animateSelectionBadges: false),
+                now: now,
+                placeholderPulse: placeholderPulse,
+                canRetryPlaceholder: canRetryPlaceholder
             ).groups
             let targetGroups = MetalGridFrameComposer.buildGroups(
                 slots: MetalGridFrameComposer.viewportDrawSlots(targetSlots, viewportSize: viewportSize),
@@ -1665,16 +2033,23 @@
                 cache: textureCache,
                 displayMode: plan.targetDisplayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
-                decorations: productionDecorations(),
-                now: now
+                decorations: productionDecorations(animateSelectionBadges: false),
+                now: now,
+                placeholderPulse: placeholderPulse,
+                canRetryPlaceholder: canRetryPlaceholder
             ).groups
+            let activeReveal =
+                textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+                || uploadBadgeAnimator.isAnimating(uids, now: now)
             guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
             renderer.renderLayerDissolve(
                 to: acquisition.target,
                 viewportSize: viewportSize,
-                redrawSource: sourceResidentAfter != sourceResidentBefore || activeReveal,
-                redrawTarget: targetResidentAfter != targetResidentBefore || activeReveal,
+                redrawSource: sourceResidentAfter != sourceResidentBefore || activeReveal
+                    || placeholderPulse.needsLayerRedraw,
+                redrawTarget: targetResidentAfter != targetResidentBefore || activeReveal
+                    || placeholderPulse.needsLayerRedraw,
                 sourceGroups: { sourceGroups },
                 targetGroups: { targetGroups },
                 t: Float(plan.targetOpacity)
@@ -1771,6 +2146,7 @@
                 provideImage: { feed?.memoryCGImage(for: $0) },
                 signposts: composeSignposts
             )
+            updatePlaceholderPulse(visibleUIDs: ids.visible, isResident: textureCache.isResident, now: now)
             if let metadataProvider {
                 thumbnailOverlayResolver.noteVisible(
                     ids.visible.filter { textureCache.isResident($0) },
@@ -1784,52 +2160,48 @@
                 displayMode: displayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
                 decorations: productionDecorations(),
-                now: now
+                now: now,
+                placeholderPulse: placeholderPulse,
+                canRetryPlaceholder: canRetryPlaceholder
             ).groups
             textureCache.evictToBudget()
             guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
-            renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups)
+            guard renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups) else {
+                return .encodingFailed
+            }
 
             let (missingVisible, ramReadyMissing) = missingRetryableTiles(
                 in: ids.visible, isResident: textureCache.isResident)
-            // The first visible thumbnail tells the shell to lift the loading UI onto the grid. Remaining
-            // thumbnails continue loading behind the presented grid.
+            // The first resident visible thumbnail tells the shell to lift the loading UI onto the grid, so a failing
+            // byte route still reaches the shell as a load failure. Remaining thumbnails load there.
             // One-shot per content set; deferred to the next runloop tick so it never mutates observed shell
             // state during a SwiftUI update pass (renderNow can run inside updateUIView and layoutSubviews).
-            if reportFirstContent, !firstContentReported, !ids.visible.isEmpty,
-                ids.visible.contains(where: { textureCache.isResident($0) })
-            {
-                firstContentReported = true
-                let generation = contentGeneration
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.contentGeneration == generation else { return }
-                    self.onFirstContentReady?()
-                }
+            if reportFirstContent {
+                reportFirstRenderedContent(
+                    visibleUIDs: ids.visible, isResident: textureCache.isResident, frameEncoded: true)
             }
             // Warm still-missing visible tiles and the composer's warm list, which, when settled,
             // adds the sources of undersized resident textures whose RAM decode was evicted, so the upgrade can
             // re-decode and sharpen instead of the loop spinning on a pending upgrade it can never satisfy. Mirrors
             // the macOS host, which warms `result.warm`.
             scheduleWarmIfNeeded(warmUnion(missingVisible, streamResult.warm), pixelSize: uploadPixels)
-            // Keep ticking only for work the render loop can make progress on this vsync: a visible tile
-            // already decoded in RAM but held back by the per-frame upload budget (`uploadPending`), a soft-to-sharp
-            // upgrade in flight, or a warm pass running. A visible tile that is still missing with no RAM image is
-            // waiting on the network/disk crawl - the feed's arrival wake (`handleImagesAvailable`) re-arms the loop
-            // when its bytes land, so we idle through that wait instead of spinning full frames the whole time.
-            // RAM-decoded but not yet GPU-resident (the `ramHitGpuMissing` diagnostic): these tiles can fill on
-            // the very next frames within the upload budget - a persistent count means upload-budget starvation.
-            let uploadPending = ramReadyMissing > 0
-            // Residency saturation means neither a deferred upload nor a deferred upgrade can make progress until the
-            // streaming window changes (scroll/zoom, which re-arm on their own), so both are gated on it - matching
-            // the macOS coordinator and avoiding a spin on placeholders that cannot fill this frame.
+            // Keep ticking only for work this loop can finish on its own: the placeholder sweep, a thumbnail fade,
+            // a badge move, decoded images that still wait for the per-frame upload budget, and a soft-to-sharp
+            // upgrade that can progress. A visible tile that is still missing with no RAM image waits on the
+            // network or disk crawl; the feed's arrival wake (`handleImagesAvailable`) re-arms the loop when its
+            // bytes land. Residency saturation stops uploads and upgrades until the streaming window changes
+            // (scroll and zoom re-arm on their own).
             let canMakeProgress = !textureCache.residencySaturatedThisFrame
             let hasPendingWork =
                 forcePendingWork
-                || warmInFlight
+                || placeholderPulse.isAnimating
                 || textureCache.hasActiveThumbnailReveal(in: ids.visible, now: now)
                 || uploadBadgeAnimator.isAnimating(ids.visible, now: now)
-                || ((uploadPending || streamResult.pendingVisibleQualityUpgrade) && canMakeProgress)
+                || selectionBadgeAnimationActive
+                || MetalGridFrameComposer.hasProgressingVisibleUploads(
+                    cache: textureCache, ramReadyMissing: ramReadyMissing)
+                || (streamResult.pendingVisibleQualityUpgrade && canMakeProgress)
             perf.noteDraw(
                 visible: ids.visible.count, missing: missingVisible.count,
                 ramHitGpuMiss: ramReadyMissing, saturated: textureCache.residencySaturatedThisFrame,
@@ -1951,11 +2323,18 @@
             return items[slot.index]
         }
 
-        private func productionDecorations() -> MetalGridDecorations<PhotoUID> {
+        private func productionDecorations(animateSelectionBadges: Bool = true) -> MetalGridDecorations<PhotoUID> {
             let accent = SIMD4<Float>(Float(0x6D) / 255, Float(0x4A) / 255, Float(0xFF) / 255, 1)
             // One time for the whole frame, so every badge of the frame animates in step.
             let frameTime = CACurrentMediaTime()
-            return MetalGridDecorations(
+            selectionBadgeMotions = selectionBadgeMotions.filter { selectionBadgeSeen.contains($0.key) }
+            selectionBadgeSeen.removeAll(keepingCapacity: true)
+            selectionBadgeAnimationActive = false
+            if !animateSelectionBadges {
+                // Dissolve layers have different geometry for the same UID. Their compositor owns the transition.
+                selectionBadgeMotions.removeAll(keepingCapacity: true)
+            }
+            var decorations = MetalGridDecorations<PhotoUID>(
                 accent: accent,
                 accentGlyphColor: MetalGridGlyphColor(
                     red: Double(accent.x), green: Double(accent.y), blue: Double(accent.z), alpha: 1),
@@ -1967,13 +2346,66 @@
                 overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) },
                 uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
                     uploadBadgeAnimator.frame(for: uid, target: badge, now: frameTime)
+                },
+                reservedRegions: reservedRegionLayout, selectionBadgeLayout: selectionBadgeLayout)
+            if animateSelectionBadges {
+                decorations.selectionBadgeFrame = {
+                    [self] uid, tile, side, inset, regions, occupied, neighbors, row, layout in
+                    selectionBadgeSeen.insert(uid)
+                    var motion = selectionBadgeMotions[uid] ?? GridSelectionBadgeMotion()
+                    let rect = motion.frame(
+                        tile: tile, side: side, inset: inset, regions: regions, avoiding: occupied,
+                        neighboringTiles: neighbors, row: row, layout: layout, now: frameTime,
+                        reduceMotion: UIAccessibility.isReduceMotionEnabled)
+                    selectionBadgeMotions[uid] = motion
+                    selectionBadgeAnimationActive = selectionBadgeAnimationActive || motion.isAnimating
+                    return rect
                 }
-            )
+            }
+            return decorations
+        }
+
+        /// The Metal view fills the host, so the host's reserved regions are already in viewport coordinates.
+        private func currentReservedRegionLayout() -> ReservedRegionLayout {
+            #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
+                if #available(iOS 27.1, *) {
+                    let divisions = reservedRegions(kind: .division).map {
+                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive, isDivision: true)
+                    }
+                    let occlusions = reservedRegions(kind: .occlusion).map {
+                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive)
+                    }
+                    // Tiles under the bars are not visible, so a mark must not move there.
+                    return ReservedRegionLayout(
+                        areas: divisions + occlusions,
+                        bounds: bounds.inset(by: scrollView.adjustedContentInset))
+                }
+            #endif
+            return .none
+        }
+
+        /// UIKit reports no separate change of reserved regions. Folding or opening iPhone Duo changes the hinge, so
+        /// the hinge update reads the regions again and draws only when they changed. The angle itself decides nothing.
+        private func observeHingeForReservedRegions() {
+            #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
+                if #available(iOS 27.1, *) {
+                    addInteraction(UIHingeInteraction { [weak self] _, _ in self?.refreshReservedRegions() })
+                }
+            #endif
+        }
+
+        private func refreshReservedRegions() {
+            let layout = currentReservedRegionLayout()
+            guard layout != reservedRegionLayout else { return }
+            reservedRegionLayout = layout
+            setNeedsLayout()
+            requestRender()
         }
     }
 
     extension UIKitTimelineGridHostView: UIScrollViewDelegate {
         public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
             scrollInputActive = true
             updateFeedInteractionState()
         }
@@ -2014,6 +2446,7 @@
         public func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
             if !decelerate {
                 scrollInputActive = false
+                finishPlaceholderScroll()
                 updateFeedInteractionState()
                 requestRender()
             }
@@ -2021,11 +2454,13 @@
 
         public func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
             scrollInputActive = false
+            finishPlaceholderScroll()
             updateFeedInteractionState()
             requestRender()
         }
 
         public func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+            finishPlaceholderScroll()
             requestRender()
         }
     }

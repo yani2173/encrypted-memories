@@ -97,6 +97,56 @@ extension DriveSessionStubSuite {
             }
         }
 
+        // MARK: Album listing
+
+        private static let albumRoute = "GET /drive/photos/volumes/vol1/albums/album1/children"
+
+        private static func albumPage(
+            _ linkID: String, more: Bool, anchor: String? = nil
+        ) -> (status: Int, json: String) {
+            let anchorField = anchor.map { #","AnchorID":"\#($0)""# } ?? ""
+            return (
+                status: 200,
+                json:
+                    #"{"Code":1000,"Photos":[{"LinkID":"\#(linkID)","CaptureTime":1,"Tags":[],"RelatedPhotos":[]}],"More":\#(more)"#
+                    + anchorField + "}"
+            )
+        }
+
+        @Test func albumPagesFollowTheirAnchorsInOrder() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.routeSequence(
+                Self.albumRoute,
+                responses: [
+                    Self.albumPage("a", more: true, anchor: "x"),
+                    Self.albumPage("b", more: true, anchor: "y"),
+                    Self.albumPage("c", more: false),
+                ])
+
+            let entries = try await makeSessionForPhotosListTests().fetchAlbumPhotos(
+                volumeID: "vol1", albumLinkID: "album1")
+
+            #expect(entries.map(\.linkID) == ["a", "b", "c"])
+            #expect(StubURLProtocol.requests().count == 3)
+        }
+
+        @Test func anAlbumPageThatRepeatsAnAnchorFailsInsteadOfLooping() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.routeSequence(
+                Self.albumRoute,
+                responses: [
+                    Self.albumPage("a", more: true, anchor: "x"),
+                    Self.albumPage("b", more: true, anchor: "x"),
+                    Self.albumPage("c", more: false),
+                ])
+
+            await #expect(throws: DrivePaginationError.repeatedAlbumAnchor("x")) {
+                _ = try await makeSessionForPhotosListTests().fetchAlbumPhotos(
+                    volumeID: "vol1", albumLinkID: "album1")
+            }
+            #expect(StubURLProtocol.requests().count == 2, "the repeated anchor is never requested a third time")
+        }
+
         @Test func invalidPageSizeZeroThrowsWithoutNetwork() async throws {
             StubURLProtocol.reset()
             // pageSize=0 should fail before making any network request.

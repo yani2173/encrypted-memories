@@ -10,8 +10,8 @@ public extension View {
 }
 
 struct ActivitySpin: ViewModifier {
-    /// The one speed multiplier of every spinning activity symbol: the factor the Backup symbols used before. The
-    /// system sets the base duration of the rotate effect, so this is a relative speed, not a number of seconds.
+    /// The one speed multiplier of every spinning activity symbol. The system sets the base duration of the rotate
+    /// effect, so this is a relative speed, not a number of seconds.
     nonisolated static let speed: Double = 1 / 1.7
 
     let active: Bool

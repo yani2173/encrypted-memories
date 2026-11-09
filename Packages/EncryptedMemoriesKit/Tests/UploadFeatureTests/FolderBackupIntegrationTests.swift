@@ -205,7 +205,7 @@ final class FolderBackupIntegrationTests: XCTestCase {
             XCTAssertEqual(caught, error)
         }
 
-        let summary = queueStore.summary()
+        let summary = queueStore.summary()!
         XCTAssertEqual(summary.total, 1)
         XCTAssertEqual(summary.waiting, 1)
         XCTAssertEqual(summary.failed, 0)

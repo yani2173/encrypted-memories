@@ -42,12 +42,15 @@ public final class VideoPlaybackController {
     private var isStreaming = false
     private var hasStartedPlayback = false
     private var attachmentGeneration: UInt64 = 0
+    /// The number of players that were ever attached. It only grows, so a test sees an attachment that a later
+    /// teardown removed again.
+    package private(set) var attachedPlayerCount = 0
     private var attachmentIdentity: VideoPlaybackAttachmentIdentity?
     private var playbackActivity: LibraryRuntimeActivityRegistration?
     private let runtimeState: LibraryRuntimeState
 
-    /// Seconds to wait for initial playback before declaring the attempt stuck. The public label remains
-    /// source-compatible with existing callers even though the timer measures startup, not display readiness.
+    /// Seconds to wait for initial playback before declaring the attempt stuck. The timer measures startup, not
+    /// display readiness.
     private let startupDeadline: TimeInterval
     private let diagnostics: VideoPlaybackDiagnosticSink?
 
@@ -64,7 +67,6 @@ public final class VideoPlaybackController {
     // MARK: - State the model pushes in (resolution phase, before a player exists)
 
     public func setResolving() { transition(.resolving) }
-    public func setDownloading(_ progress: Double) { transition(.downloading(progress)) }
 
     /// Resets to idle and tears down any player - used when navigating to a new item or when a
     /// stream-resolve turns out to be an image.
@@ -98,6 +100,7 @@ public final class VideoPlaybackController {
 
     private func attach(_ item: AVPlayerItem, uid: PhotoUID, initial: VideoViewerState) {
         hasStartedPlayback = false
+        attachedPlayerCount += 1
         let player = AVPlayer(playerItem: item)
         VideoPlaybackTuning.configure(player: player, item: item, isStreaming: isStreaming)
         attachmentGeneration &+= 1
@@ -119,27 +122,6 @@ public final class VideoPlaybackController {
                 let error = observed.error
                 Task { @MainActor in
                     box.value?.onStatus(raw, error: error, uid: uid, identity: identity)
-                }
-            })
-        observations.append(
-            item.observe(\.isPlaybackBufferEmpty, options: [.new]) { observed, _ in
-                let empty = observed.isPlaybackBufferEmpty
-                Task { @MainActor in
-                    box.value?.onBufferEmpty(empty, uid: uid, identity: identity)
-                }
-            })
-        observations.append(
-            item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { observed, _ in
-                let likely = observed.isPlaybackLikelyToKeepUp
-                Task { @MainActor in
-                    box.value?.onLikelyToKeepUp(likely, uid: uid, identity: identity)
-                }
-            })
-        observations.append(
-            item.observe(\.loadedTimeRanges, options: [.new]) { observed, _ in
-                let ranges = observed.loadedTimeRanges.map(\.timeRangeValue)
-                Task { @MainActor in
-                    box.value?.onLoadedRanges(ranges, uid: uid, identity: identity)
                 }
             })
         observations.append(
@@ -218,33 +200,6 @@ public final class VideoPlaybackController {
         default:
             break
         }
-    }
-
-    private func onBufferEmpty(
-        _: Bool,
-        uid: PhotoUID,
-        identity: VideoPlaybackAttachmentIdentity
-    ) {
-        guard isCurrent(uid: uid, identity: identity), let player else { return }
-        logPlayer(item: player.currentItem, player: player)
-    }
-
-    private func onLikelyToKeepUp(
-        _: Bool,
-        uid: PhotoUID,
-        identity: VideoPlaybackAttachmentIdentity
-    ) {
-        guard isCurrent(uid: uid, identity: identity), let player else { return }
-        logPlayer(item: player.currentItem, player: player)
-    }
-
-    private func onLoadedRanges(
-        _: [CMTimeRange],
-        uid: PhotoUID,
-        identity: VideoPlaybackAttachmentIdentity
-    ) {
-        guard isCurrent(uid: uid, identity: identity), let player else { return }
-        logPlayer(item: player.currentItem, player: player)
     }
 
     /// `timeControlStatus` is authoritative for native play, pause, replay, and waiting. This handler only
@@ -337,7 +292,7 @@ public final class VideoPlaybackController {
                 self.player?.timeControlStatus != .paused
             else { return }
             self.emitDiagnostics([
-                "uid": self.key(uid), "event": "watchdogTimeout", "deadline": "\(Int(deadline))s",
+                "event": "watchdogTimeout", "deadline": "\(Int(deadline))s",
             ])
             self.handleFailure(.timedOut, uid: uid, identity: identity)
         }
@@ -387,8 +342,6 @@ public final class VideoPlaybackController {
         state = next
     }
 
-    private func key(_ uid: PhotoUID) -> String { "\(uid.volumeID)~\(uid.nodeID)" }
-
     private func emitDiagnostics(_ fields: [String: String], throttleSeconds: TimeInterval = 0) {
         diagnostics?(
             VideoPlaybackDiagnosticEvent(
@@ -409,7 +362,6 @@ public final class VideoPlaybackController {
         let duration = item.duration.isNumeric ? String(format: "%.1f", item.duration.seconds) : "?"
         emitDiagnostics(
             [
-                "uid": currentUID.map(key) ?? "-",
                 "status": "\(item.status.rawValue)",
                 "timeControl": "\(player.timeControlStatus.rawValue)",
                 "bufferEmpty": "\(item.isPlaybackBufferEmpty)",
@@ -422,9 +374,10 @@ public final class VideoPlaybackController {
     }
 }
 
-/// Sendable weak box so the `@Sendable` KVO / notification closures can hop back to the
-/// `@MainActor` controller without capturing it directly under Swift 6 concurrency.
-private final class Weak<T: AnyObject>: @unchecked Sendable {
-    weak var value: T?
-    init(_ value: T) { self.value = value }
+/// Sendable weak box so the `@Sendable` KVO / notification / progress closures can hop back to a
+/// `@MainActor` owner (this controller, the viewer model) without capturing it directly under Swift 6
+/// concurrency. All access happens inside a `@MainActor` Task.
+package final class Weak<T: AnyObject>: @unchecked Sendable {
+    package weak var value: T?
+    package init(_ value: T) { self.value = value }
 }

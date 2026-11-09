@@ -6,6 +6,88 @@ import Testing
 
 @Suite("Video byte-range cache generations")
 struct VideoByteRangeCacheTests {
+    @Test func staleLookupTicketCannotWriteWithCurrentOwner() {
+        let fixture = makeCache()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let cache = fixture.cache
+        let photo = uid("stale-ticket-current-owner")
+        let staleTicket = cache.lookup(uid: photo, block: 1).ticket
+        cache.clearAll()
+        let currentOwner = cache.captureOwnerGeneration()
+
+        #expect(
+            !cache.store(
+                uid: photo, block: 1, encrypted: Data([42]), ticket: staleTicket,
+                ownerGeneration: currentOwner))
+        #expect(cache.lookup(uid: photo, block: 1).encrypted == nil)
+    }
+
+    @Test func defaultPolicyBudgetControlsEvictionAndPreservesCurrentVideo() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = VideoByteRangeCache(rootDirectory: root, policyBudget: { _ in 10 })
+        let old = uid("policy-old")
+        let current = uid("policy-current")
+        let oldTicket = cache.lookup(uid: old, block: 0).ticket
+        #expect(
+            cache.store(
+                uid: old, block: 0, encrypted: Data(repeating: 1, count: 6), ticket: oldTicket,
+                ownerGeneration: oldTicket))
+        let currentTicket = cache.lookup(uid: current, block: 0).ticket
+        #expect(
+            cache.store(
+                uid: current, block: 0, encrypted: Data(repeating: 2, count: 11), ticket: currentTicket,
+                ownerGeneration: currentTicket))
+        #expect(cache.lookup(uid: old, block: 0).encrypted == nil)
+        #expect(cache.lookup(uid: current, block: 0).encrypted == Data(repeating: 2, count: 11))
+    }
+
+    @Test func defaultBudgetAndExplicitOverrideStayUnchanged() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let policy = DiskCacheBudgetPolicy(platform: .mobile)
+        let cache = VideoByteRangeCache(rootDirectory: root)
+        #expect(policy.videoBudget == .bytes(512 * 1024 * 1024))
+        #expect(cache.budgetBytes == 512 * 1024 * 1024)
+        #expect(VideoByteRangeCache.shared.budgetBytes == 512 * 1024 * 1024)
+        let override = VideoByteRangeCache(budgetBytes: 23, rootDirectory: root, policyBudget: { _ in 10 })
+        #expect(override.budgetBytes == 23)
+        #expect(VideoByteRangeCache.byteLimit(for: .unlimited) == Int.max)
+        #expect(VideoByteRangeCache.byteLimit(for: .bytes(17)) == 17)
+    }
+
+    @Test func evictionStartsOnlyAboveBudgetAndRemovesOldest() throws {
+        let fixture = makeCache(budgetBytes: 10)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let cache = fixture.cache
+        let oldest = uid("oldest")
+        let newer = uid("newer")
+        let exact = uid("exact")
+        let trigger = uid("trigger")
+        func put(_ photo: PhotoUID, _ size: Int) {
+            let ticket = cache.lookup(uid: photo, block: 0).ticket
+            #expect(
+                cache.store(
+                    uid: photo, block: 0, encrypted: Data(repeating: 1, count: size), ticket: ticket,
+                    ownerGeneration: ticket))
+        }
+        put(oldest, 4)
+        let firstDirectory = try #require(
+            FileManager.default.contentsOfDirectory(at: fixture.root, includingPropertiesForKeys: nil).first)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: firstDirectory.path)
+        put(newer, 4)
+        put(exact, 2)
+        #expect(cache.lookup(uid: oldest, block: 0).encrypted != nil)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: firstDirectory.path)
+        put(trigger, 2)
+        #expect(cache.lookup(uid: oldest, block: 0).encrypted == nil)
+        #expect(cache.lookup(uid: newer, block: 0).encrypted != nil)
+        #expect(cache.lookup(uid: exact, block: 0).encrypted != nil)
+        #expect(cache.lookup(uid: trigger, block: 0).encrypted != nil)
+    }
+
     @Test func storagePressurePausesWritesAndEvictsAtCritical() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("EncryptedMemories-video-pressure-\(UUID().uuidString)")

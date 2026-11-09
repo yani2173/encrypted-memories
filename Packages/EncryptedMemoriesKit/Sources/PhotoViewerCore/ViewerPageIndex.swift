@@ -2,8 +2,8 @@ import PhotosCore
 
 /// Stable UID-to-page projection for a viewer route.
 ///
-/// Native pagers continue to own their integer page. Filmstrips and route restoration use this value to
-/// resolve a `PhotoUID` back into that existing page without becoming a second navigation owner.
+/// Native pagers continue to own their integer page. Filmstrips use this value to resolve a `PhotoUID`
+/// back into that existing page without becoming a second navigation owner.
 public struct ViewerPageIndex: Equatable, Sendable {
     public let orderedUIDs: [PhotoUID]
     private let indicesByUID: [PhotoUID: Int]
@@ -32,14 +32,5 @@ public struct ViewerPageIndex: Equatable, Sendable {
             guard let index = indicesByUID[uid], items.indices.contains(index) else { return nil }
             return items[index]
         }
-    }
-
-    /// Resolves the selected identity first. If it left the route, keeps the nearest valid existing page.
-    public func resolvedIndex(selectedUID: PhotoUID?, fallbackIndex: Int) -> Int? {
-        guard !orderedUIDs.isEmpty else { return nil }
-        if let selectedUID, let selectedIndex = index(of: selectedUID) {
-            return selectedIndex
-        }
-        return min(max(fallbackIndex, 0), orderedUIDs.count - 1)
     }
 }

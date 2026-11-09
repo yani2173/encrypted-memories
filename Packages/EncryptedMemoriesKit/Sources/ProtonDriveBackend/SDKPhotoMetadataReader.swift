@@ -15,21 +15,29 @@ enum SDKPhotoMetadataReader {
     }
 
     /// Reuses the SDK's decrypted sections from the same node read as the Info panel.
-    static func read(for uid: PhotoUID, client: any SDKPhotoCatalogClient) async throws -> ReadResult {
-        let node = try await SDKCancellableOperation.run { token in
-            try await client.getNode(
-                nodeUid: SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID), cancellationToken: token)
-        } cancel: { token in
-            try? await client.cancelGetNode(cancellationToken: token)
-        }
-        try Task.checkCancellation()
-        switch node {
-        case .photo(let photo):
-            return read(name: photo.name, mimeType: photo.mediaType, revision: photo.activeRevision)
-        case .file(let file):
-            return read(name: file.name, mimeType: file.mediaType, revision: file.activeRevision)
-        default:
-            throw CocoaError(.fileReadUnknown)
+    /// With `sharing`, an overlapping album membership read of the same photo shares the SDK read.
+    static func read(
+        for uid: PhotoUID, client: any SDKPhotoCatalogClient, sharing: SDKPresentationNodeReads? = nil,
+        workMeasurements: SupportWorkMeasurements? = nil
+    ) async throws -> ReadResult {
+        try await WorkMeasurementOperation.run(.viewerRead, collector: workMeasurements) { measurement in
+            measurement?.record(.nodesRequested)
+            measurement?.record(.nodesUnique)
+            let node = try await SDKNodeRead.node(
+                SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID), client: client, sharing: sharing,
+                measurement: measurement)
+            try Task.checkCancellation()
+            let result: ReadResult
+            switch node {
+            case .photo(let photo):
+                result = read(name: photo.name, mimeType: photo.mediaType, revision: photo.activeRevision)
+            case .file(let file):
+                result = read(name: file.name, mimeType: file.mediaType, revision: file.activeRevision)
+            default:
+                throw CocoaError(.fileReadUnknown)
+            }
+            measurement?.record(.factsCreated)
+            return result
         }
     }
 
@@ -84,9 +92,7 @@ enum SDKPhotoMetadataReader {
             filename: name,
             mediaType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
             captureTime: captureDate,
-            modificationDate: revision.claimedModificationTime.flatMap {
-                $0.isFinite ? Date(timeIntervalSince1970: $0) : nil
-            } ?? captureDate,
+            modificationDate: revision.claimedModificationTime.flatMap(SDKModificationTime.date(from:)) ?? captureDate,
             additionalMetadata: (revision.claimedAdditionalMetadata ?? [])
                 .filter { $0.name != "iOS.photos" && !$0.name.hasPrefix("EncryptedMemories.") }
                 .map { PhotoUploadAdditionalMetadata(name: $0.name, utf8JsonValue: $0.utf8JsonValue) }
@@ -116,9 +122,7 @@ enum SDKPhotoMetadataReader {
         let media = decode(Media.self, name: "Media")
         let camera = decode(Camera.self, name: "Camera")
         let location = decode(Location.self, name: "Location")
-        let modificationTime = revision.claimedModificationTime.flatMap {
-            $0.isFinite ? Date(timeIntervalSince1970: $0) : nil
-        }
+        let modificationTime = revision.claimedModificationTime.flatMap(SDKModificationTime.date(from:))
         return PhotoMetadata(
             filename: try? name.get(),
             mimeType: mimeType.isEmpty ? nil : mimeType,

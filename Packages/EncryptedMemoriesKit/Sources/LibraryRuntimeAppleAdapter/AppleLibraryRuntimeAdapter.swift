@@ -29,7 +29,15 @@ public final class AppleLibraryRuntimeAdapter {
     private var dispatchPressure: MemoryConditions.Pressure = .normal
     private var memoryWarningLatched = false
 
+    /// The shared policy is the one source of disk-cache budget facts, including storage-pressure thresholds.
+    private let diskCachePolicy: DiskCacheBudgetPolicy
+
     private init() {
+        #if os(macOS)
+            diskCachePolicy = DiskCacheBudgetPolicy(platform: .macOS)
+        #else
+            diskCachePolicy = DiskCacheBudgetPolicy(platform: .mobile)
+        #endif
         runtimeState = .shared
         memoryGovernor = .shared
         networkMonitor = NWPathMonitor()
@@ -95,9 +103,10 @@ public final class AppleLibraryRuntimeAdapter {
             DeviceStorage.availableCapacity(at: home)
         }.value
         guard !Task.isCancelled else { return }
+        let policy = diskCachePolicy
         runtimeState.update {
             $0.storagePressure = LibraryStoragePressure.next(
-                after: $0.storagePressure, availableBytes: available)
+                after: $0.storagePressure, availableBytes: available, policy: policy)
         }
     }
 

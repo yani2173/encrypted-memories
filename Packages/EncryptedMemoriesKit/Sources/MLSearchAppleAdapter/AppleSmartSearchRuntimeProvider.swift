@@ -1,7 +1,6 @@
 @preconcurrency import CoreML
 import Foundation
 import MLSearchCore
-import MediaFeedCore
 import PhotosCore
 
 public enum AppleSmartSearchRuntimeError: Error, Equatable {
@@ -23,11 +22,6 @@ public enum AppleSmartSearchRuntimeError: Error, Equatable {
 public struct AppleSmartSearchRuntimeProvider: MLSmartSearchRuntimeProvider {
     private let imageSource: any CoreMLImageSource
     private let runnerConfiguration: MLIndexRunner.Configuration
-
-    public init(feed: ThumbnailFeedCore, runnerConfiguration: MLIndexRunner.Configuration = .init()) {
-        self.imageSource = CachedThumbnailMLImageSource(feed: feed)
-        self.runnerConfiguration = runnerConfiguration
-    }
 
     public init(
         imageSource: any CoreMLImageSource,

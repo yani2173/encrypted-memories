@@ -101,7 +101,7 @@ import TimelineCore
         ]
         for (text, displayable, published, isCurrent, expected) in cases {
             let decision = SmartSearchDiscoveryModel.commitDecision(
-                for: text, displayable: displayable, published: published, isCurrent: isCurrent)
+                for: text, displayable: displayable, published: published, isCurrent: isCurrent, scope: .all)
             let label: String
             switch decision {
             case .structured(let suggestion):
@@ -112,6 +112,23 @@ import TimelineCore
             }
             #expect(label == expected, "\(text) displayable=\(displayable.count) current=\(isCurrent)")
         }
+    }
+
+    /// A suggestion's result set answers the broad Smart Search scope. A narrower scope, such as OCR, searches the
+    /// text that the field shows, so switching the scope after choosing a suggestion changes the results.
+    @Test func aNarrowerScopeSearchesTheSuggestionTitleAsText() {
+        for scope in MLSearchScope.allCases where scope != .all {
+            for (displayable, isCurrent) in [([place], true), ([place], false), ([], false)] {
+                let decision = SmartSearchDiscoveryModel.commitDecision(
+                    for: place.query, displayable: displayable, published: [place], isCurrent: isCurrent,
+                    scope: scope)
+                #expect(decision == .text, "\(scope) displayable=\(displayable.count) current=\(isCurrent)")
+            }
+        }
+        #expect(
+            SmartSearchDiscoveryModel.commitDecision(
+                for: place.query, displayable: [place], published: [place], isCurrent: true, scope: .all)
+                == .structured(place))
     }
 
     @Test func rebindTable() {
@@ -159,7 +176,8 @@ import TimelineCore
         #expect(model.isSettled(content: one))
         let first = try #require(model.forYou(content: one, snapshot: nil).first)
         #expect(!model.chips(content: one, snapshot: nil).isEmpty)
-        #expect(model.commitDecision(for: first.query, content: one, snapshot: nil) == .structured(first))
+        #expect(model.commitDecision(for: first.query, content: one, snapshot: nil, scope: .all) == .structured(first))
+        #expect(model.commitDecision(for: first.query, content: one, snapshot: nil, scope: .text) == .text)
 
         // The library changed and no refresh ran yet: nothing computed for revision 1 may be offered, and the
         // title waits for the refresh instead of running as text.
@@ -169,8 +187,8 @@ import TimelineCore
         #expect(model.forYou(content: two, snapshot: nil).isEmpty)
         #expect(model.chips(content: two, snapshot: nil).isEmpty)
         #expect(model.textSuggestions(content: two, snapshot: nil).isEmpty)
-        #expect(model.commitDecision(for: first.query, content: two, snapshot: nil) == .deferUntilRefresh)
-        #expect(model.commitDecision(for: "typed text", content: two, snapshot: nil) == .text)
+        #expect(model.commitDecision(for: first.query, content: two, snapshot: nil, scope: .all) == .deferUntilRefresh)
+        #expect(model.commitDecision(for: "typed text", content: two, snapshot: nil, scope: .all) == .text)
         #expect(model.rebind(first, content: two, snapshot: nil) == .pending)
 
         let generation = model.settledGeneration
@@ -186,7 +204,7 @@ import TimelineCore
             return
         }
         #expect(fresh.id == first.id)
-        #expect(model.commitDecision(for: first.query, content: two, snapshot: nil) == .structured(fresh))
+        #expect(model.commitDecision(for: first.query, content: two, snapshot: nil, scope: .all) == .structured(fresh))
     }
 
     @MainActor @Test func aSuggestionThatNoLongerExistsIsDroppedAndItsTitleBecomesText() async throws {
@@ -199,7 +217,7 @@ import TimelineCore
         let two = await refresh(model, revision: 2, favorites: [])
         #expect(model.isSettled(content: two))
         #expect(model.rebind(favoritesRow, content: two, snapshot: nil) == .drop)
-        #expect(model.commitDecision(for: favoritesRow.query, content: two, snapshot: nil) == .text)
+        #expect(model.commitDecision(for: favoritesRow.query, content: two, snapshot: nil, scope: .all) == .text)
     }
 
     @MainActor @Test func aFavoritesChangeInvalidatesThePublishedSuggestions() async throws {
@@ -251,11 +269,13 @@ import TimelineCore
         #expect(model.chips.isEmpty)
         #expect(!model.isCurrent(content: two))
         #expect(model.publishedKind(owning: first.query) == first.kind)
-        #expect(model.commitDecision(for: first.query, content: two, snapshot: nil) == .deferUntilRefresh)
-        #expect(model.commitDecision(for: "typed text", content: two, snapshot: nil) == .text)
+        #expect(model.commitDecision(for: first.query, content: two, snapshot: nil, scope: .all) == .deferUntilRefresh)
+        #expect(model.commitDecision(for: "typed text", content: two, snapshot: nil, scope: .all) == .text)
 
         await refresh(model, revision: 2)
-        guard case .structured(let fresh) = model.commitDecision(for: first.query, content: two, snapshot: nil)
+        guard
+            case .structured(let fresh) = model.commitDecision(
+                for: first.query, content: two, snapshot: nil, scope: .all)
         else {
             Issue.record("the title must resolve to its current suggestion")
             return
@@ -283,7 +303,9 @@ import TimelineCore
         }
 
         let one = await refresh(model, revision: 1, coordinates: home)
-        guard case .structured(let first) = model.commitDecision(for: "Vienna", content: one, snapshot: nil) else {
+        guard
+            case .structured(let first) = model.commitDecision(for: "Vienna", content: one, snapshot: nil, scope: .all)
+        else {
             Issue.record("the first refresh must publish the place")
             return
         }
@@ -296,17 +318,19 @@ import TimelineCore
         #expect(model.isCurrent(content: two))
         #expect(!model.isSettled(content: two))
         #expect(model.publishedKind(owning: "Vienna") == .place)
-        #expect(model.commitDecision(for: "Vienna", content: two, snapshot: nil) == .deferUntilRefresh)
+        #expect(model.commitDecision(for: "Vienna", content: two, snapshot: nil, scope: .all) == .deferUntilRefresh)
 
         releaseContinuation.yield()
         await second.value
         #expect(model.isSettled(content: two))
-        guard case .structured(let fresh) = model.commitDecision(for: "Vienna", content: two, snapshot: nil) else {
+        guard
+            case .structured(let fresh) = model.commitDecision(for: "Vienna", content: two, snapshot: nil, scope: .all)
+        else {
             Issue.record("the title must resolve to the current place")
             return
         }
         #expect(fresh.id == first.id)
-        #expect(model.commitDecision(for: "Klosterneuburg", content: two, snapshot: nil) != .text)
+        #expect(model.commitDecision(for: "Klosterneuburg", content: two, snapshot: nil, scope: .all) != .text)
     }
 
     @MainActor @Test func aSupersededRefreshCannotPublishOverTheCurrentLibrary() async {
@@ -383,7 +407,9 @@ import TimelineCore
         #expect(rankedPlaces.count == 3)
         let rankedOut = try #require(
             cities.map(\.name).first { name in !rankedPlaces.contains { $0.query == name } })
-        guard case .structured(let selected) = model.commitDecision(for: rankedOut, content: one, snapshot: nil)
+        guard
+            case .structured(let selected) = model.commitDecision(
+                for: rankedOut, content: one, snapshot: nil, scope: .all)
         else {
             Issue.record("the title of a suggestion that is ranked out of the rows must commit it")
             return

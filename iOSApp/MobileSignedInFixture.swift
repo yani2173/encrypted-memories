@@ -11,6 +11,7 @@ import ProtonDriveBackend
 import TimelineCore
 import UIKit
 import UploadCore
+import os
 
 #if DEBUG
     /// A deterministic, offline account for hosted tests and UI tests. Debug builds only.
@@ -121,7 +122,8 @@ import UploadCore
         /// Signs the shared account runtime in with this fixture. Library content first, then the session, so the
         /// runtime's session observer finds an already configured account and does not start a network backend.
         func install() {
-            let albums = MobileFixtureAlbums()
+            let albums = MobileFixtureAlbums(
+                startsEmpty: ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesEmptyAlbumFixture"))
             runtime.libraryModel.installIsolatedLibrary(
                 session: session, store: runtime.sessionModel.sessionStore, backend: backend,
                 sections: MobileUITestLaunch.libraryLoadScenario == nil ? sections : [],
@@ -156,7 +158,12 @@ import UploadCore
                         scanDelay: ProcessInfo.processInfo.arguments.contains(
                             "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil,
                         invalidatingMergeReloadFails: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesReloadFailure")))
+                            "-EncryptedMemoriesDuplicatesReloadFailure"),
+                        mergeFailure: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesPermanentMergeFailure")
+                            ? .userAuthenticationRequired
+                            : ProcessInfo.processInfo.arguments.contains(
+                                "-EncryptedMemoriesDuplicatesMergeFailure") ? .timedOut : nil))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesWideFixture") {
                 // One group with more copies than fit on the screen, and one whose two copies fit.
                 let wide = Array(sections[0].items.prefix(12))
@@ -173,15 +180,18 @@ import UploadCore
                 let groups = (0..<1_500).map { index in
                     (0..<(index.isMultiple(of: 3) ? 3 : 2)).map { items[(index * 3 + $0) % items.count].uid }
                 }
+                // A held scan or check keeps its screen for 300 s, longer than any test (the longest takes about
+                // 31 s). No test waits for the end of the hold, so a slow runner cannot lose the screen.
+                let hold = Duration.seconds(300)
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(
                         groups: groups,
                         captureDates: Dictionary(
                             items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }),
                         scanDelay: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil,
+                            "-EncryptedMemoriesDuplicatesSlowScan") ? hold : nil,
                         rankDelay: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesSlowCheck") ? .seconds(5) : nil,
+                            "-EncryptedMemoriesDuplicatesSlowCheck") ? hold : nil,
                         // Each batch of Merge All takes a while, so a UI test can stop it.
                         mergeDelay: ProcessInfo.processInfo.arguments.contains(
                             "-EncryptedMemoriesDuplicatesSlowMerge") ? .milliseconds(500) : nil))
@@ -279,6 +289,17 @@ import UploadCore
             }
         }
 
+        /// A visible local preview without reading the person's Photos library in UI tests.
+        static func backupProblemThumbnail(for uid: PhotoUID) -> CGImage? {
+            guard !ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesMissingProblemPreview"),
+                uid.localPendingNamespace == .photoLibrary, uid.nodeID.hasPrefix("fixture-")
+            else { return nil }
+            return UIGraphicsImageRenderer(size: CGSize(width: 120, height: 120)).image { context in
+                UIColor.magenta.setFill()
+                context.fill(CGRect(x: 0, y: 0, width: 120, height: 120))
+            }.cgImage
+        }
+
         private func installDeletedBackupFixture(failedItems: Bool = false, queue: Bool = false) {
             let directory = cacheDirectory.appendingPathComponent("backup", isDirectory: true)
             do {
@@ -311,7 +332,9 @@ import UploadCore
                     }
                     installed = controller.installFailedItemsFixtureForTesting(kinds: kinds)
                 } else {
-                    installed = controller.installDeletedElsewhereFixtureForTesting()
+                    let large = ProcessInfo.processInfo.arguments.contains(
+                        "-EncryptedMemoriesDeletedBackupLargeFixture")
+                    installed = controller.installDeletedElsewhereFixtureForTesting(count: large ? 5_000 : 1)
                 }
                 guard installed else { return }
                 backupFixture = controller
@@ -339,8 +362,27 @@ import UploadCore
                 backupFixture = controller
                 runtime.libraryModel.installIsolatedPendingBackupForTesting(
                     controller, store: store, remote: MobileFixturePendingRemoteEffects())
+                if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesExcludedBackupFixture") {
+                    excludeWaitingPhoto()
+                }
             } catch {
                 assertionFailure("The paused backup fixture could not be installed")
+            }
+        }
+
+        /// The person deleted the waiting photo and removed it from Recently Deleted: the Backup settings list it as
+        /// excluded from the backup.
+        private func excludeWaitingPhoto() {
+            let uid = PhotoUID(localPending: .photoLibrary, identifier: "fixture-paused-photo")
+            let model = runtime.libraryModel
+            Task { @MainActor in
+                // The pending grid starts its coordinator on its own; a delete before it shows the photo does nothing.
+                @MainActor func shows() -> Bool {
+                    model.pendingGrid?.pendingSnapshot.tiles.contains { $0.item.uid == uid } == true
+                }
+                for _ in 0..<200 where !shows() { try? await Task.sleep(for: .milliseconds(50)) }
+                guard await model.pendingGrid?.delete([uid]) == true else { return }
+                _ = await model.pendingGrid?.removeFromTrashList([uid])
             }
         }
 
@@ -417,6 +459,7 @@ import UploadCore
     /// `checking` leaves the library check running: its index is not built, and its build stays at 1,234 of 15,000.
     /// The first copy of each group is a favorite in an own album, so the screen shows badges and a reason.
     final class MobileFixtureDuplicates: ExactDuplicateMerging, @unchecked Sendable {
+        func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
         private let lock = NSLock()
         private var groups: [ExactDuplicateGroup]
         private let checking: Bool
@@ -437,13 +480,15 @@ import UploadCore
         private let buildInterruptions: Int
         private var buildCalls = 0
         private var indexComplete = false
+        /// One failed group on the first merge, so the real alert can retry it.
+        private var mergeFailure: URLError.Code?
 
         init(
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
             rescanDropsLastGroup: Bool = false, scanDelay: Duration? = nil, rankDelay: Duration? = nil,
             mergeDelay: Duration? = nil,
             confirmsNoPendingMerges: Bool = true, invalidatingMergeReloadFails: Bool = false,
-            buildInterruptions: Int = 0
+            buildInterruptions: Int = 0, mergeFailure: URLError.Code? = nil
         ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
@@ -457,6 +502,7 @@ import UploadCore
             self.confirmsNoPendingMerges = confirmsNoPendingMerges
             self.invalidatingMergeReloadFails = invalidatingMergeReloadFails
             self.buildInterruptions = buildInterruptions
+            self.mergeFailure = mergeFailure
         }
 
         func confirmNoPendingMerges() async -> Bool { confirmsNoPendingMerges }
@@ -545,9 +591,20 @@ import UploadCore
                 lock.withLock { reloadMustFail = true }
                 return requests.map { _ in .success(.skipped(.preselectionChanged)) }
             }
-            lock.withLock { groups.removeAll { group in requests.contains { $0.group.id == group.id } } }
+            let failure = lock.withLock {
+                let failure = mergeFailure
+                mergeFailure = nil
+                let failedID = failure == nil ? nil : requests.first?.group.id
+                groups.removeAll { group in
+                    group.id != failedID && requests.contains { $0.group.id == group.id }
+                }
+                return failure
+            }
             return requests.map { request in
-                .success(
+                if let failure, request.group.id == requests.first?.group.id {
+                    return .failure(URLError(failure))
+                }
+                return .success(
                     .merged(
                         kept: request.kept, trashed: request.group.members.filter { $0 != request.kept },
                         keptDuplicates: [:]))
@@ -555,39 +612,66 @@ import UploadCore
         }
     }
 
-    enum MobileFixtureError: Error {
+    enum MobileFixtureError: Error, VideoPlaybackClassifiable {
         case bitmap
         case unavailable
         case pendingAccountPurge
+        case rateLimited
+        case permanentVideoFailure
+
+        var videoPlaybackError: VideoPlaybackError? {
+            switch self {
+            case .rateLimited: .quotaOrRateLimited
+            case .permanentVideoFailure: .decryptionFailed
+            default: nil
+            }
+        }
     }
 
-    /// One owned album in memory, so the UI tests can add photos to an album without an account.
+    /// Owned albums in memory, so UI tests can create albums and add photos without an account.
     final class MobileFixtureAlbums: AlbumCatalogBackend, AlbumWriteBackend, @unchecked Sendable {
         static let albumTitle = "Fixture Album"
         static let capabilities = AlbumCapabilities(
-            canList: true, canCreate: false, canAddPhotos: true, canSetCover: false, canReadMemberships: true)
+            canList: true, canCreate: true, canAddPhotos: true, canSetCover: false, canReadMemberships: true)
 
         private let lock = NSLock()
-        private var members: [PhotoUID] = []
+        private let startsEmpty: Bool
+        private var createdAlbums: [(id: AlbumID, title: String)] = []
+        private var members: [AlbumID: Set<PhotoUID>] = [:]
+
+        init(startsEmpty: Bool = false) { self.startsEmpty = startsEmpty }
 
         func listAlbums() async throws -> [AlbumSummary] {
-            let count = lock.withLock { members.count }
-            return [AlbumSummary(id: "fixture-album", title: Self.albumTitle, photoCount: count, coverPhotoID: nil)]
+            lock.withLock {
+                ((startsEmpty ? [] : [(id: "fixture-album", title: Self.albumTitle)]) + createdAlbums).map { album in
+                    AlbumSummary(
+                        id: album.id, title: album.title, photoCount: members[album.id]?.count ?? 0, coverPhotoID: nil)
+                }
+            }
         }
         func listSharedWithMeAlbums() async throws -> [SharedAlbumSummary] { [] }
         func leaveSharedAlbum(_ album: AlbumNodeIdentifier) async throws {}
         func albumMemberships(for photoUIDs: [PhotoUID]) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
-            let members = lock.withLock { Set(self.members) }
+            let members = lock.withLock { self.members }
             return Dictionary(
                 uniqueKeysWithValues: photoUIDs.map { uid in
-                    let album = AlbumNodeIdentifier(volumeID: uid.volumeID, nodeID: "fixture-album")
-                    return (uid, members.contains(uid) ? [album] : [])
+                    let albums = Set(
+                        members.compactMap { albumID, photos in
+                            photos.contains(uid) ? AlbumNodeIdentifier(volumeID: uid.volumeID, nodeID: albumID) : nil
+                        })
+                    return (uid, albums)
                 })
         }
-        func createAlbum(name: String) async throws -> AlbumID { throw MobileFixtureError.unavailable }
+        func createAlbum(name: String) async throws -> AlbumID {
+            lock.withLock {
+                let id = "fixture-created-album-\(createdAlbums.count)"
+                createdAlbums.append((id: id, title: name))
+                return id
+            }
+        }
         func deleteAlbum(albumID: AlbumID) async throws { throw MobileFixtureError.unavailable }
         func addPhotos(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async throws {
-            lock.withLock { members += photoUIDs.filter { !members.contains($0) } }
+            lock.withLock { members[albumID, default: []].formUnion(photoUIDs) }
         }
         func removePhotos(_ photoUIDs: [PhotoUID], from albumID: AlbumID) async throws {
             throw MobileFixtureError.unavailable
@@ -616,6 +700,9 @@ import UploadCore
         var favoriteLoader: (@Sendable () async throws -> Set<PhotoUID>)? = nil
         var favoriteWriter: (@Sendable ([PhotoUID], Bool) async throws -> Void)? = nil
         var trashEmptier: (@Sendable () async throws -> Void)? = nil
+        var streamingAssetLoader: (@Sendable (PhotoUID) async throws -> StreamingVideoAsset)? = nil
+        /// Overrides the empty default burst-group answer, for viewer share/export wiring tests.
+        var burstGroupLoader: (@Sendable (PhotoUID) async throws -> [PhotoItem])? = nil
         /// Recently Deleted lists every fixture photo until it is emptied.
         let trashState = MobileFixtureTrashState()
 
@@ -669,9 +756,25 @@ import UploadCore
         {
             throw MobileFixtureError.unavailable
         }
+        /// Without the scenario argument the video never prepares and fails in a changeable way, as before. With
+        /// `-EncryptedMemoriesVideoFailureScenario` the first preparation hits a rate limit, which the viewer retries
+        /// silently, the second fails in a way that a new attempt can change, and every later one fails for good.
         func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
-            throw MobileFixtureError.unavailable
+            if let streamingAssetLoader { return try await streamingAssetLoader(uid) }
+            guard ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesVideoFailureScenario") else {
+                throw MobileFixtureError.unavailable
+            }
+            let attempt = streamingAttempts.withLock { count in
+                count += 1
+                return count
+            }
+            switch attempt {
+            case 1: throw MobileFixtureError.rateLimited
+            case 2: throw MobileFixtureError.unavailable
+            default: throw MobileFixtureError.permanentVideoFailure
+            }
         }
+        private let streamingAttempts = OSAllocatedUnfairLock(initialState: 0)
         func prefetchEncrypted(for uid: PhotoUID) async throws {}
         func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
             guard uid.nodeID == MobileSignedInFixture.videoNodeID else {
@@ -681,7 +784,9 @@ import UploadCore
             return PhotoMetadata(
                 filename: "\(uid.nodeID).mov", mimeType: "video/quicktime", pixelWidth: 160, pixelHeight: 160)
         }
-        func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem] { [] }
+        func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem] {
+            try await burstGroupLoader?(uid) ?? []
+        }
         func favoriteUIDs() async throws -> Set<PhotoUID> {
             try await favoriteLoader?() ?? []
         }
@@ -698,8 +803,16 @@ import UploadCore
             trashState.isEmptied = true
         }
         func metadataRowCount() async -> Int { sections.reduce(0) { $0 + $1.items.count } }
-        func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {}
     }
+
+    /// The fixture reverts at once, or refuses every revert when the UI test passes `revertFixtureFails`.
+    extension MobileFixtureBackend: EditedPhotoReverting {
+        func revertToOriginal(of main: PhotoItem, original: PhotoItem) async throws {
+            if MobileUITestLaunch.revertFixtureFails { throw MobileFixtureRevertRefused() }
+        }
+    }
+
+    private struct MobileFixtureRevertRefused: Error {}
 
     /// Every fixture photo is an edit with an original, so the UI tests can show it; the video has none.
     extension MobileFixtureBackend: EditedPhotoOriginalProviding {

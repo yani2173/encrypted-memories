@@ -7,7 +7,6 @@ public struct BackupMobileDataSection: View {
     @AppStorage(AppSettingsKey.backupUsesMobileData)
     private var usesMobileData = AppSettingsDefault.backupUsesMobileData
     private let onChange: @MainActor () -> Void
-
     public init(onChange: @escaping @MainActor () -> Void = {}) {
         self.onChange = onChange
     }

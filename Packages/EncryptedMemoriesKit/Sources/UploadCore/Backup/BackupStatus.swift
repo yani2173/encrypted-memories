@@ -131,12 +131,6 @@ public struct BackupStatus: Sendable, Equatable {
         let issue: BackupIssueKind?
         let nextAttemptAt: Date?
     }
-    /// Every item that is not currently proven present in Proton Drive. Intentional remote deletions are
-    /// excluded because the backup policy has already settled them successfully.
-    public var notBackedUpCount: Int {
-        guard let totalConsidered else { return needsAttentionCount + waitingRetry }
-        return max(0, totalConsidered - backedUp - skippedRemoteDeletions)
-    }
     /// Only Photos checks remain, without a separate remote-index operation or failure.
     var hasOnlyDismissedSourceRechecks: Bool {
         pendingSourceRechecks > 0 && outstandingCount == pendingSourceRechecks
@@ -347,11 +341,6 @@ public struct BackupStatus: Sendable, Equatable {
             }
             return L10n.string("backup.detail_attention \(needsAttentionCount)")
         }
-    }
-
-    /// A reachable permitted path ends the Wi-Fi wait, including an expensive path when mobile data is on.
-    public func endsWiFiWait(for inputs: BackupThrottleInputs) -> Bool {
-        phase == .waitingForWiFi && inputs.canEndWiFiWait
     }
 
     /// Scaled units let a continued-processing task advance within one large item while preserving

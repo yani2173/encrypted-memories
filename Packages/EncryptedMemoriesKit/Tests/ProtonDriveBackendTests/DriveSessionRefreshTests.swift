@@ -1,4 +1,3 @@
-import AppleSecurityCore
 import Foundation
 import ProtonAuth
 import Testing
@@ -120,7 +119,7 @@ struct DriveSessionRefreshTests {
         server.release(path, 1)
         // X handles its 401 now. A retry before refresh B ends would reach the server; give it the chance to.
         try #require(await server.waitUntilAnswered(path, 1))
-        _ = await server.eventually(timeout: .seconds(1)) { server.authorizations(for: path).count > 1 }
+        _ = await eventually(timeout: .seconds(1)) { server.authorizations(for: path).count > 1 }
         server.release(RefreshServer.refreshPath, 2)
 
         try await x.value
@@ -158,7 +157,7 @@ struct DriveSessionRefreshTests {
 
     /// A late waiter of an earlier flight must not retire the flight that runs now.
     @Test func aLateWaiterOfAnEarlierFlightKeepsTheCurrentFlight() {
-        var flights = RefreshFlight()
+        var flights = RefreshFlight<Bool>()
         let first = flights.join { Task { true } }
         flights.retire(first.id)
         let second = flights.join { Task { true } }
@@ -171,13 +170,56 @@ struct DriveSessionRefreshTests {
     }
 
     @Test func theWaiterOfTheCurrentFlightRetiresIt() {
-        var flights = RefreshFlight()
+        var flights = RefreshFlight<Bool>()
         let flight = flights.join { Task { true } }
 
         flights.retire(flight.id)
 
         #expect(flights.id == nil)
         #expect(flights.join { Task { true } }.id != flight.id)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func direct429RebuildsHeadersAfterAnotherRequestRefreshes() async throws {
+        let path = "/tests/held"
+        let server = RefreshServer.start(holding: [(path, 1)], rateLimitedFirstPaths: [path])
+        defer { server.releaseAll() }
+        let session = makeSession()
+        let held = Task { try await session.getJSON(path, as: Answer.self) }
+        defer { held.cancel() }
+        try #require(await server.waitUntilHeld(path, 1))
+        _ = try await session.getJSON("/tests/other", as: Answer.self)
+        server.release(path, 1)
+        let result = try await held.value
+        #expect(result.code == 1000)
+        #expect(server.refreshCount == 1)
+        #expect(server.authorizations(for: path) == ["Bearer test-access", "Bearer access-1"])
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func sdk429KeepsOriginalRequestAndGenerationUntilItsLate401() async throws {
+        let path = "/drive/tests/held"
+        let server = RefreshServer.start(holding: [(path, 1)], rateLimitedFirstPaths: [path])
+        defer { server.releaseAll() }
+        let session = makeSession()
+        let client = makeClient(session)
+        let held = Task {
+            let response = try await client.requestDriveApi(
+                method: "GET", relativePath: path, content: Data(), headers: []
+            ).get()
+            return response.statusCode
+        }
+        defer { held.cancel() }
+        try #require(await server.waitUntilHeld(path, 1))
+        _ = try await session.getJSON("/tests/other", as: Answer.self)
+        server.release(path, 1)
+        let status = try await held.value
+        #expect(status == 200)
+        #expect(server.refreshCount == 1)
+        #expect(
+            server.authorizations(for: path) == [
+                "Bearer test-access", "Bearer test-access", "Bearer access-1",
+            ])
     }
 
     private func makeSession() -> DriveSession {
@@ -187,7 +229,7 @@ struct DriveSessionRefreshTests {
             store: SessionKeychainStore(
                 service: "at.oncloud.encryptedmemories.tests.refresh-\(UUID().uuidString)",
                 account: "default",
-                keychain: RefreshTestKeychainStore()
+                keychain: MemoryKeychainStore()
             ),
             accountCacheDirectory: FileManager.default.temporaryDirectory,
             urlProtocolClasses: [RefreshServerProtocol.self]
@@ -236,6 +278,7 @@ private final class RefreshServer: @unchecked Sendable {
     private let lock = NSLock()
     private let refreshFails: Bool
     private let holds: Set<String>
+    private let rateLimitedFirstPaths: Set<String>
     private var issued = 0
     private var newestValid: Bool
     private var seen: [String: Int] = [:]
@@ -243,16 +286,23 @@ private final class RefreshServer: @unchecked Sendable {
     private var answered: Set<String> = []
     private var recorded: [Recorded] = []
 
-    private init(holding: [(String, Int)], refreshFails: Bool, firstTokenValid: Bool) {
+    private init(
+        holding: [(String, Int)], refreshFails: Bool, firstTokenValid: Bool,
+        rateLimitedFirstPaths: Set<String>
+    ) {
         holds = Set(holding.map { "\($0.0)#\($0.1)" })
         self.refreshFails = refreshFails
+        self.rateLimitedFirstPaths = rateLimitedFirstPaths
         newestValid = firstTokenValid
     }
 
     static func start(
-        holding: [(String, Int)] = [], refreshFails: Bool = false, firstTokenValid: Bool = false
+        holding: [(String, Int)] = [], refreshFails: Bool = false, firstTokenValid: Bool = false,
+        rateLimitedFirstPaths: Set<String> = []
     ) -> RefreshServer {
-        let server = RefreshServer(holding: holding, refreshFails: refreshFails, firstTokenValid: firstTokenValid)
+        let server = RefreshServer(
+            holding: holding, refreshFails: refreshFails, firstTokenValid: firstTokenValid,
+            rateLimitedFirstPaths: rateLimitedFirstPaths)
         lock.withLock { active = server }
         return server
     }
@@ -287,16 +337,6 @@ private final class RefreshServer: @unchecked Sendable {
         return await eventually(timeout: .seconds(5)) { self.lock.withLock { self.answered.contains(key) } }
     }
 
-    /// Polls a condition up to `timeout`; a false result is for the caller to judge.
-    func eventually(timeout: Duration, _ condition: () -> Bool) async -> Bool {
-        let end = ContinuousClock.now + timeout
-        while ContinuousClock.now < end {
-            if condition() { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return condition()
-    }
-
     /// The gate of this request when the test holds it.
     func arrive(_ path: String) -> (key: String, gate: RequestGate?) {
         lock.withLock {
@@ -323,6 +363,7 @@ private final class RefreshServer: @unchecked Sendable {
                 newestValid = true
                 return (200, #"{"AccessToken":"access-\#(issued)","RefreshToken":"refresh-\#(issued)"}"#)
             }
+            if rateLimitedFirstPaths.contains(path), key == "\(path)#1" { return (429, "{}") }
             let newest = issued > 0 ? "Bearer access-\(issued)" : "Bearer test-access"
             let accepted = newestValid && request.value(forHTTPHeaderField: "Authorization") == newest
             return accepted ? (200, #"{"Code":1000}"#) : (401, "{}")
@@ -376,28 +417,5 @@ private final class RefreshServerProtocol: URLProtocol {
             if count <= 0 { return result }
             result.append(contentsOf: buffer.prefix(count))
         }
-    }
-}
-
-private final class RefreshTestKeychainStore: AppleKeychainStoring, @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [AppleKeychainItem: Data] = [:]
-
-    func data(for item: AppleKeychainItem) throws -> Data? { lock.withLock { storage[item] } }
-
-    func setData(_ data: Data, for item: AppleKeychainItem) throws { lock.withLock { storage[item] = data } }
-
-    func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data {
-        lock.withLock {
-            if let existing = storage[item] { return existing }
-            storage[item] = data
-            return data
-        }
-    }
-
-    func removeData(for item: AppleKeychainItem) throws { lock.withLock { _ = storage.removeValue(forKey: item) } }
-
-    func removeAllData(service: String) throws {
-        lock.withLock { storage = storage.filter { $0.key.service != service } }
     }
 }

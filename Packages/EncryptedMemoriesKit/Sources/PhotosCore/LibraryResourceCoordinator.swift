@@ -623,14 +623,9 @@ public actor LibraryResourceCoordinator {
             DispatchTime.now().uptimeNanoseconds
         }
     ) {
-        self.runtimeState = runtimeState
-        self.policy = policy
-        self.recoveryDelay = recoveryDelay
-        recoverySleep = { try await Task.sleep(for: $0) }
-        self.monotonicNow = monotonicNow
-        let snapshot = runtimeState.snapshot()
-        observedSnapshot = snapshot
-        effectiveSnapshot = snapshot
+        self.init(
+            runtimeState: runtimeState, policy: policy, recoveryDelay: recoveryDelay, monotonicNow: monotonicNow,
+            recoverySleep: { try await Task.sleep(for: $0) })
     }
 
     init(

@@ -31,6 +31,9 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         let completion: VideoLoadingRequestCompletion
     }
     private var tasks: [ObjectIdentifier: RequestTask] = [:]
+    /// Test seam for the `VideoStream` diagnostics. Production passes no sink; the shared
+    /// singleton then receives every event exactly as before.
+    private let diagnostics: (@Sendable (String, [String: String]) -> Void)?
     private struct PrefetchTask {
         let id: UUID
         let task: Task<Void, Never>
@@ -71,7 +74,8 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         crypto: DriveCrypto,
         admission: JoinedShutdownGate,
         requestCause: ProtonRequestCauseBinding? = nil,
-        cache: VideoByteRangeCache = .shared
+        cache: VideoByteRangeCache = .shared,
+        diagnostics: (@Sendable (String, [String: String]) -> Void)? = nil
     ) {
         self.prepared = prepared
         self.source = source
@@ -79,6 +83,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         self.admission = admission
         self.requestCause = requestCause
         self.cache = cache
+        self.diagnostics = diagnostics
         self.ownerGeneration = cache.captureOwnerGeneration()
         super.init()
         // Keep the read-ahead window and recent blocks. At about 4 MB per block, the transient limit is 80 MB.
@@ -109,10 +114,9 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             return true
         }
         guard changed else { return }
-        PhotoDiagnostics.shared.emit(
-            "VideoStream",
+        emitDiagnostics(
             [
-                "uid": uidKey, "strategy": "readAhead",
+                "strategy": "readAhead",
                 "blocks": "\(bounded)",
                 "mbitPerSecond": String(format: "%.1f", bytesPerSecond * 8 / 1_000_000),
             ], throttleSeconds: 0.5)
@@ -228,10 +232,9 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         request?.task.cancel()
         // The read-ahead stays alive: AVFoundation also cancels for reasons other than a seek (for example
         // a full buffer), and the next served block re-schedules the window without duplicates.
-        PhotoDiagnostics.shared.emit(
-            "VideoStream",
+        emitDiagnostics(
             [
-                "uid": uidKey, "strategy": "range", "cancelled": "true",
+                "strategy": "range", "cancelled": "true",
             ])
     }
 
@@ -288,10 +291,8 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             scheduleForwardPrefetch(afterClearOffset: offset, reason: "requestServed")
         }
 
-        PhotoDiagnostics.shared.emit(
-            "VideoStream",
+        emitDiagnostics(
             [
-                "uid": uidKey,
                 "strategy": "range",
                 "contentLength": "\(total)",
                 "contentType": prepared.contentTypeUTI,
@@ -412,10 +413,9 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         }
         guard advanced else {
             PhotoDiagnostics.shared.increment("perf.videoPrefetchDeduped")
-            PhotoDiagnostics.shared.emit(
-                "VideoStream",
+            emitDiagnostics(
                 [
-                    "uid": uidKey, "strategy": "prefetch", "reason": reason,
+                    "strategy": "prefetch", "reason": reason,
                     "scheduled": "false", "deduped": "true",
                 ], throttleSeconds: 0.5)
             return
@@ -440,24 +440,35 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     private func scheduleEncryptedWarm(_ block: VideoBlock, reason: String) {
         let key = NSNumber(value: block.index)
         guard decryptedCache.object(forKey: key) == nil else { return }
-        let scheduled = lock.withLock { () -> Bool in
+        let scheduled = startPrefetchTask(for: block) { loader in
+            do {
+                try await loader.admitted { [loader] in
+                    _ = try await loader.sharedEncryptedBlock(block, priority: .foregroundPrefetch)
+                }
+            } catch is CancellationError {
+            } catch {
+                loader.emitDiagnostics(
+                    [
+                        "strategy": "deepWarm",
+                        "block": "\(block.index)", "reason": reason,
+                        "error": String(describing: type(of: error)),
+                    ], throttleSeconds: 0.5)
+            }
+        }
+        if scheduled { PhotoDiagnostics.shared.increment("perf.videoDeepWarmScheduled") }
+    }
+
+    /// Registers one background task for `block` unless the loader is closed or already works on that block, and
+    /// removes the registration when `work` ends. Returns whether the task started.
+    private func startPrefetchTask(
+        for block: VideoBlock, work: @escaping @Sendable (ProtonVideoResourceLoader) async -> Void
+    ) -> Bool {
+        lock.withLock { () -> Bool in
             guard !isClosed, prefetchTasks[block.index] == nil else { return false }
             let taskID = UUID()
             let task = Task { [weak self] in
                 guard let self else { return }
-                do {
-                    try await self.admitted { [self] in
-                        _ = try await self.sharedEncryptedBlock(block, priority: .foregroundPrefetch)
-                    }
-                } catch is CancellationError {
-                } catch {
-                    PhotoDiagnostics.shared.emit(
-                        "VideoStream",
-                        [
-                            "uid": self.uidKey, "strategy": "deepWarm",
-                            "block": "\(block.index)", "reason": reason, "error": "\(error)",
-                        ], throttleSeconds: 0.5)
-                }
+                await work(self)
                 self.lock.withLock {
                     guard self.prefetchTasks[block.index]?.id == taskID else { return }
                     self.prefetchTasks.removeValue(forKey: block.index)
@@ -466,7 +477,6 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             prefetchTasks[block.index] = PrefetchTask(id: taskID, task: task)
             return true
         }
-        if scheduled { PhotoDiagnostics.shared.increment("perf.videoDeepWarmScheduled") }
     }
 
     private func schedulePrefetch(
@@ -480,50 +490,34 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             return
         }
 
-        let scheduled = lock.withLock { () -> Bool in
-            guard !isClosed, prefetchTasks[block.index] == nil else { return false }
-            let taskID = UUID()
-            let task = Task { [weak self] in
-                guard let self else { return }
-                do {
-                    let (_, hit) = try await self.admitted { [self] in
-                        try await self.decryptedBlock(block, priority: priority)
-                    }
-                    PhotoDiagnostics.shared.emit(
-                        "VideoStream",
-                        [
-                            "uid": self.uidKey,
-                            "strategy": "prefetch",
-                            "block": "\(block.index)",
-                            "reason": reason,
-                            "cacheHit": "\(hit)",
-                        ], throttleSeconds: 0.5)
-                } catch is CancellationError {
-                } catch {
-                    PhotoDiagnostics.shared.emit(
-                        "VideoStream",
-                        [
-                            "uid": self.uidKey,
-                            "strategy": "prefetch",
-                            "block": "\(block.index)",
-                            "reason": reason,
-                            "error": "\(error)",
-                        ], throttleSeconds: 0.5)
+        let scheduled = startPrefetchTask(for: block) { loader in
+            do {
+                let (_, hit) = try await loader.admitted { [loader] in
+                    try await loader.decryptedBlock(block, priority: priority)
                 }
-                self.lock.withLock {
-                    guard self.prefetchTasks[block.index]?.id == taskID else { return }
-                    self.prefetchTasks.removeValue(forKey: block.index)
-                }
+                loader.emitDiagnostics(
+                    [
+                        "strategy": "prefetch",
+                        "block": "\(block.index)",
+                        "reason": reason,
+                        "cacheHit": "\(hit)",
+                    ], throttleSeconds: 0.5)
+            } catch is CancellationError {
+            } catch {
+                loader.emitDiagnostics(
+                    [
+                        "strategy": "prefetch",
+                        "block": "\(block.index)",
+                        "reason": reason,
+                        "error": String(describing: type(of: error)),
+                    ], throttleSeconds: 0.5)
             }
-            prefetchTasks[block.index] = PrefetchTask(id: taskID, task: task)
-            return true
         }
         if scheduled {
             PhotoDiagnostics.shared.increment("perf.videoPrefetchScheduled")
-            PhotoDiagnostics.shared.emit(
-                "VideoStream",
+            emitDiagnostics(
                 [
-                    "uid": uidKey, "strategy": "prefetch", "reason": reason,
+                    "strategy": "prefetch", "reason": reason,
                     "block": "\(block.index)", "scheduled": "true", "deduped": "false",
                 ], throttleSeconds: 0.5)
         } else {
@@ -531,7 +525,15 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         }
     }
 
-    private var uidKey: String { "\(prepared.uid.volumeID)~\(prepared.uid.nodeID)" }
+    /// Sends one `VideoStream` event through the diagnostics seam. Production passes no sink,
+    /// so every event reaches the shared singleton with the same fields and throttle as before.
+    private func emitDiagnostics(_ fields: [String: String], throttleSeconds: TimeInterval = 0) {
+        if let diagnostics {
+            diagnostics("VideoStream", fields)
+        } else {
+            PhotoDiagnostics.shared.emit("VideoStream", fields, throttleSeconds: throttleSeconds)
+        }
+    }
 }
 
 extension ProtonVideoResourceLoader {

@@ -188,16 +188,16 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
         queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
         XCTAssertEqual(queue.backupSupportSnapshot(), dismissed)
         let claimed = try XCTUnwrap(
-            queue.claimRunnable(limit: 1, claimedAt: now, excludingSourcesOf: []).first)
+            queue.claimRunnable(limit: 1, claimedAt: now, excludingSourcesOf: [])?.first)
         XCTAssertEqual(claimed.state, .discovered)
-        XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision)?.state, .checking)
+        XCTAssertEqual(try queue.entry(for: entry.source, revision: entry.revision)?.state, .checking)
         XCTAssertEqual(claimed.lastError, missing)
         XCTAssertEqual(queue.backupSupportSnapshot(), dismissed)
         queue.close()
         queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
         XCTAssertEqual(queue.backupSupportSnapshot(), dismissed)
         XCTAssertEqual(queue.requeueStaleActive(before: now.addingTimeInterval(1), updatedAt: now), 1)
-        XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: entry.source, revision: entry.revision)?.state, .discovered)
         XCTAssertEqual(queue.backupSupportSnapshot(), dismissed)
 
         entry.state = .dismissedFailure
@@ -208,7 +208,7 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
         XCTAssertEqual(
             queue.updateDismissedSourceRecheck(entry, matchingState: .dismissedFailure, matchingLastError: missing),
             true)
-        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: now, excludingSourcesOf: []).count, 1)
+        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: now, excludingSourcesOf: [])?.count, 1)
         entry.lastError = nil
         entry.byteCount = 10
         XCTAssertEqual(
@@ -267,11 +267,13 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
             sqlite3_exec(handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil),
             SQLITE_OK)
 
-        XCTAssertNil(queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertThrowsError(
+            try queue.entry(for: entry.source, revision: entry.revision),
+            "an undecodable receipt is unknown, not an absent row")
         XCTAssertFalse(queue.isOperational())
         XCTAssertEqual(queue.backupSupportSnapshot(), BackupQueueSupportSnapshot())
         XCTAssertTrue(queue.upsert(entry), "the handle remains open after the recorded failure")
-        XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision), entry)
+        XCTAssertEqual(try queue.entry(for: entry.source, revision: entry.revision), entry)
         XCTAssertFalse(queue.isOperational(), "successful SQL cannot clear recorded failure")
         XCTAssertEqual(queue.backupSupportSnapshot(), BackupQueueSupportSnapshot())
     }

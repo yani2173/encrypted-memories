@@ -44,7 +44,27 @@ final class TimelineGridProfileResolverTests: XCTestCase {
                 for: TimelineGridViewport(layoutWidth: width, inputAffinity: .touch)
             )
             XCTAssertEqual(profile.id, "touchRegularTimeline", "width \(width)")
-            XCTAssertEqual(profile.metrics(level: profile.defaultLevel).nominalColumns, 5)
+            XCTAssertEqual(profile.metrics(level: profile.defaultLevel).nominalColumns, 6)
+        }
+    }
+
+    func testWideTouchUsesEvenColumnsAndKeepsTheDenseLevels() {
+        for width: CGFloat in [821, 867, 951, 1210] {
+            let profile = resolver.profile(
+                for: TimelineGridViewport(layoutWidth: width, inputAffinity: .touch))
+            XCTAssertEqual(profile.id, "touchRegularTimeline", "width \(width)")
+            XCTAssertEqual(profile.levels.map(\.nominalColumns), [4, 6, 8, 10, 20, 30], "width \(width)")
+            XCTAssertEqual(profile.metrics(level: profile.defaultLevel).nominalColumns, 6, "width \(width)")
+        }
+        let pointer = resolver.profile(
+            for: TimelineGridViewport(layoutWidth: 951, inputAffinity: .pointer))
+        XCTAssertEqual(pointer.levels.map(\.nominalColumns), [3, 5, 7, 9, 20, 30])
+        for width: CGFloat in [402, 768, 820] {
+            let compact = resolver.profile(
+                for: TimelineGridViewport(layoutWidth: width, inputAffinity: .touch))
+            XCTAssertEqual(compact.id, "touchCompactTimeline", "width \(width)")
+            XCTAssertEqual(compact.levels.map(\.nominalColumns), [2, 3, 5, 7, 12, 20], "width \(width)")
+            XCTAssertEqual(compact.metrics(level: compact.defaultLevel).nominalColumns, 3, "width \(width)")
         }
     }
 
@@ -76,7 +96,8 @@ final class TimelineGridProfileResolverTests: XCTestCase {
         let touchRegular = try XCTUnwrap(resolver.profile(id: "touchRegularTimeline"))
         let pointerRegular = try XCTUnwrap(resolver.profile(id: "regularTimeline"))
         XCTAssertEqual(touchRegular.defaultLevel, 1)
-        XCTAssertEqual(touchRegular.levels.map(\.nominalColumns), pointerRegular.levels.map(\.nominalColumns))
+        XCTAssertEqual(touchRegular.levels.map(\.nominalColumns), [4, 6, 8, 10, 20, 30])
+        XCTAssertEqual(pointerRegular.levels.map(\.nominalColumns), [3, 5, 7, 9, 20, 30])
     }
 
     func testUnknownInputAffinityStringIsRejected() {

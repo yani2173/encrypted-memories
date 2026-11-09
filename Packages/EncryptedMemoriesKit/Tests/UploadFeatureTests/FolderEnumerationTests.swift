@@ -1,4 +1,5 @@
 import Photos
+import PhotosCore
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
@@ -134,6 +135,115 @@ final class FolderEnumerationTests: XCTestCase {
         }
     }
 
+    private static let skipCounterKeys = [
+        "folderScan.unreadableEntrySkips.missing",
+        "folderScan.unreadableEntrySkips.permissionDenied",
+        "folderScan.unreadableEntrySkips.transient",
+    ]
+
+    private func skipCounters() -> [Int] {
+        Self.skipCounterKeys.map { PhotoDiagnostics.shared.counter($0) }
+    }
+
+    private func makeFlatFolder(_ fileManager: FileManager, names: [String]) throws -> URL {
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("enum-skip-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in names {
+            try Data("x".utf8).write(to: root.appendingPathComponent(name))
+        }
+        return root
+    }
+
+    func testAsyncStreamSkipsAnUnreadableEntryAndContinuesWithLaterEntries() async throws {
+        let fileManager = NoPrefetchListingFileManager()
+        let root = try makeFlatFolder(fileManager, names: ["a.jpg", "b.jpg", "z.jpg"])
+        defer { try? fileManager.removeItem(at: root) }
+
+        let skippedMissing = PhotoDiagnostics.shared.counter("folderScan.unreadableEntrySkips.missing")
+        let iterator = FolderEnumerator.stream(root, fileManager: fileManager).makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertEqual(first?.url.lastPathComponent, "a.jpg")
+
+        // The entry vanishes after its directory was listed, so the scan cannot read its
+        // resource values: exactly one unreadable entry between two readable ones.
+        try fileManager.removeItem(at: root.appendingPathComponent("b.jpg"))
+
+        var later: [String] = []
+        while let entry = try await iterator.next() {
+            later.append(entry.url.lastPathComponent)
+        }
+
+        XCTAssertEqual(later, ["z.jpg"], "one unreadable entry must be skipped and never end the scan")
+        XCTAssertEqual(
+            PhotoDiagnostics.shared.counter("folderScan.unreadableEntrySkips.missing"),
+            skippedMissing + 1,
+            "a skip must leave a class-only hint on the internal diagnostics surface, without names or paths")
+        let exported = PhotoDiagnostics.shared.supportSnapshot()
+            .counters["folderScan.unreadableEntrySkips.missing"]
+        XCTAssertEqual(
+            exported, skippedMissing + 1,
+            "the skip hint must be part of the existing support diagnostics export")
+    }
+
+    func testAsyncStreamFailsTheFolderWhenItLosesSearchPermissionDuringTheScan() async throws {
+        let fileManager = NoPrefetchListingFileManager()
+        let root = try makeFlatFolder(fileManager, names: ["a.jpg", "b.jpg", "z.jpg"])
+        defer {
+            try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.path)
+            try? fileManager.removeItem(at: root)
+        }
+
+        let before = skipCounters()
+        let iterator = FolderEnumerator.stream(root, fileManager: fileManager).makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertEqual(first?.url.lastPathComponent, "a.jpg")
+
+        // Reading an entry needs search permission on its folder. Without it every later entry
+        // fails, which is a failure of the folder, not of one entry.
+        try fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: root.path)
+        do {
+            while try await iterator.next() != nil {}
+            XCTFail("a folder that lost access must not end as a successful scan")
+        } catch let error as FolderEnumerationError {
+            XCTAssertEqual(error.operation, .readDirectory)
+            XCTAssertEqual(error.failureClass, .permissionDenied)
+            XCTAssertEqual(error.url, root)
+            XCTAssertTrue(error.requiresRootAccessRenewal(for: root))
+        }
+        XCTAssertEqual(skipCounters(), before, "a folder failure must not count as skipped entries")
+    }
+
+    func testAsyncStreamFailsTheFolderWhenItIsReplacedDuringTheScan() async throws {
+        let fileManager = NoPrefetchListingFileManager()
+        let root = try makeFlatFolder(fileManager, names: [])
+        defer { try? fileManager.removeItem(at: root) }
+        let sub = root.appendingPathComponent("sub", isDirectory: true)
+        try fileManager.createDirectory(at: sub, withIntermediateDirectories: true)
+        for name in ["a.jpg", "b.jpg", "z.jpg"] {
+            try Data("x".utf8).write(to: sub.appendingPathComponent(name))
+        }
+
+        let before = skipCounters()
+        let iterator = FolderEnumerator.stream(root, fileManager: fileManager).makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertEqual(first?.url.lastPathComponent, "a.jpg")
+
+        // An unmounted volume can leave its mount point behind as an empty directory: the path
+        // still exists and is searchable, but it is no longer the listed directory.
+        try fileManager.moveItem(at: sub, to: root.appendingPathComponent("sub-moved", isDirectory: true))
+        try fileManager.createDirectory(at: sub, withIntermediateDirectories: true)
+        do {
+            while try await iterator.next() != nil {}
+            XCTFail("a replaced folder must not end as a successful scan")
+        } catch let error as FolderEnumerationError {
+            XCTAssertEqual(error.operation, .readDirectory)
+            XCTAssertEqual(error.failureClass, .missing)
+            XCTAssertEqual(error.url, sub)
+        }
+        XCTAssertEqual(skipCounters(), before, "a folder failure must not count as skipped entries")
+    }
+
     func testTypedFilesystemErrorPreservesClassificationAndLocation() {
         let url = URL(fileURLWithPath: "/private/tmp/denied")
         let permission = FolderEnumerationError(
@@ -173,6 +283,44 @@ final class FolderEnumerationTests: XCTestCase {
         XCTAssertTrue(permission.requiresRootAccessRenewal(for: url))
         XCTAssertFalse(permission.requiresRootAccessRenewal(for: url.deletingLastPathComponent()))
         XCTAssertFalse(transient.requiresRootAccessRenewal(for: url))
+    }
+
+    func testSkipUnreadableEntryRuleEligibility() throws {
+        let folder = try makeFlatFolder(.default, names: [])
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let parent = try FolderEnumerator.ListedDirectory.read(folder)
+
+        // Only entry metadata failures are eligible; each records its class on the internal
+        // diagnostics surface.
+        for (operation, failureClass) in [
+            (FolderEnumerationError.Operation.resourceValues, FolderEnumerationError.FailureClass.permissionDenied),
+            (FolderEnumerationError.Operation.attributes, FolderEnumerationError.FailureClass.transient),
+        ] {
+            let key = "folderScan.unreadableEntrySkips.\(failureClass.rawValue)"
+            let before = PhotoDiagnostics.shared.counter(key)
+            let error = FolderEnumerationError(
+                operation: operation,
+                url: folder.appendingPathComponent("x.jpg"),
+                failureClass: failureClass,
+                domain: "Test",
+                code: 1
+            )
+            XCTAssertTrue(try FolderEnumerator.skipUnreadableEntry(error, in: parent), "\(operation) must be skippable")
+            XCTAssertEqual(PhotoDiagnostics.shared.counter(key), before + 1, "\(operation) must record its class")
+        }
+
+        // Directory reads and non-enumeration errors still fail the scan and record nothing.
+        let before = skipCounters()
+        let readDirectoryError = FolderEnumerationError(
+            operation: .readDirectory,
+            url: folder,
+            failureClass: .missing,
+            domain: "Test",
+            code: 1
+        )
+        XCTAssertFalse(try FolderEnumerator.skipUnreadableEntry(readDirectoryError, in: parent))
+        XCTAssertFalse(try FolderEnumerator.skipUnreadableEntry(CancellationError(), in: parent))
+        XCTAssertEqual(skipCounters(), before, "a refused error must not count as a skipped entry")
     }
 
     func testAsyncStreamChecksCancellationBetweenEntries() async throws {
@@ -227,9 +375,9 @@ final class PhotoLibraryChangeMonitorTests: XCTestCase {
             }
         )
 
-        monitor.startObserving {}
+        let subscription = monitor.subscribe {}
         let ranOnMain = await probe.wait()
-        monitor.stopObserving()
+        subscription.cancel()
 
         XCTAssertFalse(ranOnMain)
     }
@@ -278,5 +426,20 @@ private actor EnumerationGate {
         let pending = waiters
         waiters.removeAll(keepingCapacity: false)
         pending.forEach { $0.resume() }
+    }
+}
+
+/// Lists directory children through fresh URLs, without the prefetch cache of
+/// `contentsOfDirectory(at:includingPropertiesForKeys:options:)`. An entry removed after its
+/// directory was listed then behaves like an entry whose metadata truly cannot be read.
+private final class NoPrefetchListingFileManager: FileManager {
+    override func contentsOfDirectory(
+        at url: URL,
+        includingPropertiesForKeys keys: [URLResourceKey]?,
+        options: FileManager.DirectoryEnumerationOptions = []
+    ) throws -> [URL] {
+        let names = try super.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: options)
+            .map(\.lastPathComponent)
+        return names.map { url.appendingPathComponent($0) }
     }
 }

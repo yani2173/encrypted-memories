@@ -166,7 +166,7 @@ final class BackupSpeedProjectorTests: XCTestCase {
     }
 
     private func runnerProgress(bytes: Int64) -> BackupSyncProgress {
-        var progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
+        var progress = BackupSyncProgress(summary: queue.summary()!, isRunning: true)
         progress.transferredByteCount = bytes
         return progress
     }

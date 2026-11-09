@@ -16,11 +16,43 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
     private var journals: [WeakSource] = []
     private weak var places: (any PhotoPlaceSupportSource)?
     private weak var requests: (any RemoteRequestSupportSource)?
+    private weak var workMeasurements: (any SupportWorkMeasurementSource)?
+    private weak var thumbnailCaches: (any ThumbnailCacheSupportSource)?
+    private final class ThumbnailRegistration {}
+    private var thumbnailRegistration: ThumbnailRegistration?
     private var pendingGrid = PendingGridSupportSnapshot()
     private let trail: SupportEventTrail
 
     public init(trail: SupportEventTrail = .shared) {
         self.trail = trail
+    }
+
+    public func registerThumbnailCaches(_ source: any ThumbnailCacheSupportSource) {
+        lock.withLock {
+            thumbnailCaches = source
+            thumbnailRegistration = ThumbnailRegistration()
+        }
+    }
+
+    public func unregisterThumbnailCaches(_ source: any ThumbnailCacheSupportSource) {
+        lock.withLock {
+            if thumbnailCaches === source {
+                thumbnailCaches = nil
+                thumbnailRegistration = nil
+            }
+        }
+    }
+
+    public func thumbnailCacheSnapshot(deadline: ContinuousClock.Instant) async -> ThumbnailCacheSupportSnapshot {
+        let captured: ((any ThumbnailCacheSupportSource), ThumbnailRegistration)? = lock.withLock {
+            guard let source = thumbnailCaches, let registration = thumbnailRegistration else { return nil }
+            return (source, registration)
+        }
+        guard let (source, registration) = captured else { return .unavailable }
+        let snapshot = await source.thumbnailCacheSupportSnapshot(deadline: deadline)
+        return lock.withLock {
+            thumbnailCaches === source && thumbnailRegistration === registration ? snapshot : .unavailable
+        }
     }
 
     public func registerLibrary(_ source: any LibrarySyncSupportSource) {
@@ -59,6 +91,26 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
     public func requestSnapshot() async -> RemoteRequestSupportSnapshot? {
         let source = lock.withLock { requests }
         return await source?.remoteRequestSupportSnapshot()
+    }
+
+    public func registerWorkMeasurements(_ source: any SupportWorkMeasurementSource) {
+        lock.withLock { workMeasurements = source }
+    }
+
+    /// A retired account cannot remove the replacement account's measurement source.
+    public func unregisterWorkMeasurements(_ source: any SupportWorkMeasurementSource) {
+        lock.withLock {
+            if workMeasurements === source { workMeasurements = nil }
+        }
+    }
+
+    public func workMeasurementSnapshot() -> SupportWorkMeasurementSnapshot {
+        let source = lock.withLock { workMeasurements }
+        guard let source else { return .unavailable }
+        let snapshot = source.workMeasurementSupportSnapshot()
+        return lock.withLock {
+            workMeasurements === source ? snapshot : .unavailable
+        }
     }
 
     public func registerPlaces(_ source: any PhotoPlaceSupportSource) {

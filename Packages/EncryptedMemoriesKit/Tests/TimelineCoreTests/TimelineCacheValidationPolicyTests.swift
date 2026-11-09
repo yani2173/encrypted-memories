@@ -101,7 +101,6 @@ private actor CacheValidationRepository: PhotosRepository, LibraryChangeTokenPro
     }
 
     func loadTimeline() async throws -> [TimelineSection] { [] }
-    func cachedTimelineValidationToken() async -> String? { cachedToken }
 
     func libraryChangeToken() async throws -> String {
         probeCount += 1

@@ -286,14 +286,22 @@ public final class SmartSearchDiscoveryModel {
         return suggestion.kind != .concept || visualConceptsAvailable(snapshot)
     }
 
+    /// Whether a suggestion's result set answers searches in this scope. It answers the broad Smart Search scope
+    /// only; a narrower scope, such as OCR, runs the text the field shows through that scope.
+    public nonisolated static func usesSuggestionResults(in scope: MLSearchScope) -> Bool {
+        scope == .all
+    }
+
     /// What to do with a search text. The title of a suggestion is run as ordinary text only after a current
     /// refresh has confirmed that no suggestion owns it; text the user typed is never erased.
     public nonisolated static func commitDecision(
         for text: String,
         displayable: [TimelineSearchSuggestion],
         published: [TimelineSearchSuggestion],
-        isCurrent: Bool
+        isCurrent: Bool,
+        scope: MLSearchScope
     ) -> SmartSearchSuggestionCommitDecision {
+        guard usesSuggestionResults(in: scope) else { return .text }
         if let suggestion = displayable.first(where: { $0.owns(searchText: text) }) {
             return .structured(suggestion)
         }
@@ -413,7 +421,8 @@ public final class SmartSearchDiscoveryModel {
     public func commitDecision(
         for text: String,
         content: SmartSearchContentIdentity,
-        snapshot: MLSmartSearchSnapshot?
+        snapshot: MLSmartSearchSnapshot?,
+        scope: MLSearchScope
     ) -> SmartSearchSuggestionCommitDecision {
         // A visual concept cannot work while visual search is unavailable, so its title is ordinary text at once.
         let isCurrent = publishedKind(owning: text).map { kind in
@@ -423,7 +432,8 @@ public final class SmartSearchDiscoveryModel {
             for: text,
             displayable: resolvableSuggestions(content: content, snapshot: snapshot),
             published: lastPublished,
-            isCurrent: isCurrent ?? true
+            isCurrent: isCurrent ?? true,
+            scope: scope
         )
     }
 
@@ -441,26 +451,6 @@ public final class SmartSearchDiscoveryModel {
                 ? isDecisive(for: .concept, content: content) : isSettled(content: content),
             visualAvailable: Self.visualConceptsAvailable(snapshot)
         )
-    }
-
-    /// Identity of every input that can change the suggestions. Hosts restart `refresh` when it changes.
-    public static func revisionKey(
-        timelineRevision: UInt64,
-        favoriteCount: Int,
-        coordinateCount: Int,
-        snapshot: MLSmartSearchSnapshot?,
-        now: Date = Date()
-    ) -> String {
-        let day = Calendar.current.ordinality(of: .day, in: .era, for: now) ?? 0
-        return [
-            "\(timelineRevision)",
-            "\(favoriteCount)",
-            "\(coordinateCount / 250)",
-            "\(snapshot?.isEnabled == true)",
-            snapshot?.selectedModelID.map { "\($0)" } ?? "-",
-            indexingBucket(snapshot),
-            "\(day)",
-        ].joined(separator: "|")
     }
 
     /// Coarse indexing progress: evidence is recomputed at most once per 10 % of coverage gained.
@@ -842,5 +832,55 @@ public final class SmartSearchDiscoveryModel {
                 }
         }
         return resolved + carried
+    }
+}
+
+/// What the Search landing shows for the suggestions.
+public enum SmartSearchLandingPhase: Equatable, Sendable {
+    case suggestions
+    /// Placeholder rows: the suggestions are being computed.
+    case loading
+    /// Placeholder rows with a short note: the computation waits for the library to settle.
+    case preparing
+    /// A finished computation with no result, or a library without photos.
+    case empty
+}
+
+extension SmartSearchDiscoveryModel {
+    /// The Search landing shows the empty state only for a finished computation without a result or for a library
+    /// without photos. Until a computation has finished, the suggestions are on their way: placeholder rows show
+    /// while it runs, and the same rows with a short note show while it waits for the library to settle.
+    public nonisolated static func landingPhase(
+        hasSuggestions: Bool, hasComputed: Bool, isComputing: Bool, libraryIsEmpty: Bool
+    ) -> SmartSearchLandingPhase {
+        if hasSuggestions { return .suggestions }
+        if hasComputed || libraryIsEmpty { return .empty }
+        return isComputing ? .loading : .preparing
+    }
+}
+
+extension SmartSearchDiscoveryModel.PersistedSnapshot {
+    /// The saved rows that still describe a library that changed since they were computed, for a provisional
+    /// restore. A row stays only when every photo it names is still in the library, and a favorites row only
+    /// while all its photos are favorites. Places and On This Day rows never come back: their content depends on
+    /// the place policy and on the current day, which a changed fingerprint cannot tell apart. Photos that
+    /// arrived since cannot enter a row, so nothing here bypasses the sensitive-content gate. Nil when no For You row stays.
+    func provisional(library: Set<PhotoUID>, favorites: Set<PhotoUID>) -> Self? {
+        let kept = candidates.filter { row in
+            switch row.kind {
+            case .place, .placeSeason, .onThisDay: return false
+            case .favorites: if row.matchingUIDs?.isSubset(of: favorites) != true { return false }
+            default: break
+            }
+            return row.matchingUIDs?.isSubset(of: library) != false
+                && row.representativeUIDs.allSatisfy(library.contains)
+        }
+        // A snapshot with chips only would show the empty state for a result that is not finished.
+        let forYou = Set(forYouIDs)
+        guard kept.contains(where: { forYou.contains($0.id) }) else { return nil }
+        return Self(
+            candidates: kept, forYouIDs: forYouIDs, chipIDs: chipIDs, showsSmartSearchHint: showsSmartSearchHint,
+            visualAvailability: visualAvailability, visualCompletedWhenReady: visualCompletedWhenReady,
+            placeNames: placeNames, placeNamesLocale: placeNamesLocale)
     }
 }

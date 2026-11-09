@@ -156,7 +156,6 @@ public enum MLRemoteModelCatalogError: Error, Equatable {
     case unsafeArtifactPath(String)
     case invalidArtifactURL(String)
     case invalidHash(String)
-    case invalidByteCount(String)
     case invalidModelLayout(String)
     case missingRuntimeResource(String)
     case unknownCompatibilityRecipe(String)

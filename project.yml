@@ -35,13 +35,36 @@ packages:
     path: Packages/EncryptedMemoriesKit
   ProtonCore:
     url: https://github.com/ProtonMail/protoncore_ios.git
-    # Proton Drive SDK 0.32.1 does not pin ProtonCore; the app pins this version for ProtonAuth and crypto.
+    # Proton Drive SDK 0.33.0 does not pin ProtonCore; the app pins this version for ProtonAuth and crypto.
     exactVersion: 37.3.0
 
 fileGroups:
   - TestFlight
 
 targets:
+  EncryptedMemoriesMacSupportTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources: [App/Offline/OfflineLibraryManager.swift, macOSTests/ThumbnailSupportHostTests.swift]
+    dependencies:
+      - {package: EncryptedMemoriesKit, product: MapFeature}
+      - {package: EncryptedMemoriesKit, product: MediaByteCache}
+      - {package: EncryptedMemoriesKit, product: MediaCache}
+      - {package: EncryptedMemoriesKit, product: MediaLocationCore}
+      - {package: EncryptedMemoriesKit, product: PhotosCore}
+      - {package: EncryptedMemoriesKit, product: ProtonAuth}
+      - {package: EncryptedMemoriesKit, product: ProtonDriveBackend}
+      - {package: EncryptedMemoriesKit, product: TimelineCore}
+      - {package: ProtonCore, product: ProtonCoreCryptoPatchedGoImplementation}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.macsupporttests
+        GENERATE_INFOPLIST_FILE: YES
+        LIBRARY_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Vendor/sdk-swift/Resources"]
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: ["$(inherited)", "DEBUG"]
   EncryptedMemories:
     type: application
     platform: macOS
@@ -270,6 +293,11 @@ targets:
         SUPPORTS_MACCATALYST: NO
 
 schemes:
+  EncryptedMemoriesMacSupportTests:
+    build:
+      targets: {EncryptedMemoriesMacSupportTests: [test]}
+    test:
+      targets: [EncryptedMemoriesMacSupportTests]
   EncryptedMemories:
     build:
       targets:

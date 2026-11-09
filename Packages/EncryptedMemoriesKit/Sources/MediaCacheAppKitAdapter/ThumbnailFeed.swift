@@ -24,7 +24,6 @@ public actor ThumbnailFeed {
     public init(
         cache: ThumbnailCache,
         loader: ThumbnailBatchLoader,
-        dimensions: PhotoDimensionCoalescer? = nil,
         targetPixels: CGFloat = 320,
         concurrency: Int = 10,
         batch: Int = 8,
@@ -33,7 +32,6 @@ public actor ThumbnailFeed {
         self.init(
             cache: cache,
             loader: loader,
-            dimensions: dimensions,
             targetPixels: targetPixels,
             concurrency: concurrency,
             batch: batch,
@@ -45,7 +43,6 @@ public actor ThumbnailFeed {
     public init(
         cache: ThumbnailCache,
         loader: ThumbnailBatchLoader,
-        dimensions: PhotoDimensionCoalescer? = nil,
         targetPixels: CGFloat = 320,
         concurrency: Int = 10,
         batch: Int = 8,
@@ -77,12 +74,7 @@ public actor ThumbnailFeed {
                 scope: cache.coverageCheckpointScope()
             ),
             diagnostics: diagnostics,
-            clock: clock,
-            onDecoded: { uid, decoded in
-                // Learned dimensions flow into the library metadata DB (batched, off this path);
-                // thumbnail-scale values fill only rows that have none yet.
-                dimensions?.record(uid, width: decoded.pixelWidth, height: decoded.pixelHeight)
-            }
+            clock: clock
         )
     }
 
@@ -107,10 +99,6 @@ public actor ThumbnailFeed {
     public nonisolated func applyMemoryPressure(scale: Double, purge: Bool) {
         imageWrappers.applyMemoryPressure(scale: scale, purge: purge)
         core.applyDecodedMemoryPressure(scale: scale, purge: purge)
-    }
-
-    static func decodedCost(_ image: NSImage) -> Int {
-        MacThumbnailImageDecoder.decodedCost(image)
     }
 
     public func cachedImage(for uid: PhotoUID) async -> NSImage? {
@@ -240,7 +228,7 @@ public actor ThumbnailFeed {
         ticket: WrapperImageCache<NSImage>.InsertionTicket
     ) -> NSImage? {
         guard let decoded = core.memoryDecoded(for: uid) else { return nil }
-        let key = Self.key(uid)
+        let key = uid.cacheKey
         return imageWrappers.resolvePairedImage(
             forKey: key,
             cost: decoded.decodedCostBytes,
@@ -253,10 +241,6 @@ public actor ThumbnailFeed {
                 MacThumbnailImageDecoder.image(from: decoded)
             }
         )
-    }
-
-    private static func key(_ uid: PhotoUID) -> NSString {
-        "\(uid.volumeID)~\(uid.nodeID)" as NSString
     }
 }
 

@@ -17,8 +17,8 @@ enum MobileViewerMotionPolicy {
 enum MobileViewerBottomLayout {
     static let horizontalPadding: CGFloat = 12
 
-    static func profile(compactLandscape: Bool) -> ViewerChromeLayoutProfile {
-        compactLandscape ? .compactLandscape : .regular
+    static func profile(compactLandscape: Bool, sideBySide: Bool) -> ViewerChromeLayoutProfile {
+        ViewerChromeLayoutProfile.resolve(sideBySide: sideBySide, compactLandscape: compactLandscape)
     }
 }
 
@@ -47,8 +47,72 @@ enum MobileViewerMediaRoute {
     }
 }
 
+/// Names what a viewer share could not prepare. The items are the photos of the shared decision,
+/// counted before their files: a Live Photo or the original of an edited photo is one photo.
+enum MobileViewerShareFailureText {
+    static func message(
+        for items: [PhotoItem], expandedSingleSeries: Bool, resolvedKinds: [PhotoUID: MediaKind]
+    ) -> String {
+        if expandedSingleSeries { return String(localized: "viewer.share_failed_photos") }
+        if items.count == 1, let item = items.first,
+            MobileViewerMediaRoute.isVideo(item: item, resolvedKind: resolvedKinds[item.uid])
+        {
+            return String(localized: "viewer.share_failed_video")
+        }
+        return String(localized: "viewer.share_failed")
+    }
+}
+
 /// Identifies Live Photo preparation without tying it to changing viewport geometry.
 struct MobileLivePhotoMotionTaskID: Equatable {
     let item: PhotoItem
     let isCurrent: Bool
 }
+
+#if DEBUG
+    private struct MobileViewerDividedTestKey: EnvironmentKey {
+        static let defaultValue: Bool? = nil
+    }
+
+    private struct MobileViewerTransportChromeTestKey: EnvironmentKey {
+        static let defaultValue: Bool? = nil
+    }
+
+    private struct MobileViewerShareProbeTestKey: EnvironmentKey {
+        static let defaultValue: MobileViewerShareDecisionProbe? = nil
+    }
+
+    /// Records the viewer's share decisions so hosted tests can observe them without reaching
+    /// into the private selection controller. Production builds inject nothing and record nothing.
+    @MainActor
+    final class MobileViewerShareDecisionProbe {
+        enum Event: Equatable {
+            case shared(nodeIDs: [String], failureMessage: String)
+            case burstReadFailed(message: String)
+            case burstUnsettled
+        }
+
+        private(set) var events: [Event] = []
+
+        func record(_ event: Event) { events.append(event) }
+    }
+
+    extension EnvironmentValues {
+        var mobileViewerTransportChromeForTesting: Bool? {
+            get { self[MobileViewerTransportChromeTestKey.self] }
+            set { self[MobileViewerTransportChromeTestKey.self] = newValue }
+        }
+
+        /// Injects the system arrangement fact for hosted tests; it does not simulate a native fold.
+        var mobileViewerIsDividedForTesting: Bool? {
+            get { self[MobileViewerDividedTestKey.self] }
+            set { self[MobileViewerDividedTestKey.self] = newValue }
+        }
+
+        /// Injects the share-decision recorder used by the hosted viewer wiring tests.
+        var mobileViewerShareProbeForTesting: MobileViewerShareDecisionProbe? {
+            get { self[MobileViewerShareProbeTestKey.self] }
+            set { self[MobileViewerShareProbeTestKey.self] = newValue }
+        }
+    }
+#endif

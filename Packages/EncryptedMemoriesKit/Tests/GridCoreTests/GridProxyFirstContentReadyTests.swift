@@ -60,4 +60,19 @@ final class GridProxyFirstContentReadyTests: XCTestCase {
         proxy.reportContentReady(revision: 9)
         XCTAssertEqual(revisions, [7, 9])
     }
+
+    func testInvalidationDiscardsUndeliveredReadinessAndAllowsNextFrame() {
+        let proxy = GridProxy<String>()
+        proxy.reportContentReady(revision: 4)
+        proxy.invalidatePendingContentReady()
+        var first = 0
+        var revisions: [UInt64] = []
+        proxy.onFirstContentReady = { first += 1 }
+        proxy.onContentReady = { revisions.append($0) }
+        XCTAssertEqual(first, 0)
+        XCTAssertEqual(revisions, [])
+        proxy.reportContentReady(revision: 7)
+        XCTAssertEqual(first, 1)
+        XCTAssertEqual(revisions, [7])
+    }
 }

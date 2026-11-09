@@ -53,6 +53,7 @@ public actor BackupStatusProjector {
     private struct RunnerEvent: Sendable {
         let generation: UUID
         let progress: BackupSyncProgress
+        let sequence: UInt64
     }
 
     private let queue: any UploadBackupSyncQueueStore
@@ -60,6 +61,23 @@ public actor BackupStatusProjector {
     private let now: @Sendable () -> Date
     private let stream: AsyncStream<RunnerEvent>
     private nonisolated let continuation: AsyncStream<RunnerEvent>.Continuation
+
+    /// Tracks the runner callback sequence number. The sequence is handed out and the matching
+    /// stream yield is performed in one locked section, so the sequence order is also the yield
+    /// order, which the drain barrier in `drainSubmittedEvents` relies on.
+    private final class SubmissionCounters: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _current = UInt64(0)
+        func withNextSequence(_ body: (UInt64) -> Void) {
+            lock.withLock {
+                _current += 1
+                body(_current)
+            }
+        }
+        var current: UInt64 { lock.withLock { _current } }
+    }
+
+    private let counters = SubmissionCounters()
 
     private var generation = UUID()
     private var contextRevision: UInt64 = 0
@@ -71,6 +89,17 @@ public actor BackupStatusProjector {
     private var lastRawPhase: BackupStatus.Phase?
     private var lastPublishedAt = Date.distantPast
     private var speedEstimator = BackupUploadSpeedEstimator()
+    private var lastConsumedSequence: UInt64 = 0
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Identifies the current stream consumer; a new `start` bumps the epoch, so a drain that
+    /// began against the previous consumer stops waiting instead of blocking a later session.
+    private var streamConsumerEpoch: UInt64 = 0
+    /// False once the current consumer left its loop, even when its task handle is not cancelled.
+    private var streamConsumerActive = false
+    #if DEBUG
+        private var statusIngestionGateForTesting: (@Sendable () async -> Void)?
+        private var statusIngestionObserverForTesting: (@Sendable () async -> Void)?
+    #endif
 
     public init(
         queue: any UploadBackupSyncQueueStore,
@@ -91,7 +120,43 @@ public actor BackupStatusProjector {
     /// Safe to call directly from `BackupSyncRunner`'s synchronous progress callback. No task is
     /// allocated per callback and an overwhelmed UI path retains only the newest ephemeral value.
     public nonisolated func submit(_ progress: BackupSyncProgress, generation: UUID) {
-        continuation.yield(RunnerEvent(generation: generation, progress: progress))
+        counters.withNextSequence { sequence in
+            continuation.yield(RunnerEvent(generation: generation, progress: progress, sequence: sequence))
+        }
+    }
+
+    #if DEBUG
+        /// Test hook: holds each ingested stream event at the consumer before projection.
+        public func setIngestionGateForTesting(_ gate: (@Sendable () async -> Void)?) {
+            statusIngestionGateForTesting = gate
+        }
+
+        /// Test hook: called on the actor after each stream event is fully ingested and published.
+        public func setIngestionObserverForTesting(_ observer: (@Sendable () async -> Void)?) {
+            statusIngestionObserverForTesting = observer
+        }
+    #endif
+
+    /// Waits on the current actor context until every runner event already submitted to this
+    /// projector has been fully ingested (published or discarded) by the stream consumer, or
+    /// until that consumer stops consuming events entirely. The `completeSyncRun` barrier
+    /// prevents a starved consumer from applying a straggler snapshot after a pass has already
+    /// decided its next attempt date.
+    public func drainSubmittedEvents() async {
+        let target = counters.current
+        let consumerEpoch = streamConsumerEpoch
+        guard lastConsumedSequence < target, streamConsumerActive,
+            let consumer = streamTask, !consumer.isCancelled
+        else { return }
+        while lastConsumedSequence < target {
+            await withCheckedContinuation { continuation in
+                drainWaiters.append(continuation)
+            }
+            // Wake-ups can also come from a consumer that stopped or was replaced meanwhile.
+            guard streamConsumerEpoch == consumerEpoch, streamConsumerActive,
+                let active = streamTask, !active.isCancelled
+            else { return }
+        }
     }
 
     /// Starts one long-lived stream consumer for an account session and immediately projects the
@@ -120,11 +185,15 @@ public actor BackupStatusProjector {
         speedEstimator.reset()
 
         let stream = self.stream
+        streamConsumerEpoch += 1
+        let epoch = streamConsumerEpoch
+        streamConsumerActive = true
         streamTask = Task { [weak self] in
             for await event in stream {
-                guard !Task.isCancelled, let self else { return }
-                await self.ingest(event)
+                guard let self, !Task.isCancelled else { break }
+                await self.consumeRunnerEvent(event)
             }
+            await self?.consumerDidExit(epoch: epoch)
         }
         _ = await publishNow()
     }
@@ -163,7 +232,37 @@ public actor BackupStatusProjector {
         contextRevision = 0
     }
 
+    /// Single entry point of the stream consumer: gate, ingest, notify.
+    private func consumeRunnerEvent(_ event: RunnerEvent) async {
+        #if DEBUG
+            if let gate = statusIngestionGateForTesting { await gate() }
+        #endif
+        await ingest(event)
+        #if DEBUG
+            await statusIngestionObserverForTesting?()
+        #endif
+    }
+
+    /// Advances the drain barrier and wakes every waiter after a stream event settles.
+    private func noteConsumed(_ sequence: UInt64) {
+        lastConsumedSequence = max(lastConsumedSequence, sequence)
+        let waiters = drainWaiters
+        drainWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Wakes every drain waiter after the stream consumer stops consuming, without advancing
+    /// the drain barrier: the waiter re-checks consumer liveness and returns if it stopped.
+    private func consumerDidExit(epoch: UInt64) {
+        guard epoch == streamConsumerEpoch else { return }
+        streamConsumerActive = false
+        let waiters = drainWaiters
+        drainWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
     private func ingest(_ event: RunnerEvent) async {
+        defer { noteConsumed(event.sequence) }
         guard event.generation == generation else { return }
         let previous = latestRunnerProgress
         latestRunnerProgress = event.progress
@@ -223,7 +322,7 @@ public actor BackupStatusProjector {
 
     private func publishNow() async -> BackupStatusProjection? {
         guard queue.isOperational() else { return nil }
-        let summary = queue.summary()
+        guard let summary = queue.summary() else { return nil }
         guard queue.isOperational() else { return nil }
 
         var progress = latestRunnerProgress ?? BackupSyncProgress()

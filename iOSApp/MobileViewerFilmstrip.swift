@@ -43,6 +43,8 @@ struct MobileViewerFilmstrip: UIViewRepresentable {
         collectionView.alwaysBounceVertical = false
         collectionView.showsHorizontalScrollIndicator = false
         collectionView.showsVerticalScrollIndicator = false
+        collectionView.leftEdgeEffect.isHidden = true
+        collectionView.rightEdgeEffect.isHidden = true
         collectionView.contentInsetAdjustmentBehavior = .never
         collectionView.decelerationRate = .fast
         collectionView.accessibilityLabel = L10n.string("a11y.photo_library_grid")
@@ -305,10 +307,7 @@ private final class MobileViewerFilmstripCell: UICollectionViewCell {
     static let reuseIdentifier = "MobileViewerFilmstripCell"
 
     private let imageView = UIImageView()
-    private var representedUID: PhotoUID?
-    private var thumbnailTask: Task<Void, Never>?
-    private var visibleThumbnail: VisibleThumbnailSession?
-    private var generation: UInt64 = 0
+    private lazy var loader = FilmstripThumbnailLoader<UIImage> { [weak self] in self?.imageView.image = $0 }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -335,9 +334,6 @@ private final class MobileViewerFilmstripCell: UICollectionViewCell {
         fatalError("init(coder:) has not been implemented")
     }
 
-    // A released cell must not leave its load running; cancelling it ends a Duplicates read access.
-    deinit { thumbnailTask?.cancel() }
-
     override func layoutSubviews() {
         super.layoutSubviews()
         let radius = min(10, max(7, bounds.width * 0.14))
@@ -347,9 +343,7 @@ private final class MobileViewerFilmstripCell: UICollectionViewCell {
 
     override func prepareForReuse() {
         super.prepareForReuse()
-        cancelThumbnailLoad()
-        representedUID = nil
-        imageView.image = nil
+        loader.reset()
         accessibilityLabel = nil
         accessibilityValue = nil
         accessibilityTraits = [.button, .image]
@@ -363,63 +357,32 @@ private final class MobileViewerFilmstripCell: UICollectionViewCell {
         feed: UIKitThumbnailFeed?,
         allowsVisibleDuplicateThumbnails: Bool
     ) {
-        cancelThumbnailLoad()
-        generation &+= 1
-        let requestGeneration = generation
-        representedUID = item.uid
         updateSelection(selected)
         updateAccessibility(item: item, selected: selected, position: position, total: total)
         // A Duplicates copy reads only while the cell is on screen (`loadVisibleThumbnail`).
-        guard !allowsVisibleDuplicateThumbnails else {
-            visibleThumbnail = feed.map { VisibleThumbnailSession(feed: $0.feedCore) }
-            imageView.image = nil
-            return
-        }
-        visibleThumbnail = nil
-        imageView.image = feed?.memoryImage(for: item.uid)
-
-        guard imageView.image == nil, let feed else { return }
-        let uid = item.uid
-        thumbnailTask = Task { [weak self, feed] in
-            let image = await MobileThumbnailArrival.image(for: uid, feed: feed)
-            guard !Task.isCancelled else { return }
-            guard let self,
-                self.representedUID == uid,
-                self.generation == requestGeneration
-            else { return }
-            self.imageView.image = image
+        if allowsVisibleDuplicateThumbnails {
+            let reads = feed.map { feed in
+                let session = VisibleThumbnailSession(feed: feed.feedCore)
+                return FilmstripVisibleReads(
+                    select: { session.select($0) },
+                    memoryImage: { session.memoryImage(for: $0) },
+                    image: { await session.visibleImage(for: $0) })
+            }
+            loader.configure(uid: item.uid, source: .duplicatesCopy(reads))
+        } else {
+            loader.configure(
+                uid: item.uid,
+                source: .library(
+                    memoryImage: { feed?.memoryImage(for: $0) },
+                    image: feed.map { feed in { await MobileThumbnailArrival.image(for: $0, feed: feed) } }))
         }
     }
 
-    func loadVisibleThumbnail() {
-        guard let visibleThumbnail, let uid = representedUID else { return }
-        thumbnailTask?.cancel()
-        generation &+= 1
-        let requestGeneration = generation
-        visibleThumbnail.select(uid)
-        imageView.image = visibleThumbnail.memoryImage(for: uid)
-        guard imageView.image == nil else { return }
-        thumbnailTask = Task { [weak self] in
-            let image = await visibleThumbnail.visibleImage(for: uid)
-            guard !Task.isCancelled, let self, self.representedUID == uid, self.generation == requestGeneration
-            else { return }
-            self.imageView.image = image
-        }
-    }
+    func loadVisibleThumbnail() { loader.loadVisible() }
 
-    /// Revokes the read access of a Duplicates copy that left the screen.
-    func endVisibleThumbnail() {
-        guard visibleThumbnail != nil else { return }
-        cancelThumbnailLoad()
-        imageView.image = nil
-    }
+    func endVisibleThumbnail() { loader.endVisible() }
 
-    func cancelThumbnailLoad() {
-        visibleThumbnail?.end()
-        thumbnailTask?.cancel()
-        thumbnailTask = nil
-        generation &+= 1
-    }
+    func cancelThumbnailLoad() { loader.cancel() }
 
     private func updateSelection(_ selected: Bool) {
         contentView.layer.borderWidth = selected ? 2 : 0

@@ -113,19 +113,6 @@ final class UploadBackupStateTests: XCTestCase {
         XCTAssertEqual(store.count(), 1)
     }
 
-    func testTrustedNoContentEditsSeedsCurrentRevisionAsBackedUp() async throws {
-        let store = MemoryStore()
-        let index = UploadBackupPreflightIndex(store: store)
-        try await index.markBackedUp(snapshot(revision: 10))
-
-        let changed = snapshot(revision: 20, editRevision: .trustedNoContentEdits)
-        let result = try await index.classify(changed)
-
-        XCTAssertEqual(result, .alreadyBackedUp)
-        XCTAssertNotNil(store.record(for: changed.source, revision: changed.revision))
-        XCTAssertEqual(store.count(), 2)
-    }
-
     func testKnownEditRevisionSkipsAndSeedsCurrentRevision() async throws {
         let store = MemoryStore()
         let index = UploadBackupPreflightIndex(store: store)
@@ -203,7 +190,7 @@ final class UploadBackupStateTests: XCTestCase {
 
         do {
             _ = try await index.classify(
-                snapshot(revision: 20, editRevision: .trustedNoContentEdits)
+                snapshot(revision: 20, editRevision: .revision(revision(10)))
             )
             XCTFail("a failed current-revision seed must not be silently accepted")
         } catch {

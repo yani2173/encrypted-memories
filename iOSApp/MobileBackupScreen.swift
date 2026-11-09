@@ -18,16 +18,9 @@ struct MobileBackupScreen: View {
     let uploadCoordinator: UploadCoordinator?
 
     var body: some View {
+        let excludedCount = libraryModel.excludedPendingTiles.count
         List {
-            MobilePhotoBackupSections(controller: controller)
-            if !libraryModel.excludedPendingTiles.isEmpty {
-                PendingExcludedPhotosSection(
-                    tiles: libraryModel.excludedPendingTiles,
-                    thumbnail: PhotoKitLocalThumbnailLoader(request: PhotoKitPlatformImages.request).listThumbnail(for:)
-                ) { tile in
-                    try? await libraryModel.restoreItems([tile.item])
-                }
-            }
+            MobilePhotoBackupSections(controller: controller, excludedCount: excludedCount)
             if let uploadCoordinator {
                 MobileManualUploadCheckSection(
                     status: BackupStatus(manualUploadCheck: uploadCoordinator.preparationStatus)
@@ -35,6 +28,23 @@ struct MobileBackupScreen: View {
             }
         }
         .mobileNavigationTitle(String(localized: "settings.section_backup"))
+    }
+}
+
+/// The photos excluded from the backup, one level below the Backup settings.
+private struct MobileExcludedPhotosScreen: View {
+    @Environment(MobileLibraryModel.self) private var libraryModel
+
+    var body: some View {
+        PendingExcludedPhotosList(
+            tiles: libraryModel.excludedPendingTiles,
+            thumbnail: PhotoKitLocalThumbnailLoader(request: PhotoKitPlatformImages.request).listThumbnail(for:)
+        ) { tile in
+            // The pending grid answers with a cancellation error when it refuses the photo, so any thrown
+            // error means the photo did not go back into the backup.
+            (try? await libraryModel.restoreItems([tile.item])) != nil
+        }
+        .mobileNavigationTitle(L10n.string("backup.excluded_title"))
     }
 }
 
@@ -135,6 +145,7 @@ private struct MobilePhotoBackupSections: View {
     @AppStorage(AppSettingsKey.keepDisplayAwakeDuringForegroundBackup)
     private var keepDisplayAwake = AppSettingsDefault.keepDisplayAwakeDuringForegroundBackup
     @State var controller: PhotoLibraryBackupController
+    let excludedCount: Int
     @State private var rowModel = BackupStatusRowModel()
     @State private var showFailedList = false
     @State private var confirmsDisable = false
@@ -197,8 +208,23 @@ private struct MobilePhotoBackupSections: View {
             } footer: {
                 Text(String(localized: "settings.photos_backup_background_note"))
             }
+        }
 
-            BackupMobileDataSection { controller.mobileDataSettingDidChange() }
+        if controller.isEnabled {
+            Section {
+                NavigationLink {
+                    MobileExcludedPhotosScreen()
+                } label: {
+                    PendingExcludedPhotosEntryLabel(count: excludedCount)
+                }
+                .accessibilityIdentifier("backup.excludedPhotos")
+            } footer: {
+                Text(L10n.string("settings.backup_excluded_footer"))
+            }
+        }
+
+        if controller.isAvailable && controller.isEnabled {
+            BackupMobileDataSection(onChange: { controller.mobileDataSettingDidChange() })
 
             Section {
                 NavigationLink {
@@ -254,7 +280,7 @@ private struct MobilePhotoBackupSections: View {
 
         // Icon, headline, and action share the headline's first line; details stay below.
         HStack(alignment: .firstTextBaseline, spacing: 12) {
-            statusIcon(display)
+            BackupStatusIcon(display.accessory)
                 .frame(width: 20, height: 24, alignment: .center)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -471,37 +497,6 @@ private struct MobilePhotoBackupSections: View {
             .accessibilityIdentifier("backup.left")
     }
 
-    /// The row's single icon. Only `.activity` spins - there is never a second activity indicator.
-    @ViewBuilder private func statusIcon(_ display: BackupStatusPresentation) -> some View {
-        switch display.accessory {
-        case .activity:
-            Image(systemName: "arrow.trianglehead.2.clockwise")
-                .foregroundStyle(ProtonColor.primary)
-                .spinsWhileActive(true)
-        case .attention:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-        case .paused:
-            Image(systemName: "pause.circle")
-                .foregroundStyle(ProtonColor.textWeak)
-        case .waiting:
-            Image(systemName: "clock.arrow.circlepath")
-                .foregroundStyle(ProtonColor.textWeak)
-        case .waitingForWiFi:
-            Image(systemName: BackupStatus.waitingForWiFiSymbolName)
-                .foregroundStyle(ProtonColor.textWeak)
-        case .notice:
-            Image(systemName: "info.circle")
-                .foregroundStyle(ProtonColor.textWeak)
-        case .success:
-            Image(systemName: "checkmark.shield.fill")
-                .foregroundStyle(ProtonColor.primary)
-        case .idle:
-            Image(systemName: "checkmark.shield")
-                .foregroundStyle(ProtonColor.textWeak)
-        }
-    }
-
     /// Determinate bar matching the percentage directly above it while bytes move; otherwise it shows
     /// queue-wide completion. An empty reserved slot keeps the row stable. Scanning stays barless.
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
@@ -634,8 +629,8 @@ private struct MobileBackupQueueScreen: View {
 /// Tapping "N nicht gesichert" opens this: a plain-language list of exactly which files failed and
 /// why. Deleted-from-device files are marked permanent (retrying can't help and no retry is offered
 /// for them); everything else can be retried here and is also auto-retried on the next app launch.
-/// An album row opens the same sheet with its last run's photos. That list is read-only: the row's
-/// Sync now is its retry.
+/// An album row opens the same sheet with its last-run photos and restores a trashed copy through the shared
+/// controller. Sync now on the album row retries the album.
 struct MobileFailedBackupSheet: View {
     enum Source {
         case backup(PhotoLibraryBackupController)
@@ -644,37 +639,107 @@ struct MobileFailedBackupSheet: View {
 
     let source: Source
     @Environment(\.dismiss) private var dismiss
-    @State private var problemList = BackupProblemListModel()
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var pagedList: BackupProblemListSession
+    @State private var sessionSourceID: String
+    @State private var previews = Self.makePreviews()
     @State private var deletionItem: BackupFailedItem?
     @State private var personReadTask: Task<Void, Never>?
-    @State private var readOrder = BackupProblemListReadOrder()
 
     init(controller: PhotoLibraryBackupController) {
         source = .backup(controller)
+        _pagedList = State(initialValue: controller.makeProblemListSession())
+        _sessionSourceID = State(initialValue: "backup-\(ObjectIdentifier(controller))")
     }
 
     init(albumSync: AlbumSyncController, albumID: String) {
         source = .album(albumSync, albumID: albumID)
+        _pagedList = State(initialValue: albumSync.makeProblemListSession(albumID: albumID))
+        _sessionSourceID = State(initialValue: "album-\(ObjectIdentifier(albumSync))-\(albumID)")
+    }
+
+    private static func makePreviews() -> BackupProblemPreviewModel {
+        #if DEBUG
+            if MobileUITestLaunch.isRequested {
+                return BackupProblemPreviewModel { uid in
+                    await MobileSignedInFixture.backupProblemThumbnail(for: uid)
+                }
+            }
+        #endif
+        return BackupProblemPreviewModel(
+            load: PhotoKitLocalThumbnailLoader.problemListPreviews(
+                request: PhotoKitPlatformImages.request
+            ).listThumbnail(for:))
     }
 
     private var controller: PhotoLibraryBackupController? {
         if case .backup(let controller) = source { controller } else { nil }
     }
 
-    private var items: [BackupFailedItem] {
+    private var sourceID: String {
         switch source {
-        case .backup: problemList.items
-        case .album(let albumSync, let albumID):
-            albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
+        case .backup(let controller): "backup-\(ObjectIdentifier(controller))"
+        case .album(let controller, let albumID): "album-\(ObjectIdentifier(controller))-\(albumID)"
         }
     }
 
-    /// What the sheet shows. The backup list never says that nothing needs attention while the summary counts items.
-    private var presentation: BackupProblemListModel.Presentation {
-        if let controller {
-            return problemList.presentation(expectsItems: controller.status.needsAttentionCount > 0)
+    private var sourceIsSelected: Bool {
+        if case .album(let controller, let albumID) = source {
+            return controller.selectedAlbumIDs.contains(albumID)
         }
-        return items.isEmpty ? .empty : .list
+        return true
+    }
+
+    private struct FollowKey: Equatable {
+        let session: ObjectIdentifier
+        let source: String
+        let backup: BackupStatus.ProblemListKey?
+        let album: UUID?
+    }
+
+    private var followKey: FollowKey {
+        let albumRevision: UUID?
+        if case .album(let controller, _) = source {
+            albumRevision = controller.problemListRevision
+        } else {
+            albumRevision = nil
+        }
+        return FollowKey(
+            session: ObjectIdentifier(pagedList), source: sourceID,
+            backup: controller?.status.problemListKey, album: albumRevision)
+    }
+
+    private var items: [BackupFailedItem] {
+        guard sessionSourceID == sourceID, sourceIsSelected else { return [] }
+        return pagedList.rows.map(\.item)
+    }
+
+    private var presentation: BackupProblemListModel.Presentation {
+        guard sessionSourceID == sourceID else { return .loading }
+        guard sourceIsSelected else { return .empty }
+        let expectsItems: Bool
+        switch source {
+        case .backup(let controller): expectsItems = controller.status.needsAttentionCount > 0
+        case .album(let controller, let albumID):
+            expectsItems = controller.selectedAlbums.first { $0.id == albumID }?.hasNeedsAttention == true
+        }
+        return pagedList.presentation(expectsItems: expectsItems)
+    }
+
+    private func makeSession() -> BackupProblemListSession {
+        switch source {
+        case .backup(let controller): controller.makeProblemListSession()
+        case .album(let controller, let albumID): controller.makeProblemListSession(albumID: albumID)
+        }
+    }
+
+    private func prepareSession() {
+        guard sessionSourceID != sourceID || pagedList.isRetired else { return }
+        let previous = pagedList
+        pagedList = makeSession()
+        sessionSourceID = sourceID
+        personReadTask?.cancel()
+        Task { await previous.shutdown() }
     }
 
     var body: some View {
@@ -683,14 +748,13 @@ struct MobileFailedBackupSheet: View {
                 switch presentation {
                 case .loading, .unavailable, .empty:
                     BackupProblemListStateView(presentation) {
-                        guard let controller else { return }
-                        problemList.beginReading()
-                        readList(of: controller)
+                        pagedList.requestRefresh()
                     }
                 case .list:
                     List {
-                        BackupProblemSections(items: items) { item in
-                            BackupProblemRow(item: item, showsFailureDetail: true)
+                        BackupProblemSections(rows: pagedList.rows) { item in
+                            BackupProblemRow(item: item, showsFailureDetail: true, previews: previews)
+                                .onAppear { pagedList.requestNextPage(near: item) }
                                 .contentShape(Rectangle())
                                 .onTapGesture {
                                     if offersDecision(item) { deletionItem = item }
@@ -713,7 +777,7 @@ struct MobileFailedBackupSheet: View {
                                                 : L10n.string("backup.failed_item_ignore")
                                         ) {
                                             controller.dismissFailedItem(item)
-                                            problemList.dismissItem(id: item.id)
+                                            pagedList.dismissItem(id: item.id)
                                         }
                                         .tint(ProtonColor.textWeak)
                                         .accessibilityIdentifier(
@@ -722,7 +786,36 @@ struct MobileFailedBackupSheet: View {
                                 }
                         }
                     }
+                    #if DEBUG
+                        .modifier(PagingFixtureDriver(session: pagedList))
+                    #endif
                 }
+            }
+            // Inside the stack, so the List insets its last rows above the fixed area instead of under it.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                BackupProblemActionArea(message: sessionSourceID == sourceID ? pagedList.fixedActionMessage : nil) {
+                    if sessionSourceID == sourceID, let controller {
+                        BulkPhotoActionControls(
+                            runner: controller.bulkPhotoActions, count: pagedList.decisionCount,
+                            isAvailable: { controller.isBulkBackUpAgainAvailable },
+                            prepare: { await controller.prepareBackUpAgain() },
+                            start: { controller.startBackUpAgain($0) }
+                        )
+                        .id(ObjectIdentifier(controller))
+                    } else if sessionSourceID == sourceID, case .album(let albumSync, let albumID) = source {
+                        BulkPhotoActionControls(
+                            runner: albumSync.bulkPhotoActions, action: .restore, count: pagedList.decisionCount,
+                            isAvailable: { albumSync.isBulkRestoreAvailable(albumID: albumID) },
+                            ownsActivity: { albumSync.bulkRestoreAlbumID == albumID },
+                            prepare: { await albumSync.prepareRestore(albumID: albumID) },
+                            start: { albumSync.startRestore($0, albumID: albumID) }
+                        )
+                        .id(sourceID)
+                    }
+                }
+                // One container frame that starts at the bar background; the inner elements keep their identifiers.
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("backup.problemList.actionArea")
             }
             .mobileNavigationTitle(
                 controller == nil
@@ -730,8 +823,12 @@ struct MobileFailedBackupSheet: View {
                     : L10n.string("backup.failed_sheet_title")
             )
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
+                ProminentToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label(L10n.string("backup.failed_sheet_done"), systemImage: "checkmark").textBarItem()
+                    }
                 }
                 .mobileVisibilityPriority(.high)
                 if let controller, items.offersUserRetry {
@@ -748,7 +845,8 @@ struct MobileFailedBackupSheet: View {
             }
         }
         .confirmationDialog(
-            L10n.string("backup.issue_deleted_elsewhere"),
+            deletionItem?.issue == .remoteDeletion
+                ? L10n.string("contextmenu.restore") : L10n.string("backup.issue_deleted_elsewhere"),
             isPresented: Binding(
                 get: { deletionItem != nil }, set: { if !$0 { deletionItem = nil } }),
             titleVisibility: .visible
@@ -756,19 +854,74 @@ struct MobileFailedBackupSheet: View {
             if let deletionItem { deletionActions(for: deletionItem, place: "dialog") }
             Button(L10n.string("action.cancel"), role: .cancel) { deletionItem = nil }
         }
-        .presentationDetents([.medium, .large])
-        // A photo can need the person while the list is open; Try again then appears.
-        .task(id: controller?.status.problemListKey) {
-            guard let controller else { return }
-            await controller.followProblemList(
-                order: readOrder, { problemList.replaceItems($0) }, ifUnavailable: { problemList.markUnavailable() })
+        .presentationDetents(dynamicTypeSize.isAccessibilitySize ? [.large] : [.medium, .large])
+        .task(id: followKey) {
+            guard sessionSourceID == sourceID, sourceIsSelected else { return }
+            switch source {
+            case .backup(let controller): await controller.followProblemList(session: pagedList)
+            case .album:
+                pagedList.requestRefresh()
+                await pagedList.waitUntilIdle()
+            }
         }
-        .onDisappear { personReadTask?.cancel() }
+        .onAppear { prepareSession() }
+        .onChange(of: sourceID) { _, _ in prepareSession() }
+        .backupProblemPreviews(previews)
+        .onDisappear {
+            personReadTask?.cancel()
+            let session = pagedList
+            Task { await session.shutdown() }
+        }
     }
 
-    /// Only the backup list offers the deleted-elsewhere decision; the album list is read-only.
+    #if DEBUG
+        /// The smoke test jumps through the same pager instead of synthesizing thousands of scroll gestures.
+        private struct PagingFixtureDriver: ViewModifier {
+            let session: BackupProblemListSession
+
+            private var isRequested: Bool {
+                MobileUITestLaunch.isRequested
+                    && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesProblemListSmoke")
+            }
+
+            func body(content: Content) -> some View {
+                if isRequested {
+                    ScrollViewReader { scroll in
+                        content
+                            .accessibilityIdentifier("backup.problemList.fixture")
+                            .accessibilityValue(Text(verbatim: "loaded=\(session.rows.count);total=\(session.total)"))
+                            .task(id: session.total) {
+                                await session.waitUntilIdle()
+                                while !Task.isCancelled, session.rows.count < session.total {
+                                    let previousCount = session.rows.count
+                                    session.requestNextPage()
+                                    await session.waitUntilIdle()
+                                    guard session.rows.count > previousCount else { return }
+                                }
+                                guard !Task.isCancelled, session.rows.count == session.total else { return }
+                                let filename =
+                                    session.total == 5_000
+                                    ? "Deleted 0250 fixture.heic" : "Deleted 5000 fixture.heic"
+                                guard let row = session.rows.first(where: { $0.item.filename == filename }) else {
+                                    return
+                                }
+                                do { try await Task.sleep(for: .milliseconds(120)) } catch { return }
+                                guard !Task.isCancelled else { return }
+                                scroll.scrollTo(row.id, anchor: .top)
+                            }
+                    }
+                } else {
+                    content
+                }
+            }
+        }
+    #endif
+
     private func offersDecision(_ item: BackupFailedItem) -> Bool {
-        controller != nil && item.issue == .deletedElsewhere
+        switch source {
+        case .backup: item.issue == .deletedElsewhere
+        case .album: item.issue == .remoteDeletion
+        }
     }
 
     @ViewBuilder
@@ -776,32 +929,31 @@ struct MobileFailedBackupSheet: View {
     private func deletionActions(for item: BackupFailedItem, place: String) -> some View {
         if let controller {
             Button(L10n.string("backup.keep_deleted")) {
-                controller.keepDeleted(item)
-                refreshAfterDecision(item, controller: controller)
+                pagedList.resolveDecision(item) { controller.keepDeleted(item) }
+                refreshAfterDecision()
             }
             .keyboardShortcut(.defaultAction)
             .accessibilityIdentifier("backup.keepDeleted.\(place)")
             Button(L10n.string("backup.back_up_again")) {
-                controller.backUpAgain(item)
-                refreshAfterDecision(item, controller: controller)
+                pagedList.resolveDecision(item) { controller.backUpAgain(item) }
+                refreshAfterDecision()
             }
             .accessibilityIdentifier("backup.backUpAgain.\(place)")
+        } else if case .album(let albumSync, let albumID) = source {
+            Button(L10n.string("contextmenu.restore")) {
+                deletionItem = nil
+                personReadTask?.cancel()
+                personReadTask = Task { await albumSync.restorePhotoFromProblemList(item, albumID: albumID) }
+            }
+            .disabled(
+                (place != "dialog" && !albumSync.canRestorePhotos(albumID: albumID))
+                    || albumSync.bulkPhotoActions.isRunning
+            )
+            .accessibilityIdentifier("albumsync.restore.\(place)")
         }
     }
 
-    private func refreshAfterDecision(_ item: BackupFailedItem, controller: PhotoLibraryBackupController) {
+    private func refreshAfterDecision() {
         deletionItem = nil
-        readList(of: controller, afterDecision: item)
-    }
-
-    /// A person's action reads the list like the automatic follow does. The sheet keeps the task, so closing the
-    /// sheet or a newer action ends it.
-    private func readList(of controller: PhotoLibraryBackupController, afterDecision item: BackupFailedItem? = nil) {
-        personReadTask?.cancel()
-        personReadTask = Task {
-            await controller.readProblemList(
-                order: readOrder, afterDecision: item, { problemList.replaceItems($0) },
-                ifUnavailable: { problemList.markUnavailable() })
-        }
     }
 }

@@ -80,8 +80,18 @@ public enum BackupLocalDataPurge {
         if let persistentDomainName {
             defaults.removePersistentDomain(forName: persistentDomainName)
         }
+        // The flag comes first: a window that starts before the generation advances then sees the pending purge.
         defaults.set(true, forKey: pendingKey)
+        #if DEBUG
+            afterPendingMarkForTesting?()
+        #endif
+        BackgroundWindowLedger.signOutPurgeWasRequested()
     }
+
+    #if DEBUG
+        /// Runs between the pending flag and the advance of the window generation, so a test can start a window there.
+        nonisolated(unsafe) static var afterPendingMarkForTesting: (() -> Void)?
+    #endif
 
     public static func isPurgePending(defaults: UserDefaults = .standard) -> Bool {
         defaults.bool(forKey: pendingKey)

@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import ProtonAuth
+import ProtonDriveSDK
 import Testing
 import UploadCore
 
@@ -129,9 +130,23 @@ private func makeSession() -> DriveSession {
     )
 }
 
+private struct VisibilityOnlySDK: SDKPhotoDuplicatesClient {
+    func findPhotoDuplicates(name: String, sha1: Data, cancellationToken: UUID) async throws -> [SDKNodeUid] {
+        throw UploadCore.UploadError.backend("A visibility read must not query SDK duplicates")
+    }
+    func cancelFindPhotoDuplicates(cancellationToken: UUID) async throws {}
+}
+
 private struct DecodedVisibilityChecker: UploadDuplicateChecking {
     let session: DriveSession
     let blocked: Bool
+    let visibilityService: ProtonUploadDedupeService?
+
+    init(session: DriveSession, blocked: Bool, visibilityService: ProtonUploadDedupeService? = nil) {
+        self.session = session
+        self.blocked = blocked
+        self.visibilityService = visibilityService
+    }
 
     func hashKeyEpoch() async throws -> String { "epoch" }
     func nameHash(forCorrectedName name: String) async throws -> String { "name" }
@@ -150,8 +165,22 @@ private struct DecodedVisibilityChecker: UploadDuplicateChecking {
     }
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> { [] }
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
-        try await session.fetchLinkVisibility(shareID: "share1", linkIDs: linkIDs)
+        if let visibilityService { return try await visibilityService.linkVisibility(of: linkIDs) }
+        return try await session.fetchLinkVisibility(shareID: "share1", linkIDs: linkIDs)
     }
+}
+
+/// The dedupe service over fixed key material, so a read never resolves the photos root.
+private func makeDedupeService(
+    session: DriveSession, store: UploadIdentityManifestStore
+) -> ProtonUploadDedupeService {
+    ProtonUploadDedupeService(
+        session: session, crypto: DriveCrypto(addressKeys: [], signers: []),
+        photosClient: VisibilityOnlySDK(), contentIndexStore: store,
+        material: .init(
+            context: .init(volumeID: "vol", shareID: "share1", rootLinkID: "root"),
+            rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
+        contextProvider: { throw UploadCore.UploadError.backend("The test material must be reused") })
 }
 
 private func linkIDs(inBodyOf request: StubURLProtocol.Recorded) throws -> [String] {
@@ -403,6 +432,76 @@ extension DriveSessionStubSuite {
             #expect(paths.contains("/drive/shares/share1/links/fetch_metadata"))
         }
 
+        @Test func defaultVisibilityKeepsItsPartialEnvelopeBehavior() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"{"Code":2000,"Links":[{"LinkID":"photo","State":1}],"Partial":true}"#)
+
+            let links = try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["photo"])
+
+            #expect(links["photo"]?.isActive == true)
+            #expect(links["photo"]?.hasExplicitPhotoState == false)
+        }
+
+        @Test(arguments: [
+            #"{"Code":1000,"Links":[],"Partial":true}"#,
+            #"{"Code":2000,"Links":[]}"#,
+        ])
+        func dedupeRejectsIncompleteVisibilityBeforeReturningAnUpload(response: String) async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route("POST /drive/shares/share1/links/fetch_metadata", json: response)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let store = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("manifest.sqlite")))
+            defer { store.close() }
+            let session = makeSession()
+            let service = makeDedupeService(session: session, store: store)
+            let pipeline = UploadDedupePipeline(
+                store: store,
+                checker: DecodedVisibilityChecker(session: session, blocked: false, visibilityService: service))
+            let file = directory.appendingPathComponent("current.heic")
+            let descriptor = UploadResourceDescriptor(
+                source: .file(file), fileURL: file, filename: "current.heic", fileSize: 20,
+                modificationDate: Date(timeIntervalSince1970: 1_720_000_000),
+                precomputedSHA1Digest: Data(repeating: 1, count: 20))
+
+            do {
+                let result = try await pipeline.resolve(descriptor)
+                Issue.record(
+                    "An incomplete visibility response must throw before returning an upload: \(result.decision)")
+                await pipeline.uploadDidFail(descriptor)
+            } catch {
+                #expect(error as? UploadCore.UploadError == .backend("The link visibility response is incomplete"))
+            }
+
+            #expect(store.record(for: descriptor.source)?.remoteLinkID == nil)
+            #expect(store.record(for: descriptor.source)?.outcome == nil)
+            #expect(StubURLProtocol.requests().allSatisfy { $0.path == "/drive/shares/share1/links/fetch_metadata" })
+        }
+
+        /// Exact Duplicates asks for the lenient read: an incomplete answer gives the links that it names.
+        @Test func duplicatesReadAcceptsAnIncompleteVisibilityAnswer() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"{"Code":1000,"Links":[{"LinkID":"photo","State":1}],"Partial":true}"#)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let store = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("manifest.sqlite")))
+            defer { store.close() }
+            let service = makeDedupeService(session: makeSession(), store: store)
+
+            let links = try? await service.linkVisibility(of: ["photo"], requiresCompleteResponse: false)
+
+            #expect(links?.keys.sorted() == ["photo"])
+            #expect(links?["photo"]?.isActive == true)
+        }
+
         @Test func linkVisibilityReadsTheStateAndTheMainPhoto() async throws {
             StubURLProtocol.reset()
             StubURLProtocol.route(
@@ -419,8 +518,11 @@ extension DriveSessionStubSuite {
             let links = try await makeSession().fetchLinkVisibility(
                 shareID: "share1", linkIDs: ["trashed-edit", "original", "deleted"])
 
-            #expect(links["trashed-edit"] == .init(isActive: false, mainPhotoLinkID: nil, trashTime: 1_790_000_000))
-            #expect(links["original"] == .init(isActive: true, mainPhotoLinkID: "trashed-edit"))
+            #expect(
+                links["trashed-edit"]
+                    == .init(
+                        isActive: false, mainPhotoLinkID: nil, hasExplicitState: true, trashTime: 1_790_000_000))
+            #expect(links["original"] == .init(isActive: true, mainPhotoLinkID: "trashed-edit", hasExplicitState: true))
             #expect(links["deleted"] == nil, "a link that the server no longer knows is absent")
         }
 
@@ -438,8 +540,34 @@ extension DriveSessionStubSuite {
             let links = try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["unproven"])
 
             #expect(
-                links["unproven"] == .init(isActive: true, mainPhotoLinkID: "some-main", hasExplicitPhotoState: false),
+                links["unproven"]
+                    == .init(
+                        isActive: true, mainPhotoLinkID: "some-main", hasExplicitState: false,
+                        hasExplicitPhotoState: false
+                    ),
                 "the legacy active default carries the role, yet the answer states nothing")
+        }
+
+        @Test func linkVisibilityWithAStateButNoRoleReportsAnExplicitState() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"""
+                    {"Code":1000,"Links":[{"LinkID":"roleless","Type":2,"State":1}]}
+                    """#)
+
+            let links = try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["roleless"])
+
+            #expect(
+                links["roleless"]
+                    == .init(
+                        isActive: true, mainPhotoLinkID: nil, hasExplicitState: true, hasExplicitPhotoState: false),
+                "an explicit state without role data is the pattern that #988 counts as kept")
+        }
+
+        @Test func theInitializerDefaultsToNoExplicitState() {
+            let legacy = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+            #expect(legacy.hasExplicitState == false, "the safety signal must default to false (fail-closed)")
         }
 
         @Test(arguments: [
@@ -449,17 +577,17 @@ extension DriveSessionStubSuite {
             #"{"LinkID":"photo","FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":null}}}}"#,
         ])
         func blockedContentRejectsIncompleteDecodedPhotoState(link: String) async throws {
-            try await assertDecodedContentDecision(link: link, acceptsBlocked: false)
+            try await assertDecodedContentDecision(link: link, stateProvesActiveMain: false)
         }
 
         @Test func blockedContentAcceptsCompleteDecodedMainPhoto() async throws {
             try await assertDecodedContentDecision(
                 link:
                     #"{"LinkID":"photo","State":1,"FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":null}}}}"#,
-                acceptsBlocked: true)
+                stateProvesActiveMain: true)
         }
 
-        private func assertDecodedContentDecision(link: String, acceptsBlocked: Bool) async throws {
+        private func assertDecodedContentDecision(link: String, stateProvesActiveMain: Bool) async throws {
             StubURLProtocol.reset()
             StubURLProtocol.route(
                 "POST /drive/shares/share1/links/fetch_metadata", json: "{\"Code\":1000,\"Links\":[\(link)]}")
@@ -484,12 +612,14 @@ extension DriveSessionStubSuite {
                     store: store, checker: DecodedVisibilityChecker(session: session, blocked: blocked),
                     currentClientUID: "this-uploader")
                 let result = try await pipeline.resolve(descriptor)
-                let accepts = !blocked || acceptsBlocked
+                let accepts = stateProvesActiveMain
+                // Without the state proof, an incomplete decoded answer never adopts the photo (#876):
+                // a foreign draft still settles as a draft skip, and an open lookup uploads again.
                 #expect(
                     result.decision
                         == (accepts
                             ? .skip(.activeDuplicate, remoteLinkID: "photo")
-                            : .skip(.draftExists, remoteLinkID: "draft")))
+                            : (blocked ? .skip(.draftExists, remoteLinkID: "draft") : .upload)))
                 #expect(store.record(for: descriptor.source)?.remoteLinkID == (accepts ? "photo" : nil))
                 #expect(store.record(for: descriptor.source)?.outcome == (accepts ? "duplicateActive" : nil))
             }
@@ -690,6 +820,82 @@ extension DriveSessionStubSuite {
             #expect(page.requiresRefresh)
             #expect(!page.hasMore)
             #expect(page.events.isEmpty)
+        }
+    }
+}
+
+extension DriveSessionStubSuite {
+    /// "Keep only favorites" ends with a notice that names the series members that stay in the library
+    /// without a reported role (#988). That count stands on `memberRoles`, so a cut-short server answer
+    /// that holds a member's State but not its role record must not feed it: the server can hide the photo
+    /// behind its trashed main photo, and the notice would promise grid visibility the photo does not have.
+    /// The bridge read therefore demands a complete answer, like the dedupe reads that protect backups.
+    @Suite struct DriveSessionSeriesMemberRoleTests {
+        @Test func memberRolesThrowsWhenTheAnswerIsCutShort() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "GET /drive/shares",
+                json: #"""
+                    {"Code":1000,"Shares":[{"ShareID":"share1","VolumeID":"own-volume","LinkID":"root","State":1}]}
+                    """#
+            )
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"{"Code":1000,"Links":[{"LinkID":"m2","State":1}],"Partial":true}"#)
+
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let governor = ProtonRequestGovernor()
+            let session = DriveSession(
+                session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
+                store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
+                accountCacheDirectory: directory, requestGovernor: governor,
+                urlProtocolClasses: [StubURLProtocol.self])
+            let client = try await EncryptedMemoriesClient(
+                configuration: ProtonDriveClientConfiguration(
+                    baseURL: "https://fixture.invalid/", clientUID: "fixture"),
+                httpClient: SDKHttpClient(
+                    driveSession: session, requestGovernor: governor,
+                    urlProtocolClasses: [StubURLProtocol.self]),
+                accountClient: SDKAccountClient(addresses: [], unlockedByKeyID: [:]),
+                logCallback: { _ in }, featureFlagProviderCallback: { _, completion in completion(false) },
+                recordMetricEventCallback: { _ in })
+            let crypto = DriveCrypto(addressKeys: [], signers: [])
+            let gate = TimelineMetadataStartGate()
+            let bridge = DriveSDKBridge(
+                prepared: .init(
+                    photosClient: client, uploadClientUID: "fixture", driveSession: session,
+                    requestGovernor: governor, expensiveUploadAccess: ExpensiveUploadAccess(),
+                    timelineStore: nil, timelineOrderStore: nil, firstIndexBuildGate: gate,
+                    metadataReconciliation: TimelineMetadataReconciliation(startGate: gate),
+                    crypto: crypto,
+                    photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
+                    recentlyDeletedStore: RecentlyDeletedListingStore(
+                        directory: directory, accountUID: "fixture", keyPassword: ""),
+                    photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
+                    uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
+                    uploadManifestPolicy: .conservative))
+
+            do {
+                await #expect(
+                    throws: UploadCore.UploadError.backend("The link visibility response is incomplete")
+                ) {
+                    _ = try await bridge.memberRoles(of: [PhotoUID(volumeID: "own-volume", nodeID: "m2")])
+                }
+                // Nothing may follow the refused read: no favorite tag write, no trash move.
+                // (Recorded.path keeps the query; the share listing carries ShareType.)
+                #expect(
+                    StubURLProtocol.requests().allSatisfy {
+                        let path = $0.path.split(separator: "?").first.map(String.init) ?? $0.path
+                        return path == "/drive/shares"
+                            || path == "/drive/shares/share1/links/fetch_metadata"
+                    })
+                await bridge.shutdown()
+            } catch {
+                await bridge.shutdown()
+                throw error
+            }
         }
     }
 }

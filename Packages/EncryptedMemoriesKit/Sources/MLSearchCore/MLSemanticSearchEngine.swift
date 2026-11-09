@@ -58,17 +58,8 @@ public actor MLSemanticSearchEngine {
         let text = query.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw MLSemanticSearchError.emptyQuery }
 
-        let raw = try await encoder.encode(text: text, descriptor: query.descriptor)
-        try checkContinuation()
-        guard raw.count == query.descriptor.embeddingDimension else {
-            throw MLSemanticSearchError.queryDimensionMismatch(
-                expected: query.descriptor.embeddingDimension,
-                actual: raw.count
-            )
-        }
-        guard let normalized = MLVectorNormalization.normalized(raw) else {
-            throw MLSemanticSearchError.invalidQueryEmbedding
-        }
+        let normalized = try await normalizedQueryVector(
+            text: text, descriptor: query.descriptor, checkContinuation: checkContinuation)
 
         let startedAt = ContinuousClock.now
         var rankedResults: [MLSearchResult] = []
@@ -97,8 +88,7 @@ public actor MLSemanticSearchEngine {
             descriptor: query.descriptor,
             queryText: text,
             results: relevancePolicy.relevantResults(from: rankedResults),
-            durationMs: Double(duration.components.seconds) * 1_000
-                + Double(duration.components.attoseconds) / 1_000_000_000_000_000
+            durationMs: Self.milliseconds(duration)
         )
     }
 
@@ -128,17 +118,8 @@ public actor MLSemanticSearchEngine {
             if let cached = promptEmbeddings[key] {
                 vector = cached
             } else {
-                let raw = try await encoder.encode(text: text, descriptor: query.descriptor)
-                try checkContinuation()
-                guard raw.count == query.descriptor.embeddingDimension else {
-                    throw MLSemanticSearchError.queryDimensionMismatch(
-                        expected: query.descriptor.embeddingDimension, actual: raw.count
-                    )
-                }
-                guard let normalized = MLVectorNormalization.normalized(raw) else {
-                    throw MLSemanticSearchError.invalidQueryEmbedding
-                }
-                vector = normalized
+                vector = try await normalizedQueryVector(
+                    text: text, descriptor: query.descriptor, checkContinuation: checkContinuation)
                 if promptEmbeddings.count >= 40 { promptEmbeddings.removeAll(keepingCapacity: true) }
                 promptEmbeddings[key] = vector
             }
@@ -165,9 +146,7 @@ public actor MLSemanticSearchEngine {
         }
         try checkContinuation()
         let duration = ContinuousClock.now - startedAt
-        let durationMs =
-            Double(duration.components.seconds) * 1_000
-            + Double(duration.components.attoseconds) / 1_000_000_000_000_000
+        let durationMs = Self.milliseconds(duration)
         let results = queries.indices.map { index in
             MLSearchResults(
                 descriptor: first.descriptor, queryText: texts[index],
@@ -193,9 +172,33 @@ public actor MLSemanticSearchEngine {
             })
     }
 
-    public func purgeCachedBlocks() {
+    /// Index vectors are streamed, so only the prompt-embedding cache is held. Lifecycle callers also
+    /// release the inference model through the adapter.
+    public func purgePromptEmbeddings() {
         promptEmbeddings.removeAll()
-        // Index vectors are streamed. Lifecycle callers also release the inference model through the adapter.
+    }
+
+    private func normalizedQueryVector(
+        text: String,
+        descriptor: MLModelDescriptor,
+        checkContinuation: () throws -> Void
+    ) async throws -> ContiguousArray<Float32> {
+        let raw = try await encoder.encode(text: text, descriptor: descriptor)
+        try checkContinuation()
+        guard raw.count == descriptor.embeddingDimension else {
+            throw MLSemanticSearchError.queryDimensionMismatch(
+                expected: descriptor.embeddingDimension, actual: raw.count
+            )
+        }
+        guard let normalized = MLVectorNormalization.normalized(raw) else {
+            throw MLSemanticSearchError.invalidQueryEmbedding
+        }
+        return normalized
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Double {
+        Double(duration.components.seconds) * 1_000
+            + Double(duration.components.attoseconds) / 1_000_000_000_000_000
     }
 
     private static func mergeTopResults(

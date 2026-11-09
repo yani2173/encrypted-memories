@@ -10,22 +10,29 @@ public extension AlbumSyncBackupReport {
         let requested = Set(localIdentifiers)
         var summary = UploadBackupSyncQueueSummary()
         var problems: [String: BackupFailedItem] = [:]
-        queue.forEachProblemEntry { entry in
-            if entry.source.kind == .photoLibraryAsset, requested.contains(entry.source.identifier),
-                problems[entry.source.identifier] == nil
-            {
-                problems[entry.source.identifier] = BackupFailedItem(entry: entry)
+        // Complete reads only: a photo missing from a cut-short problem list would count as fully backed up.
+        let rows: [UploadBackupQueueRowState]
+        do {
+            try queue.decisionForEachProblemEntry { entry in
+                if entry.source.kind == .photoLibraryAsset, requested.contains(entry.source.identifier),
+                    problems[entry.source.identifier] == nil
+                {
+                    problems[entry.source.identifier] = BackupFailedItem(entry: entry)
+                }
+                return true
             }
-            return true
+            rows = try queue.decisionRows(kind: .photoLibraryAsset, identifiers: requested)
+        } catch {
+            throw AlbumSyncError.mappingStoreUnavailable
         }
         var filenames: [String: String] = [:]
-        for row in queue.rows(kind: .photoLibraryAsset, identifiers: requested) {
+        for row in rows {
             summary.include(row.state)
             let id = row.source.identifier
             if row.state == .skippedRemoteDeletion,
                 problems[id] == nil || row.source.resource == .primary
             {
-                guard let entry = queue.entry(for: row.source, revision: row.revision) else {
+                guard let entry = (try? queue.entry(for: row.source, revision: row.revision)) else {
                     throw AlbumSyncError.mappingStoreUnavailable
                 }
                 problems[id] = BackupFailedItem(entry: entry)

@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import ProtonDriveSDK
 import Testing
 
@@ -6,6 +7,123 @@ import Testing
 
 @Suite("Proton request governor")
 struct ProtonRequestGovernorTests {
+    @Test(.enabled(if: D1SupportOverheadProbe.enabled))
+    func benchmarkD1UncontendedGovernorCollectionOverhead() async throws {
+        try await D1SupportOverheadProbe.pairs(workload: "governorUncontended") { enabled in
+            let collector = SupportWorkMeasurements(enabled: enabled)
+            let governor = ProtonRequestGovernor(
+                configuration: Self.configuration(initial: 1, maximum: 1),
+                workMeasurements: collector, summaryLog: { _ in })
+            let (_, elapsed) = try await D1SupportOverheadProbe.timed {
+                for _ in 0..<2048 {
+                    let permit = try await governor.acquire(scope: .api)
+                    await governor.finish(permit, statusCode: 200)
+                }
+            }
+            let state = await governor.snapshot().api
+            #expect(state.inFlight == 0 && state.queued == 0)
+            let snapshot = collector.workMeasurementSupportSnapshot()
+            if enabled {
+                #expect(snapshot.governorWaits[0].admitted.reduce(0, +) == 2048)
+                #expect(snapshot.governorWaits[0].cancelled.reduce(0, +) == 0)
+            } else {
+                #expect(snapshot == .unavailable)
+            }
+            return elapsed
+        }
+    }
+
+    @Test(.enabled(if: D1SupportOverheadProbe.enabled))
+    func benchmarkD1QueuedGovernorCollectionOverhead() async throws {
+        let priorities: [ProtonRequestPriority] = [.maintenance, .background, .userInitiated, .immediate]
+        let expected = (0..<256).flatMap { _ in ["0", "1", "3", "4"] }
+        try await D1SupportOverheadProbe.pairs(workload: "governorQueuedFour") { enabled in
+            let collector = SupportWorkMeasurements(enabled: enabled)
+            let governor = ProtonRequestGovernor(
+                configuration: Self.configuration(initial: 1, maximum: 1),
+                workMeasurements: collector, summaryLog: { _ in })
+            let order = OrderRecorder()
+            let (_, elapsed) = try await D1SupportOverheadProbe.timed {
+                for _ in 0..<256 {
+                    let held = try await governor.acquire(scope: .api)
+                    let waiters = priorities.map { priority in
+                        Task {
+                            let permit = try await governor.acquire(scope: .api, priority: priority)
+                            await order.append(String(priority.rawValue))
+                            await governor.finish(permit, statusCode: 200)
+                        }
+                    }
+                    defer { for waiter in waiters { waiter.cancel() } }
+                    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+                    while await governor.snapshot().api.queued < 4, ContinuousClock.now < deadline {
+                        await Task.yield()
+                    }
+                    guard await governor.snapshot().api.queued == 4 else {
+                        for waiter in waiters { waiter.cancel() }
+                        await governor.finish(held, statusCode: 200)
+                        for waiter in waiters { _ = try? await waiter.value }
+                        throw D1SupportOverheadProbe.Failure.queueDidNotFill
+                    }
+                    await governor.finish(held, statusCode: 200)
+                    for waiter in waiters { try await waiter.value }
+                }
+            }
+            #expect(await order.values == expected)
+            let state = await governor.snapshot().api
+            #expect(state.inFlight == 0 && state.queued == 0)
+            let snapshot = collector.workMeasurementSupportSnapshot()
+            if enabled {
+                #expect(snapshot.governorWaits[0].admitted.reduce(0, +) == 1280)
+                #expect(snapshot.governorWaits[0].cancelled.reduce(0, +) == 0)
+            } else {
+                #expect(snapshot == .unavailable)
+            }
+            return elapsed
+        }
+    }
+
+    @Test func diagnosticWaitsCountAdmissionWithoutChangingTheQueue() async throws {
+        let clock = TestClock()
+        let measurements = SupportWorkMeasurements(now: { .seconds(clock.now.timeIntervalSince1970) })
+        let governor = ProtonRequestGovernor(
+            configuration: Self.configuration(initial: 1, maximum: 1), now: { clock.now },
+            workMeasurements: measurements)
+        let first = try await governor.acquire(scope: .api)
+        let queued = Task { try await governor.acquire(scope: .api, priority: .maintenance) }
+        defer { queued.cancel() }
+        try await Self.waitUntil { await governor.snapshot().api.queued == 1 }
+        clock.now = clock.now.addingTimeInterval(2)
+        await governor.finish(first, statusCode: 200)
+        let second = try await queued.value
+        await governor.finish(second, statusCode: 200)
+        let state = measurements.workMeasurementSupportSnapshot().governorWaits[0]
+        #expect(state.admitted == [1, 0, 0, 0, 1, 0, 0])
+        #expect(state.cancelled.reduce(0, +) == 0)
+        #expect(await governor.snapshot().api.inFlight == 0)
+        #expect(await governor.snapshot().api.queued == 0)
+    }
+
+    @Test func diagnosticCancellationIsNotAnAdmission() async throws {
+        let clock = TestClock()
+        let measurements = SupportWorkMeasurements(now: { .seconds(clock.now.timeIntervalSince1970) })
+        let governor = ProtonRequestGovernor(
+            configuration: Self.configuration(initial: 1, maximum: 1), now: { clock.now },
+            workMeasurements: measurements)
+        let first = try await governor.acquire(scope: .api)
+        let queued = Task { try await governor.acquire(scope: .api, priority: .maintenance) }
+        defer { queued.cancel() }
+        try await Self.waitUntil { await governor.snapshot().api.queued == 1 }
+        clock.now = clock.now.addingTimeInterval(0.125)
+        queued.cancel()
+        await #expect(throws: CancellationError.self) { try await queued.value }
+        await governor.finish(first, statusCode: 200)
+        let state = measurements.workMeasurementSupportSnapshot().governorWaits[0]
+        #expect(state.admitted == [1, 0, 0, 0, 0, 0, 0])
+        #expect(state.cancelled == [0, 0, 0, 1, 0, 0, 0])
+        #expect(await governor.snapshot().api.inFlight == 0)
+        #expect(await governor.snapshot().api.queued == 0)
+    }
+
     @Test(arguments: [false, true])
     func demandedPrefetchOvertakesOtherWorkWithoutRestarting(promoteBeforeEnqueue: Bool) async throws {
         let governor = ProtonRequestGovernor(configuration: Self.configuration(initial: 1, maximum: 1))
@@ -281,10 +399,10 @@ struct ProtonRequestGovernorTests {
         await governor.finish(resumed, statusCode: 200)
     }
 
-    @Test func structuredPriorityScopeSurvivesWatchdogAndEndsOnCompletion() async throws {
+    @Test func priorityScopeSurvivesElapsedTimeAndEndsOnCompletion() async throws {
         let clock = TestClock()
         let governor = ProtonRequestGovernor(
-            configuration: Self.configuration(initial: 1, maximum: 1, priorityLifetime: 1),
+            configuration: Self.configuration(initial: 1, maximum: 1),
             now: { clock.now }
         )
         let activeUpload = try await governor.acquire(scope: .storageUpload, priority: .background)
@@ -314,31 +432,6 @@ struct ProtonRequestGovernorTests {
         #expect(await governor.snapshot().storageUpload.queued == 1)
         await complete.open()
         await interactive.value
-        let resumed = try await queuedUpload.value
-        await governor.finish(resumed, statusCode: 200)
-        #expect(await governor.snapshot().storageUpload.inFlight == 0)
-    }
-
-    @Test func unstructuredPriorityScopeExpiresAndResumesQueuedUploads() async throws {
-        let clock = TestClock()
-        let governor = ProtonRequestGovernor(
-            configuration: Self.configuration(initial: 1, maximum: 1, priorityLifetime: 1),
-            now: { clock.now }
-        )
-        let activeUpload = try await governor.acquire(scope: .storageUpload, priority: .background)
-        _ = await governor.beginUnstructuredPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        let queuedUpload = Task {
-            try await governor.acquire(scope: .storageUpload, priority: .background)
-        }
-        try await Self.waitUntil { await governor.snapshot().storageUpload.queued == 1 }
-
-        await governor.finish(activeUpload, statusCode: 200)
-        clock.now = clock.now.addingTimeInterval(2)
-        _ = await governor.snapshot()
         let resumed = try await queuedUpload.value
         await governor.finish(resumed, statusCode: 200)
         #expect(await governor.snapshot().storageUpload.inFlight == 0)
@@ -492,7 +585,6 @@ struct ProtonRequestGovernorTests {
         initial: Int,
         maximum: Int,
         successWindow: Int = 32,
-        priorityLifetime: TimeInterval = 60,
         recoveryInterval: TimeInterval = 5
     ) -> ProtonRequestGovernor.Configuration {
         let scope = ProtonRequestGovernor.Configuration.Scope(
@@ -505,7 +597,6 @@ struct ProtonRequestGovernorTests {
             storageUpload: scope,
             successWindowForIncrease: successWindow,
             starvationPromotionInterval: 10,
-            priorityScopeLifetime: priorityLifetime,
             rateLimitRecoveryInterval: recoveryInterval
         )
     }
@@ -550,5 +641,52 @@ private actor AsyncLatch {
     func wait() async {
         guard !opened else { return }
         await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+/// Opt-in Release measurements. The caller prepares fixtures and verifies results outside the timed interval.
+enum D1SupportOverheadProbe {
+    static var enabled: Bool {
+        ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_D1_OVERHEAD"] == "1"
+    }
+
+    enum Failure: Error { case queueDidNotFill }
+
+    static func timed<Value: Sendable>(
+        _ operation: () async throws -> Value
+    ) async rethrows -> (Value, Double) {
+        let start = ContinuousClock.now
+        let result = try await operation()
+        let duration = start.duration(to: .now).components
+        let nanoseconds = Double(duration.seconds) * 1e9 + Double(duration.attoseconds) / 1e9
+        return (result, nanoseconds)
+    }
+
+    static func pairs(
+        workload: String, sample: (Bool) async throws -> Double
+    ) async throws {
+        #if DEBUG
+            Issue.record("Run the D1 overhead measurements with Release optimization")
+            return
+        #endif
+        for block in 0..<2 {
+            // Two predefined warm-up pairs, followed by twelve retained pairs. Both orders occur equally often.
+            for index in 0..<14 {
+                let enabledFirst = (index + block).isMultiple(of: 2)
+                let first = try await sample(enabledFirst)
+                let second = try await sample(!enabledFirst)
+                #expect(first.isFinite && first > 0 && second.isFinite && second > 0)
+                if index >= 2 {
+                    let row: [String: Any] = [
+                        "workload": workload, "block": block, "pair": index - 2,
+                        "enabledFirst": enabledFirst ? 1 : 0,
+                        "enabledNanoseconds": enabledFirst ? first : second,
+                        "disabledNanoseconds": enabledFirst ? second : first,
+                    ]
+                    let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+                    print("D1_OVERHEAD_PAIR " + String(decoding: data, as: UTF8.self))
+                }
+            }
+        }
     }
 }

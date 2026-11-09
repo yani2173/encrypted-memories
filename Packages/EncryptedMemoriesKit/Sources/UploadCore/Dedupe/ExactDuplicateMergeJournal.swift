@@ -80,6 +80,14 @@ public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJourn
         Self.lock.withLock { read().intents }
     }
 
+    /// True only when the journal cannot be read. No contents or names are returned.
+    public func cannotBeRead() -> Bool {
+        Self.lock.withLock {
+            guard case .unavailable = read() else { return false }
+            return true
+        }
+    }
+
     /// Moves a file that does not decode aside, so a damaged file never blocks every later merge. The moved file stays
     /// in the account folder for diagnostics. A file that cannot be read stays, because it can hold intents.
     public func prepareForWrites() -> ExactDuplicateMergeJournalState {

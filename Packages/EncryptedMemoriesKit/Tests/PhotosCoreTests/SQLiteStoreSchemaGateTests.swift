@@ -453,6 +453,26 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         return false
     }
 
+    func testRealFullAfterOpenIsAlreadyKeptDuringVerification() throws {
+        let directory = try scratchDirectory()
+        let url = try markedStore(in: directory)
+        var checks = 0
+        let outcome = openMarkerStore(
+            at: url,
+            verifyVersion: { db in
+                checks += 1
+                if checks == 1 { return self.markerVersionIsCurrent(db) }
+                XCTAssertNotNil(sqlite3_db_filename(db, "main"))
+                XCTAssertEqual(sqlite3_exec(db, "PRAGMA max_page_count=1;", nil, nil, nil), SQLITE_OK)
+                XCTAssertEqual(
+                    sqlite3_exec(db, "INSERT INTO marker VALUES (zeroblob(1000000));", nil, nil, nil), SQLITE_FULL)
+                return false
+            })
+        XCTAssertEqual(checks, 2)
+        XCTAssertTrue(isRetryLater(outcome))
+        XCTAssertEqual(markerRowCount(at: url), 2)
+    }
+
     private func closeIfOpened(_ outcome: SQLiteRebuildableStoreOutcome) -> Bool {
         guard case .opened(let handle) = outcome else { return false }
         sqlite3_close(handle)
@@ -597,5 +617,104 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
                 XCTAssertEqual(markerRowCount(at: url), 1)
             }
         }
+    }
+
+    // MARK: A full disk in the index-column query of the exact-schema comparison
+
+    private let indexedSchema = """
+        CREATE TABLE marker (version INTEGER NOT NULL, tag INTEGER);
+        CREATE INDEX marker_tag ON marker(tag);
+        """
+
+    /// Opens a store whose table has an index, so the comparison runs the index-column query for it.
+    private func openIndexedStore(
+        at url: URL, schemaSQL: String? = nil, verifyVersion: @escaping (OpaquePointer?) -> Bool,
+        probe: SQLiteFailureProbe = .live
+    ) -> SQLiteRebuildableStoreOutcome {
+        SQLiteStoreSchemaGate.openRebuildableStoreOutcome(
+            at: url, schemaSQL: schemaSQL ?? indexedSchema, policy: noWaitPolicy,
+            verifyVersion: verifyVersion,
+            stampVersion: { sqlite3_exec($0, "INSERT INTO marker(version) VALUES (1);", nil, nil, nil) == SQLITE_OK },
+            probe: probe)
+    }
+
+    /// An indexed store with a second row, so a replaced file shows by its row count.
+    private func markedIndexedStore(in directory: URL, schemaSQL: String? = nil) throws -> URL {
+        let url = directory.appendingPathComponent("\(UUID().uuidString).sqlite")
+        guard case .opened(let handle) = openIndexedStore(at: url, schemaSQL: schemaSQL, verifyVersion: { _ in true })
+        else {
+            XCTFail("the store opens")
+            return url
+        }
+        XCTAssertEqual(sqlite3_exec(handle, "INSERT INTO marker(version) VALUES (2);", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(handle)
+        return url
+    }
+
+    /// Makes the index-column query fail with a real SQLite error (`SQLITE_AUTH`), and no other statement.
+    private func denyIndexColumnQuery(on db: OpaquePointer?) {
+        sqlite3_set_authorizer(
+            db,
+            { _, action, name, _, _, _ in
+                guard action == SQLITE_PRAGMA, let name, String(cString: name) == "index_xinfo" else {
+                    return SQLITE_OK
+                }
+                return SQLITE_DENY
+            }, nil)
+    }
+
+    /// The first call of the version check is the read-only inspection, which finds the file current. The second call
+    /// is the read-write verification: it denies the index-column query on the connection that the gate compares.
+    private func versionCheckThatDeniesTheIndexColumnQuery(_ calls: inout Int, _ db: OpaquePointer?) -> Bool {
+        calls += 1
+        if calls == 2 { denyIndexColumnQuery(on: db) }
+        return markerVersionIsCurrent(db)
+    }
+
+    func testAFullDiskAnswerInTheIndexColumnQueryKeepsTheFile() throws {
+        let directory = try scratchDirectory()
+        for answer in fullDiskAnswers {
+            let url = try markedIndexedStore(in: directory)
+            var calls = 0
+            let outcome = openIndexedStore(
+                at: url, verifyVersion: { self.versionCheckThatDeniesTheIndexColumnQuery(&calls, $0) },
+                probe: probe(at: .verification, answer))
+            XCTAssertTrue(isRetryLater(outcome), "\(answer.name): retry later")
+            XCTAssertEqual(markerRowCount(at: url), 2, "\(answer.name): the file stays with its rows")
+        }
+    }
+
+    func testAnotherAnswerInTheIndexColumnQueryReplacesTheFileAsBefore() throws {
+        let directory = try scratchDirectory()
+        for answer in otherAnswers {
+            let url = try markedIndexedStore(in: directory)
+            var calls = 0
+            let outcome = openIndexedStore(
+                at: url, verifyVersion: { self.versionCheckThatDeniesTheIndexColumnQuery(&calls, $0) },
+                probe: probe(at: .verification, answer))
+            XCTAssertTrue(closeIfOpened(outcome), "\(answer.name): another schema is replaced")
+            XCTAssertEqual(markerRowCount(at: url), 1, "\(answer.name): the file is replaced")
+        }
+    }
+
+    /// The comparison still reads every index: no call fails here, so no answer about the disk applies.
+    func testAnIndexedFileWithTheSameSchemaOpensAndAChangedIndexIsReplaced() throws {
+        let directory = try scratchDirectory()
+        let url = try markedIndexedStore(in: directory)
+        let full = ("SQLITE_FULL", SQLiteFailure(code: SQLITE_FULL, systemErrno: 0), true)
+        let opened = openIndexedStore(
+            at: url, verifyVersion: markerVersionIsCurrent, probe: probe(at: .verification, full))
+        XCTAssertTrue(closeIfOpened(opened), "the same schema opens")
+        XCTAssertEqual(markerRowCount(at: url), 2, "and keeps its rows")
+
+        let otherIndex = """
+            CREATE TABLE marker (version INTEGER NOT NULL, tag INTEGER);
+            CREATE INDEX marker_tag ON marker(tag DESC);
+            """
+        let changed = try markedIndexedStore(in: directory, schemaSQL: otherIndex)
+        let replaced = openIndexedStore(
+            at: changed, verifyVersion: markerVersionIsCurrent, probe: probe(at: .verification, full))
+        XCTAssertTrue(closeIfOpened(replaced), "another index is another schema")
+        XCTAssertEqual(markerRowCount(at: changed), 1, "the file is replaced")
     }
 }

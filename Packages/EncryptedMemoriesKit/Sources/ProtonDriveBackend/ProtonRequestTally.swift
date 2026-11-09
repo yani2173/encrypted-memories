@@ -18,6 +18,8 @@ enum ProtonRequestCause: String, CaseIterable, Sendable {
     case trashList = "trash.list"
     case trashWrite = "trash.write"
     case account
+    case accountForeground = "account.foreground"
+    case accountSettings = "account.settings"
     case backup
     /// Reads of the Duplicates screen: its content index build, the ranking node reads and the merge plan.
     case duplicatesRead = "duplicates.read"

@@ -143,10 +143,6 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
         }
     }
 
-    public static func databaseFileNames() -> [String] {
-        [databaseFileName, databaseFileName + "-wal", databaseFileName + "-shm"]
-    }
-
     /// Starts one graph-owned persistence session and invalidates leases from older graph lifetimes.
     public func activate(for epoch: LibrarySourceEpoch) async throws -> SessionLease {
         try await perform {
@@ -657,7 +653,7 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
         case .incompatible:
             return .incompatible
         case .unavailable, .retryLater:
-            // The store stays as it is: it holds user data, so it is never replaced here.
+            // The check is inconclusive, so the file stays for the next open; only .incompatible is replaced.
             return .failed
         case .empty, .current:
             break

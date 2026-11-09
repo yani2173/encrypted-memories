@@ -1,42 +1,12 @@
 import AppKit
 import GridCore
-import PhotosCore
 import Testing
 
 @testable import TimelineFeature
 
-//
-// These tests cover `PhotoDiagnostics` accounting for the live pinch path.
-
-/// `.serialized`: reads `PhotoDiagnostics.shared` counter deltas, so it must not run in parallel with
-/// other suites that touch the same shared counters.
-@Suite("Perf small pass - counters", .serialized)
+@Suite("Perf small pass - draw slots")
 @MainActor
-struct PerfSmallPassCounterTests {
-    @Test func diskPresenceCheckNotCountedAsDiskRead() {
-        let d = PhotoDiagnostics.shared
-        d.setActivePinch(true)
-        defer { d.setActivePinch(false) }
-
-        let before = d.hotPathCounters()
-        d.recordDiskPresenceCheckDuringPinch()
-        d.recordDiskPresenceCheckDuringPinch()
-        d.recordDiskReadDuringPinch()
-        let after = d.hotPathCounters()
-
-        #expect(after.diskPresenceCheckDuringPinch - before.diskPresenceCheckDuringPinch == 2)
-        #expect(after.diskReadDuringPinch - before.diskReadDuringPinch == 1)
-
-        // Outside a pinch both are ignored.
-        d.setActivePinch(false)
-        let idle = d.hotPathCounters()
-        d.recordDiskPresenceCheckDuringPinch()
-        d.recordDiskReadDuringPinch()
-        let stillIdle = d.hotPathCounters()
-        #expect(stillIdle.diskPresenceCheckDuringPinch == idle.diskPresenceCheckDuringPinch)
-        #expect(stillIdle.diskReadDuringPinch == idle.diskReadDuringPinch)
-    }
-
+struct PerfSmallPassDrawSlotTests {
     @Test func viewportDrawSlotsExcludeOverscanOnlyTiles() {
         let slots = [
             GridRenderSlot(index: 0, column: 0, row: -2, rect: CGRect(x: 0, y: -220, width: 100, height: 100)),

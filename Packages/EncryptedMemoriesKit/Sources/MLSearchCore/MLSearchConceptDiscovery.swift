@@ -111,22 +111,6 @@ public enum MLSearchConceptDiscovery {
         public let isComplete: Bool
     }
 
-    /// Evaluates the curated concepts. `sensitiveUIDs` must come from a successful `sensitiveUIDs(search:)`;
-    /// those items never count towards a concept. A failed concept query skips only that concept.
-    public static func evaluate(
-        concepts: [MLSearchConcept] = MLSearchConceptCatalog.curated,
-        coveredAssetCount: Int,
-        sensitiveUIDs: Set<PhotoUID>,
-        limit: Int = 400,
-        maximumOverlap: Double = 0.8,
-        search: Search
-    ) async -> [MLSearchConceptEvidence] {
-        await evaluateWithCompletion(
-            concepts: concepts, coveredAssetCount: coveredAssetCount, sensitiveUIDs: sensitiveUIDs,
-            limit: limit, maximumOverlap: maximumOverlap, search: search
-        ).evidence
-    }
-
     public static func evaluateWithCompletion(
         concepts: [MLSearchConcept] = MLSearchConceptCatalog.curated,
         coveredAssetCount: Int,

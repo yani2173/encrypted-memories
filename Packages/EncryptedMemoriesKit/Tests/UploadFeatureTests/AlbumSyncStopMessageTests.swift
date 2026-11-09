@@ -169,10 +169,10 @@ final class AlbumSyncStopMessageTests: XCTestCase {
         }
         XCTAssertEqual(
             try value("albumsync.error_stopped", "en"),
-            "Sync stopped. Progress is saved and the next run continues where it left off.")
+            "Album sync stopped.")
         XCTAssertEqual(
             try value("albumsync.error_stopped", "de"),
-            "Synchronisierung gestoppt. Der Fortschritt bleibt erhalten, der nächste Lauf setzt fort.")
+            "Die Album-Synchronisierung wurde gestoppt.")
         XCTAssertEqual(try value("albumsync.phase_completed", "en"), "Album synced")
         XCTAssertEqual(try value("albumsync.phase_completed", "de"), "Album synchronisiert")
     }

@@ -81,7 +81,7 @@
             let clamped = min(1, max(0, scale))
             let scaledLimit = Int(Double(cache.nominalCostLimitBytes) * clamped)
             if purge {
-                let keptKey = currentPageUID.map(Self.key)
+                let keptKey = currentPageUID.map(\.cacheKey)
                 let keptCost = keptKey.flatMap { cache.image(forKey: $0)?.cost } ?? 0
                 // Floor the shrunken limit at the kept page's cost so the on-screen entry survives its own
                 // re-insert even at scale 0 - "keep only what is currently essential", which this page IS.
@@ -102,7 +102,7 @@
         /// a second edit that reuses the UID of the first. The next request loads them again.
         public func forget(_ uids: [PhotoUID]) {
             for uid in uids {
-                cache.remove(forKey: Self.key(uid))
+                cache.remove(forKey: uid.cacheKey)
                 // A load that started before keeps its result out of the cache and away from the page.
                 forgottenGenerations[uid, default: 0] &+= 1
             }
@@ -120,7 +120,7 @@
         public func displayImage(for uid: PhotoUID, maxPixelSize: Int) async -> DisplayImage? {
             let startGeneration = generation(of: uid)
             currentPageUID = uid
-            let key = Self.key(uid)
+            let key = uid.cacheKey
             // Avoid reusing a thumbnail-sized decode for a later full-screen request.
             if let cached = cache.image(forKey: key), cached.decodedCap >= maxPixelSize {
                 return DisplayImage(image: cached.image, source: cached.source)
@@ -152,16 +152,9 @@
                     let image = await streamedImage(for: uid, maxPixelSize: maxPixelSize)
                 {
                     guard !Task.isCancelled else { return nil }
-                    let px = image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
-                    let cost = Int(px.width * px.height) * 4
-                    let source = "originalFallbackStream"
-                    guard generation(of: uid) == startGeneration else { return nil }
-                    cache.set(
-                        CachedDisplayImage(image: image, source: source, cost: cost, decodedCap: maxPixelSize),
-                        forKey: key,
-                        cost: cost
-                    )
-                    return DisplayImage(image: image, source: source)
+                    return keep(
+                        image, source: "originalFallbackStream", maxPixelSize: maxPixelSize, key: key, uid: uid,
+                        startGeneration: startGeneration)
                 }
                 guard !Task.isCancelled else { return nil }
                 if Self.verbose {
@@ -205,13 +198,13 @@
                 return nil
             }
             let decodeMs = (CACurrentMediaTime() - decodeStart) * 1000
-            let px = image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
-            let cost = Int(px.width * px.height) * 4
-            guard generation(of: uid) == startGeneration else { return nil }
-            cache.set(
-                CachedDisplayImage(image: image, source: source, cost: cost, decodedCap: maxPixelSize), forKey: key,
-                cost: cost)
+            guard
+                let displayed = keep(
+                    image, source: source, maxPixelSize: maxPixelSize, key: key, uid: uid,
+                    startGeneration: startGeneration)
+            else { return nil }
             if Self.verbose {
+                let px = Self.pixelSize(of: image)
                 Self.logger.notice(
                     """
                     [ViewerPerf] display ready uid=\(Self.short(uid), privacy: .public) source=\(source, privacy: .public) \
@@ -219,14 +212,14 @@
                     decodeMs=\(String(format: "%.0f", decodeMs), privacy: .public) bytes=\(data.count)
                     """)
             }
-            return DisplayImage(image: image, source: source)
+            return displayed
         }
 
         /// Loads the original image tier, decoded off-main to the same bounded display size as previews.
         public func originalImage(for uid: PhotoUID, maxPixelSize: Int) async -> DisplayImage? {
             let startGeneration = generation(of: uid)
             currentPageUID = uid
-            let key = Self.key(uid)
+            let key = uid.cacheKey
             // Reuse original-backed decodes only when they satisfy this request's size.
             if let cached = cache.image(forKey: key), cached.source.hasPrefix("original"),
                 cached.decodedCap >= maxPixelSize
@@ -238,15 +231,9 @@
                 let image = await streamedImage(for: uid, maxPixelSize: maxPixelSize)
             {
                 guard !Task.isCancelled else { return nil }
-                let px = image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
-                let cost = Int(px.width * px.height) * 4
-                guard generation(of: uid) == startGeneration else { return nil }
-                cache.set(
-                    CachedDisplayImage(image: image, source: "original", cost: cost, decodedCap: maxPixelSize),
-                    forKey: key,
-                    cost: cost
-                )
-                return DisplayImage(image: image, source: "original")
+                return keep(
+                    image, source: "original", maxPixelSize: maxPixelSize, key: key, uid: uid,
+                    startGeneration: startGeneration)
             }
             guard !Task.isCancelled else { return nil }
 
@@ -285,13 +272,13 @@
                 return nil
             }
             let decodeMs = (CACurrentMediaTime() - decodeStart) * 1000
-            let px = image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
-            let cost = Int(px.width * px.height) * 4
-            guard generation(of: uid) == startGeneration else { return nil }
-            cache.set(
-                CachedDisplayImage(image: image, source: "original", cost: cost, decodedCap: maxPixelSize), forKey: key,
-                cost: cost)
+            guard
+                let displayed = keep(
+                    image, source: "original", maxPixelSize: maxPixelSize, key: key, uid: uid,
+                    startGeneration: startGeneration)
+            else { return nil }
             if Self.verbose {
+                let px = Self.pixelSize(of: image)
                 Self.logger.notice(
                     """
                     [ViewerPerf] original ready uid=\(Self.short(uid), privacy: .public) \
@@ -299,7 +286,26 @@
                     decodeMs=\(String(format: "%.0f", decodeMs), privacy: .public) bytes=\(data.count)
                     """)
             }
-            return DisplayImage(image: image, source: "original")
+            return displayed
+        }
+
+        /// Keeps a decode for the next request, unless `forget` ran for the photo after `startGeneration`: then the
+        /// bytes may belong to earlier content, so nothing is cached and the caller shows nothing.
+        private func keep(
+            _ image: UIImage, source: String, maxPixelSize: Int, key: NSString, uid: PhotoUID,
+            startGeneration: UInt64
+        ) -> DisplayImage? {
+            let px = Self.pixelSize(of: image)
+            let cost = Int(px.width * px.height) * 4
+            guard generation(of: uid) == startGeneration else { return nil }
+            cache.set(
+                CachedDisplayImage(image: image, source: source, cost: cost, decodedCap: maxPixelSize), forKey: key,
+                cost: cost)
+            return DisplayImage(image: image, source: source)
+        }
+
+        private static func pixelSize(of image: UIImage) -> CGSize {
+            image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
         }
 
         private func streamedImage(for uid: PhotoUID, maxPixelSize: Int) async -> UIImage? {
@@ -315,10 +321,6 @@
             } catch {
                 return nil
             }
-        }
-
-        private static func key(_ uid: PhotoUID) -> NSString {
-            "\(uid.volumeID)~\(uid.nodeID)" as NSString
         }
 
         private static func short(_ uid: PhotoUID) -> String {

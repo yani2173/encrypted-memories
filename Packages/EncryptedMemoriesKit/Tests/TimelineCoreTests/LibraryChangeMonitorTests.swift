@@ -5,345 +5,529 @@ import Testing
 @testable import TimelineCore
 
 @Suite struct LibraryChangeMonitorTests {
-    @Test(.timeLimit(.minutes(1)))
-    func legacyCustomPolicyKeepsImmediateTrailingRefreshes() async {
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func legacyCustomPolicyKeepsImmediateTrailingRefreshes() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let provider = TokenProvider("a")
+            let timeline = MonitorRefreshTimeline()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            await monitor.start(
+                provider: provider, policy: .init(interval: .seconds(5), failureInterval: .seconds(5)),
+                initialToken: "a"
+            ) {
+                let token = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: token)
+                return .refreshed(token: token)
+            }
+            #expect(await clock.waitForSleepCount(1))
+            await provider.set("b")
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(2))
+            await provider.set("c")
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(3))
+            let observedTimes = await timeline.times
+            #expect(observedTimes == [.seconds(5), .seconds(10)])
+            #expect(await monitor.testingBaseline() == "c")
+            await monitor.stop()
+        }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func delayedClockRegistrationKeepsTheAbsoluteMonitorQuietDeadline() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let sequence = MonitorSleepSequence()
+            let entered = TestSignal()
+            let release = TestSignal()
+            let provider = TokenProvider("a")
+            let timeline = MonitorRefreshTimeline()
+            let dependency = TimelineRefreshClock(
+                now: { clock.now },
+                sleep: { duration in
+                    if await sequence.nextIsThird() {
+                        await entered.signal()
+                        await release.wait()
+                    }
+                    try await clock.dependency.sleep(duration)
+                },
+                sleepUntil: { deadline in
+                    await entered.signal()
+                    await release.wait()
+                    try await clock.dependency.sleepUntil(deadline)
+                }
+            )
+            let monitor = LibraryChangeMonitor(clock: dependency)
+            await monitor.start(provider: provider, initialToken: "a") {
+                let token = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: token)
+                return .refreshed(token: token)
+            }
+            #expect(await clock.waitForSleepCount(1))
+            await provider.set("b")
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(2))
+            await provider.set("c")
+            clock.advance(by: .seconds(5))
+            await entered.wait()
+            clock.advance(by: .seconds(25))
+            await release.signal()
+            #expect(await timeline.waitForLoadOrSleep(after: 1, clock: clock))
+            if await timeline.times.count < 2, clock.pendingSleeps > 0 { clock.advanceToNextSleep() }
+            #expect(await clock.waitForSleepCount(4))
+            let observedTimes = await timeline.times
+            #expect(observedTimes == [.seconds(5), .seconds(35)])
+            #expect(await monitor.testingBaseline() == "c")
+            await monitor.stop()
+        }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func failedDeadlineAttemptsRetainTheFirstPendingChangeAcrossNewTokens() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let provider = TokenProvider("0")
+            let timeline = MonitorRefreshTimeline()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            await monitor.start(provider: provider, initialToken: "0") {
+                let token = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: token)
+                let count = await timeline.times.count
+                return count == 2 || count == 3 ? .retry : .refreshed(token: token)
+            }
+            #expect(await clock.waitForSleepCount(1))
+            for tick in 1...16 {
+                await provider.set(String(tick))
+                clock.advance(by: .seconds(5))
+                #expect(await clock.waitForSleepCount(tick + 1))
+                if tick == 14 || tick == 15 { #expect(await monitor.testingBaseline() == "1") }
+            }
+            let observedTimes = await timeline.times
+            #expect(observedTimes == [.seconds(5), .seconds(70), .seconds(75), .seconds(80)])
+            #expect(await monitor.testingBaseline() == "16")
+            await monitor.stop()
+            #expect(clock.pendingSleeps == 0)
+        }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func overduePendingChangesKeepRetryBackoffAndRequireAPublishedRevision() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let provider = TokenProvider("a")
+            let timeline = MonitorRefreshTimeline()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            await monitor.start(provider: provider, initialToken: "a") {
+                let token = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: token)
+                switch await timeline.times.count {
+                case 2, 3: return .retry
+                case 4: return .refreshed(token: nil)
+                default: return .refreshed(token: token)
+                }
+            }
+            #expect(await clock.waitForSleepCount(1))
+            for tick in 1...8 {
+                if tick == 1 { await provider.set("b") }
+                if tick == 2 { await provider.set("c") }
+                if tick == 3 { await provider.set("d") }
+                clock.advance(by: .seconds(5))
+                #expect(await clock.waitForSleepCount(tick + 1))
+            }
+            #expect(await monitor.testingBaseline() == "b")
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(10))
+            #expect(await monitor.testingBaseline() == "b")
+            clock.advance(by: .seconds(10))
+            #expect(await clock.waitForSleepCount(11))
+            #expect(await monitor.testingBaseline() == "b")
+            clock.advance(by: .seconds(20))
+            #expect(await clock.waitForSleepCount(12))
+            let observedTimes = await timeline.times
+            #expect(observedTimes == [.seconds(5), .seconds(40), .seconds(45), .seconds(55), .seconds(75)])
+            #expect(Array(clock.requestedSleeps.suffix(4)) == [.seconds(5), .seconds(10), .seconds(20), .seconds(5)])
+            #expect(await monitor.testingBaseline() == "d")
+            await monitor.stop()
+        }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func expiredBurstDeadlineDoesNotBypassAFilteredRouteDeferral() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let provider = TokenProvider("a")
+            let timeline = MonitorRefreshTimeline()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            await monitor.start(provider: provider, initialToken: "a") {
+                let token = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: token)
+                return await timeline.times.count == 2 ? .refreshedWithoutRevision : .refreshed(token: token)
+            }
+            #expect(await clock.waitForSleepCount(1))
+            for tick in 1...20 {
+                if tick == 1 { await provider.set("b") }
+                if tick == 2 { await provider.set("c") }
+                if tick == 3 { await provider.set("d") }
+                clock.advance(by: .seconds(5))
+                #expect(await clock.waitForSleepCount(tick + 1))
+            }
+            let beforeResume = await timeline.times
+            #expect(beforeResume == [.seconds(5), .seconds(40)])
+            #expect(await monitor.testingBaseline() == "b")
+            await monitor.resumeDeferredRefresh()
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(22))
+            let afterResume = await timeline.times
+            #expect(afterResume == [.seconds(5), .seconds(40), .seconds(105)])
+            #expect(await monitor.testingBaseline() == "d")
+            await monitor.stop()
+        }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func cancellationRetiresThePendingBurstAndRestartKeepsFirstChangeFreshness() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let provider = TokenProvider("a")
+            let timeline = MonitorRefreshTimeline()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            let refresh: @Sendable () async -> LibraryChangeRefreshOutcome = {
+                let token = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: token)
+                return .refreshed(token: token)
+            }
+            await monitor.start(provider: provider, initialToken: "a", onChange: refresh)
+            #expect(await clock.waitForSleepCount(1))
+            await provider.set("b")
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(2))
+            await provider.set("c")
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(3))
+            await monitor.stop()
+            #expect(clock.pendingSleeps == 0)
+            clock.advance(by: .seconds(60))
+            #expect(await timeline.times == [.seconds(5)])
+            #expect(await monitor.testingBaseline() == "b")
+            await monitor.start(provider: provider, initialToken: "a", onChange: refresh)
+            #expect(await clock.waitForSleepCount(4))
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(5))
+            let observedTimes = await timeline.times
+            #expect(observedTimes == [.seconds(5), .seconds(75)])
+            #expect(await monitor.testingBaseline() == "c")
+            await monitor.stop()
+        }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func foreignBurstKeepsFirstRefreshImmediateAndCoalescesOnlyTrailingChanges() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let provider = TokenProvider("a")
+            let timeline = MonitorRefreshTimeline()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            await monitor.start(provider: provider, initialToken: "a") {
+                let published = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: published)
+                return .refreshed(token: published)
+            }
+
+            #expect(await clock.waitForSleepCount(1))
+            for second in stride(from: 5, through: 70, by: 5) {
+                switch second {
+                case 5: await provider.set("b")
+                case 10: await provider.set("c")
+                case 15: await provider.set("d")
+                case 70: await provider.set("e")
+                default: break
+                }
+                clock.advance(by: .seconds(5))
+                #expect(await clock.waitForSleepCount(second / 5 + 1))
+                if second == 5 {
+                    #expect(
+                        await timeline.times == [.seconds(5)], "The isolated first change keeps five-second freshness")
+                }
+                if second == 15 || second == 35 {
+                    #expect(
+                        await timeline.times == [.seconds(5)], "Trailing changes wait for twenty-five seconds of quiet")
+                }
+                if second == 40 {
+                    #expect(await timeline.times == [.seconds(5), .seconds(40)])
+                    #expect(await monitor.testingBaseline() == "d")
+                }
+            }
+            let observedTimes = await timeline.times
+            let observedTokens = await timeline.tokens
+            #expect(observedTimes == [.seconds(5), .seconds(40), .seconds(70)])
+            #expect(observedTokens == ["b", "d", "e"], "A later isolated change refreshes on its next probe")
+            await monitor.stop()
+            #expect(clock.pendingSleeps == 0)
+        }
+    #endif
+
+    /// 30 token changes, one every 5 s, as an own bulk write (Merge All of many groups) causes them. Returns the times
+    /// of the refreshes that the monitor ran while the bulk write lasted.
+    private func refreshTimesDuringABulkWrite(
+        hold: HoldFlag?
+    ) async -> (
+        times: [Duration], clock: TimelineRefreshTestClock, monitor: LibraryChangeMonitor,
+        timeline: MonitorRefreshTimeline, provider: TokenProvider
+    ) {
         let clock = TimelineRefreshTestClock()
         let origin = clock.now
-        let provider = TokenProvider("a")
+        let provider = TokenProvider("t0")
         let timeline = MonitorRefreshTimeline()
         let monitor = LibraryChangeMonitor(clock: clock.dependency)
         await monitor.start(
-            provider: provider, policy: .init(interval: .seconds(5), failureInterval: .seconds(5)), initialToken: "a"
-        ) {
-            let token = await provider.currentToken()
-            await timeline.record(clock.now - origin, token: token)
-            return .refreshed(token: token)
+            provider: provider, initialToken: "t0",
+            holdRefresh: { await hold?.isHeld ?? false },
+            onChange: {
+                let published = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: published)
+                return .refreshed(token: published)
+            })
+        #expect(await clock.waitForSleepCount(1))
+        for step in 1...30 {
+            await provider.set("t\(step)")
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(step + 1))
         }
+        return (await timeline.times, clock, monitor, timeline, provider)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func withoutAHoldAnOwnBulkWriteRefreshesSeveralTimes() async {
+        let run = await refreshTimesDuringABulkWrite(hold: nil)
+        #expect(run.times.count >= 3, "The monitor refreshes the first change and every burst deadline: \(run.times)")
+        await run.monitor.stop()
+    }
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func aHeldMonitorRefreshesNothingDuringAnOwnBulkWriteAndOnceAfterItEnds() async {
+            let hold = HoldFlag(true)
+            let run = await refreshTimesDuringABulkWrite(hold: hold)
+            #expect(run.times.isEmpty, "No refresh runs while the bulk write holds the monitor: \(run.times)")
+
+            await hold.set(false)
+            run.clock.advance(by: .seconds(5))
+            #expect(await run.clock.waitForSleepCount(32))
+            let afterRelease = await run.timeline.times
+            #expect(afterRelease == [.seconds(155)], "One refresh within one probe of the end")
+            #expect(await run.timeline.tokens == ["t30"], "It carries the newest token")
+            #expect(await run.monitor.testingBaseline() == "t30")
+
+            run.clock.advance(by: .seconds(30))
+            #expect(await run.clock.waitForSleepCount(33))
+            #expect(await run.timeline.times.count == 1, "Nothing refreshes again without a new change")
+            await run.monitor.stop()
+        }
+    #endif
+
+    /// A merge that never ends: the cap lets one refresh run after ten minutes, and the hold applies again.
+    @Test(.timeLimit(.minutes(1)))
+    func aHoldThatLastsLongerThanTheCapRefreshesOncePerCap() async {
+        let clock = TimelineRefreshTestClock()
+        let origin = clock.now
+        let provider = TokenProvider("t0")
+        let timeline = MonitorRefreshTimeline()
+        let hold = HoldFlag(true)
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(
+            provider: provider, initialToken: "t0",
+            holdRefresh: { await hold.isHeld },
+            onChange: {
+                let published = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: published)
+                return .refreshed(token: published)
+            })
+        #expect(await clock.waitForSleepCount(1))
+        let cap = Int(LibraryChangePollingPolicy.foreground.maxHoldInterval.components.seconds)
+        for step in 1...(cap * 5 / 2 / 5) {
+            await provider.set("t\(step)")
+            clock.advance(by: .seconds(5))
+            guard await clock.waitForSleepCount(step + 1) else {
+                Issue.record("the monitor did not reach probe \(step + 1)")
+                break
+            }
+        }
+        let times = (await timeline.times).map { Int($0.components.seconds) }
+        // The first held change is seen at 5 s; the cap runs out at the first probe that is `cap` seconds later.
+        #expect(times == [5 + cap, 10 + 2 * cap], "One refresh per cap, none in between: \(times)")
+        await monitor.stop()
+    }
+
+    /// The cap counts one hold: a token that returns to the baseline ends it, so a later hold gets a full window.
+    @Test(.timeLimit(.minutes(1)))
+    func aTokenThatReturnsToTheBaselineEndsTheHoldWindow() async {
+        let clock = TimelineRefreshTestClock()
+        let provider = TokenProvider("a")
+        let timeline = MonitorRefreshTimeline()
+        let hold = HoldFlag(true)
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(
+            provider: provider, initialToken: "a",
+            holdRefresh: { await hold.isHeld },
+            onChange: {
+                await timeline.record(.zero, token: "x")
+                return .refreshed(token: "x")
+            })
         #expect(await clock.waitForSleepCount(1))
         await provider.set("b")
         clock.advance(by: .seconds(5))
         #expect(await clock.waitForSleepCount(2))
-        await provider.set("c")
+        await provider.set("a")
         clock.advance(by: .seconds(5))
         #expect(await clock.waitForSleepCount(3))
-        let observedTimes = await timeline.times
-        #expect(observedTimes == [.seconds(5), .seconds(10)])
-        #expect(await monitor.testingBaseline() == "c")
+        let cap = Int(LibraryChangePollingPolicy.foreground.maxHoldInterval.components.seconds)
+        // Idle until long after the first window would have run out, then a new change arrives during a new hold.
+        for step in 4...(4 + cap / 5 + 2) {
+            clock.advance(by: .seconds(5))
+            guard await clock.waitForSleepCount(step) else {
+                Issue.record("the monitor did not reach probe \(step)")
+                break
+            }
+        }
+        await provider.set("c")
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(4 + cap / 5 + 3))
+        #expect(await timeline.times.isEmpty, "The new change starts a new hold window instead of using the old one")
         await monitor.stop()
     }
 
+    @Test func theHoldCapIsTenMinutes() {
+        #expect(LibraryChangePollingPolicy.foreground.maxHoldInterval == .seconds(600))
+    }
+
     @Test(.timeLimit(.minutes(1)))
-    func delayedClockRegistrationKeepsTheAbsoluteMonitorQuietDeadline() async {
+    func aMonitorStartedWithRestartAppliesTheHostHold() async {
         let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let sequence = MonitorSleepSequence()
-        let entered = TestSignal()
-        let release = TestSignal()
         let provider = TokenProvider("a")
         let timeline = MonitorRefreshTimeline()
-        let dependency = TimelineRefreshClock(
-            now: { clock.now },
-            sleep: { duration in
-                if await sequence.nextIsThird() {
-                    await entered.signal()
-                    await release.wait()
+        let hold = HoldFlag(true)
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.restart(
+            provider: provider, initialToken: "a",
+            holdRefresh: { await hold.isHeld },
+            onChange: {
+                await timeline.record(.zero, token: "b")
+                return .refreshed(token: "b")
+            })
+        #expect(await clock.waitForSleepCount(1))
+        await provider.set("b")
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(2))
+        #expect(await timeline.times.isEmpty, "A change during the hold does not refresh")
+        await hold.set(false)
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(3))
+        #expect(await timeline.times.count == 1, "The first probe after the hold refreshes once")
+        await monitor.stop()
+    }
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func continuousForeignChangesCannotResetTheFirstDeferredDeadline() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let provider = TokenProvider("0")
+            let timeline = MonitorRefreshTimeline()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            await monitor.start(provider: provider, initialToken: "0") {
+                let published = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: published)
+                return .refreshed(token: published)
+            }
+
+            #expect(await clock.waitForSleepCount(1))
+            for tick in 1...14 {
+                await provider.set(String(tick))
+                clock.advance(by: .seconds(5))
+                #expect(await clock.waitForSleepCount(tick + 1))
+                if tick == 13 {
+                    #expect(
+                        await timeline.times == [.seconds(5)],
+                        "The first deferred change at ten seconds owns the deadline")
                 }
-                try await clock.dependency.sleep(duration)
-            },
-            sleepUntil: { deadline in
-                await entered.signal()
-                await release.wait()
-                try await clock.dependency.sleepUntil(deadline)
             }
-        )
-        let monitor = LibraryChangeMonitor(clock: dependency)
-        await monitor.start(provider: provider, initialToken: "a") {
-            let token = await provider.currentToken()
-            await timeline.record(clock.now - origin, token: token)
-            return .refreshed(token: token)
+            let observedTimes = await timeline.times
+            let observedTokens = await timeline.tokens
+            #expect(
+                observedTimes == [.seconds(5), .seconds(70)],
+                "Sixty seconds from the first deferred change bounds the burst")
+            #expect(observedTokens == ["1", "14"])
+            #expect(await monitor.testingBaseline() == "14")
+            await monitor.stop()
+            #expect(clock.pendingSleeps == 0)
         }
-        #expect(await clock.waitForSleepCount(1))
-        await provider.set("b")
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(2))
-        await provider.set("c")
-        clock.advance(by: .seconds(5))
-        await entered.wait()
-        clock.advance(by: .seconds(25))
-        await release.signal()
-        #expect(await timeline.waitForLoadOrSleep(after: 1, clock: clock))
-        if await timeline.times.count < 2, clock.pendingSleeps > 0 { clock.advanceToNextSleep() }
-        #expect(await clock.waitForSleepCount(4))
-        let observedTimes = await timeline.times
-        #expect(observedTimes == [.seconds(5), .seconds(35)])
-        #expect(await monitor.testingBaseline() == "c")
-        await monitor.stop()
-    }
+    #endif
 
-    @Test(.timeLimit(.minutes(1)))
-    func failedDeadlineAttemptsRetainTheFirstPendingChangeAcrossNewTokens() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let provider = TokenProvider("0")
-        let timeline = MonitorRefreshTimeline()
-        let monitor = LibraryChangeMonitor(clock: clock.dependency)
-        await monitor.start(provider: provider, initialToken: "0") {
-            let token = await provider.currentToken()
-            await timeline.record(clock.now - origin, token: token)
-            let count = await timeline.times.count
-            return count == 2 || count == 3 ? .retry : .refreshed(token: token)
-        }
-        #expect(await clock.waitForSleepCount(1))
-        for tick in 1...16 {
-            await provider.set(String(tick))
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func controlledClockPreservesForegroundProbeAndPublishedBaseline() async {
+            let clock = TimelineRefreshTestClock()
+            let provider = TokenProvider("new")
+            let refreshes = Counter()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            await monitor.start(provider: provider, initialToken: "old") {
+                await refreshes.increment()
+                return .refreshed(token: "new")
+            }
+
+            #expect(await clock.waitForSleepCount(1))
+            #expect(clock.requestedSleeps == [.seconds(5)])
+            #expect(await provider.probeCount == 0)
+            clock.advance(by: .seconds(4))
+            #expect(await refreshes.value == 0)
+            clock.advance(by: .seconds(1))
+            #expect(await clock.waitForSleepCount(2))
+            #expect(await refreshes.value == 1)
+            #expect(await monitor.testingBaseline() == "new")
+
             clock.advance(by: .seconds(5))
-            #expect(await clock.waitForSleepCount(tick + 1))
-            if tick == 14 || tick == 15 { #expect(await monitor.testingBaseline() == "1") }
+            #expect(await clock.waitForSleepCount(3))
+            #expect(await refreshes.value == 1)
+            await monitor.stop()
+            #expect(clock.pendingSleeps == 0)
         }
-        let observedTimes = await timeline.times
-        #expect(observedTimes == [.seconds(5), .seconds(70), .seconds(75), .seconds(80)])
-        #expect(await monitor.testingBaseline() == "16")
-        await monitor.stop()
-        #expect(clock.pendingSleeps == 0)
-    }
+    #endif
 
-    @Test(.timeLimit(.minutes(1)))
-    func overduePendingChangesKeepRetryBackoffAndRequireAPublishedRevision() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let provider = TokenProvider("a")
-        let timeline = MonitorRefreshTimeline()
-        let monitor = LibraryChangeMonitor(clock: clock.dependency)
-        await monitor.start(provider: provider, initialToken: "a") {
-            let token = await provider.currentToken()
-            await timeline.record(clock.now - origin, token: token)
-            switch await timeline.times.count {
-            case 2, 3: return .retry
-            case 4: return .refreshed(token: nil)
-            default: return .refreshed(token: token)
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func controlledClockPreservesUnacknowledgedRetryAndCancellation() async {
+            let clock = TimelineRefreshTestClock()
+            let provider = TokenProvider("new")
+            let refreshes = Counter()
+            let monitor = LibraryChangeMonitor(clock: clock.dependency)
+            await monitor.start(provider: provider, initialToken: "old") {
+                await refreshes.increment()
+                return await refreshes.value == 1 ? .retry : .refreshed(token: "new")
             }
-        }
-        #expect(await clock.waitForSleepCount(1))
-        for tick in 1...8 {
-            if tick == 1 { await provider.set("b") }
-            if tick == 2 { await provider.set("c") }
-            if tick == 3 { await provider.set("d") }
+
+            #expect(await clock.waitForSleepCount(1))
             clock.advance(by: .seconds(5))
-            #expect(await clock.waitForSleepCount(tick + 1))
-        }
-        #expect(await monitor.testingBaseline() == "b")
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(10))
-        #expect(await monitor.testingBaseline() == "b")
-        clock.advance(by: .seconds(10))
-        #expect(await clock.waitForSleepCount(11))
-        #expect(await monitor.testingBaseline() == "b")
-        clock.advance(by: .seconds(20))
-        #expect(await clock.waitForSleepCount(12))
-        let observedTimes = await timeline.times
-        #expect(observedTimes == [.seconds(5), .seconds(40), .seconds(45), .seconds(55), .seconds(75)])
-        #expect(Array(clock.requestedSleeps.suffix(4)) == [.seconds(5), .seconds(10), .seconds(20), .seconds(5)])
-        #expect(await monitor.testingBaseline() == "d")
-        await monitor.stop()
-    }
+            #expect(await clock.waitForSleepCount(2))
+            #expect(await refreshes.value == 1)
+            #expect(await monitor.testingBaseline() == "old")
+            #expect(clock.requestedSleeps == [.seconds(5), .seconds(5)])
 
-    @Test(.timeLimit(.minutes(1)))
-    func expiredBurstDeadlineDoesNotBypassAFilteredRouteDeferral() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let provider = TokenProvider("a")
-        let timeline = MonitorRefreshTimeline()
-        let monitor = LibraryChangeMonitor(clock: clock.dependency)
-        await monitor.start(provider: provider, initialToken: "a") {
-            let token = await provider.currentToken()
-            await timeline.record(clock.now - origin, token: token)
-            return await timeline.times.count == 2 ? .refreshedWithoutRevision : .refreshed(token: token)
-        }
-        #expect(await clock.waitForSleepCount(1))
-        for tick in 1...20 {
-            if tick == 1 { await provider.set("b") }
-            if tick == 2 { await provider.set("c") }
-            if tick == 3 { await provider.set("d") }
             clock.advance(by: .seconds(5))
-            #expect(await clock.waitForSleepCount(tick + 1))
+            #expect(await clock.waitForSleepCount(3))
+            #expect(await refreshes.value == 2)
+            #expect(await monitor.testingBaseline() == "new")
+            await monitor.stop()
+            #expect(clock.pendingSleeps == 0)
         }
-        let beforeResume = await timeline.times
-        #expect(beforeResume == [.seconds(5), .seconds(40)])
-        #expect(await monitor.testingBaseline() == "b")
-        await monitor.resumeDeferredRefresh()
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(22))
-        let afterResume = await timeline.times
-        #expect(afterResume == [.seconds(5), .seconds(40), .seconds(105)])
-        #expect(await monitor.testingBaseline() == "d")
-        await monitor.stop()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func cancellationRetiresThePendingBurstAndRestartKeepsFirstChangeFreshness() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let provider = TokenProvider("a")
-        let timeline = MonitorRefreshTimeline()
-        let monitor = LibraryChangeMonitor(clock: clock.dependency)
-        let refresh: @Sendable () async -> LibraryChangeRefreshOutcome = {
-            let token = await provider.currentToken()
-            await timeline.record(clock.now - origin, token: token)
-            return .refreshed(token: token)
-        }
-        await monitor.start(provider: provider, initialToken: "a", onChange: refresh)
-        #expect(await clock.waitForSleepCount(1))
-        await provider.set("b")
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(2))
-        await provider.set("c")
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(3))
-        await monitor.stop()
-        #expect(clock.pendingSleeps == 0)
-        clock.advance(by: .seconds(60))
-        #expect(await timeline.times == [.seconds(5)])
-        #expect(await monitor.testingBaseline() == "b")
-        await monitor.start(provider: provider, initialToken: "a", onChange: refresh)
-        #expect(await clock.waitForSleepCount(4))
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(5))
-        let observedTimes = await timeline.times
-        #expect(observedTimes == [.seconds(5), .seconds(75)])
-        #expect(await monitor.testingBaseline() == "c")
-        await monitor.stop()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func foreignBurstKeepsFirstRefreshImmediateAndCoalescesOnlyTrailingChanges() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let provider = TokenProvider("a")
-        let timeline = MonitorRefreshTimeline()
-        let monitor = LibraryChangeMonitor(clock: clock.dependency)
-        await monitor.start(provider: provider, initialToken: "a") {
-            let published = await provider.currentToken()
-            await timeline.record(clock.now - origin, token: published)
-            return .refreshed(token: published)
-        }
-
-        #expect(await clock.waitForSleepCount(1))
-        for second in stride(from: 5, through: 70, by: 5) {
-            switch second {
-            case 5: await provider.set("b")
-            case 10: await provider.set("c")
-            case 15: await provider.set("d")
-            case 70: await provider.set("e")
-            default: break
-            }
-            clock.advance(by: .seconds(5))
-            #expect(await clock.waitForSleepCount(second / 5 + 1))
-            if second == 5 {
-                #expect(await timeline.times == [.seconds(5)], "The isolated first change keeps five-second freshness")
-            }
-            if second == 15 || second == 35 {
-                #expect(await timeline.times == [.seconds(5)], "Trailing changes wait for twenty-five seconds of quiet")
-            }
-            if second == 40 {
-                #expect(await timeline.times == [.seconds(5), .seconds(40)])
-                #expect(await monitor.testingBaseline() == "d")
-            }
-        }
-        let observedTimes = await timeline.times
-        let observedTokens = await timeline.tokens
-        #expect(observedTimes == [.seconds(5), .seconds(40), .seconds(70)])
-        #expect(observedTokens == ["b", "d", "e"], "A later isolated change refreshes on its next probe")
-        await monitor.stop()
-        #expect(clock.pendingSleeps == 0)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func continuousForeignChangesCannotResetTheFirstDeferredDeadline() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let provider = TokenProvider("0")
-        let timeline = MonitorRefreshTimeline()
-        let monitor = LibraryChangeMonitor(clock: clock.dependency)
-        await monitor.start(provider: provider, initialToken: "0") {
-            let published = await provider.currentToken()
-            await timeline.record(clock.now - origin, token: published)
-            return .refreshed(token: published)
-        }
-
-        #expect(await clock.waitForSleepCount(1))
-        for tick in 1...14 {
-            await provider.set(String(tick))
-            clock.advance(by: .seconds(5))
-            #expect(await clock.waitForSleepCount(tick + 1))
-            if tick == 13 {
-                #expect(
-                    await timeline.times == [.seconds(5)], "The first deferred change at ten seconds owns the deadline")
-            }
-        }
-        let observedTimes = await timeline.times
-        let observedTokens = await timeline.tokens
-        #expect(
-            observedTimes == [.seconds(5), .seconds(70)],
-            "Sixty seconds from the first deferred change bounds the burst")
-        #expect(observedTokens == ["1", "14"])
-        #expect(await monitor.testingBaseline() == "14")
-        await monitor.stop()
-        #expect(clock.pendingSleeps == 0)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func controlledClockPreservesForegroundProbeAndPublishedBaseline() async {
-        let clock = TimelineRefreshTestClock()
-        let provider = TokenProvider("new")
-        let refreshes = Counter()
-        let monitor = LibraryChangeMonitor(clock: clock.dependency)
-        await monitor.start(provider: provider, initialToken: "old") {
-            await refreshes.increment()
-            return .refreshed(token: "new")
-        }
-
-        #expect(await clock.waitForSleepCount(1))
-        #expect(clock.requestedSleeps == [.seconds(5)])
-        #expect(await provider.probeCount == 0)
-        clock.advance(by: .seconds(4))
-        #expect(await refreshes.value == 0)
-        clock.advance(by: .seconds(1))
-        #expect(await clock.waitForSleepCount(2))
-        #expect(await refreshes.value == 1)
-        #expect(await monitor.testingBaseline() == "new")
-
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(3))
-        #expect(await refreshes.value == 1)
-        await monitor.stop()
-        #expect(clock.pendingSleeps == 0)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func controlledClockPreservesUnacknowledgedRetryAndCancellation() async {
-        let clock = TimelineRefreshTestClock()
-        let provider = TokenProvider("new")
-        let refreshes = Counter()
-        let monitor = LibraryChangeMonitor(clock: clock.dependency)
-        await monitor.start(provider: provider, initialToken: "old") {
-            await refreshes.increment()
-            return await refreshes.value == 1 ? .retry : .refreshed(token: "new")
-        }
-
-        #expect(await clock.waitForSleepCount(1))
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(2))
-        #expect(await refreshes.value == 1)
-        #expect(await monitor.testingBaseline() == "old")
-        #expect(clock.requestedSleeps == [.seconds(5), .seconds(5)])
-
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(3))
-        #expect(await refreshes.value == 2)
-        #expect(await monitor.testingBaseline() == "new")
-        await monitor.stop()
-        #expect(clock.pendingSleeps == 0)
-    }
+    #endif
 
     @Test func refreshesOnlyAfterOpaqueTokenChanges() async throws {
         let provider = TokenProvider("a")
@@ -608,83 +792,89 @@ import Testing
         await monitor.stop()
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func unconfirmableRefreshIsNotRepeatedForTheSameTokenAndKeepsTheBaseline() async throws {
-        let provider = TokenProvider("a")
-        let refreshes = Counter()
-        let monitor = LibraryChangeMonitor()
-        await monitor.start(
-            provider: provider,
-            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
-            initialToken: "a"
-        ) {
-            await refreshes.increment()
-            return .refreshedWithoutRevision
-        }
-
-        await provider.set("b")
-        await refreshes.waitUntil { $0 >= 1 }
-        await provider.waitUntilProbeCount(await provider.probeCount + 20)
-        #expect(await refreshes.value == 1)
-        #expect(await monitor.testingBaseline() == "a")
-
-        await provider.set("c")
-        await refreshes.waitUntil { $0 >= 2 }
-        await provider.waitUntilProbeCount(await provider.probeCount + 20)
-        #expect(await refreshes.value == 2)
-        #expect(await monitor.testingBaseline() == "a")
-        await monitor.stop()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func resumeRefreshesTheDeferredTokenAgainAndConfirmsIt() async throws {
-        let provider = TokenProvider("a")
-        let refreshes = Counter()
-        let monitor = LibraryChangeMonitor()
-        await monitor.start(
-            provider: provider,
-            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
-            initialToken: "a"
-        ) {
-            await refreshes.increment()
-            return await refreshes.value == 1 ? .refreshedWithoutRevision : .refreshed(token: "b")
-        }
-
-        await provider.set("b")
-        await refreshes.waitUntil { $0 >= 1 }
-        await provider.waitUntilProbeCount(await provider.probeCount + 20)
-        #expect(await refreshes.value == 1)
-
-        await monitor.resumeDeferredRefresh()
-        await monitor.waitUntilBaseline("b")
-        await provider.waitUntilProbeCount(await provider.probeCount + 20)
-        #expect(await refreshes.value == 2)
-        await monitor.stop()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func resumeDuringARefreshKeepsTheTokenPendingForAnotherRefresh() async throws {
-        let provider = TokenProvider("a")
-        let refreshes = Counter()
-        let monitor = LibraryChangeMonitor()
-        await monitor.start(
-            provider: provider,
-            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
-            initialToken: "a"
-        ) {
-            await refreshes.increment()
-            if await refreshes.value == 1 {
-                await monitor.resumeDeferredRefresh()
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func unconfirmableRefreshIsNotRepeatedForTheSameTokenAndKeepsTheBaseline() async throws {
+            let provider = TokenProvider("a")
+            let refreshes = Counter()
+            let monitor = LibraryChangeMonitor()
+            await monitor.start(
+                provider: provider,
+                policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+                initialToken: "a"
+            ) {
+                await refreshes.increment()
                 return .refreshedWithoutRevision
             }
-            return .refreshed(token: "b")
-        }
 
-        await provider.set("b")
-        await monitor.waitUntilBaseline("b")
-        #expect(await refreshes.value == 2)
-        await monitor.stop()
-    }
+            await provider.set("b")
+            await refreshes.waitUntil { $0 >= 1 }
+            await provider.waitUntilProbeCount(await provider.probeCount + 20)
+            #expect(await refreshes.value == 1)
+            #expect(await monitor.testingBaseline() == "a")
+
+            await provider.set("c")
+            await refreshes.waitUntil { $0 >= 2 }
+            await provider.waitUntilProbeCount(await provider.probeCount + 20)
+            #expect(await refreshes.value == 2)
+            #expect(await monitor.testingBaseline() == "a")
+            await monitor.stop()
+        }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func resumeRefreshesTheDeferredTokenAgainAndConfirmsIt() async throws {
+            let provider = TokenProvider("a")
+            let refreshes = Counter()
+            let monitor = LibraryChangeMonitor()
+            await monitor.start(
+                provider: provider,
+                policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+                initialToken: "a"
+            ) {
+                await refreshes.increment()
+                return await refreshes.value == 1 ? .refreshedWithoutRevision : .refreshed(token: "b")
+            }
+
+            await provider.set("b")
+            await refreshes.waitUntil { $0 >= 1 }
+            await provider.waitUntilProbeCount(await provider.probeCount + 20)
+            #expect(await refreshes.value == 1)
+
+            await monitor.resumeDeferredRefresh()
+            await monitor.waitUntilBaseline("b")
+            await provider.waitUntilProbeCount(await provider.probeCount + 20)
+            #expect(await refreshes.value == 2)
+            await monitor.stop()
+        }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func resumeDuringARefreshKeepsTheTokenPendingForAnotherRefresh() async throws {
+            let provider = TokenProvider("a")
+            let refreshes = Counter()
+            let monitor = LibraryChangeMonitor()
+            await monitor.start(
+                provider: provider,
+                policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+                initialToken: "a"
+            ) {
+                await refreshes.increment()
+                if await refreshes.value == 1 {
+                    await monitor.resumeDeferredRefresh()
+                    return .refreshedWithoutRevision
+                }
+                return .refreshed(token: "b")
+            }
+
+            await provider.set("b")
+            await monitor.waitUntilBaseline("b")
+            #expect(await refreshes.value == 2)
+            await monitor.stop()
+        }
+    #endif
     @Test(.timeLimit(.minutes(1)))
     func matchedRefreshClosesTheFirstBurstBeforeTheNextBurst() async {
         let clock = TimelineRefreshTestClock()
@@ -1013,6 +1203,12 @@ private actor TokenProvider: LibraryChangeTokenProvider {
     }
 }
 
+private actor HoldFlag {
+    private(set) var isHeld: Bool
+    init(_ isHeld: Bool) { self.isHeld = isHeld }
+    func set(_ value: Bool) { isHeld = value }
+}
+
 private actor Counter {
     private(set) var value = 0
     func increment() { value += 1 }
@@ -1025,10 +1221,12 @@ private actor Counter {
 }
 
 extension LibraryChangeMonitor {
-    fileprivate func waitUntilBaseline(_ token: String) async {
-        let deadline = ContinuousClock.now + .seconds(5)
-        while testingBaseline() != token, ContinuousClock.now < deadline { await Task.yield() }
-    }
+    #if DEBUG
+        fileprivate func waitUntilBaseline(_ token: String) async {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while testingBaseline() != token, ContinuousClock.now < deadline { await Task.yield() }
+        }
+    #endif
 }
 
 private actor BlockingTokenProvider: LibraryChangeTokenProvider {

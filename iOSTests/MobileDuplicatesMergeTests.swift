@@ -168,6 +168,8 @@ import UploadCore
 }
 
 private actor HeldAccountDuplicates: ExactDuplicateMerging {
+    func confirmNoPendingMerges() async -> Bool { true }
+    func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
     private let base: MobileFixtureDuplicates
     private var waiter: CheckedContinuation<Void, Never>?
     private var open = false

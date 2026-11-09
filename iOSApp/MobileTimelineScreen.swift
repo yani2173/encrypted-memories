@@ -23,6 +23,12 @@ enum MobileTimelineSurface: Equatable {
         case .search: String(localized: "tab.search")
         }
     }
+
+    /// Whether the activity pill is shown. Connectivity messages belong to every surface; the notice that the
+    /// library is updating belongs to the library surface only.
+    func presentsActivityBanner(connectivity: LibraryConnectivityBannerState, libraryIsRefreshing: Bool) -> Bool {
+        connectivity != .hidden || (libraryIsRefreshing && self == .library)
+    }
 }
 
 /// The shared library and search timeline. Each native tab owns only its presentation state; both surfaces
@@ -30,11 +36,16 @@ enum MobileTimelineSurface: Equatable {
 struct MobileTimelineScreen: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.verticalBarEdge) private var verticalBarEdge
     @Environment(MobileLibraryModel.self) private var model
     let surface: MobileTimelineSurface
     /// Whether the Photos tab is the active surface. Threaded into the grid so a hidden grid stops its
     /// render loop; defaults to true so previews/other embeds keep the grid live.
     var isActive: Bool = true
+    /// Extra points reserved between the safe-area top and the first grid row while the search scope
+    /// picker is presented (issue #944). Passed straight through to `UIKitTimelineGrid.scopeBarGap`;
+    /// zero on every surface without a scope picker.
+    var scopeBarGap: CGFloat = 0
     /// Bumped when the active library tab is retapped. The grid observes it and performs the scroll.
     var scrollToLatestSignal: Int = 0
     @Binding private var searchText: String
@@ -93,6 +104,7 @@ struct MobileTimelineScreen: View {
     init(
         surface: MobileTimelineSurface = .library,
         isActive: Bool = true,
+        scopeBarGap: CGFloat = 0,
         scrollToLatestSignal: Int = 0,
         searchText: Binding<String> = .constant(""),
         searchScope: Binding<MLSearchScope> = .constant(.all),
@@ -101,6 +113,7 @@ struct MobileTimelineScreen: View {
     ) {
         self.surface = surface
         self.isActive = isActive
+        self.scopeBarGap = scopeBarGap
         self.scrollToLatestSignal = scrollToLatestSignal
         _searchText = searchText
         _searchScope = searchScope
@@ -122,7 +135,8 @@ struct MobileTimelineScreen: View {
         )
     }
     private var libraryBannerIsPresented: Bool {
-        connectivityBannerState != .hidden || backgroundLibraryActivityActive
+        surface.presentsActivityBanner(
+            connectivity: connectivityBannerState, libraryIsRefreshing: backgroundLibraryActivityActive)
     }
     private var libraryBannerMessage: String {
         switch connectivityBannerState {
@@ -160,7 +174,17 @@ struct MobileTimelineScreen: View {
                 .mobileSharePresentation(selection: selection)
                 .mobileSelectionBars(isSelecting: selection.isSelecting)
                 .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: selection.isSelecting)
-                .onChange(of: searchScope) { _, scope in semanticQuery?.setScope(scope) }
+                .onChange(of: searchScope) { _, scope in
+                    semanticQuery?.setScope(scope)
+                    // A suggestion's result set answers only the Smart Search scope. Commit its title again: another
+                    // scope searches it as text, and Smart Search returns to the suggestion. Typed text needs nothing
+                    // here; the semantic coordinator reruns it in the new scope.
+                    if let activeSearchSuggestion, activeSearchSuggestion.matchingUIDs != nil,
+                        activeSearchSuggestion.owns(searchText: searchText)
+                    {
+                        scheduleSearchCommit(searchText)
+                    }
+                }
                 .onChange(of: searchText) { _, value in scheduleSearchCommit(value) }
                 .onChange(of: activeSearchSuggestion) { _, suggestion in
                     // The search tab replaces the selected suggestion with its current version after a library
@@ -313,18 +337,22 @@ struct MobileTimelineScreen: View {
             }
             ToolbarSpacer(.fixed, placement: .topBarTrailing)
         }
-        ToolbarItem(placement: .topBarTrailing) {
-            Button(selection.isSelecting ? L10n.string("action.done") : L10n.string("action.select")) {
-                selection.toggleMode(reduceMotion: reduceMotion)
+        if !showsSearchLanding || selection.isSelecting {
+            ProminentToolbarItem(placement: .topBarTrailing, isProminent: selection.isSelecting) {
+                Button {
+                    selection.toggleMode(reduceMotion: reduceMotion)
+                } label: {
+                    MobileSelectionModeLabel(isSelecting: selection.isSelecting)
+                }
+                .disabled(!canSelect)
+                .opacity(launchChromeVisible ? 1 : 0)
+                .allowsHitTesting(launchChromeVisible)
+                .accessibilityHidden(!launchChromeVisible)
             }
-            .disabled(!canSelect)
-            .opacity(launchChromeVisible ? 1 : 0)
-            .allowsHitTesting(launchChromeVisible)
-            .accessibilityHidden(!launchChromeVisible)
+            .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
+            // Select/Done must stay in the bar on every bar axis: it is the only way to leave selection mode.
+            .mobileVisibilityPriority(.high)
         }
-        .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
-        // Select/Done must stay in the bar on every bar axis: it is the only way to leave selection mode.
-        .mobileVisibilityPriority(.high)
         // Keep all item identities mounted. The system can then morph the bar as one native transition.
         MobileSelectionToolbarItems(
             selection: selection,
@@ -332,11 +360,12 @@ struct MobileTimelineScreen: View {
             showAlbumPicker: $showAlbumPicker,
             onShare: startShare,
             onTrash: { selection.showTrashConfirm = true },
-            albumPicker: {
+            albumPicker: { regularPresentation in
                 if let coordinator = model.albumActions {
                     AlbumDestinationPicker(
                         coordinator: coordinator,
                         photoUIDs: model.selectedUIDs(selection.selected),
+                        regularPresentation: regularPresentation,
                         onAlbumsChanged: { model.noteAlbumsChanged() },
                         onCompleted: { _ in
                             showAlbumPicker = false
@@ -487,6 +516,22 @@ struct MobileTimelineScreen: View {
         surface == .search && searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Whether the system scope picker is presented above this grid. Mirrors `SmartSearchScopesModifier`:
+    /// the picker lists scopes only when more than one is available and activates on text entry.
+    private var showsSearchScopePicker: Bool {
+        surface == .search
+            && (model.smartSearch?.availableSearchScopes.count ?? 1) > 1
+            && !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var fixtureGridLevel: Int? {
+        #if DEBUG
+            return MobileUITestLaunch.denseGridSmokeLevel
+        #else
+            return nil
+        #endif
+    }
+
     @ViewBuilder private var content: some View {
         let visibleItems = self.visibleItems
         ZStack(alignment: .topLeading) {
@@ -506,6 +551,7 @@ struct MobileTimelineScreen: View {
                         contentRevision: visibleContentRevision,
                         thumbnailFeed: feed,
                         metadataProvider: model.backend,
+                        level: fixtureGridLevel,
                         fillOrder: usesTopLeadingProjection ? .topLeading : .newestBottomTrailing,
                         initialViewportPlacement: usesTopLeadingProjection ? .oldest : .automatic,
                         displayMode: displayMode,
@@ -513,6 +559,7 @@ struct MobileTimelineScreen: View {
                         selectedUIDs: selection.selected,
                         uploadBadges: hasProjectionCriteria ? .empty : model.pendingPresentation.uploadBadges,
                         isActive: isActive && !showsSearchLanding,
+                        scopeBarGap: showsSearchScopePicker ? scopeBarGap : 0,
                         scrollToLatestSignal: scrollToLatestSignal,
                         scrollToTopSignal: refinementTopPlacementSignal,
                         proxy: gridProxy,
@@ -522,6 +569,9 @@ struct MobileTimelineScreen: View {
                         revealSignal: revealSignal,
                         contentTransitionSignal: contentTransitionSignal,
                         prefersReducedMotion: reduceMotion,
+                        allowsPhotoActions: !model.isProvisionalPresentation,
+                        isProvisionalPresentation: model.isProvisionalPresentation,
+                        allowsPlaceholderContentReady: model.loadState.allowsPlaceholderContentReady,
                         onFirstContentReady: {
                             withAnimation(.spring(duration: 0.55)) { model.markFirstContentReady() }
                         },
@@ -539,7 +589,7 @@ struct MobileTimelineScreen: View {
                     // Extend the scroll surface below the floating navigation and tab bars. The UIKit grid keeps
                     // its safe-area content inset, so only the newest edge exposes protected space below the final
                     // row; as soon as the user scrolls away, thumbnails move naturally beneath Liquid Glass.
-                    .ignoresSafeArea(.container, edges: [.top, .horizontal, .bottom])
+                    .ignoresSafeArea(.container, edges: verticalBarEdge == nil ? .all : [.top, .bottom])
                     .allowsHitTesting(launchChromeVisible && !showsLibraryLoadingCover && !showsSearchLanding)
                     .accessibilityHidden(!launchChromeVisible || showsLibraryLoadingCover)
                     .accessibilityHidden(showsSearchLanding)
@@ -723,9 +773,11 @@ struct MobileTimelineScreen: View {
                             controller: backup, uploadCoordinator: model.facade?.uploadCoordinator
                         )
                         .toolbar {
-                            ToolbarItem(placement: .confirmationAction) {
-                                Button(L10n.string("action.done")) {
+                            ProminentToolbarItem(placement: .confirmationAction) {
+                                Button {
                                     showEmptyLibraryBackupSettings = false
+                                } label: {
+                                    Label(L10n.string("action.done"), systemImage: "checkmark").textBarItem()
                                 }
                             }
                         }
@@ -896,7 +948,8 @@ struct MobileTimelineScreen: View {
             semanticQueryLifecycle = nil
         }
         if let activeSearchSuggestion, activeSearchSuggestion.matchingUIDs != nil,
-            activeSearchSuggestion.owns(searchText: normalizedValue)
+            activeSearchSuggestion.owns(searchText: normalizedValue),
+            SmartSearchDiscoveryModel.usesSuggestionResults(in: searchScope)
         {
             // A selected suggestion already carries its result set. Commit it in the same update, without the
             // typing debounce, so the grid never shows the full library in between; a semantic query for its

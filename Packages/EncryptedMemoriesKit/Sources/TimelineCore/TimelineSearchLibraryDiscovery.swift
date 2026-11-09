@@ -132,15 +132,13 @@ public struct TimelineSearchPlaceCandidate: Identifiable, Equatable, Sendable {
     public let latitude: Double
     public let longitude: Double
     public let uids: [PhotoUID]
-    public let dates: [Date]
     public let isHome: Bool
 
-    public init(id: String, latitude: Double, longitude: Double, uids: [PhotoUID], dates: [Date], isHome: Bool) {
+    public init(id: String, latitude: Double, longitude: Double, uids: [PhotoUID], isHome: Bool) {
         self.id = id
         self.latitude = latitude
         self.longitude = longitude
         self.uids = uids
-        self.dates = dates
         self.isHome = isHome
     }
 }
@@ -459,11 +457,10 @@ extension TimelineSearchDiscovery {
                 latitude: latitude,
                 longitude: longitude,
                 uids: sorted.map(\.uid),
-                dates: sorted.map(\.date),
                 isHome: cell == largest && Double(members.count) > Double(geotaggedCount) * 0.35
             )
         }
-        // Favor places visited on several days; home stays available but ranks last.
+        // The largest places come first; home stays available but ranks last.
         return
             candidates
             .sorted { lhs, rhs in

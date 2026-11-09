@@ -162,7 +162,6 @@ private final class UnseenWindow: NSWindow {
 
 @MainActor
 private final class FollowDataSource: MetalGridDataSource {
-    let label = "sidebar-follow-test"
     let sectionCounts: [Int]
     let flatUIDs: [PhotoUID]
     var onImagesAvailable: (() -> Void)?

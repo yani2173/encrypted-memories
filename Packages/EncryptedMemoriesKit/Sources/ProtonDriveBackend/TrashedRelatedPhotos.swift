@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import UploadCore
 
 /// Brings back the related photos that an earlier build moved to the trash together with their main photo.
 ///
@@ -35,11 +36,14 @@ enum TrashedRelatedPhotos {
         var seen = Set<PhotoUID>()
         var frames: [PhotoUID] = []
         for main in mains {
-            guard let mainLink = links[main.nodeID], !mainLink.isActive, let mainTrash = mainLink.trashTime else {
+            guard let mainLink = links[main.nodeID], mainLink.hasExplicitPhotoState, !mainLink.isActive,
+                let mainTrash = mainLink.trashTime
+            else {
                 continue
             }
             for frame in candidates[main] ?? [] where !restoring.contains(frame) {
-                guard let link = links[frame.nodeID], !link.isActive, link.mainPhotoLinkID == main.nodeID,
+                guard let link = links[frame.nodeID], link.hasExplicitPhotoState, !link.isActive,
+                    frame.volumeID == main.volumeID, link.mainPhotoLinkID == main.nodeID,
                     let trash = link.trashTime, isWithinWindow(trash, of: mainTrash)
                 else { continue }
                 if seen.insert(frame).inserted { frames.append(frame) }
@@ -49,23 +53,164 @@ enum TrashedRelatedPhotos {
     }
 
     /// A distance that does not fit into `Int64` lies outside the window: server values never trap.
-    private static func isWithinWindow(_ trash: Int64, of mainTrash: Int64) -> Bool {
+    static func isWithinWindow(_ trash: Int64, of mainTrash: Int64) -> Bool {
         let (distance, overflow) = trash.subtractingReportingOverflow(mainTrash)
         return !overflow && distance.magnitude <= UInt64(trashedTogetherWindow)
     }
 
-    /// Restores `mains` and the related photos that left the library with them, and returns those related photos. The
-    /// links are read before the restore, which ends the trash time of the main photo. A failed read, or a failed
-    /// restore of the related photos, leaves them in the trash as before; only a failed restore of `mains` fails. When
-    /// that restore fails after Proton restored some of `mains`, the related photos of those that came back follow
-    /// before the error. `rereadLinks` reads their state then; unlike `readLinks` it may wait for a rate limit, because
-    /// the main photos are back already. A cancel ends the restore without that step.
+    /// Complete discovery certifies Restore candidates for this account session.
+    /// The ordinary DriveSession listing tolerates omitted metadata; that cannot prove an empty frame set.
+    static func checkedTrash(
+        session: DriveSession, volumeID: String, retryOnRateLimit: Bool
+    ) async throws -> [TrashLink] {
+        var idsByShare: [String: [String]] = [:]
+        var seenByShare: [String: Set<String>] = [:]
+        var page = 0
+        while true {
+            try Task.checkCancellation()
+            let response = try await session.getJSON(
+                "/drive/volumes/\(volumeID)/trash?Page=\(page)&PageSize=150", as: CheckedTrashPage.self,
+                retryOnRateLimit: retryOnRateLimit)
+            guard response.code == 1000, response.complete else { throw incomplete }
+            var count = 0
+            var added = 0
+            for group in response.trash {
+                count += group.linkIDs.count
+                for id in group.linkIDs where seenByShare[group.shareID, default: []].insert(id).inserted {
+                    idsByShare[group.shareID, default: []].append(id)
+                    added += 1
+                }
+            }
+            if count < 150 { break }
+            guard added > 0 else { throw DrivePaginationError.trashPageWithoutNewIDs(page) }
+            page += 1
+        }
+        var result: [TrashLink] = []
+        for share in idsByShare.keys.sorted() {
+            let ids = idsByShare[share] ?? []
+            let links = try await checkedMetadata(
+                session: session, shareID: share, ids: ids, retryOnRateLimit: retryOnRateLimit)
+            for entry in links {
+                // Folders and albums grant no photo authority. Every other returned row needs explicit photo state.
+                if entry.link.type == 1 || entry.link.type == 3 { continue }
+                guard entry.visibility.hasExplicitPhotoState else { throw incomplete }
+                result.append(entry.link)
+            }
+        }
+        return result
+    }
+
+    static func checkedVisibility(
+        session: DriveSession, shareID: String, ids: [String], retryOnRateLimit: Bool
+    ) async throws -> [String: RemoteLinkVisibility] {
+        var result: [String: RemoteLinkVisibility] = [:]
+        for entry in try await checkedMetadata(
+            session: session, shareID: shareID, ids: ids, retryOnRateLimit: retryOnRateLimit)
+        {
+            guard let id = entry.link.linkID else { throw incomplete }
+            result[id] = entry.visibility
+        }
+        return result
+    }
+
+    private static var incomplete: UploadError { .backend("The link visibility response is incomplete") }
+
+    private static func checkedMetadata(
+        session: DriveSession, shareID: String, ids: [String], retryOnRateLimit: Bool
+    ) async throws -> [CheckedLink] {
+        let ids = Array(Set(ids)).sorted()
+        var result: [CheckedLink] = []
+        for chunk in ids.chunked(by: 150) {
+            try Task.checkCancellation()
+            let data = try await session.send(
+                "/drive/shares/\(shareID)/links/fetch_metadata", method: "POST", body: ["LinkIDs": chunk],
+                retryOnRateLimit: retryOnRateLimit)
+            let response = try JSONDecoder().decode(CheckedMetadata.self, from: data)
+            guard response.code == 1000, response.complete else { throw incomplete }
+            var seen = Set<String>()
+            for entry in response.links {
+                guard let id = entry.link.linkID, chunk.contains(id), seen.insert(id).inserted else { throw incomplete }
+                result.append(entry)
+            }
+        }
+        return result
+    }
+
+    private struct CheckedTrashPage: Decodable {
+        let code: Int
+        let trash: [Group]
+        let complete: Bool
+        struct Group: Decodable {
+            let shareID: String
+            let linkIDs: [String]
+            enum CodingKeys: String, CodingKey {
+                case shareID = "ShareID"
+                case linkIDs = "LinkIDs"
+            }
+        }
+        enum CodingKeys: String, CodingKey {
+            case code = "Code"
+            case trash = "Trash"
+        }
+        init(from decoder: any Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            code = try values.decode(Int.self, forKey: .code)
+            trash = try values.decode([Group].self, forKey: .trash)
+            let fields = try decoder.container(keyedBy: Field.self)
+            complete = fields.allKeys.allSatisfy { ["Code", "Trash"].contains($0.stringValue) }
+        }
+        private struct Field: CodingKey {
+            let stringValue: String
+            let intValue: Int? = nil
+            init?(stringValue: String) { self.stringValue = stringValue }
+            init?(intValue: Int) { return nil }
+        }
+    }
+
+    private struct CheckedMetadata: Decodable {
+        let code: Int
+        let links: [CheckedLink]
+        let complete: Bool
+        enum CodingKeys: String, CodingKey {
+            case code = "Code"
+            case links = "Links"
+        }
+        init(from decoder: any Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            code = try values.decode(Int.self, forKey: .code)
+            links = try values.decode([CheckedLink].self, forKey: .links)
+            complete = try protonMetadataEnvelope(decoder: decoder).isComplete
+        }
+    }
+
+    private struct CheckedLink: Decodable {
+        let link: TrashLink
+        let visibility: RemoteLinkVisibility
+        enum CodingKeys: String, CodingKey {
+            case state = "State"
+            case trashTime = "Trashed"
+        }
+        init(from decoder: any Decoder) throws {
+            link = try TrashLink(from: decoder)
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            let state = try values.decodeIfPresent(Int.self, forKey: .state)
+            visibility = RemoteLinkVisibility(
+                isActive: state == 1, mainPhotoLinkID: link.mainPhotoLinkID,
+                trashTime: try values.decodeIfPresent(Int64.self, forKey: .trashTime),
+                hasExplicitPhotoState: (state == 1 || state == 2) && link.fileProperties?.activeRevision?.photo != nil)
+        }
+    }
+
+    /// Checks frame authority before any mutation. A failed preflight fails Restore with its original error.
+    /// A failed main Restore retains its error after checking which mains explicitly came back.
     static func restore(
         _ mains: [PhotoUID],
         candidates: [PhotoUID: [PhotoUID]],
         readLinks: ([String]) async throws -> [String: RemoteLinkVisibility],
         rereadLinks: ([String]) async throws -> [String: RemoteLinkVisibility],
         restore: ([PhotoUID]) async throws -> Void,
+        beforeMainRestore: ([String: RemoteLinkVisibility], [PhotoUID]) throws -> Void = { _, _ in },
+        resumeFrames: (([PhotoUID]) async -> [PhotoUID])? = nil,
         isolation: isolated (any Actor)? = #isolation
     ) async throws -> [PhotoUID] {
         let related = mains.flatMap { candidates[$0] ?? [] }
@@ -73,15 +218,14 @@ enum TrashedRelatedPhotos {
             try await restore(mains)
             return []
         }
-        var links: [String: RemoteLinkVisibility] = [:]
-        do {
-            links = try await readLinks((mains + related).map(\.nodeID))
-        } catch {
-            DebugLog.log("restore: related photo states unavailable - \(error)")
+        let links = try await readLinks((mains + related).map(\.nodeID))
+        guard (mains + related).allSatisfy({ links[$0.nodeID]?.hasExplicitPhotoState == true }) else {
+            throw UploadError.backend("The link visibility response is incomplete")
         }
         let frames = restoredWith(mains, candidates: candidates, links: links)
         // A cancel during the read stops the restore before any photo changes.
         try Task.checkCancellation()
+        try beforeMainRestore(links, frames)
         do {
             try await restore(mains)
         } catch let error as CancellationError {
@@ -90,12 +234,17 @@ enum TrashedRelatedPhotos {
             // A batch error, or the error of a single request that Proton may have applied: some of the main photos may
             // be back. Their related photos follow; the error stays.
             guard !frames.isEmpty, !Task.isCancelled else { throw error }
-            if let now = try? await rereadLinks(mains.map(\.nodeID)) {
-                let back = mains.filter { now[$0.nodeID]?.isActive == true }
+            if let resumeFrames {
+                _ = await resumeFrames(mains)
+            } else if let now = try? await rereadLinks(mains.map(\.nodeID)) {
+                let back = mains.filter {
+                    now[$0.nodeID]?.isActive == true && now[$0.nodeID]?.hasExplicitPhotoState == true
+                }
                 _ = await restoreFrames(restoredWith(back, candidates: candidates, links: links), restore: restore)
             }
             throw error
         }
+        if let resumeFrames { return await resumeFrames(mains) }
         return await restoreFrames(frames, restore: restore)
     }
 

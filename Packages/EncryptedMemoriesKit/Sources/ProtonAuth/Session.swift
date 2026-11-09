@@ -23,21 +23,63 @@ public struct SessionKeychainStore: Sendable {
     private let item: AppleKeychainItem
     private let keychain: any AppleKeychainStoring
 
-    public init(service: String = Self.defaultService, account: String = "default") {
+    /// `accessibility` is the platform's choice. iOS passes `.afterFirstUnlockThisDeviceOnly`, so a background window
+    /// on a locked device can read the session after the first unlock since a restart. macOS keeps the stricter
+    /// default; it has no background launch.
+    public init(
+        service: String = Self.defaultService, account: String = "default",
+        accessibility: AppleKeychainAccessibility = .whenUnlockedThisDeviceOnly
+    ) {
         #if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)
-            self.init(service: service, account: account, keychain: UpgradeTestSessionFile())
+            self.init(
+                service: service, account: account, keychain: UpgradeTestSessionFile(), accessibility: accessibility)
         #else
-            self.init(service: service, account: account, keychain: SystemAppleKeychainStore())
+            self.init(
+                service: service, account: account, keychain: SystemAppleKeychainStore(), accessibility: accessibility)
         #endif
     }
 
-    public init(service: String, account: String, keychain: any AppleKeychainStoring) {
-        self.item = AppleKeychainItem(
-            service: service,
-            account: account,
-            accessibility: .whenUnlockedThisDeviceOnly
-        )
+    public init(
+        service: String, account: String, keychain: any AppleKeychainStoring,
+        accessibility: AppleKeychainAccessibility = .whenUnlockedThisDeviceOnly
+    ) {
+        self.item = AppleKeychainItem(service: service, account: account, accessibility: accessibility)
         self.keychain = keychain
+    }
+
+    /// The class this store saves with.
+    public var accessibility: AppleKeychainAccessibility { item.accessibility }
+
+    /// What `migrateAccessibilityIfNeeded` found.
+    public enum AccessibilityMigration: Sendable, Equatable {
+        /// No item, an item that already has the store's class, or a store that cannot tell.
+        case current
+        /// The item now has the store's class and the same data.
+        case migrated
+        /// The device has not been unlocked since it started; the item stays as it is.
+        case unreadable
+        /// A read or write failed, or the read-back did not confirm the class; the item stays readable as before.
+        case failed
+    }
+
+    /// Moves a session saved with another class to this store's class, in place: one update with the data just read,
+    /// never a delete. Only a read-back of the new class and the same data counts as done. Every failure leaves the
+    /// item as it was and is reported, never thrown, so the next launch tries again and nobody is signed out.
+    public func migrateAccessibilityIfNeeded() -> AccessibilityMigration {
+        do {
+            guard let current = try keychain.accessibility(for: item), current != item.accessibility else {
+                return .current
+            }
+            guard let data = try keychain.data(for: item) else { return .current }
+            try keychain.setData(data, for: item)
+            guard try keychain.accessibility(for: item) == item.accessibility, try keychain.data(for: item) == data
+            else { return .failed }
+            return .migrated
+        } catch let error as AppleSecurityError where error.status == errSecInteractionNotAllowed {
+            return .unreadable
+        } catch {
+            return .failed
+        }
     }
 
     private static let productionService = "at.oncloud.encryptedmemories.session"
@@ -112,20 +154,9 @@ public enum SessionKeychainError: Error, LocalizedError, Sendable, Equatable {
 
 /// Full app-private Keychain reset shared by macOS, iOS and iPadOS.
 public enum ProtonAuthLocalDataPurge {
-    /// Performs the shared file + Keychain transaction. The durable request is completed only when
-    /// both halves succeed, so an interrupted or partially-failed logout is retried before the next
-    /// session can open account-owned stores.
-    @discardableResult
-    public static func perform(
-        claim: BackupLocalDataPurge.Claim,
-        defaults: UserDefaults = .standard
-    ) -> Bool {
-        perform(claim: claim, defaults: defaults, networkStores: .current) {
-            try purgeKeychain()
-        }
-    }
-
-    /// Runs the same ordered purge away from the UI executor. The caller still awaits completion, so a
+    /// Performs the shared file + Keychain transaction away from the UI executor. The durable request is
+    /// completed only when both halves succeed, so an interrupted or partially-failed logout is retried
+    /// before the next session can open account-owned stores. The caller still awaits completion, so a
     /// new account cannot open stores while deletion is in flight.
     @discardableResult
     public static func performOffMain(

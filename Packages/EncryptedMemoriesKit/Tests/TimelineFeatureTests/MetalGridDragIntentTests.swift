@@ -8,7 +8,6 @@ import TimelineCore
 @testable import TimelineFeature
 
 @MainActor private final class DragIntentDataSource: MetalGridDataSource {
-    let label = "drag-intent-test"
     let sectionCounts = [3]
     let flatUIDs = (0..<3).map { PhotoUID(volumeID: "drag-intent", nodeID: "\($0)") }
     var onImagesAvailable: (() -> Void)?

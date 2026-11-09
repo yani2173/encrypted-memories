@@ -448,7 +448,7 @@ struct ProtonRequestTallyTests {
         let scope = ProtonRequestGovernor.Configuration.Scope(initialConcurrency: initial, maximumConcurrency: initial)
         return .init(
             api: scope, storageDownload: scope, storageUpload: scope, successWindowForIncrease: 32,
-            starvationPromotionInterval: 10, priorityScopeLifetime: 60)
+            starvationPromotionInterval: 10)
     }
 }
 

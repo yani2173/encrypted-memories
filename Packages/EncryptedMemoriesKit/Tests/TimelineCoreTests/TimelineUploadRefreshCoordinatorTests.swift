@@ -3,1064 +3,1389 @@ import Testing
 
 @testable import TimelineCore
 
-@Suite struct TimelineUploadRefreshCoordinatorTests {
-    @Test(.timeLimit(.minutes(1)))
-    func aCompletedExplicitRequestRetiresWithoutReplayingItsClosure() async {
-        let scenario = AutomaticUploadScenario()
-        await scenario.coordinator.request(refresh: { _ in
-            await scenario.timeline.record(.zero)
-            return nil
-        })
-        #expect(await scenario.timeline.waitForCount(1))
-        let timeout = ContinuousClock.now + .seconds(5)
-        while await scenario.timeline.times.count < 2,
-            await scenario.coordinator.testingAutomaticState().workerActive, ContinuousClock.now < timeout
-        {
-            await Task.yield()
-        }
-        let callCount = await scenario.timeline.times.count
-        let state = await scenario.coordinator.testingAutomaticState()
-        #expect(callCount == 1)
-        #expect(state.workerActive == false)
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func aCompletedAutomaticRequestDoesNotScheduleAnUnrequestedCycle() async {
-        let scenario = AutomaticUploadScenario()
-        await scenario.requestSignal(0)
-        #expect(await scenario.timeline.waitForCount(1))
-        #expect(await scenario.waitForWorkerRetirement(), "A completed automatic request retires its worker")
-        #expect(scenario.clock.pendingSleeps == 0, "No cycle is scheduled that nobody requested")
-        let callCount = await scenario.timeline.times.count
-        #expect(callCount == 1)
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func aRetiredIntervalCannotClearTheReplacementOwnersWait() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let sequence = ClockWaitSequence()
-        let entered = AsyncGate()
-        let cancellationSeen = AsyncGate()
-        let release = AsyncGate()
-        let old = UploadRefreshTimeline()
-        let replacement = UploadRefreshTimeline()
-        let manual = UploadRefreshTimeline()
-        let dependency = TimelineRefreshClock(
-            now: { clock.now }, sleep: { try await clock.dependency.sleep($0) },
-            sleepUntil: { deadline in
-                if await sequence.takeFirst() {
-                    try await withTaskCancellationHandler {
-                        await entered.open()
-                        await release.wait()
-                        try Task.checkCancellation()
-                    } onCancel: {
-                        Task { await cancellationSeen.open() }
-                    }
-                } else {
-                    try await clock.dependency.sleepUntil(deadline)
-                }
-            }
-        )
-        let coordinator = TimelineUploadRefreshCoordinator(clock: dependency)
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await old.record(.zero)
-            return nil
-        })
-        #expect(await old.waitForCount(1))
-        clock.advance(by: .seconds(6))
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await old.record(.seconds(6))
-            return nil
-        })
-        await entered.wait()
-        let cancellation = Task { await coordinator.cancel() }
-        await cancellationSeen.wait()
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await replacement.record(clock.now - origin)
-            return nil
-        })
-        #expect(await replacement.waitForCount(1))
-        clock.advance(by: .seconds(6))
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await replacement.record(clock.now - origin)
-            return nil
-        })
-        #expect(await replacement.waitForNewLoadOrSleep(after: 1, clock: clock))
-        await release.open()
-        await cancellation.value
-        await coordinator.request(refresh: { _ in
-            await manual.record(clock.now - origin)
-            return nil
-        })
-        #expect(await manual.waitForNewLoadOrSleep(after: 0, clock: clock))
-        if await manual.times.isEmpty, clock.pendingSleeps > 0 { clock.advanceToNextSleep() }
-        #expect(await manual.waitForCount(1))
-        let observedManualTimes = await manual.times
-        #expect(observedManualTimes == [.seconds(12)])
-        #expect(await old.times == [.zero])
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func overlappingFlushSnapshotsAreCoveredByTheLatestCompletedGeneration() async {
-        let scenario = AutomaticUploadScenario()
-        let release = AsyncGate()
-        await scenario.startTwoSignals(secondRelease: release)
-        let first = Task { await scenario.coordinator.flushAutomaticUploads() }
-        #expect(await scenario.waitForFlushRegistration())
-        #expect(await scenario.timeline.waitForCount(2))
-        scenario.clock.advance(by: .seconds(6))
-        await scenario.requestSignal(2)
-        let second = Task { await scenario.coordinator.flushAutomaticUploads() }
-        #expect(await scenario.waitForFlushRegistration(2))
-        await release.open()
-        #expect(await scenario.waitForWorkerRetirement())
-        let state = await scenario.coordinator.testingAutomaticState()
-        #expect(state.flushCount == 0, "The completed latest generation must cover both earlier flush snapshots")
-        if state.flushCount > 0 {
-            await scenario.coordinator.cancel()
-            await first.value
-            await second.value
-            return
-        }
-        await first.value
-        await second.value
-        let flushedTimes = await scenario.timeline.times
-        #expect(flushedTimes == [.zero, .seconds(6), .seconds(12)])
-        scenario.clock.advance(by: .seconds(6))
-        await scenario.requestSignal(3)
-        #expect(await scenario.timeline.waitForNewLoadOrSleep(after: 3, clock: scenario.clock))
-        if scenario.clock.pendingSleeps > 0 { scenario.clock.advanceToNextSleep() }
-        #expect(await scenario.timeline.waitForCount(4))
-        let laterTimes = await scenario.timeline.times
-        #expect(laterTimes == [.zero, .seconds(6), .seconds(12), .seconds(72)])
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func delayedClockRegistrationKeepsTheAbsoluteAutomaticDeadline() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let entered = AsyncGate()
-        let release = AsyncGate()
-        let timeline = UploadRefreshTimeline()
-        let delayed = TimelineRefreshClock(
-            now: { clock.now },
-            sleep: { duration in
-                await entered.open()
-                await release.wait()
-                try await clock.dependency.sleep(duration)
-            },
-            sleepUntil: { deadline in
-                await entered.open()
-                await release.wait()
-                try await clock.dependency.sleepUntil(deadline)
-            }
-        )
-        let coordinator = TimelineUploadRefreshCoordinator(clock: delayed)
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(clock.now - origin)
-            return nil
-        })
-        #expect(await timeline.waitForCount(1))
-        clock.advance(by: .seconds(6))
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(clock.now - origin)
-            return nil
-        })
-        await entered.wait()
-        clock.advance(by: .seconds(54))
-        await release.open()
-        #expect(await timeline.waitForNewLoadOrSleep(after: 1, clock: clock))
-        if await timeline.times.count < 2, clock.pendingSleeps > 0 { clock.advanceToNextSleep() }
-        #expect(await timeline.waitForCount(2))
-        let observedTimes = await timeline.times
-        #expect(observedTimes == [.zero, .seconds(60)])
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func unexpectedConvergenceClockFailureReportsTheFailedAttempt() async {
-        let clock = TimelineRefreshTestClock()
-        let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility])
-        let dependency = TimelineRefreshClock(
-            now: { clock.now }, sleep: { _ in throw ExpectedRefreshClockFailure() },
-            sleepUntil: { _ in throw ExpectedRefreshClockFailure() }
-        )
-        let coordinator = TimelineUploadRefreshCoordinator(clock: dependency)
-        await coordinator.requestAutomaticUpload(
-            refresh: { await recorder.failure(at: $0) },
-            observer: { await recorder.record($0) }
-        )
-        let timeout = ContinuousClock.now + .seconds(5)
-        while await recorder.decisions.count < 2, ContinuousClock.now < timeout { await Task.yield() }
-        #expect(await recorder.callCount == 1)
-        #expect(await recorder.decisions == [.retry(after: .milliseconds(350)), .failed])
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func laterAutomaticSignalsKeepTheOriginalAdmissionBoundary() async {
-        let scenario = AutomaticUploadScenario()
-        await scenario.startTwoSignals()
-        scenario.clock.advance(by: .seconds(6))
-        await scenario.requestSignal(2)
-        for _ in 0..<3 {
-            if await scenario.timeline.times.count >= 2 { break }
-            #expect(scenario.clock.advanceToNextSleep())
-            #expect(await scenario.timeline.waitForNewLoadOrSleep(after: 1, clock: scenario.clock))
-        }
-        #expect(await scenario.flush())
-        let observedTimes = await scenario.timeline.times
-        let contents = await scenario.timeline.contents
-        #expect(observedTimes == [.zero, .seconds(60)])
-        #expect(contents == [0, 2])
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func manualWakeDoesNotWaitForAnAutomaticDeadline() async {
-        let scenario = AutomaticUploadScenario()
-        let manual = UploadRefreshTimeline()
-        await scenario.startTwoSignals()
-        await scenario.coordinator.request(refresh: { _ in
-            await manual.record(scenario.clock.now - scenario.origin)
-            return nil
-        })
-        #expect(await manual.waitForNewLoadOrSleep(after: 0, clock: scenario.clock))
-        if await manual.times.isEmpty, scenario.clock.pendingSleeps > 0 {
-            scenario.clock.advanceToNextSleep()
-        }
-        #expect(await manual.waitForCount(1))
-        let manualTimes = await manual.times
-        #expect(manualTimes == [.seconds(6)])
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func forceFlushServesAcceptedWorkBeforeTheIntervalDeadline() async {
-        let scenario = AutomaticUploadScenario()
-        let release = AsyncGate()
-        let completion = AutomaticFlushCompletion()
-        await scenario.startTwoSignals(secondRelease: release)
-        let flush = Task {
-            await scenario.coordinator.flushAutomaticUploads()
-            await completion.markComplete()
-        }
-        #expect(await scenario.waitForFlushRegistration())
-        #expect(await scenario.timeline.waitForNewLoadOrSleep(after: 1, clock: scenario.clock))
-        if await scenario.timeline.times.count < 2, scenario.clock.pendingSleeps > 0 {
-            scenario.clock.advanceToNextSleep()
-        }
-        #expect(await scenario.timeline.waitForCount(2))
-        let observedTimes = await scenario.timeline.times
-        #expect(observedTimes == [.zero, .seconds(6)])
-        await release.open()
-        #expect(await scenario.waitForWorkerRetirement())
-        #expect(await scenario.coordinator.testingAutomaticState().flushCount == 0)
-        // cancel() also releases a defective leftover waiter, so cleanup cannot hide a deadlock.
-        await scenario.coordinator.cancel()
-        await flush.value
-        #expect(await completion.isComplete)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func currentRequestIsRecheckedAfterAConvergenceWait() async {
-        let scenario = AutomaticUploadScenario()
-        let old = UploadRefreshTimeline()
-        let new = UploadRefreshTimeline()
-        await scenario.coordinator.request(refresh: { _ in
-            await old.record(scenario.clock.now - scenario.origin)
-            return .pendingInventoryVisibility
-        })
-        #expect(await scenario.clock.waitForSleepCount(1))
-        scenario.clock.advance(by: .milliseconds(100))
-        await scenario.coordinator.request(refresh: { _ in
-            await new.record(scenario.clock.now - scenario.origin)
-            return nil
-        })
-        scenario.clock.advanceToNextSleep()
-        #expect(await new.waitForCount(1))
-        let oldTimes = await old.times
-        let newTimes = await new.times
-        #expect(oldTimes == [.zero])
-        #expect(newTimes == [.milliseconds(350)])
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func anObserverReplacementDoesNotSleepOnTheSupersededResult() async {
-        let scenario = AutomaticUploadScenario()
-        let latest = UploadRefreshTimeline()
-        await scenario.coordinator.request(
-            refresh: { _ in .pendingInventoryVisibility },
-            observer: { _ in
+#if DEBUG
+    @Suite struct TimelineUploadRefreshCoordinatorTests {
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func aCompletedExplicitRequestRetiresWithoutReplayingItsClosure() async {
+                let scenario = AutomaticUploadScenario()
                 await scenario.coordinator.request(refresh: { _ in
-                    await latest.record(scenario.clock.now - scenario.origin)
+                    await scenario.timeline.record(.zero)
                     return nil
                 })
+                #expect(await scenario.timeline.waitForCount(1))
+                let timeout = ContinuousClock.now + .seconds(5)
+                while await scenario.timeline.times.count < 2,
+                    await scenario.coordinator.testingAutomaticState().workerActive, ContinuousClock.now < timeout
+                {
+                    await Task.yield()
+                }
+                let callCount = await scenario.timeline.times.count
+                let state = await scenario.coordinator.testingAutomaticState()
+                #expect(callCount == 1)
+                #expect(state.workerActive == false)
+                await scenario.coordinator.cancel()
             }
-        )
-        #expect(await latest.waitForNewLoadOrSleep(after: 0, clock: scenario.clock))
-        if await latest.times.isEmpty, scenario.clock.pendingSleeps > 0 {
-            scenario.clock.advanceToNextSleep()
-        }
-        #expect(await latest.waitForCount(1))
-        let observedTimes = await latest.times
-        #expect(observedTimes == [.zero])
-        await scenario.coordinator.cancel()
-    }
+        #endif
 
-    @Test(.timeLimit(.minutes(1)))
-    func unexpectedIntervalClockFailureReportsFailureWithoutAnotherLoad() async {
-        let clock = TimelineRefreshTestClock()
-        let recorder = RefreshAttemptRecorder(failures: [nil])
-        let timeline = UploadRefreshTimeline()
-        let dependency = TimelineRefreshClock(
-            now: { clock.now }, sleep: { _ in throw ExpectedRefreshClockFailure() },
-            sleepUntil: { _ in throw ExpectedRefreshClockFailure() }
-        )
-        let coordinator = TimelineUploadRefreshCoordinator(clock: dependency)
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(.zero)
-            return nil
-        })
-        let timeout = ContinuousClock.now + .seconds(5)
-        while await coordinator.testingAutomaticState().workerActive, ContinuousClock.now < timeout {
-            await Task.yield()
+        @Test(.timeLimit(.minutes(1)))
+        func aCompletedAutomaticRequestDoesNotScheduleAnUnrequestedCycle() async {
+            let scenario = AutomaticUploadScenario()
+            await scenario.requestSignal(0)
+            #expect(await scenario.timeline.waitForCount(1))
+            #expect(await scenario.waitForWorkerRetirement(), "A completed automatic request retires its worker")
+            #expect(scenario.clock.pendingSleeps == 0, "No cycle is scheduled that nobody requested")
+            let callCount = await scenario.timeline.times.count
+            #expect(callCount == 1)
+            await scenario.coordinator.cancel()
         }
-        clock.advance(by: .seconds(6))
-        await coordinator.requestAutomaticUpload(
-            refresh: { _ in
-                await timeline.record(.seconds(6))
+
+        @Test(.timeLimit(.minutes(1)))
+        func aRetiredIntervalCannotClearTheReplacementOwnersWait() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let sequence = ClockWaitSequence()
+            let entered = AsyncGate()
+            let cancellationSeen = AsyncGate()
+            let release = AsyncGate()
+            let old = UploadRefreshTimeline()
+            let replacement = UploadRefreshTimeline()
+            let manual = UploadRefreshTimeline()
+            let dependency = TimelineRefreshClock(
+                now: { clock.now }, sleep: { try await clock.dependency.sleep($0) },
+                sleepUntil: { deadline in
+                    if await sequence.takeFirst() {
+                        try await withTaskCancellationHandler {
+                            await entered.open()
+                            await release.wait()
+                            try Task.checkCancellation()
+                        } onCancel: {
+                            Task { await cancellationSeen.open() }
+                        }
+                    } else {
+                        try await clock.dependency.sleepUntil(deadline)
+                    }
+                }
+            )
+            let coordinator = TimelineUploadRefreshCoordinator(clock: dependency)
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await old.record(.zero)
                 return nil
-            },
-            observer: { await recorder.record($0) }
-        )
-        let failureTimeout = ContinuousClock.now + .seconds(5)
-        while await recorder.decisions.isEmpty, ContinuousClock.now < failureTimeout { await Task.yield() }
-        #expect(await recorder.decisions == [.failed])
-        #expect(await timeline.times == [.zero])
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func explicitRequestBypassesAnAutomaticWaitWithoutConsumingItsPendingWork() async {
-        let scenario = AutomaticUploadScenario()
-        let manual = UploadRefreshTimeline()
-        await scenario.startTwoSignals()
-        await scenario.coordinator.request(refresh: { _ in
-            await manual.record(scenario.clock.now - scenario.origin)
-            return nil
-        })
-        #expect(await manual.waitForCount(1))
-        let manualTimes = await manual.times
-        let automaticBeforeDeadline = await scenario.timeline.times
-        #expect(manualTimes == [.seconds(6)])
-        #expect(automaticBeforeDeadline == [.zero])
-
-        scenario.clock.advance(by: .seconds(54))
-        #expect(await scenario.flush())
-        let automaticTimes = await scenario.timeline.times
-        print("Manual bypass: automaticTimes=\(automaticTimes), waits=\(scenario.clock.requestedSleeps)")
-        #expect(automaticTimes == [.zero, .seconds(60)])
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func automaticEndFlushPublishesTheLatestPendingSignalWithoutAnotherGeneration() async {
-        let scenario = AutomaticUploadScenario()
-        await scenario.startTwoSignals()
-        scenario.clock.advance(by: .seconds(6))
-        let previousCount = await scenario.timeline.times.count
-        await scenario.requestSignal(2)
-        #expect(await scenario.timeline.waitForNewLoadOrSleep(after: previousCount, clock: scenario.clock))
-        let beforeFlush = await scenario.timeline.times
-        #expect(beforeFlush == [.zero])
-        #expect(await scenario.flush())
-        let flushedTimes = await scenario.timeline.times
-        let flushedContents = await scenario.timeline.contents
-        #expect(flushedTimes == [.zero, .seconds(12)])
-        #expect(flushedContents == [0, 2])
-        #expect(await scenario.flush())
-        #expect(await scenario.timeline.times.count == flushedTimes.count)
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func automaticEndAtTheIntervalBoundaryJoinsTheSameActiveGeneration() async {
-        let scenario = AutomaticUploadScenario()
-        let secondRelease = AsyncGate()
-        await scenario.startTwoSignals(secondRelease: secondRelease)
-        scenario.clock.advance(by: .seconds(54))
-        #expect(await scenario.timeline.waitForCount(2))
-        let completion = AutomaticFlushCompletion()
-        let flush = Task {
-            await scenario.coordinator.flushAutomaticUploads()
-            await completion.markComplete()
+            })
+            #expect(await old.waitForCount(1))
+            clock.advance(by: .seconds(6))
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await old.record(.seconds(6))
+                return nil
+            })
+            await entered.wait()
+            let cancellation = Task { await coordinator.cancel() }
+            await cancellationSeen.wait()
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await replacement.record(clock.now - origin)
+                return nil
+            })
+            #expect(await replacement.waitForCount(1))
+            clock.advance(by: .seconds(6))
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await replacement.record(clock.now - origin)
+                return nil
+            })
+            #expect(await replacement.waitForNewLoadOrSleep(after: 1, clock: clock))
+            await release.open()
+            await cancellation.value
+            await coordinator.request(refresh: { _ in
+                await manual.record(clock.now - origin)
+                return nil
+            })
+            #expect(await manual.waitForNewLoadOrSleep(after: 0, clock: clock))
+            if await manual.times.isEmpty, clock.pendingSleeps > 0 { clock.advanceToNextSleep() }
+            #expect(await manual.waitForCount(1))
+            let observedManualTimes = await manual.times
+            #expect(observedManualTimes == [.seconds(12)])
+            #expect(await old.times == [.zero])
+            await coordinator.cancel()
         }
-        #expect(await scenario.waitForFlushRegistration())
-        await secondRelease.open()
-        #expect(await completion.waitUntilComplete())
-        await scenario.coordinator.cancel()
-        await flush.value
-        let observedTimes = await scenario.timeline.times
-        let observedContents = await scenario.timeline.contents
-        #expect(observedTimes == [.zero, .seconds(60)])
-        #expect(observedContents == [0, 1], "The boundary end must not manufacture a third refresh")
-    }
 
-    @Test(.timeLimit(.minutes(1)))
-    func oneHundredAutomaticSignalsAndBoundaryEndUseAtMostElevenLoads() async {
-        let scenario = AutomaticUploadScenario()
-        for signal in 0..<100 {
-            if signal > 0 { scenario.clock.advance(by: .seconds(6)) }
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func overlappingFlushSnapshotsAreCoveredByTheLatestCompletedGeneration() async {
+                let scenario = AutomaticUploadScenario()
+                let release = AsyncGate()
+                await scenario.startTwoSignals(secondRelease: release)
+                let first = Task { await scenario.coordinator.flushAutomaticUploads() }
+                #expect(await scenario.waitForFlushRegistration())
+                #expect(await scenario.timeline.waitForCount(2))
+                scenario.clock.advance(by: .seconds(6))
+                await scenario.requestSignal(2)
+                let second = Task { await scenario.coordinator.flushAutomaticUploads() }
+                #expect(await scenario.waitForFlushRegistration(2))
+                await release.open()
+                #expect(await scenario.waitForWorkerRetirement())
+                let state = await scenario.coordinator.testingAutomaticState()
+                #expect(
+                    state.flushCount == 0, "The completed latest generation must cover both earlier flush snapshots")
+                if state.flushCount > 0 {
+                    await scenario.coordinator.cancel()
+                    await first.value
+                    await second.value
+                    return
+                }
+                await first.value
+                await second.value
+                let flushedTimes = await scenario.timeline.times
+                #expect(flushedTimes == [.zero, .seconds(6), .seconds(12)])
+                scenario.clock.advance(by: .seconds(6))
+                await scenario.requestSignal(3)
+                #expect(await scenario.timeline.waitForNewLoadOrSleep(after: 3, clock: scenario.clock))
+                if scenario.clock.pendingSleeps > 0 { scenario.clock.advanceToNextSleep() }
+                #expect(await scenario.timeline.waitForCount(4))
+                let laterTimes = await scenario.timeline.times
+                #expect(laterTimes == [.zero, .seconds(6), .seconds(12), .seconds(72)])
+                await scenario.coordinator.cancel()
+            }
+        #endif
+
+        @Test(.timeLimit(.minutes(1)))
+        func delayedClockRegistrationKeepsTheAbsoluteAutomaticDeadline() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let entered = AsyncGate()
+            let release = AsyncGate()
+            let timeline = UploadRefreshTimeline()
+            let delayed = TimelineRefreshClock(
+                now: { clock.now },
+                sleep: { duration in
+                    await entered.open()
+                    await release.wait()
+                    try await clock.dependency.sleep(duration)
+                },
+                sleepUntil: { deadline in
+                    await entered.open()
+                    await release.wait()
+                    try await clock.dependency.sleepUntil(deadline)
+                }
+            )
+            let coordinator = TimelineUploadRefreshCoordinator(clock: delayed)
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await timeline.record(clock.now - origin)
+                return nil
+            })
+            #expect(await timeline.waitForCount(1))
+            clock.advance(by: .seconds(6))
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await timeline.record(clock.now - origin)
+                return nil
+            })
+            await entered.wait()
+            clock.advance(by: .seconds(54))
+            await release.open()
+            #expect(await timeline.waitForNewLoadOrSleep(after: 1, clock: clock))
+            if await timeline.times.count < 2, clock.pendingSleeps > 0 { clock.advanceToNextSleep() }
+            #expect(await timeline.waitForCount(2))
+            let observedTimes = await timeline.times
+            #expect(observedTimes == [.zero, .seconds(60)])
+            await coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func unexpectedConvergenceClockFailureReportsTheFailedAttempt() async {
+            let clock = TimelineRefreshTestClock()
+            let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility])
+            let dependency = TimelineRefreshClock(
+                now: { clock.now }, sleep: { _ in throw ExpectedRefreshClockFailure() },
+                sleepUntil: { _ in throw ExpectedRefreshClockFailure() }
+            )
+            let coordinator = TimelineUploadRefreshCoordinator(clock: dependency)
+            await coordinator.requestAutomaticUpload(
+                refresh: { await recorder.failure(at: $0) },
+                observer: { await recorder.record($0) }
+            )
+            let timeout = ContinuousClock.now + .seconds(5)
+            while await recorder.decisions.count < 2, ContinuousClock.now < timeout { await Task.yield() }
+            #expect(await recorder.callCount == 1)
+            #expect(await recorder.decisions == [.retry(after: .milliseconds(350)), .failed])
+            await coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func laterAutomaticSignalsKeepTheOriginalAdmissionBoundary() async {
+            let scenario = AutomaticUploadScenario()
+            await scenario.startTwoSignals()
+            scenario.clock.advance(by: .seconds(6))
+            await scenario.requestSignal(2)
+            for _ in 0..<3 {
+                if await scenario.timeline.times.count >= 2 { break }
+                #expect(scenario.clock.advanceToNextSleep())
+                #expect(await scenario.timeline.waitForNewLoadOrSleep(after: 1, clock: scenario.clock))
+            }
+            #expect(await scenario.flush())
+            let observedTimes = await scenario.timeline.times
+            let contents = await scenario.timeline.contents
+            #expect(observedTimes == [.zero, .seconds(60)])
+            #expect(contents == [0, 2])
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func manualWakeDoesNotWaitForAnAutomaticDeadline() async {
+            let scenario = AutomaticUploadScenario()
+            let manual = UploadRefreshTimeline()
+            await scenario.startTwoSignals()
+            await scenario.coordinator.request(refresh: { _ in
+                await manual.record(scenario.clock.now - scenario.origin)
+                return nil
+            })
+            #expect(await manual.waitForNewLoadOrSleep(after: 0, clock: scenario.clock))
+            if await manual.times.isEmpty, scenario.clock.pendingSleeps > 0 {
+                scenario.clock.advanceToNextSleep()
+            }
+            #expect(await manual.waitForCount(1))
+            let manualTimes = await manual.times
+            #expect(manualTimes == [.seconds(6)])
+            await scenario.coordinator.cancel()
+        }
+
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func forceFlushServesAcceptedWorkBeforeTheIntervalDeadline() async {
+                let scenario = AutomaticUploadScenario()
+                let release = AsyncGate()
+                let completion = AutomaticFlushCompletion()
+                await scenario.startTwoSignals(secondRelease: release)
+                let flush = Task {
+                    await scenario.coordinator.flushAutomaticUploads()
+                    await completion.markComplete()
+                }
+                #expect(await scenario.waitForFlushRegistration())
+                #expect(await scenario.timeline.waitForNewLoadOrSleep(after: 1, clock: scenario.clock))
+                if await scenario.timeline.times.count < 2, scenario.clock.pendingSleeps > 0 {
+                    scenario.clock.advanceToNextSleep()
+                }
+                #expect(await scenario.timeline.waitForCount(2))
+                let observedTimes = await scenario.timeline.times
+                #expect(observedTimes == [.zero, .seconds(6)])
+                await release.open()
+                #expect(await scenario.waitForWorkerRetirement())
+                #expect(await scenario.coordinator.testingAutomaticState().flushCount == 0)
+                // cancel() also releases a defective leftover waiter, so cleanup cannot hide a deadlock.
+                await scenario.coordinator.cancel()
+                await flush.value
+                #expect(await completion.isComplete)
+            }
+        #endif
+
+        @Test(.timeLimit(.minutes(1)))
+        func currentRequestIsRecheckedAfterAConvergenceWait() async {
+            let scenario = AutomaticUploadScenario()
+            let old = UploadRefreshTimeline()
+            let new = UploadRefreshTimeline()
+            await scenario.coordinator.request(refresh: { _ in
+                await old.record(scenario.clock.now - scenario.origin)
+                return .pendingInventoryVisibility
+            })
+            #expect(await scenario.clock.waitForSleepCount(1))
+            scenario.clock.advance(by: .milliseconds(100))
+            await scenario.coordinator.request(refresh: { _ in
+                await new.record(scenario.clock.now - scenario.origin)
+                return nil
+            })
+            scenario.clock.advanceToNextSleep()
+            #expect(await new.waitForCount(1))
+            let oldTimes = await old.times
+            let newTimes = await new.times
+            #expect(oldTimes == [.zero])
+            #expect(newTimes == [.milliseconds(350)])
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func anObserverReplacementDoesNotSleepOnTheSupersededResult() async {
+            let scenario = AutomaticUploadScenario()
+            let latest = UploadRefreshTimeline()
+            await scenario.coordinator.request(
+                refresh: { _ in .pendingInventoryVisibility },
+                observer: { _ in
+                    await scenario.coordinator.request(refresh: { _ in
+                        await latest.record(scenario.clock.now - scenario.origin)
+                        return nil
+                    })
+                }
+            )
+            #expect(await latest.waitForNewLoadOrSleep(after: 0, clock: scenario.clock))
+            if await latest.times.isEmpty, scenario.clock.pendingSleeps > 0 {
+                scenario.clock.advanceToNextSleep()
+            }
+            #expect(await latest.waitForCount(1))
+            let observedTimes = await latest.times
+            #expect(observedTimes == [.zero])
+            await scenario.coordinator.cancel()
+        }
+
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func unexpectedIntervalClockFailureReportsFailureWithoutAnotherLoad() async {
+                let clock = TimelineRefreshTestClock()
+                let recorder = RefreshAttemptRecorder(failures: [nil])
+                let timeline = UploadRefreshTimeline()
+                let dependency = TimelineRefreshClock(
+                    now: { clock.now }, sleep: { _ in throw ExpectedRefreshClockFailure() },
+                    sleepUntil: { _ in throw ExpectedRefreshClockFailure() }
+                )
+                let coordinator = TimelineUploadRefreshCoordinator(clock: dependency)
+                await coordinator.requestAutomaticUpload(refresh: { _ in
+                    await timeline.record(.zero)
+                    return nil
+                })
+                let timeout = ContinuousClock.now + .seconds(5)
+                while await coordinator.testingAutomaticState().workerActive, ContinuousClock.now < timeout {
+                    await Task.yield()
+                }
+                clock.advance(by: .seconds(6))
+                await coordinator.requestAutomaticUpload(
+                    refresh: { _ in
+                        await timeline.record(.seconds(6))
+                        return nil
+                    },
+                    observer: { await recorder.record($0) }
+                )
+                let failureTimeout = ContinuousClock.now + .seconds(5)
+                while await recorder.decisions.isEmpty, ContinuousClock.now < failureTimeout { await Task.yield() }
+                #expect(await recorder.decisions == [.failed])
+                #expect(await timeline.times == [.zero])
+                await coordinator.cancel()
+            }
+        #endif
+
+        @Test(.timeLimit(.minutes(1)))
+        func explicitRequestBypassesAnAutomaticWaitWithoutConsumingItsPendingWork() async {
+            let scenario = AutomaticUploadScenario()
+            let manual = UploadRefreshTimeline()
+            await scenario.startTwoSignals()
+            await scenario.coordinator.request(refresh: { _ in
+                await manual.record(scenario.clock.now - scenario.origin)
+                return nil
+            })
+            #expect(await manual.waitForCount(1))
+            let manualTimes = await manual.times
+            let automaticBeforeDeadline = await scenario.timeline.times
+            #expect(manualTimes == [.seconds(6)])
+            #expect(automaticBeforeDeadline == [.zero])
+
+            scenario.clock.advance(by: .seconds(54))
+            #expect(await scenario.flush())
+            let automaticTimes = await scenario.timeline.times
+            print("Manual bypass: automaticTimes=\(automaticTimes), waits=\(scenario.clock.requestedSleeps)")
+            #expect(automaticTimes == [.zero, .seconds(60)])
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func automaticEndFlushPublishesTheLatestPendingSignalWithoutAnotherGeneration() async {
+            let scenario = AutomaticUploadScenario()
+            await scenario.startTwoSignals()
+            scenario.clock.advance(by: .seconds(6))
             let previousCount = await scenario.timeline.times.count
-            await scenario.requestSignal(signal)
+            await scenario.requestSignal(2)
             #expect(await scenario.timeline.waitForNewLoadOrSleep(after: previousCount, clock: scenario.clock))
+            let beforeFlush = await scenario.timeline.times
+            #expect(beforeFlush == [.zero])
+            #expect(await scenario.flush())
+            let flushedTimes = await scenario.timeline.times
+            let flushedContents = await scenario.timeline.contents
+            #expect(flushedTimes == [.zero, .seconds(12)])
+            #expect(flushedContents == [0, 2])
+            #expect(await scenario.flush())
+            #expect(await scenario.timeline.times.count == flushedTimes.count)
+            await scenario.coordinator.cancel()
         }
-        scenario.clock.advance(by: .seconds(6))
-        #expect(await scenario.flush())
-        let observedTimes = await scenario.timeline.times
-        let observedContents = await scenario.timeline.contents
-        print(
-            "Automatic upload workload: loads=\(observedTimes.count), latest=\(observedContents.last ?? -1), times=\(observedTimes)"
-        )
-        #expect(observedTimes.count <= 11)
-        #expect(observedContents.last == 99)
-        await scenario.coordinator.cancel()
-    }
 
-    @Test(.timeLimit(.minutes(1)))
-    func cancellationRetiresPendingAutomaticWorkAndResetsTheNextOwner() async {
-        let scenario = AutomaticUploadScenario()
-        await scenario.startTwoSignals()
-        let beforeCancellation = await scenario.timeline.times
-        #expect(beforeCancellation == [.zero])
-        await scenario.coordinator.cancel()
-        #expect(await scenario.flush())
+        @Test(.timeLimit(.minutes(1)))
+        func backupSignalsDuringARunningPassWaitForTheIntervalAndTheEndOfThePassPublishesOnce() async {
+            let scenario = AutomaticUploadScenario()
+            await scenario.submitBackupSignal(0, passIsRunning: true)
+            #expect(await scenario.timeline.waitForCount(1))
+            for signal in 1...3 {
+                scenario.clock.advance(by: .seconds(6))
+                await scenario.submitBackupSignal(signal, passIsRunning: true)
+            }
+            #expect(await scenario.timeline.times == [.zero], "A running pass causes one refresh cycle per interval")
 
-        // The old owner's interval ended at 60 seconds. The replacement asks at 6 seconds, long before that.
-        let replacement = UploadRefreshTimeline()
-        await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
-            await replacement.record(scenario.clock.now - scenario.origin)
-            return nil
-        })
-        #expect(await replacement.waitForCount(1))
-        let replacementTimes = await replacement.times
-        #expect(replacementTimes == [.seconds(6)], "A retired owner's interval cannot delay a new owner")
-        #expect(await scenario.waitForWorkerRetirement())
+            scenario.coordinator.submitBackupPassEnd()
+            #expect(await scenario.timeline.waitForCount(2))
+            #expect(await scenario.timeline.times == [.zero, .seconds(18)])
+            #expect(await scenario.timeline.contents == [0, 3], "The end of the pass publishes the latest signal once")
+            scenario.coordinator.submitBackupPassEnd()
+            #expect(await scenario.settlesWithoutAnotherLoad(after: 2), "An end without a new signal loads nothing")
+            await scenario.coordinator.cancel()
+        }
 
-        // The cancelled work never runs, also after the old interval would have ended.
-        scenario.clock.advance(by: .seconds(60))
-        #expect(await scenario.timeline.times.count == beforeCancellation.count)
-        #expect(await replacement.times == [.seconds(6)])
-        await scenario.coordinator.cancel()
-    }
+        /// The count that the PR text names: one signal every 3 s for 300 s, loads that finish at once. The expected
+        /// number follows `TimelineRefreshConvergencePolicy.backupUploads`. The formula holds for intervals that are whole
+        /// multiples of 3 s and do not end a cycle on the last step.
+        @Test(.timeLimit(.minutes(1)))
+        func oneHundredBackupSignalsInThreeHundredSecondsLoadOncePerIntervalInsteadOfOncePerSignal() async throws {
+            let interval = Int(TimelineRefreshConvergencePolicy.backupUploads.automaticInterval.components.seconds)
+            try #require(
+                interval > 0 && interval % 3 == 0 && 297 % interval != 0, "The count formula needs this interval")
+            let before = AutomaticUploadScenario()
+            for signal in 0..<100 {
+                if signal > 0 { before.clock.advance(by: .seconds(3)) }
+                let count = await before.timeline.times.count
+                await before.coordinator.request(refresh: { _ in
+                    await before.timeline.record(before.clock.now - before.origin, content: signal)
+                    return nil
+                })
+                #expect(await before.timeline.waitForCount(count + 1))
+            }
+            #expect(await before.timeline.times.count == 100, "The immediate route loads once per signal")
+            await before.coordinator.cancel()
 
-    @Test(.timeLimit(.minutes(1)))
-    func automaticConvergenceKeepsImmediateDefaultVisibilityFeedback() async {
-        let scenario = AutomaticUploadScenario()
-        let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility, .pendingInventoryVisibility, nil])
-        await scenario.coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                await scenario.timeline.record(scenario.clock.now - scenario.origin)
-                return await recorder.failure(at: attempt)
-            },
-            observer: { await recorder.record($0) }
-        )
-        #expect(await scenario.clock.waitForSleepCount(1))
-        #expect(scenario.clock.requestedSleeps == [.milliseconds(350)])
-        scenario.clock.advance(by: .milliseconds(350))
-        #expect(await scenario.clock.waitForSleepCount(2))
-        #expect(scenario.clock.requestedSleeps == [.milliseconds(350), .milliseconds(650)])
-        scenario.clock.advance(by: .milliseconds(650))
-        #expect(await scenario.timeline.waitForCount(3))
-        #expect(await scenario.flush())
-        let observedTimes = await scenario.timeline.times
-        #expect(observedTimes == [.zero, .milliseconds(350), .seconds(1)])
-        #expect(await recorder.attempts == [0, 1, 2])
-        #expect(
-            await recorder.decisions == [
-                .retry(after: .milliseconds(350)), .retry(after: .milliseconds(650)), .succeeded,
+            // A cycle starts at the first clock step on or after the previous start plus the interval.
+            var starts = [0]
+            while let last = starts.last, (last + interval + 2) / 3 * 3 <= 297 {
+                starts.append((last + interval + 2) / 3 * 3)
+            }
+            let scenario = AutomaticUploadScenario(policy: .backupUploads)
+            for signal in 0..<100 {
+                if signal > 0 { scenario.clock.advance(by: .seconds(3)) }
+                await scenario.submitBackupSignal(signal, passIsRunning: true)
+                // Wait until the load of this step, when one is due, has run.
+                let due = starts.filter { $0 <= signal * 3 }.count
+                #expect(await scenario.timeline.waitForCount(due))
+            }
+            scenario.coordinator.submitBackupPassEnd()
+            #expect(await scenario.timeline.waitForCount(starts.count + 1))
+            let times = await scenario.timeline.times
+            let contents = await scenario.timeline.contents
+            #expect(times.dropLast().map { Int($0.components.seconds) } == starts, "One load per interval")
+            #expect(times.count == starts.count + 1, "One more load at the end of the pass")
+            #expect(times.first == .zero, "The first signal loads at once")
+            #expect(contents.last == 99, "The end of the pass publishes the newest signal")
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func theEndOfAPassPublishesTheWaitingSignalEvenAfterAFailedRefresh() async {
+            let scenario = AutomaticUploadScenario(policy: .backupUploads)
+            scenario.coordinator.submitBackupUpload(
+                passIsRunning: true,
+                refresh: { _ in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+                    return .other
+                })
+            #expect(await scenario.timeline.waitForCount(1))
+            scenario.clock.advance(by: .seconds(3))
+            await scenario.submitBackupSignal(1, passIsRunning: true)
+            scenario.coordinator.submitBackupPassEnd()
+            #expect(
+                await scenario.timeline.waitForCount(2), "The end publishes the waiting signal after a failed refresh")
+            #expect(await scenario.timeline.contents.last == 1)
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aSubmittedPassEndPublishesTheSignalSubmittedBeforeIt() async {
+            let scenario = AutomaticUploadScenario(policy: .backupUploads)
+            await scenario.submitBackupSignal(0, passIsRunning: true)
+            #expect(await scenario.timeline.waitForCount(1))
+            scenario.clock.advance(by: .seconds(3))
+            // No wait between the two submissions: the chain alone keeps the pass end behind its signal.
+            scenario.coordinator.submitBackupUpload(
+                passIsRunning: true,
+                refresh: { _ in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+                    return nil
+                })
+            scenario.coordinator.submitBackupPassEnd()
+            #expect(
+                await scenario.timeline.waitForCount(2), "The pass end follows its signal, so it publishes it at once")
+            #expect(await scenario.timeline.times == [.zero, .seconds(3)])
+            await scenario.coordinator.cancel()
+        }
+
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func lateSignalsDuringARunningLoadShareOneFollowUpLoad() async {
+                let scenario = AutomaticUploadScenario(policy: .backupUploads)
+                let held = AsyncGate()
+                await scenario.submitBackupSignal(0, passIsRunning: true)
+                #expect(await scenario.timeline.waitForCount(1))
+                scenario.clock.advance(by: .seconds(3))
+                scenario.coordinator.submitBackupUpload(
+                    passIsRunning: false,
+                    refresh: { _ in
+                        await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+                        await held.wait()
+                        return nil
+                    })
+                await scenario.coordinator.testingDrainSubmissions()
+                #expect(await scenario.timeline.waitForCount(2))
+                for signal in 2...5 { await scenario.submitBackupSignal(signal, passIsRunning: false) }
+                await held.open()
+                #expect(await scenario.timeline.waitForCount(3))
+                #expect(await scenario.settlesWithoutAnotherLoad(after: 3))
+                let seen = await scenario.timeline.contents
+                #expect(seen == [0, 1, 5], "Four late signals share one follow-up load, saw \(seen)")
+                await scenario.coordinator.cancel()
+            }
+        #endif
+
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func aSignalThatArrivesDuringAnUnchangedLoadKeepsItsUsualAdmission() async {
+                let scenario = AutomaticUploadScenario(policy: .backupUploads)
+                let held = AsyncGate()
+                await scenario.submitBackupSignal(0, passIsRunning: true)
+                #expect(await scenario.timeline.waitForCount(1))
+                scenario.clock.advance(by: .seconds(3))
+                // A load that finds no change starts at t=3 and is held open.
+                scenario.coordinator.submitBackupUpload(
+                    passIsRunning: false,
+                    refresh: { _ in
+                        await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+                        await held.wait()
+                        return .unchanged
+                    })
+                await scenario.coordinator.testingDrainSubmissions()
+                #expect(await scenario.timeline.waitForCount(2))
+                // Signals 2...5 arrive while that unchanged load is still running.
+                for signal in 2...5 { await scenario.submitBackupSignal(signal, passIsRunning: true) }
+                await held.open()
+                // The unchanged load completed while signal 5 was already pending, so the next tick is not skipped:
+                // the follow-up load keeps the usual admission, one interval after the previous admission.
+                #expect(await scenario.clock.waitForSleepCount(1), "The follow-up admission is scheduled")
+                if scenario.clock.pendingSleeps > 0 { scenario.clock.advanceToNextSleep() }
+                #expect(await scenario.timeline.waitForCount(3))
+                let times = await scenario.timeline.times
+                #expect(times == [.zero, .seconds(3), .seconds(33)], "The usual admission is kept, saw \(times)")
+                await scenario.coordinator.cancel()
+            }
+        #endif
+
+        @Test(.timeLimit(.minutes(1)))
+        func aSignalThatArrivesAfterAnUnchangedLoadWaitsForTheMovedTick() async {
+            let scenario = AutomaticUploadScenario(policy: .backupUploads)
+            await scenario.requestSignal(0, unchanged: true)
+            #expect(await scenario.timeline.waitForCount(1))
+            #expect(await scenario.waitForQuiescence())
+            // The unchanged load ended with no newer signal pending, so the skip moved the next tick from 30 s to 60 s.
+            // A signal that arrives after that completion carries content this load could not have seen, yet the design
+            // of #516 accepts one interval of delay for it: the load waits for the moved tick.
+            scenario.clock.advance(by: .seconds(31))
+            await scenario.submitBackupSignal(1, passIsRunning: true)
+            #expect(await scenario.clock.waitForSleepCount(1), "The follow-up admission is scheduled")
+            if scenario.clock.pendingSleeps > 0 { scenario.clock.advanceToNextSleep() }
+            #expect(await scenario.timeline.waitForCount(2))
+            let times = await scenario.timeline.times
+            #expect(
+                times == [.zero, .seconds(60)],
+                "A signal after an unchanged load waits for the moved tick, saw \(times)")
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aCancelledAutomaticResultDoesNotMoveTheNextTick() async {
+            let scenario = AutomaticUploadScenario(policy: .backupUploads)
+            await scenario.coordinator.requestAutomaticUpload(
+                refresh: { _ in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+                    return .cancelled
+                },
+                observer: { _ in await scenario.timeline.noteTerminalObservation() })
+            #expect(await scenario.timeline.waitForCount(1))
+            #expect(await scenario.waitForQuiescence())
+            // A cancelled automatic result is not an unchanged load, so the next tick stays at the usual 30 s.
+            scenario.clock.advance(by: .seconds(31))
+            await scenario.submitBackupSignal(1, passIsRunning: true)
+            #expect(await scenario.timeline.waitForCount(2))
+            let times = await scenario.timeline.times
+            #expect(
+                times == [.zero, .seconds(31)],
+                "A cancelled result does not defer the next automatic cycle, saw \(times)")
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aManualRefreshNeverWaitsForASkippedTick() async {
+            let scenario = AutomaticUploadScenario(policy: .backupUploads)
+            await scenario.requestSignal(0, unchanged: true)
+            #expect(await scenario.timeline.waitForCount(1))
+            #expect(await scenario.waitForQuiescence())
+            scenario.clock.advance(by: .seconds(5))
+            await scenario.coordinator.request(refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 99)
+                return nil
+            })
+            #expect(await scenario.timeline.waitForCount(2))
+            #expect(await scenario.timeline.times == [.zero, .seconds(5)], "A manual refresh ignores the skipped tick")
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aBackupSignalAfterThePassEndedRefreshesWithoutWaitingForTheInterval() async {
+            let scenario = AutomaticUploadScenario()
+            await scenario.submitBackupSignal(0, passIsRunning: true)
+            #expect(await scenario.timeline.waitForCount(1))
+            scenario.clock.advance(by: .seconds(6))
+            await scenario.submitBackupSignal(1, passIsRunning: false)
+            #expect(await scenario.timeline.waitForCount(2))
+            #expect(
+                await scenario.timeline.times == [.zero, .seconds(6)], "No later pass end comes, so it publishes itself"
+            )
+            #expect(await scenario.timeline.contents == [0, 1])
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aManualRefreshStaysImmediateWhileBackupSignalsWait() async {
+            let scenario = AutomaticUploadScenario()
+            await scenario.submitBackupSignal(0, passIsRunning: true)
+            #expect(await scenario.timeline.waitForCount(1))
+            scenario.clock.advance(by: .seconds(6))
+            await scenario.submitBackupSignal(1, passIsRunning: true)
+            await scenario.coordinator.request(refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 99)
+                return nil
+            })
+            #expect(await scenario.timeline.waitForCount(2))
+            #expect(await scenario.timeline.times == [.zero, .seconds(6)])
+            #expect(
+                await scenario.timeline.contents == [0, 99], "The manual refresh does not wait for the backup interval")
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func automaticEndAtTheIntervalBoundaryJoinsTheSameActiveGeneration() async {
+            let scenario = AutomaticUploadScenario()
+            let secondRelease = AsyncGate()
+            await scenario.startTwoSignals(secondRelease: secondRelease)
+            scenario.clock.advance(by: .seconds(54))
+            #expect(await scenario.timeline.waitForCount(2))
+            let completion = AutomaticFlushCompletion()
+            let flush = Task {
+                await scenario.coordinator.flushAutomaticUploads()
+                await completion.markComplete()
+            }
+            #expect(await scenario.waitForFlushRegistration())
+            await secondRelease.open()
+            #expect(await completion.waitUntilComplete())
+            await scenario.coordinator.cancel()
+            await flush.value
+            let observedTimes = await scenario.timeline.times
+            let observedContents = await scenario.timeline.contents
+            #expect(observedTimes == [.zero, .seconds(60)])
+            #expect(observedContents == [0, 1], "The boundary end must not manufacture a third refresh")
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func oneHundredAutomaticSignalsAndBoundaryEndUseAtMostElevenLoads() async {
+            let scenario = AutomaticUploadScenario()
+            for signal in 0..<100 {
+                if signal > 0 { scenario.clock.advance(by: .seconds(6)) }
+                let previousCount = await scenario.timeline.times.count
+                await scenario.requestSignal(signal)
+                #expect(await scenario.timeline.waitForNewLoadOrSleep(after: previousCount, clock: scenario.clock))
+            }
+            scenario.clock.advance(by: .seconds(6))
+            #expect(await scenario.flush())
+            let observedTimes = await scenario.timeline.times
+            let observedContents = await scenario.timeline.contents
+            print(
+                "Automatic upload workload: loads=\(observedTimes.count), latest=\(observedContents.last ?? -1), times=\(observedTimes)"
+            )
+            #expect(observedTimes.count <= 11)
+            #expect(observedContents.last == 99)
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func oneHundredAutomaticSignalsUnderProductionBackupUploadsPolicyStayWithinTheIssueBound() async {
+            let scenario = AutomaticUploadScenario(policy: .backupUploads)
+            // Signals 0...98 back up photos that were already visible as local tiles, so their loads find no change.
+            // Signal 99 carries the last new content and must be visible without waiting behind a skipped tick.
+            for signal in 0..<100 {
+                if signal > 0 {
+                    scenario.clock.advance(by: .seconds(6))
+                    #expect(
+                        await scenario.waitForQuiescence(), "A tick load must settle before submitting the next signal")
+                }
+                await scenario.requestSignal(signal, unchanged: signal != 99)
+                #expect(await scenario.waitForQuiescence(), "The coordinator must be ready for the next signal")
+            }
+            scenario.clock.advance(by: .seconds(6))
+            #expect(await scenario.flush())
+            let observedTimes = await scenario.timeline.times
+            let observedContents = await scenario.timeline.contents
+            let summary = "loads=\(observedTimes.count), latest=\(observedContents.last ?? -1)"
+            print("Backup upload workload: \(summary), times=\(observedTimes)")
+            #expect(
+                observedTimes.count <= 11, "The production backupUploads policy must keep 100 signals within 11 loads")
+            #expect(observedContents.last == 99, "The production backupUploads policy must publish the newest signal")
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aLoadThatFoundNewContentKeepsTheUsualInterval() async {
+            let scenario = AutomaticUploadScenario(policy: .backupUploads)
+            await scenario.requestSignal(0, unchanged: false)
+            #expect(await scenario.timeline.waitForCount(1))
+            #expect(await scenario.waitForQuiescence())
+            scenario.clock.advance(by: .seconds(6))
+            await scenario.requestSignal(1, unchanged: false)
+            #expect(await scenario.clock.waitForSleepCount(1), "The follow-up admission is scheduled")
+            if scenario.clock.pendingSleeps > 0 { scenario.clock.advanceToNextSleep() }
+            #expect(await scenario.timeline.waitForCount(2))
+            let times = await scenario.timeline.times
+            #expect(times == [.zero, .seconds(30)], "A load with new content keeps the 30 s interval")
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func cancellationRetiresPendingAutomaticWorkAndResetsTheNextOwner() async {
+            let scenario = AutomaticUploadScenario()
+            await scenario.startTwoSignals()
+            let beforeCancellation = await scenario.timeline.times
+            #expect(beforeCancellation == [.zero])
+            await scenario.coordinator.cancel()
+            #expect(await scenario.flush())
+
+            // The old owner's interval ended at 60 seconds. The replacement asks at 6 seconds, long before that.
+            let replacement = UploadRefreshTimeline()
+            await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
+                await replacement.record(scenario.clock.now - scenario.origin)
+                return nil
+            })
+            #expect(await replacement.waitForCount(1))
+            let replacementTimes = await replacement.times
+            #expect(replacementTimes == [.seconds(6)], "A retired owner's interval cannot delay a new owner")
+            #expect(await scenario.waitForWorkerRetirement())
+
+            // The cancelled work never runs, also after the old interval would have ended.
+            scenario.clock.advance(by: .seconds(60))
+            #expect(await scenario.timeline.times.count == beforeCancellation.count)
+            #expect(await replacement.times == [.seconds(6)])
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func automaticConvergenceKeepsImmediateDefaultVisibilityFeedback() async {
+            let scenario = AutomaticUploadScenario()
+            let recorder = RefreshAttemptRecorder(failures: [
+                .pendingInventoryVisibility, .pendingInventoryVisibility, nil,
             ])
-        await scenario.coordinator.cancel()
-    }
+            await scenario.coordinator.requestAutomaticUpload(
+                refresh: { attempt in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin)
+                    return await recorder.failure(at: attempt)
+                },
+                observer: { await recorder.record($0) }
+            )
+            #expect(await scenario.clock.waitForSleepCount(1))
+            #expect(scenario.clock.requestedSleeps == [.milliseconds(350)])
+            scenario.clock.advance(by: .milliseconds(350))
+            #expect(await scenario.clock.waitForSleepCount(2))
+            #expect(scenario.clock.requestedSleeps == [.milliseconds(350), .milliseconds(650)])
+            scenario.clock.advance(by: .milliseconds(650))
+            #expect(await scenario.timeline.waitForCount(3))
+            #expect(await scenario.flush())
+            let observedTimes = await scenario.timeline.times
+            #expect(observedTimes == [.zero, .milliseconds(350), .seconds(1)])
+            #expect(await recorder.attempts == [0, 1, 2])
+            #expect(
+                await recorder.decisions == [
+                    .retry(after: .milliseconds(350)), .retry(after: .milliseconds(650)), .succeeded,
+                ])
+            await scenario.coordinator.cancel()
+        }
 
-    @Test(.timeLimit(.minutes(1)))
-    func automaticSupersessionKeepsAdmittedObserverAndDefersTheNextCycle() async {
-        let scenario = AutomaticUploadScenario()
-        let firstRelease = AsyncGate()
-        let recorder = CoordinatorRaceRecorder()
-        await scenario.coordinator.requestAutomaticUpload(
-            refresh: { _ in
-                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
-                await firstRelease.wait()
+        @Test(.timeLimit(.minutes(1)))
+        func automaticSupersessionKeepsAdmittedObserverAndDefersTheNextCycle() async {
+            let scenario = AutomaticUploadScenario()
+            let firstRelease = AsyncGate()
+            let recorder = CoordinatorRaceRecorder()
+            await scenario.coordinator.requestAutomaticUpload(
+                refresh: { _ in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+                    await firstRelease.wait()
+                    return .cancelled
+                },
+                observer: { _ in await recorder.recordOldObservation() }
+            )
+            #expect(await scenario.timeline.waitForCount(1))
+            scenario.clock.advance(by: .seconds(6))
+            await scenario.coordinator.requestAutomaticUpload(
+                refresh: { _ in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+                    return nil
+                },
+                observer: { _ in await recorder.recordNewObservation() }
+            )
+            await firstRelease.open()
+            #expect(await scenario.timeline.waitForNewLoadOrSleep(after: 1, clock: scenario.clock))
+            let beforeDeadline = await scenario.timeline.times
+            #expect(beforeDeadline == [.zero])
+            scenario.clock.advance(by: .seconds(54))
+            #expect(await scenario.timeline.waitForCount(2))
+            #expect(await scenario.flush())
+            let observedTimes = await scenario.timeline.times
+            #expect(observedTimes == [.zero, .seconds(60)])
+            #expect(await recorder.oldObservations == 1)
+            #expect(await recorder.newObservations == 1)
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func automaticCancellationJoinsTheAdmittedLoadAndSuppressesItsObserver() async {
+            let release = AsyncGate()
+            let recorder = CoordinatorRaceRecorder()
+            let completion = AutomaticFlushCompletion()
+            let coordinator = TimelineUploadRefreshCoordinator()
+            await coordinator.requestAutomaticUpload(
+                refresh: { _ in
+                    await recorder.markFirstStarted()
+                    while !Task.isCancelled { await Task.yield() }
+                    await recorder.markFirstCancelled()
+                    await release.wait()
+                    return .cancelled
+                },
+                observer: { _ in await recorder.recordOldObservation() }
+            )
+            await recorder.waitForFirstStart()
+            let cancellation = Task {
+                await coordinator.cancel()
+                await completion.markComplete()
+            }
+            await recorder.waitForFirstCancellation()
+            #expect(await completion.isComplete == false)
+            await coordinator.flushAutomaticUploads()
+            await release.open()
+            await cancellation.value
+            #expect(await completion.isComplete)
+            #expect(await recorder.oldObservations == 0)
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func cancellationKeepsCompletionAndFlushPendingUntilHeldRefreshReturns() async {
+            let release = AsyncGate()
+            let refreshAdmitted = AutomaticFlushCompletion()
+            let refreshFinished = AutomaticFlushCompletion()
+            let cancellationCompletion = AutomaticFlushCompletion()
+            let flushCompletion = AutomaticFlushCompletion()
+            let recorder = CoordinatorRaceRecorder()
+            let coordinator = TimelineUploadRefreshCoordinator()
+            let heldRefresh = Task<TimelineRefreshFailureReason?, Never> {
+                await release.wait()
                 return .cancelled
-            },
-            observer: { _ in await recorder.recordOldObservation() }
-        )
-        #expect(await scenario.timeline.waitForCount(1))
-        scenario.clock.advance(by: .seconds(6))
-        await scenario.coordinator.requestAutomaticUpload(
-            refresh: { _ in
+            }
+            await coordinator.requestAutomaticUpload(
+                refresh: { _ in
+                    await refreshAdmitted.markComplete()
+                    let result = await heldRefresh.value
+                    await refreshFinished.markComplete()
+                    return result
+                },
+                observer: { _ in await recorder.recordOldObservation() }
+            )
+            let refreshWasAdmitted = await refreshAdmitted.waitUntilComplete()
+            #expect(refreshWasAdmitted)
+            let flush = Task {
+                await coordinator.flushAutomaticUploads()
+                await flushCompletion.markComplete()
+            }
+            let flushWasRegistered = await waitForAutomaticCoordinatorState(
+                coordinator, flushCount: 1, workerActive: true)
+            #expect(flushWasRegistered)
+            let cancellation = Task {
+                await coordinator.cancel()
+                await cancellationCompletion.markComplete()
+            }
+            let cancellationWasAdmitted = await waitForAutomaticCoordinatorState(
+                coordinator, flushCount: 0, workerActive: false)
+            #expect(cancellationWasAdmitted)
+
+            // These bounded observations run while the held refresh's release stays closed.
+            async let cancellationObservation = cancellationCompletion.completesWithinTheObservationWindow()
+            async let flushObservation = flushCompletion.completesWithinTheObservationWindow()
+            let (cancelReturnedWhileHeld, flushReturnedWhileHeld) = await (
+                cancellationObservation, flushObservation
+            )
+            #expect(cancelReturnedWhileHeld == false)
+            #expect(flushReturnedWhileHeld == false)
+
+            // Expectations continue through cleanup, including when cancellation returns too early.
+            await release.open()
+            _ = await heldRefresh.value
+            let refreshDidFinish = await refreshFinished.waitUntilComplete()
+            await cancellation.value
+            await flush.value
+            #expect(refreshDidFinish)
+            #expect(await cancellationCompletion.isComplete)
+            #expect(await flushCompletion.isComplete)
+            #expect(await recorder.oldObservations == 0)
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func automaticSignalsDeferOnlyTheNewCycleToSixtySeconds() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let firstRelease = AsyncGate()
+            let timeline = UploadRefreshTimeline()
+            let coordinator = TimelineUploadRefreshCoordinator(clock: clock.dependency)
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await timeline.record(clock.now - origin)
+                await firstRelease.wait()
+                return nil
+            })
+            #expect(await timeline.waitForCount(1))
+            #expect(await timeline.times == [.zero])
+            clock.advance(by: .seconds(6))
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await timeline.record(clock.now - origin)
+                return nil
+            })
+            await firstRelease.open()
+            #expect(await timeline.waitForNewLoadOrSleep(after: 1, clock: clock))
+            let beforeDeadline = await timeline.times
+            #expect(beforeDeadline == [.zero], "A second automatic signal stays pending inside sixty seconds")
+            #expect(clock.requestedSleeps == [.seconds(54)])
+            clock.advance(by: .seconds(54))
+            #expect(await timeline.waitForCount(2))
+            let observedTimes = await timeline.times
+            #expect(observedTimes == [.zero, .seconds(60)])
+            await coordinator.flushAutomaticUploads()
+            #expect(await timeline.times.count == 2)
+            await coordinator.cancel()
+        }
+
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func automaticFlushWithoutAutomaticWorkDoesNotJoinAHeldManualLoad() async {
+                let release = AsyncGate()
+                let timeline = UploadRefreshTimeline()
+                let completion = AutomaticFlushCompletion()
+                let coordinator = TimelineUploadRefreshCoordinator()
+                await coordinator.request(refresh: { _ in
+                    await timeline.record(.zero)
+                    await release.wait()
+                    return nil
+                })
+                #expect(await timeline.waitForCount(1))
+                let flush = Task {
+                    await coordinator.flushAutomaticUploads()
+                    await completion.markComplete()
+                }
+                #expect(
+                    await completion.waitUntilComplete(),
+                    "An automatic-only flush must return while manual work is held")
+                #expect(await coordinator.testingAutomaticState().flushCount == 0)
+                #expect(await timeline.times.count == 1)
+                await release.open()
+                await coordinator.cancel()
+                await flush.value
+            }
+        #endif
+
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func aCancelledFlushingTaskStopsWaitingWhileTheAutomaticWorkContinues() async {
+                let release = AsyncGate()
+                let timeline = UploadRefreshTimeline()
+                let completion = AutomaticFlushCompletion()
+                let coordinator = TimelineUploadRefreshCoordinator()
+                await coordinator.requestAutomaticUpload(refresh: { _ in
+                    await timeline.record(.zero)
+                    await release.wait()
+                    return nil
+                })
+                #expect(await timeline.waitForCount(1))
+                let flush = Task {
+                    await coordinator.flushAutomaticUploads()
+                    await completion.markComplete()
+                }
+                #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
+                flush.cancel()
+                // The flushing task stops waiting while the refresh is still held.
+                #expect(
+                    await completion.waitUntilComplete(),
+                    "A cancelled flushing task must not stay suspended until the automatic work ends")
+                let state = await coordinator.testingAutomaticState()
+                #expect(state.flushCount == 0)
+                #expect(state.workerActive, "The automatic work goes on after the flush was cancelled")
+                await release.open()
+                #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 0, workerActive: false))
+                await flush.value
+                await coordinator.cancel()
+            }
+        #endif
+
+        @Test(.timeLimit(.minutes(1)))
+        func aFlushingTaskThatIsCancelledWhileCancelJoinsTheWorkerIsReleased() async {
+            let release = AsyncGate()
+            let admitted = AutomaticFlushCompletion()
+            let flushReturned = AutomaticFlushCompletion()
+            let cancelReturned = AutomaticFlushCompletion()
+            let coordinator = TimelineUploadRefreshCoordinator()
+            let heldRefresh = Task<TimelineRefreshFailureReason?, Never> {
+                await release.wait()
+                return nil
+            }
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await admitted.markComplete()
+                return await heldRefresh.value
+            })
+            #expect(await admitted.waitUntilComplete())
+            let flush = Task {
+                await coordinator.flushAutomaticUploads()
+                await flushReturned.markComplete()
+            }
+            #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
+            // cancel() takes the waiter and joins the worker, which stays held.
+            let cancellation = Task {
+                await coordinator.cancel()
+                await cancelReturned.markComplete()
+            }
+            #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 0, workerActive: false))
+            flush.cancel()
+            let flushReturnedWhileHeld = await flushReturned.waitUntilComplete()
+            #expect(
+                flushReturnedWhileHeld,
+                "A cancelled flushing task must be released although cancel() still joins the held refresh")
+            #expect(await cancelReturned.isComplete == false)
+
+            await release.open()
+            _ = await heldRefresh.value
+            await cancellation.value
+            await flush.value
+            #expect(await cancelReturned.isComplete)
+            #expect(await flushReturned.isComplete)
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func anExplicitRequestWaitsForTheObserverOfTheAdmittedAutomaticLoad() async {
+            let release = AsyncGate()
+            let order = EventOrder()
+            let coordinator = TimelineUploadRefreshCoordinator()
+            let heldRefresh = Task<TimelineRefreshFailureReason?, Never> {
+                await release.wait()
+                return nil
+            }
+            await coordinator.requestAutomaticUpload(
+                refresh: { _ in
+                    await order.add("automatic load")
+                    return await heldRefresh.value
+                },
+                observer: { _ in await order.add("automatic observer") }
+            )
+            #expect(await order.waitForCount(1))
+            // The explicit request arrives while the automatic load is held, so it is chosen when the load returns.
+            await coordinator.request(refresh: { _ in
+                await order.add("explicit load")
+                return nil
+            })
+            await release.open()
+            #expect(await order.waitForCount(3))
+            #expect(
+                await order.events == ["automatic load", "automatic observer", "explicit load"],
+                "The explicit load runs after the observer of the admitted automatic load")
+            await coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aFlushDuringAConvergenceRetryWaitKeepsTheRetryDelay() async {
+            let scenario = AutomaticUploadScenario()
+            let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility, nil])
+            await scenario.coordinator.requestAutomaticUpload(
+                refresh: { attempt in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin)
+                    return await recorder.failure(at: attempt)
+                },
+                observer: { await recorder.record($0) }
+            )
+            #expect(await scenario.clock.waitForSleepCount(1))
+            #expect(scenario.clock.requestedSleeps == [.milliseconds(350)])
+            let completion = AutomaticFlushCompletion()
+            let flush = Task {
+                await scenario.coordinator.flushAutomaticUploads()
+                await completion.markComplete()
+            }
+            #expect(await scenario.waitForFlushRegistration())
+            // The flush neither retries early nor wakes the delay. A woken delay would register its sleep again at once;
+            // this bounded observation runs while the clock stays where it is.
+            let delayWasRegisteredAgain = await clockRegistersSleeps(scenario.clock, count: 2)
+            #expect(delayWasRegisteredAgain == false, "The flush must not wake the pending convergence delay")
+            #expect(await scenario.timeline.times == [.zero])
+            #expect(await completion.isComplete == false)
+            scenario.clock.advance(by: .milliseconds(350))
+            #expect(await completion.waitUntilComplete())
+            #expect(await scenario.timeline.times == [.zero, .milliseconds(350)])
+            #expect(
+                scenario.clock.requestedSleeps == [.milliseconds(350)],
+                "The flush keeps the one pending delay: it does not wake it and register it again")
+            await flush.value
+            await scenario.coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aNewerExplicitRequestReplacesAnOlderOneThatWaitsBehindAnAdmittedAutomaticRefresh() async {
+            let scenario = AutomaticUploadScenario()
+            let release = AsyncGate()
+            await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+                await release.wait()
+                return nil
+            })
+            #expect(await scenario.timeline.waitForCount(1))
+            await scenario.coordinator.request(refresh: { _ in
                 await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
                 return nil
-            },
-            observer: { _ in await recorder.recordNewObservation() }
-        )
-        await firstRelease.open()
-        #expect(await scenario.timeline.waitForNewLoadOrSleep(after: 1, clock: scenario.clock))
-        let beforeDeadline = await scenario.timeline.times
-        #expect(beforeDeadline == [.zero])
-        scenario.clock.advance(by: .seconds(54))
-        #expect(await scenario.timeline.waitForCount(2))
-        #expect(await scenario.flush())
-        let observedTimes = await scenario.timeline.times
-        #expect(observedTimes == [.zero, .seconds(60)])
-        #expect(await recorder.oldObservations == 1)
-        #expect(await recorder.newObservations == 1)
-        await scenario.coordinator.cancel()
-    }
+            })
+            await scenario.coordinator.request(refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 2)
+                return nil
+            })
+            await release.open()
+            #expect(await scenario.timeline.waitForCount(2))
+            #expect(await scenario.waitForWorkerRetirement())
+            #expect(
+                await scenario.timeline.contents == [0, 2],
+                "The explicit request that a newer one replaced never runs; the newer one runs after the admitted load")
+            await scenario.coordinator.cancel()
+        }
 
-    @Test(.timeLimit(.minutes(1)))
-    func automaticCancellationJoinsTheAdmittedLoadAndSuppressesItsObserver() async {
-        let release = AsyncGate()
-        let recorder = CoordinatorRaceRecorder()
-        let completion = AutomaticFlushCompletion()
-        let coordinator = TimelineUploadRefreshCoordinator()
-        await coordinator.requestAutomaticUpload(
-            refresh: { _ in
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func aFlushForANewerRequestIsNotReleasedByTheCompletionOfAnOlderOne() async {
+                let scenario = AutomaticUploadScenario()
+                let releaseOlder = AsyncGate()
+                let releaseNewer = AsyncGate()
+                await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+                    await releaseOlder.wait()
+                    return nil
+                })
+                #expect(await scenario.timeline.waitForCount(1))
+                scenario.clock.advance(by: .seconds(6))
+                await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
+                    await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+                    await releaseNewer.wait()
+                    return nil
+                })
+                let completion = AutomaticFlushCompletion()
+                let flush = Task {
+                    await scenario.coordinator.flushAutomaticUploads()
+                    await completion.markComplete()
+                }
+                #expect(await scenario.waitForFlushRegistration())
+                // The flush targets the newer request. The older load completes first and must not release it.
+                await releaseOlder.open()
+                #expect(
+                    await scenario.timeline.waitForCount(2), "SETUP: the forced newer request runs after the older load"
+                )
+                // The older load completed before the newer one entered, so a wrong release has happened by now: it would
+                // have removed the flush waiter from the coordinator.
+                let flushStillRegistered = await scenario.coordinator.testingAutomaticState().flushCount == 1
+                #expect(flushStillRegistered, "The older completion must not release the newer target")
+                #expect(await completion.isComplete == false, "The older completion must not release the newer target")
+                await releaseNewer.open()
+                #expect(await completion.waitUntilComplete())
+                await flush.value
+                await scenario.coordinator.cancel()
+            }
+        #endif
+
+        @Test(.timeLimit(.minutes(1)))
+        func acceptedAutomaticFlushCompletesWithoutAddingARequest() async {
+            let release = AsyncGate()
+            let timeline = UploadRefreshTimeline()
+            let completion = AutomaticFlushCompletion()
+            let coordinator = TimelineUploadRefreshCoordinator()
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await timeline.record(.zero)
+                await release.wait()
+                return nil
+            })
+            #expect(await timeline.waitForCount(1))
+            let flush = Task {
+                await coordinator.flushAutomaticUploads()
+                await completion.markComplete()
+            }
+            #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
+            await release.open()
+            await flush.value
+            #expect(await completion.isComplete)
+            #expect(await timeline.times == [.zero])
+            await coordinator.flushAutomaticUploads()
+            #expect(await timeline.times == [.zero], "Repeated end calls must not manufacture another request")
+            await coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func explicitUploadRequestKeepsImmediateFollowUp() async {
+            let clock = TimelineRefreshTestClock()
+            let origin = clock.now
+            let firstRelease = AsyncGate()
+            let timeline = UploadRefreshTimeline()
+            let coordinator = TimelineUploadRefreshCoordinator(clock: clock.dependency)
+            await coordinator.request(refresh: { _ in
+                await timeline.record(clock.now - origin)
+                await firstRelease.wait()
+                return nil
+            })
+            #expect(await timeline.waitForCount(1))
+            #expect(await timeline.times == [.zero])
+
+            clock.advance(by: .seconds(6))
+            await coordinator.request(refresh: { _ in
+                await timeline.record(clock.now - origin)
+                return nil
+            })
+            await firstRelease.open()
+            // Both versions reach a positive boundary: an actual second load or the controlled interval wait.
+            let timeout = ContinuousClock.now + .seconds(5)
+            while await timeline.times.count < 2, clock.pendingSleeps == 0, ContinuousClock.now < timeout {
+                await Task.yield()
+            }
+            #expect(await timeline.waitForCount(2))
+            #expect(
+                await timeline.times == [.zero, .seconds(6)], "Explicit requests retain an immediate fresh follow-up")
+            #expect(clock.requestedSleeps.isEmpty)
+            await coordinator.cancel()
+            #expect(clock.pendingSleeps == 0)
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func controlledClockPreservesConvergenceDelaysAndCancellation() async {
+            let clock = TimelineRefreshTestClock()
+            let recorder = RefreshAttemptRecorder(failures: [
+                .pendingInventoryVisibility, .pendingInventoryVisibility, nil,
+            ])
+            let coordinator = TimelineUploadRefreshCoordinator(
+                policy: .init(schedule: .init(delays: [.zero, .seconds(5), .seconds(10)])),
+                clock: clock.dependency
+            )
+            await coordinator.request(
+                refresh: { attempt in await recorder.failure(at: attempt) },
+                observer: { attempt in await recorder.record(attempt) }
+            )
+            #expect(await clock.waitForSleepCount(1))
+            #expect(await recorder.attempts == [0])
+            #expect(clock.requestedSleeps == [.seconds(5)])
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(2))
+            #expect(await recorder.attempts == [0, 1])
+            #expect(clock.requestedSleeps == [.seconds(5), .seconds(10)])
+            await coordinator.cancel()
+            #expect(clock.pendingSleeps == 0)
+            clock.advance(by: .seconds(10))
+            #expect(await recorder.callCount == 2)
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func retriesOnlyPendingVisibilityWithSharedSchedule() async {
+            let recorder = RefreshAttemptRecorder(failures: [
+                .pendingInventoryVisibility, .pendingInventoryVisibility, nil,
+            ])
+            let coordinator = TimelineUploadRefreshCoordinator(
+                policy: .init(schedule: .init(delays: [.zero, .zero, .zero])))
+            await coordinator.request(
+                refresh: { attempt in await recorder.failure(at: attempt) },
+                observer: { attempt in await recorder.record(attempt) }
+            )
+            await recorder.waitForAttempts(3)
+            #expect(await recorder.attempts == [0, 1, 2])
+            #expect(await recorder.decisions == [.retry(after: .zero), .retry(after: .zero), .succeeded])
+            await coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func repeatedSignalsJoinOneDrainAndCauseOneFollowUp() async {
+            let recorder = RefreshAttemptRecorder(failures: [nil, nil])
+            let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
+            await coordinator.request(refresh: { attempt in
+                let result = await recorder.failure(at: attempt)
+                if await recorder.callCount == 1 {
+                    await coordinator.request(refresh: { next in await recorder.failure(at: next) })
+                }
+                return result
+            })
+            await recorder.waitForCalls(2)
+            #expect(await recorder.callCount == 2)
+            await coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func supersededCancelledResultRunsLatestRequestAndSkipsStaleObserver() async {
+            let firstRelease = AsyncGate()
+            let recorder = CoordinatorRaceRecorder()
+            let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
+
+            await coordinator.request(
+                refresh: { _ in
+                    await recorder.markFirstStarted()
+                    await firstRelease.wait()
+                    return .cancelled
+                },
+                observer: { _ in await recorder.recordOldObservation() }
+            )
+            await recorder.waitForFirstStart()
+            await coordinator.request(
+                refresh: { _ in
+                    await recorder.markSecondStarted()
+                    return nil
+                },
+                observer: { _ in await recorder.recordNewObservation() }
+            )
+            await firstRelease.open()
+            await recorder.waitForNewObservation()
+
+            #expect(await recorder.secondStarts == 1)
+            #expect(await recorder.oldObservations == 0)
+            #expect(await recorder.newObservations == 1)
+            await coordinator.cancel()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func cancelledWorkerCannotClearReplacementWorker() async {
+            let firstRelease = AsyncGate()
+            let secondRelease = AsyncGate()
+            let recorder = CoordinatorRaceRecorder()
+            let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
+
+            await coordinator.request(refresh: { _ in
                 await recorder.markFirstStarted()
                 while !Task.isCancelled { await Task.yield() }
                 await recorder.markFirstCancelled()
-                await release.wait()
-                return .cancelled
-            },
-            observer: { _ in await recorder.recordOldObservation() }
-        )
-        await recorder.waitForFirstStart()
-        let cancellation = Task {
-            await coordinator.cancel()
-            await completion.markComplete()
-        }
-        await recorder.waitForFirstCancellation()
-        #expect(await completion.isComplete == false)
-        await coordinator.flushAutomaticUploads()
-        await release.open()
-        await cancellation.value
-        #expect(await completion.isComplete)
-        #expect(await recorder.oldObservations == 0)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func cancellationKeepsCompletionAndFlushPendingUntilHeldRefreshReturns() async {
-        let release = AsyncGate()
-        let refreshAdmitted = AutomaticFlushCompletion()
-        let refreshFinished = AutomaticFlushCompletion()
-        let cancellationCompletion = AutomaticFlushCompletion()
-        let flushCompletion = AutomaticFlushCompletion()
-        let recorder = CoordinatorRaceRecorder()
-        let coordinator = TimelineUploadRefreshCoordinator()
-        let heldRefresh = Task<TimelineRefreshFailureReason?, Never> {
-            await release.wait()
-            return .cancelled
-        }
-        await coordinator.requestAutomaticUpload(
-            refresh: { _ in
-                await refreshAdmitted.markComplete()
-                let result = await heldRefresh.value
-                await refreshFinished.markComplete()
-                return result
-            },
-            observer: { _ in await recorder.recordOldObservation() }
-        )
-        let refreshWasAdmitted = await refreshAdmitted.waitUntilComplete()
-        #expect(refreshWasAdmitted)
-        let flush = Task {
-            await coordinator.flushAutomaticUploads()
-            await flushCompletion.markComplete()
-        }
-        let flushWasRegistered = await waitForAutomaticCoordinatorState(
-            coordinator, flushCount: 1, workerActive: true)
-        #expect(flushWasRegistered)
-        let cancellation = Task {
-            await coordinator.cancel()
-            await cancellationCompletion.markComplete()
-        }
-        let cancellationWasAdmitted = await waitForAutomaticCoordinatorState(
-            coordinator, flushCount: 0, workerActive: false)
-        #expect(cancellationWasAdmitted)
-
-        // These bounded observations run while the held refresh's release stays closed.
-        async let cancellationObservation = cancellationCompletion.completesWithinTheObservationWindow()
-        async let flushObservation = flushCompletion.completesWithinTheObservationWindow()
-        let (cancelReturnedWhileHeld, flushReturnedWhileHeld) = await (
-            cancellationObservation, flushObservation
-        )
-        #expect(cancelReturnedWhileHeld == false)
-        #expect(flushReturnedWhileHeld == false)
-
-        // Expectations continue through cleanup, including when cancellation returns too early.
-        await release.open()
-        _ = await heldRefresh.value
-        let refreshDidFinish = await refreshFinished.waitUntilComplete()
-        await cancellation.value
-        await flush.value
-        #expect(refreshDidFinish)
-        #expect(await cancellationCompletion.isComplete)
-        #expect(await flushCompletion.isComplete)
-        #expect(await recorder.oldObservations == 0)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func automaticSignalsDeferOnlyTheNewCycleToSixtySeconds() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let firstRelease = AsyncGate()
-        let timeline = UploadRefreshTimeline()
-        let coordinator = TimelineUploadRefreshCoordinator(clock: clock.dependency)
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(clock.now - origin)
-            await firstRelease.wait()
-            return nil
-        })
-        #expect(await timeline.waitForCount(1))
-        #expect(await timeline.times == [.zero])
-        clock.advance(by: .seconds(6))
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(clock.now - origin)
-            return nil
-        })
-        await firstRelease.open()
-        #expect(await timeline.waitForNewLoadOrSleep(after: 1, clock: clock))
-        let beforeDeadline = await timeline.times
-        #expect(beforeDeadline == [.zero], "A second automatic signal stays pending inside sixty seconds")
-        #expect(clock.requestedSleeps == [.seconds(54)])
-        clock.advance(by: .seconds(54))
-        #expect(await timeline.waitForCount(2))
-        let observedTimes = await timeline.times
-        #expect(observedTimes == [.zero, .seconds(60)])
-        await coordinator.flushAutomaticUploads()
-        #expect(await timeline.times.count == 2)
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func automaticFlushWithoutAutomaticWorkDoesNotJoinAHeldManualLoad() async {
-        let release = AsyncGate()
-        let timeline = UploadRefreshTimeline()
-        let completion = AutomaticFlushCompletion()
-        let coordinator = TimelineUploadRefreshCoordinator()
-        await coordinator.request(refresh: { _ in
-            await timeline.record(.zero)
-            await release.wait()
-            return nil
-        })
-        #expect(await timeline.waitForCount(1))
-        let flush = Task {
-            await coordinator.flushAutomaticUploads()
-            await completion.markComplete()
-        }
-        #expect(await completion.waitUntilComplete(), "An automatic-only flush must return while manual work is held")
-        #expect(await coordinator.testingAutomaticState().flushCount == 0)
-        #expect(await timeline.times.count == 1)
-        await release.open()
-        await coordinator.cancel()
-        await flush.value
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func aCancelledFlushingTaskStopsWaitingWhileTheAutomaticWorkContinues() async {
-        let release = AsyncGate()
-        let timeline = UploadRefreshTimeline()
-        let completion = AutomaticFlushCompletion()
-        let coordinator = TimelineUploadRefreshCoordinator()
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(.zero)
-            await release.wait()
-            return nil
-        })
-        #expect(await timeline.waitForCount(1))
-        let flush = Task {
-            await coordinator.flushAutomaticUploads()
-            await completion.markComplete()
-        }
-        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
-        flush.cancel()
-        // The flushing task stops waiting while the refresh is still held.
-        #expect(
-            await completion.waitUntilComplete(),
-            "A cancelled flushing task must not stay suspended until the automatic work ends")
-        let state = await coordinator.testingAutomaticState()
-        #expect(state.flushCount == 0)
-        #expect(state.workerActive, "The automatic work goes on after the flush was cancelled")
-        await release.open()
-        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 0, workerActive: false))
-        await flush.value
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func aFlushingTaskThatIsCancelledWhileCancelJoinsTheWorkerIsReleased() async {
-        let release = AsyncGate()
-        let admitted = AutomaticFlushCompletion()
-        let flushReturned = AutomaticFlushCompletion()
-        let cancelReturned = AutomaticFlushCompletion()
-        let coordinator = TimelineUploadRefreshCoordinator()
-        let heldRefresh = Task<TimelineRefreshFailureReason?, Never> {
-            await release.wait()
-            return nil
-        }
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await admitted.markComplete()
-            return await heldRefresh.value
-        })
-        #expect(await admitted.waitUntilComplete())
-        let flush = Task {
-            await coordinator.flushAutomaticUploads()
-            await flushReturned.markComplete()
-        }
-        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
-        // cancel() takes the waiter and joins the worker, which stays held.
-        let cancellation = Task {
-            await coordinator.cancel()
-            await cancelReturned.markComplete()
-        }
-        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 0, workerActive: false))
-        flush.cancel()
-        let flushReturnedWhileHeld = await flushReturned.waitUntilComplete()
-        #expect(
-            flushReturnedWhileHeld,
-            "A cancelled flushing task must be released although cancel() still joins the held refresh")
-        #expect(await cancelReturned.isComplete == false)
-
-        await release.open()
-        _ = await heldRefresh.value
-        await cancellation.value
-        await flush.value
-        #expect(await cancelReturned.isComplete)
-        #expect(await flushReturned.isComplete)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func anExplicitRequestWaitsForTheObserverOfTheAdmittedAutomaticLoad() async {
-        let release = AsyncGate()
-        let order = EventOrder()
-        let coordinator = TimelineUploadRefreshCoordinator()
-        let heldRefresh = Task<TimelineRefreshFailureReason?, Never> {
-            await release.wait()
-            return nil
-        }
-        await coordinator.requestAutomaticUpload(
-            refresh: { _ in
-                await order.add("automatic load")
-                return await heldRefresh.value
-            },
-            observer: { _ in await order.add("automatic observer") }
-        )
-        #expect(await order.waitForCount(1))
-        // The explicit request arrives while the automatic load is held, so it is chosen when the load returns.
-        await coordinator.request(refresh: { _ in
-            await order.add("explicit load")
-            return nil
-        })
-        await release.open()
-        #expect(await order.waitForCount(3))
-        #expect(
-            await order.events == ["automatic load", "automatic observer", "explicit load"],
-            "The explicit load runs after the observer of the admitted automatic load")
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func aFlushDuringAConvergenceRetryWaitKeepsTheRetryDelay() async {
-        let scenario = AutomaticUploadScenario()
-        let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility, nil])
-        await scenario.coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                await scenario.timeline.record(scenario.clock.now - scenario.origin)
-                return await recorder.failure(at: attempt)
-            },
-            observer: { await recorder.record($0) }
-        )
-        #expect(await scenario.clock.waitForSleepCount(1))
-        #expect(scenario.clock.requestedSleeps == [.milliseconds(350)])
-        let completion = AutomaticFlushCompletion()
-        let flush = Task {
-            await scenario.coordinator.flushAutomaticUploads()
-            await completion.markComplete()
-        }
-        #expect(await scenario.waitForFlushRegistration())
-        // The flush neither retries early nor wakes the delay. A woken delay would register its sleep again at once;
-        // this bounded observation runs while the clock stays where it is.
-        let delayWasRegisteredAgain = await clockRegistersSleeps(scenario.clock, count: 2)
-        #expect(delayWasRegisteredAgain == false, "The flush must not wake the pending convergence delay")
-        #expect(await scenario.timeline.times == [.zero])
-        #expect(await completion.isComplete == false)
-        scenario.clock.advance(by: .milliseconds(350))
-        #expect(await completion.waitUntilComplete())
-        #expect(await scenario.timeline.times == [.zero, .milliseconds(350)])
-        #expect(
-            scenario.clock.requestedSleeps == [.milliseconds(350)],
-            "The flush keeps the one pending delay: it does not wake it and register it again")
-        await flush.value
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func aNewerExplicitRequestReplacesAnOlderOneThatWaitsBehindAnAdmittedAutomaticRefresh() async {
-        let scenario = AutomaticUploadScenario()
-        let release = AsyncGate()
-        await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
-            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
-            await release.wait()
-            return nil
-        })
-        #expect(await scenario.timeline.waitForCount(1))
-        await scenario.coordinator.request(refresh: { _ in
-            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
-            return nil
-        })
-        await scenario.coordinator.request(refresh: { _ in
-            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 2)
-            return nil
-        })
-        await release.open()
-        #expect(await scenario.timeline.waitForCount(2))
-        #expect(await scenario.waitForWorkerRetirement())
-        #expect(
-            await scenario.timeline.contents == [0, 2],
-            "The explicit request that a newer one replaced never runs; the newer one runs after the admitted load")
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func aFlushForANewerRequestIsNotReleasedByTheCompletionOfAnOlderOne() async {
-        let scenario = AutomaticUploadScenario()
-        let releaseOlder = AsyncGate()
-        let releaseNewer = AsyncGate()
-        await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
-            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
-            await releaseOlder.wait()
-            return nil
-        })
-        #expect(await scenario.timeline.waitForCount(1))
-        scenario.clock.advance(by: .seconds(6))
-        await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
-            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
-            await releaseNewer.wait()
-            return nil
-        })
-        let completion = AutomaticFlushCompletion()
-        let flush = Task {
-            await scenario.coordinator.flushAutomaticUploads()
-            await completion.markComplete()
-        }
-        #expect(await scenario.waitForFlushRegistration())
-        // The flush targets the newer request. The older load completes first and must not release it.
-        await releaseOlder.open()
-        #expect(await scenario.timeline.waitForCount(2), "SETUP: the forced newer request runs after the older load")
-        // The older load completed before the newer one entered, so a wrong release has happened by now: it would
-        // have removed the flush waiter from the coordinator.
-        let flushStillRegistered = await scenario.coordinator.testingAutomaticState().flushCount == 1
-        #expect(flushStillRegistered, "The older completion must not release the newer target")
-        #expect(await completion.isComplete == false, "The older completion must not release the newer target")
-        await releaseNewer.open()
-        #expect(await completion.waitUntilComplete())
-        await flush.value
-        await scenario.coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func acceptedAutomaticFlushCompletesWithoutAddingARequest() async {
-        let release = AsyncGate()
-        let timeline = UploadRefreshTimeline()
-        let completion = AutomaticFlushCompletion()
-        let coordinator = TimelineUploadRefreshCoordinator()
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(.zero)
-            await release.wait()
-            return nil
-        })
-        #expect(await timeline.waitForCount(1))
-        let flush = Task {
-            await coordinator.flushAutomaticUploads()
-            await completion.markComplete()
-        }
-        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
-        await release.open()
-        await flush.value
-        #expect(await completion.isComplete)
-        #expect(await timeline.times == [.zero])
-        await coordinator.flushAutomaticUploads()
-        #expect(await timeline.times == [.zero], "Repeated end calls must not manufacture another request")
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func explicitUploadRequestKeepsImmediateFollowUp() async {
-        let clock = TimelineRefreshTestClock()
-        let origin = clock.now
-        let firstRelease = AsyncGate()
-        let timeline = UploadRefreshTimeline()
-        let coordinator = TimelineUploadRefreshCoordinator(clock: clock.dependency)
-        await coordinator.request(refresh: { _ in
-            await timeline.record(clock.now - origin)
-            await firstRelease.wait()
-            return nil
-        })
-        #expect(await timeline.waitForCount(1))
-        #expect(await timeline.times == [.zero])
-
-        clock.advance(by: .seconds(6))
-        await coordinator.request(refresh: { _ in
-            await timeline.record(clock.now - origin)
-            return nil
-        })
-        await firstRelease.open()
-        // Both versions reach a positive boundary: an actual second load or the controlled interval wait.
-        let timeout = ContinuousClock.now + .seconds(5)
-        while await timeline.times.count < 2, clock.pendingSleeps == 0, ContinuousClock.now < timeout {
-            await Task.yield()
-        }
-        #expect(await timeline.waitForCount(2))
-        #expect(await timeline.times == [.zero, .seconds(6)], "Explicit requests retain an immediate fresh follow-up")
-        #expect(clock.requestedSleeps.isEmpty)
-        await coordinator.cancel()
-        #expect(clock.pendingSleeps == 0)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func controlledClockPreservesConvergenceDelaysAndCancellation() async {
-        let clock = TimelineRefreshTestClock()
-        let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility, .pendingInventoryVisibility, nil])
-        let coordinator = TimelineUploadRefreshCoordinator(
-            policy: .init(schedule: .init(delays: [.zero, .seconds(5), .seconds(10)])),
-            clock: clock.dependency
-        )
-        await coordinator.request(
-            refresh: { attempt in await recorder.failure(at: attempt) },
-            observer: { attempt in await recorder.record(attempt) }
-        )
-        #expect(await clock.waitForSleepCount(1))
-        #expect(await recorder.attempts == [0])
-        #expect(clock.requestedSleeps == [.seconds(5)])
-        clock.advance(by: .seconds(5))
-        #expect(await clock.waitForSleepCount(2))
-        #expect(await recorder.attempts == [0, 1])
-        #expect(clock.requestedSleeps == [.seconds(5), .seconds(10)])
-        await coordinator.cancel()
-        #expect(clock.pendingSleeps == 0)
-        clock.advance(by: .seconds(10))
-        #expect(await recorder.callCount == 2)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func retriesOnlyPendingVisibilityWithSharedSchedule() async {
-        let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility, .pendingInventoryVisibility, nil])
-        let coordinator = TimelineUploadRefreshCoordinator(
-            policy: .init(schedule: .init(delays: [.zero, .zero, .zero])))
-        await coordinator.request(
-            refresh: { attempt in await recorder.failure(at: attempt) },
-            observer: { attempt in await recorder.record(attempt) }
-        )
-        await recorder.waitForAttempts(3)
-        #expect(await recorder.attempts == [0, 1, 2])
-        #expect(await recorder.decisions == [.retry(after: .zero), .retry(after: .zero), .succeeded])
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func repeatedSignalsJoinOneDrainAndCauseOneFollowUp() async {
-        let recorder = RefreshAttemptRecorder(failures: [nil, nil])
-        let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
-        await coordinator.request(refresh: { attempt in
-            let result = await recorder.failure(at: attempt)
-            if await recorder.callCount == 1 {
-                await coordinator.request(refresh: { next in await recorder.failure(at: next) })
-            }
-            return result
-        })
-        await recorder.waitForCalls(2)
-        #expect(await recorder.callCount == 2)
-        await coordinator.cancel()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func supersededCancelledResultRunsLatestRequestAndSkipsStaleObserver() async {
-        let firstRelease = AsyncGate()
-        let recorder = CoordinatorRaceRecorder()
-        let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
-
-        await coordinator.request(
-            refresh: { _ in
-                await recorder.markFirstStarted()
                 await firstRelease.wait()
                 return .cancelled
-            },
-            observer: { _ in await recorder.recordOldObservation() }
-        )
-        await recorder.waitForFirstStart()
-        await coordinator.request(
-            refresh: { _ in
+            })
+            await recorder.waitForFirstStart()
+            let cancellation = Task { await coordinator.cancel() }
+            await recorder.waitForFirstCancellation()
+
+            await coordinator.request(refresh: { _ in
                 await recorder.markSecondStarted()
+                await secondRelease.wait()
                 return nil
-            },
-            observer: { _ in await recorder.recordNewObservation() }
-        )
-        await firstRelease.open()
-        await recorder.waitForNewObservation()
+            })
+            await recorder.waitForSecondStart()
+            await firstRelease.open()
+            await cancellation.value
 
-        #expect(await recorder.secondStarts == 1)
-        #expect(await recorder.oldObservations == 0)
-        #expect(await recorder.newObservations == 1)
-        await coordinator.cancel()
+            await coordinator.request(refresh: { _ in
+                await recorder.markThirdStarted()
+                return nil
+            })
+            try? await Task.sleep(for: .milliseconds(20))
+            #expect(await recorder.thirdStarts == 0)
+
+            await secondRelease.open()
+            await recorder.waitForThirdStart()
+            #expect(await recorder.thirdStarts == 1)
+            await coordinator.cancel()
+        }
     }
-
-    @Test(.timeLimit(.minutes(1)))
-    func cancelledWorkerCannotClearReplacementWorker() async {
-        let firstRelease = AsyncGate()
-        let secondRelease = AsyncGate()
-        let recorder = CoordinatorRaceRecorder()
-        let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
-
-        await coordinator.request(refresh: { _ in
-            await recorder.markFirstStarted()
-            while !Task.isCancelled { await Task.yield() }
-            await recorder.markFirstCancelled()
-            await firstRelease.wait()
-            return .cancelled
-        })
-        await recorder.waitForFirstStart()
-        let cancellation = Task { await coordinator.cancel() }
-        await recorder.waitForFirstCancellation()
-
-        await coordinator.request(refresh: { _ in
-            await recorder.markSecondStarted()
-            await secondRelease.wait()
-            return nil
-        })
-        await recorder.waitForSecondStart()
-        await firstRelease.open()
-        await cancellation.value
-
-        await coordinator.request(refresh: { _ in
-            await recorder.markThirdStarted()
-            return nil
-        })
-        try? await Task.sleep(for: .milliseconds(20))
-        #expect(await recorder.thirdStarts == 0)
-
-        await secondRelease.open()
-        await recorder.waitForThirdStart()
-        #expect(await recorder.thirdStarts == 1)
-        await coordinator.cancel()
-    }
-}
+#endif
 
 private actor RefreshAttemptRecorder {
     private let failures: [TimelineRefreshFailureReason?]
@@ -1145,11 +1470,40 @@ private actor CoordinatorRaceRecorder {
 private actor UploadRefreshTimeline {
     private(set) var times: [Duration] = []
     private(set) var contents: [Int] = []
+    /// One note per observer call, so a load that is still running is `times.count > terminalObservations`.
+    private(set) var terminalObservations = 0
 
     func record(_ time: Duration, content: Int? = nil) {
         times.append(time)
         if let content { contents.append(content) }
     }
+
+    func noteTerminalObservation() { terminalObservations += 1 }
+
+    /// True when the coordinator holds no load in flight and either waits for its interval or has retired its worker.
+    /// A signal submitted in this state cannot be superseded by a load that is already running, so the test sees the
+    /// same cadence on every run.
+    #if DEBUG
+        func isQuiescent(clock: TimelineRefreshTestClock, coordinator: TimelineUploadRefreshCoordinator) async -> Bool {
+            guard times.count == terminalObservations else { return false }
+            if clock.pendingSleeps > 0 { return true }
+            return await !coordinator.testingAutomaticState().workerActive
+        }
+    #endif
+
+    #if DEBUG
+        func waitForQuiescence(
+            clock: TimelineRefreshTestClock,
+            coordinator: TimelineUploadRefreshCoordinator
+        ) async -> Bool {
+            let timeout = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < timeout {
+                if await isQuiescent(clock: clock, coordinator: coordinator) { return true }
+                await Task.yield()
+            }
+            return false
+        }
+    #endif
 
     func waitForNewLoadOrSleep(after count: Int, clock: TimelineRefreshTestClock) async -> Bool {
         let timeout = ContinuousClock.now + .seconds(5)
@@ -1196,86 +1550,131 @@ private func clockRegistersSleeps(_ clock: TimelineRefreshTestClock, count: Int)
     return clock.requestedSleeps.count >= count
 }
 
-private func waitForAutomaticCoordinatorState(
-    _ coordinator: TimelineUploadRefreshCoordinator,
-    flushCount: Int,
-    workerActive: Bool
-) async -> Bool {
-    let deadline = ContinuousClock.now + .seconds(5)
-    repeat {
-        let state = await coordinator.testingAutomaticState()
-        if state.flushCount == flushCount, state.workerActive == workerActive { return true }
-        await Task.yield()
-    } while ContinuousClock.now < deadline
-    return false
-}
-
-private struct AutomaticUploadScenario: Sendable {
-    let clock: TimelineRefreshTestClock
-    let origin: ContinuousClock.Instant
-    let timeline = UploadRefreshTimeline()
-    let coordinator: TimelineUploadRefreshCoordinator
-
-    init() {
-        let clock = TimelineRefreshTestClock()
-        self.clock = clock
-        origin = clock.now
-        coordinator = TimelineUploadRefreshCoordinator(clock: clock.dependency)
-    }
-
-    func startTwoSignals(secondRelease: AsyncGate? = nil) async {
-        let firstRelease = AsyncGate()
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(clock.now - origin, content: 0)
-            await firstRelease.wait()
-            return nil
-        })
-        #expect(await timeline.waitForCount(1))
-        clock.advance(by: .seconds(6))
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(clock.now - origin, content: 1)
-            await secondRelease?.wait()
-            return nil
-        })
-        await firstRelease.open()
-        #expect(await timeline.waitForNewLoadOrSleep(after: 1, clock: clock))
-    }
-
-    func waitForFlushRegistration(_ count: Int = 1) async -> Bool {
-        let timeout = ContinuousClock.now + .seconds(5)
-        while await coordinator.testingAutomaticState().flushCount < count, ContinuousClock.now < timeout {
+#if DEBUG
+    private func waitForAutomaticCoordinatorState(
+        _ coordinator: TimelineUploadRefreshCoordinator,
+        flushCount: Int,
+        workerActive: Bool
+    ) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(5)
+        repeat {
+            let state = await coordinator.testingAutomaticState()
+            if state.flushCount == flushCount, state.workerActive == workerActive { return true }
             await Task.yield()
-        }
-        return await coordinator.testingAutomaticState().flushCount >= count
+        } while ContinuousClock.now < deadline
+        return false
     }
+#endif
 
-    func waitForWorkerRetirement() async -> Bool {
-        let timeout = ContinuousClock.now + .seconds(5)
-        while await coordinator.testingAutomaticState().workerActive, ContinuousClock.now < timeout {
-            await Task.yield()
-        }
-        return await coordinator.testingAutomaticState().workerActive == false
-    }
+#if DEBUG
+    private struct AutomaticUploadScenario: Sendable {
+        let clock: TimelineRefreshTestClock
+        let origin: ContinuousClock.Instant
+        let timeline = UploadRefreshTimeline()
+        let coordinator: TimelineUploadRefreshCoordinator
 
-    func requestSignal(_ content: Int) async {
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(clock.now - origin, content: content)
-            return nil
-        })
-    }
-
-    func flush() async -> Bool {
-        let completion = AutomaticFlushCompletion()
-        let task = Task {
-            await coordinator.flushAutomaticUploads()
-            await completion.markComplete()
+        init(policy: TimelineRefreshConvergencePolicy = .init()) {
+            let clock = TimelineRefreshTestClock()
+            self.clock = clock
+            origin = clock.now
+            coordinator = TimelineUploadRefreshCoordinator(policy: policy, clock: clock.dependency)
         }
-        let completed = await completion.waitUntilComplete()
-        if !completed { await coordinator.cancel() }
-        await task.value
-        return completed
+
+        func startTwoSignals(secondRelease: AsyncGate? = nil) async {
+            let firstRelease = AsyncGate()
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await timeline.record(clock.now - origin, content: 0)
+                await firstRelease.wait()
+                return nil
+            })
+            #expect(await timeline.waitForCount(1))
+            clock.advance(by: .seconds(6))
+            await coordinator.requestAutomaticUpload(refresh: { _ in
+                await timeline.record(clock.now - origin, content: 1)
+                await secondRelease?.wait()
+                return nil
+            })
+            await firstRelease.open()
+            #expect(await timeline.waitForNewLoadOrSleep(after: 1, clock: clock))
+        }
+
+        #if DEBUG
+            func waitForFlushRegistration(_ count: Int = 1) async -> Bool {
+                let timeout = ContinuousClock.now + .seconds(5)
+                while await coordinator.testingAutomaticState().flushCount < count, ContinuousClock.now < timeout {
+                    await Task.yield()
+                }
+                return await coordinator.testingAutomaticState().flushCount >= count
+            }
+        #endif
+
+        #if DEBUG
+            func waitForWorkerRetirement() async -> Bool {
+                let timeout = ContinuousClock.now + .seconds(5)
+                while await coordinator.testingAutomaticState().workerActive, ContinuousClock.now < timeout {
+                    await Task.yield()
+                }
+                return await coordinator.testingAutomaticState().workerActive == false
+            }
+        #endif
+
+        /// Submits the signal and returns when the coordinator has accepted it.
+        #if DEBUG
+            func submitBackupSignal(_ content: Int, passIsRunning: Bool) async {
+                coordinator.submitBackupUpload(
+                    passIsRunning: passIsRunning,
+                    refresh: { _ in
+                        await timeline.record(clock.now - origin, content: content)
+                        return nil
+                    })
+                await coordinator.testingDrainSubmissions()
+            }
+        #endif
+
+        /// True when no load beyond `count` starts within the negative observation window.
+        func settlesWithoutAnotherLoad(after count: Int) async -> Bool {
+            let end = ContinuousClock.now + negativeObservationWindow
+            while await timeline.times.count <= count, ContinuousClock.now < end { await Task.yield() }
+            return await timeline.times.count == count
+        }
+
+        func requestSignal(_ content: Int) async {
+            await requestSignal(content, unchanged: false)
+        }
+
+        /// `unchanged` marks a load that succeeded without new content, so the coordinator may skip the next interval tick.
+        func requestSignal(_ content: Int, unchanged: Bool) async {
+            await coordinator.requestAutomaticUpload(
+                refresh: { [unchanged] _ in
+                    await timeline.record(clock.now - origin, content: content)
+                    return unchanged ? .unchanged : nil
+                },
+                observer: { _ in await timeline.noteTerminalObservation() }
+            )
+        }
+
+        /// True when the scenario can take another signal without meeting a load that is already running.
+        func isQuiescent() async -> Bool {
+            await timeline.isQuiescent(clock: clock, coordinator: coordinator)
+        }
+
+        func waitForQuiescence() async -> Bool {
+            await timeline.waitForQuiescence(clock: clock, coordinator: coordinator)
+        }
+
+        func flush() async -> Bool {
+            let completion = AutomaticFlushCompletion()
+            let task = Task {
+                await coordinator.flushAutomaticUploads()
+                await completion.markComplete()
+            }
+            let completed = await completion.waitUntilComplete()
+            if !completed { await coordinator.cancel() }
+            await task.value
+            return completed
+        }
     }
-}
+#endif
 
 private struct ExpectedRefreshClockFailure: Error {}
 
@@ -1288,367 +1687,377 @@ private actor ClockWaitSequence {
     }
 }
 
-extension TimelineUploadRefreshCoordinatorTests {
-    @Test(.timeLimit(.minutes(1)))
-    func f1ExplicitStartsAfterHeldAutomaticRefreshBeforeRetryDelay() async {
-        let h = F1F2Harness()
-        let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
-        let release = AsyncGate()
-        let held = Task { await release.wait() }
-        await coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                h.begin("auto.enter", attempt: attempt)
-                if attempt == 0 { await held.value }
-                h.end()
-                return attempt == 0 ? .pendingInventoryVisibility : nil
-            },
-            observer: { value in h.observe("auto.observe", value: value) }
-        )
-        #expect(await h.log.waitFor("auto.enter"), "SETUP: automatic refresh entered")
-        h.clock.advance(by: .seconds(6))
-        await coordinator.request(refresh: { attempt in
-            h.begin("manual.enter", attempt: attempt)
-            h.end()
-            return nil
-        })
-        let boundary = h.log.count
-        await release.open()
-        let action = await h.log.waitForScheduling(after: boundary)
-        #expect(action != nil, "SETUP: an actual scheduling event followed refresh completion")
-        #expect(action?.name == "manual.enter", "F1A: explicit entry precedes automatic retry registration")
-        if action?.name == "manual.enter" {
-            #expect(action?.time == Duration.seconds(6))
-            #expect(await h.log.waitFor("auto.observe"), "SETUP: suspended actual result resumes")
-            #expect(await h.clock.waitForSleepCount(1), "SETUP: original retry delay registers")
-            #expect(h.clock.requestedSleeps == [.milliseconds(350)])
-        }
-        await release.open()
-        await held.value
-        await coordinator.cancel()
-        #expect(h.log.maximumActiveLoads == 1)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func f1ExplicitWakesRegisteredAutomaticRetryAndJoinsItsWait() async {
-        let h = F1F2Harness()
-        let releaseWaitReturn = AsyncGate()
-        let heldWaitReturn = Task { await releaseWaitReturn.wait() }
-        let dependency = TimelineRefreshClock(
-            now: { h.clock.now },
-            sleep: { duration in
-                do { try await h.dependency.sleep(duration) } catch {
-                    h.log.record("cancelled.wait.held", time: h.time)
-                    await heldWaitReturn.value
-                    throw error
-                }
-            },
-            sleepUntil: { deadline in
-                do { try await h.dependency.sleepUntil(deadline) } catch {
-                    h.log.record("cancelled.wait.held", time: h.time)
-                    await heldWaitReturn.value
-                    throw error
-                }
-            }
-        )
-        let coordinator = TimelineUploadRefreshCoordinator(clock: dependency)
-        await coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                h.begin("auto.enter", attempt: attempt)
-                h.end()
-                return attempt == 0 ? .pendingInventoryVisibility : nil
-            },
-            observer: { value in h.observe("auto.observe", value: value) }
-        )
-        #expect(await h.clock.waitForSleepCount(1), "SETUP: automatic retry is registered")
-        #expect(h.clock.requestedSleeps == [.milliseconds(350)])
-        h.clock.advance(by: .milliseconds(100))
-        await coordinator.request(refresh: { attempt in
-            h.begin("manual.enter", attempt: attempt)
-            h.end()
-            return nil
-        })
-        // The cancelled wait itself stays noncooperatively held. No manual load may overlap it.
-        #expect(await h.log.waitFor("cancelled.wait.held"), "SETUP: the explicit request cancelled the retry wait")
-        let explicitEnteredWhileWaitWasHeld = await h.log.appearsWithinTheObservationWindow("manual.enter")
-        #expect(explicitEnteredWhileWaitWasHeld == false)
-        await releaseWaitReturn.open()
-        // Virtual time still stays below350ms. This finite entry observation is the F1 behavior.
-        let explicitEnteredAfterWaitRelease = await h.log.waitFor("manual.enter")
-        #expect(explicitEnteredAfterWaitRelease == true, "F1B: explicit work wakes and joins the owned retry wait")
-        if explicitEnteredAfterWaitRelease {
-            #expect(h.log.events.filter { $0.name == "cancelled.wait.held" }.count == 1)
-            let events = h.log.events
-            let manual = events.firstIndex { $0.name == "manual.enter" }
-            let waitExit = events.firstIndex { $0.name == "wait.exit" }
-            #expect(waitExit != nil && manual != nil && waitExit! < manual!)
-            #expect(events.first { $0.name == "manual.enter" }?.time == Duration.milliseconds(100))
-            #expect(await h.clock.waitForSleepCount(2), "SETUP: suspended original deadline is registered again")
-            h.clock.advance(by: .milliseconds(250))
-            #expect(await h.log.waitFor("auto.enter", count: 2), "SETUP: same admitted cycle resumed")
-            #expect(h.log.events.filter { $0.name == "auto.enter" }.map(\.time) == [.zero, .milliseconds(350)])
-            #expect(h.log.events.filter { $0.name == "auto.enter" }.map(\.attempt) == [0, 1])
-        }
-        await releaseWaitReturn.open()
-        await heldWaitReturn.value
-        await coordinator.cancel()
-        #expect(h.log.maximumActiveLoads == 1)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func f2AdmittedFeedbackKeepsItsPairAndLatestPairRunsNextRetry() async {
-        let h = F1F2Harness()
-        let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
-        let release = AsyncGate()
-        let held = Task { await release.wait() }
-        await coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                h.begin("auto.enter", attempt: attempt, content: 0)
-                if attempt == 0 { await held.value }
-                h.end()
-                return attempt == 0 ? .pendingInventoryVisibility : nil
-            },
-            observer: { value in h.observe("a.observe", value: value, content: 0) }
-        )
-        #expect(await h.log.waitFor("auto.enter"), "SETUP: A entered")
-        h.clock.advance(by: .seconds(6))
-        await coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                h.begin("auto.enter", attempt: attempt, content: 1)
-                h.end()
-                return nil
-            },
-            observer: { value in h.observe("b.observe", value: value, content: 1) }
-        )
-        let boundary = h.log.count
-        await release.open()
-        let action = await h.log.waitForScheduling(after: boundary)
-        #expect(action != nil, "SETUP: actual retry or interval registration")
-        let admittedFeedbackCount = h.log.events.filter { $0.name == "a.observe" }.count
-        #expect(admittedFeedbackCount == 1, "F2A: admitted A reports its own actual result")
-        #expect(
-            action?.delay == Duration.milliseconds(350),
-            "F2A: latest pair continues admitted cycle, not a new 60-second cycle")
-        if action?.delay == Duration.milliseconds(350) {
-            #expect(await h.clock.waitForSleepCount(1), "SETUP: retry registered before advance")
-            h.clock.advance(by: .milliseconds(350))
-            #expect(await h.log.waitFor("b.observe"), "SETUP: actual B attempt completed")
-            let loads = h.log.events.filter { $0.name == "auto.enter" }
-            #expect(loads.map(\.content) == [0, 1])
-            #expect(loads.map(\.attempt) == [0, 1])
-            #expect(loads.map(\.time) == [.zero, .seconds(6) + .milliseconds(350)])
-            #expect(
-                h.log.events.filter { $0.name == "a.observe" }.map(\.decision) == [.retry(after: .milliseconds(350))])
-            #expect(h.log.events.filter { $0.name == "b.observe" }.map(\.decision) == [.succeeded])
-        }
-        await release.open()
-        await held.value
-        await coordinator.cancel()
-        #expect(h.log.maximumActiveLoads == 1)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func f2ContinuingSupersessionKeepsFeedbackAndTheOriginalAttemptBudget() async {
-        let h = F1F2Harness()
-        let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
-        let gates = (0..<8).map { _ in AsyncGate() }
-        let held = gates.map { gate in Task { await gate.wait() } }
-        let delays = TimelineRefreshRetrySchedule.uploadDefault.delays
-        func submit(_ content: Int) async {
+#if DEBUG
+    extension TimelineUploadRefreshCoordinatorTests {
+        @Test(.timeLimit(.minutes(1)))
+        func f1ExplicitStartsAfterHeldAutomaticRefreshBeforeRetryDelay() async {
+            let h = F1F2Harness()
+            let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
+            let release = AsyncGate()
+            let held = Task { await release.wait() }
             await coordinator.requestAutomaticUpload(
                 refresh: { attempt in
-                    h.begin("auto.enter", attempt: attempt, content: content)
-                    if content < 8, held.indices.contains(attempt) { await held[attempt].value }
+                    h.begin("auto.enter", attempt: attempt)
+                    if attempt == 0 { await held.value }
                     h.end()
-                    return content < 8 ? .pendingInventoryVisibility : nil
+                    return attempt == 0 ? .pendingInventoryVisibility : nil
                 },
-                observer: { value in h.observe("auto.observe", value: value, content: content) }
+                observer: { value in h.observe("auto.observe", value: value) }
             )
-        }
-        await submit(0)
-        #expect(await h.log.waitFor("auto.enter"), "SETUP: first admitted load entered")
-        for attempt in 0..<8 {
-            await submit(attempt + 1)
+            #expect(await h.log.waitFor("auto.enter"), "SETUP: automatic refresh entered")
+            h.clock.advance(by: .seconds(6))
+            await coordinator.request(refresh: { attempt in
+                h.begin("manual.enter", attempt: attempt)
+                h.end()
+                return nil
+            })
             let boundary = h.log.count
-            await gates[attempt].open()
-            if attempt < 7 {
-                let action = await h.log.waitForScheduling(after: boundary)
-                #expect(action != nil, "SETUP: actual automatic wait registration")
-                let pairedFeedbackCount = h.log.events.filter {
-                    $0.name == "auto.observe" && $0.attempt == attempt && $0.content == attempt
-                }.count
-                #expect(pairedFeedbackCount == 1, "F2B: continuing signals do not suppress admitted feedback")
-                #expect(
-                    action?.delay == delays[attempt + 1], "F2B: signals cannot reset convergence into a new admission")
-                if action?.delay != delays[attempt + 1] {
-                    for gate in gates { await gate.open() }
-                    for task in held { await task.value }
-                    await coordinator.cancel()
-                    #expect(h.log.maximumActiveLoads == 1)
-                    return
+            await release.open()
+            let action = await h.log.waitForScheduling(after: boundary)
+            #expect(action != nil, "SETUP: an actual scheduling event followed refresh completion")
+            #expect(action?.name == "manual.enter", "F1A: explicit entry precedes automatic retry registration")
+            if action?.name == "manual.enter" {
+                #expect(action?.time == Duration.seconds(6))
+                #expect(await h.log.waitFor("auto.observe"), "SETUP: suspended actual result resumes")
+                #expect(await h.clock.waitForSleepCount(1), "SETUP: original retry delay registers")
+                #expect(h.clock.requestedSleeps == [.milliseconds(350)])
+            }
+            await release.open()
+            await held.value
+            await coordinator.cancel()
+            #expect(h.log.maximumActiveLoads == 1)
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func f1ExplicitWakesRegisteredAutomaticRetryAndJoinsItsWait() async {
+            let h = F1F2Harness()
+            let releaseWaitReturn = AsyncGate()
+            let heldWaitReturn = Task { await releaseWaitReturn.wait() }
+            let dependency = TimelineRefreshClock(
+                now: { h.clock.now },
+                sleep: { duration in
+                    do { try await h.dependency.sleep(duration) } catch {
+                        h.log.record("cancelled.wait.held", time: h.time)
+                        await heldWaitReturn.value
+                        throw error
+                    }
+                },
+                sleepUntil: { deadline in
+                    do { try await h.dependency.sleepUntil(deadline) } catch {
+                        h.log.record("cancelled.wait.held", time: h.time)
+                        await heldWaitReturn.value
+                        throw error
+                    }
                 }
-                #expect(await h.clock.waitForSleepCount(attempt + 1), "SETUP: controlled retry registered")
-                h.clock.advance(by: delays[attempt + 1])
-                #expect(await h.log.waitFor("auto.enter", count: attempt + 2), "SETUP: next attempt entered")
+            )
+            let coordinator = TimelineUploadRefreshCoordinator(clock: dependency)
+            await coordinator.requestAutomaticUpload(
+                refresh: { attempt in
+                    h.begin("auto.enter", attempt: attempt)
+                    h.end()
+                    return attempt == 0 ? .pendingInventoryVisibility : nil
+                },
+                observer: { value in h.observe("auto.observe", value: value) }
+            )
+            #expect(await h.clock.waitForSleepCount(1), "SETUP: automatic retry is registered")
+            #expect(h.clock.requestedSleeps == [.milliseconds(350)])
+            h.clock.advance(by: .milliseconds(100))
+            await coordinator.request(refresh: { attempt in
+                h.begin("manual.enter", attempt: attempt)
+                h.end()
+                return nil
+            })
+            // The cancelled wait itself stays noncooperatively held. No manual load may overlap it.
+            #expect(await h.log.waitFor("cancelled.wait.held"), "SETUP: the explicit request cancelled the retry wait")
+            let explicitEnteredWhileWaitWasHeld = await h.log.appearsWithinTheObservationWindow("manual.enter")
+            #expect(explicitEnteredWhileWaitWasHeld == false)
+            await releaseWaitReturn.open()
+            // Virtual time still stays below350ms. This finite entry observation is the F1 behavior.
+            let explicitEnteredAfterWaitRelease = await h.log.waitFor("manual.enter")
+            #expect(explicitEnteredAfterWaitRelease == true, "F1B: explicit work wakes and joins the owned retry wait")
+            if explicitEnteredAfterWaitRelease {
+                #expect(h.log.events.filter { $0.name == "cancelled.wait.held" }.count == 1)
+                let events = h.log.events
+                let manual = events.firstIndex { $0.name == "manual.enter" }
+                let waitExit = events.firstIndex { $0.name == "wait.exit" }
+                #expect(waitExit != nil && manual != nil && waitExit! < manual!)
+                #expect(events.first { $0.name == "manual.enter" }?.time == Duration.milliseconds(100))
+                #expect(await h.clock.waitForSleepCount(2), "SETUP: suspended original deadline is registered again")
+                h.clock.advance(by: .milliseconds(250))
+                #expect(await h.log.waitFor("auto.enter", count: 2), "SETUP: same admitted cycle resumed")
+                #expect(h.log.events.filter { $0.name == "auto.enter" }.map(\.time) == [.zero, .milliseconds(350)])
+                #expect(h.log.events.filter { $0.name == "auto.enter" }.map(\.attempt) == [0, 1])
             }
+            await releaseWaitReturn.open()
+            await heldWaitReturn.value
+            await coordinator.cancel()
+            #expect(h.log.maximumActiveLoads == 1)
         }
-        #expect(await h.log.waitFor("auto.observe", count: 8), "SETUP: terminal feedback completed")
-        let loads = h.log.events.filter { $0.name == "auto.enter" }
-        #expect(loads.map(\.attempt) == Array(0..<8))
-        #expect(loads.map(\.content) == Array(0..<8))
-        #expect(
-            loads.map(\.time) == [
-                .zero, .milliseconds(350), .seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(16),
-                .seconds(30),
-            ])
-        #expect(h.log.events.filter { $0.name == "auto.observe" }.last?.decision == .notYetVisible)
-        #expect(
-            await h.clock.waitForSleepCount(8), "SETUP: unattempted latest generation waits for the original boundary")
-        #expect(h.clock.requestedSleeps.last == Duration.seconds(30))
-        let completion = AutomaticFlushCompletion()
-        let flush = Task {
-            await coordinator.flushAutomaticUploads()
-            await completion.markComplete()
-        }
-        let flushed = await completion.waitUntilComplete()
-        #expect(flushed, "SETUP: forced latest actual generation completed")
-        for gate in gates { await gate.open() }
-        for task in held { await task.value }
-        await coordinator.cancel()
-        await flush.value
-        let finalLoads = h.log.events.filter { $0.name == "auto.enter" }
-        #expect(finalLoads.count == 9)
-        #expect(finalLoads.last?.content == 8)
-        #expect(finalLoads.last?.attempt == 0)
-        #expect(finalLoads.last?.time == Duration.seconds(30))
-        #expect(h.log.maximumActiveLoads == 1)
-    }
 
-    @Test(.timeLimit(.minutes(1)))
-    func f2OlderSuccessDoesNotAcknowledgeTheNewerFlushTarget() async {
-        let h = F1F2Harness()
-        let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
-        let releaseA = AsyncGate()
-        let releaseB = AsyncGate()
-        let heldA = Task { await releaseA.wait() }
-        let heldB = Task { await releaseB.wait() }
-        await coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                h.begin("auto.enter", attempt: attempt, content: 0)
-                await heldA.value
-                h.end()
-                return nil
-            },
-            observer: { value in h.observe("a.observe", value: value, content: 0) }
-        )
-        #expect(await h.log.waitFor("auto.enter"), "SETUP: A entered")
-        h.clock.advance(by: .seconds(6))
-        await coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                h.begin("auto.enter", attempt: attempt, content: 1)
-                await heldB.value
-                h.end()
-                return nil
-            },
-            observer: { value in h.observe("b.observe", value: value, content: 1) }
-        )
-        let boundary = h.log.count
-        await releaseA.open()
-        let action = await h.log.waitForScheduling(after: boundary)
-        #expect(action != nil, "SETUP: pending B reaches the interval boundary")
-        #expect(
-            h.log.events.filter { $0.name == "a.observe" }.count == 1,
-            "F2C: A reports its actual success without serving B")
-        #expect(action?.delay == Duration.seconds(54))
-        #expect(await h.clock.waitForSleepCount(1), "SETUP: pending B interval registered")
-        let completion = AutomaticFlushCompletion()
-        let flush = Task {
-            await coordinator.flushAutomaticUploads()
-            await completion.markComplete()
-        }
-        #expect(await h.log.waitFor("auto.enter", count: 2), "SETUP: forced B entered")
-        #expect(
-            await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true),
-            "SETUP: target B waiter registered")
-        // The held B load cannot be acknowledged by A's completed success.
-        // A's completion came before B entered, so a wrong release of the flush has happened by now: it would have
-        // removed the waiter, and the registration check above would have failed.
-        let flushReturnedWhileBWasHeld = await completion.isComplete
-        #expect(flushReturnedWhileBWasHeld == false)
-        #expect(await coordinator.testingAutomaticState().flushCount == 1, "A's success must not release target B")
-        await releaseB.open()
-        #expect(await completion.waitUntilComplete(), "SETUP: B completion released its own waiter")
-        await releaseA.open()
-        await heldA.value
-        await heldB.value
-        await coordinator.cancel()
-        await flush.value
-        #expect(h.log.events.filter { $0.name == "auto.enter" }.map(\.content) == [0, 1])
-        #expect(h.log.events.filter { $0.name == "b.observe" }.map(\.decision) == [.succeeded])
-        #expect(h.log.maximumActiveLoads == 1)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func f1AlreadyAdmittedAutomaticObserverJoinsBeforeExplicitLoad() async {
-        let h = F1F2Harness()
-        let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
-        let release = AsyncGate()
-        let heldObserver = Task { await release.wait() }
-        await coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                h.begin("auto.enter", attempt: attempt)
-                h.end()
-                return nil
-            },
-            observer: { value in
-                h.observe("auto.observe", value: value)
-                await heldObserver.value
+        @Test(.timeLimit(.minutes(1)))
+        func f2AdmittedFeedbackKeepsItsPairAndLatestPairRunsNextRetry() async {
+            let h = F1F2Harness()
+            let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
+            let release = AsyncGate()
+            let held = Task { await release.wait() }
+            await coordinator.requestAutomaticUpload(
+                refresh: { attempt in
+                    h.begin("auto.enter", attempt: attempt, content: 0)
+                    if attempt == 0 { await held.value }
+                    h.end()
+                    return attempt == 0 ? .pendingInventoryVisibility : nil
+                },
+                observer: { value in h.observe("a.observe", value: value, content: 0) }
+            )
+            #expect(await h.log.waitFor("auto.enter"), "SETUP: A entered")
+            h.clock.advance(by: .seconds(6))
+            await coordinator.requestAutomaticUpload(
+                refresh: { attempt in
+                    h.begin("auto.enter", attempt: attempt, content: 1)
+                    h.end()
+                    return nil
+                },
+                observer: { value in h.observe("b.observe", value: value, content: 1) }
+            )
+            let boundary = h.log.count
+            await release.open()
+            let action = await h.log.waitForScheduling(after: boundary)
+            #expect(action != nil, "SETUP: actual retry or interval registration")
+            let admittedFeedbackCount = h.log.events.filter { $0.name == "a.observe" }.count
+            #expect(admittedFeedbackCount == 1, "F2A: admitted A reports its own actual result")
+            #expect(
+                action?.delay == Duration.milliseconds(350),
+                "F2A: latest pair continues admitted cycle, not a new 60-second cycle")
+            if action?.delay == Duration.milliseconds(350) {
+                #expect(await h.clock.waitForSleepCount(1), "SETUP: retry registered before advance")
+                h.clock.advance(by: .milliseconds(350))
+                #expect(await h.log.waitFor("b.observe"), "SETUP: actual B attempt completed")
+                let loads = h.log.events.filter { $0.name == "auto.enter" }
+                #expect(loads.map(\.content) == [0, 1])
+                #expect(loads.map(\.attempt) == [0, 1])
+                #expect(loads.map(\.time) == [.zero, .seconds(6) + .milliseconds(350)])
+                #expect(
+                    h.log.events.filter { $0.name == "a.observe" }.map(\.decision) == [
+                        .retry(after: .milliseconds(350))
+                    ])
+                #expect(h.log.events.filter { $0.name == "b.observe" }.map(\.decision) == [.succeeded])
             }
-        )
-        #expect(await h.log.waitFor("auto.observe"), "SETUP: observer was admitted before explicit work")
-        h.clock.advance(by: .seconds(6))
-        await coordinator.request(refresh: { attempt in
-            h.begin("manual.enter", attempt: attempt)
-            h.end()
-            return nil
-        })
-        let explicitEnteredWhileObserverHeld = await h.log.appearsWithinTheObservationWindow("manual.enter")
-        #expect(explicitEnteredWhileObserverHeld == false)
-        await release.open()
-        #expect(await h.log.waitFor("manual.enter"), "SETUP: joined observer permits manual work")
-        await heldObserver.value
-        await coordinator.cancel()
-        #expect(h.log.events.filter { $0.name == "manual.enter" }.map(\.time) == [.seconds(6)])
-        #expect(h.log.maximumActiveLoads == 1)
-    }
+            await release.open()
+            await held.value
+            await coordinator.cancel()
+            #expect(h.log.maximumActiveLoads == 1)
+        }
 
-    @Test(.timeLimit(.minutes(1)))
-    func f1ObserverReentrySelectsExplicitBeforeAutomaticRetry() async {
-        let h = F1F2Harness()
-        let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
-        await coordinator.requestAutomaticUpload(
-            refresh: { attempt in
-                h.begin("auto.enter", attempt: attempt)
-                h.end()
-                return attempt == 0 ? .pendingInventoryVisibility : nil
-            },
-            observer: { value in
-                h.observe("auto.observe", value: value)
-                if value.attempt == 0 {
-                    await coordinator.request(refresh: { attempt in
-                        h.begin("manual.enter", attempt: attempt)
+        @Test(.timeLimit(.minutes(1)))
+        func f2ContinuingSupersessionKeepsFeedbackAndTheOriginalAttemptBudget() async {
+            let h = F1F2Harness()
+            let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
+            let gates = (0..<8).map { _ in AsyncGate() }
+            let held = gates.map { gate in Task { await gate.wait() } }
+            let delays = TimelineRefreshRetrySchedule.uploadDefault.delays
+            func submit(_ content: Int) async {
+                await coordinator.requestAutomaticUpload(
+                    refresh: { attempt in
+                        h.begin("auto.enter", attempt: attempt, content: content)
+                        if content < 8, held.indices.contains(attempt) { await held[attempt].value }
+                        h.end()
+                        return content < 8 ? .pendingInventoryVisibility : nil
+                    },
+                    observer: { value in h.observe("auto.observe", value: value, content: content) }
+                )
+            }
+            await submit(0)
+            #expect(await h.log.waitFor("auto.enter"), "SETUP: first admitted load entered")
+            for attempt in 0..<8 {
+                await submit(attempt + 1)
+                let boundary = h.log.count
+                await gates[attempt].open()
+                if attempt < 7 {
+                    let action = await h.log.waitForScheduling(after: boundary)
+                    #expect(action != nil, "SETUP: actual automatic wait registration")
+                    let pairedFeedbackCount = h.log.events.filter {
+                        $0.name == "auto.observe" && $0.attempt == attempt && $0.content == attempt
+                    }.count
+                    #expect(pairedFeedbackCount == 1, "F2B: continuing signals do not suppress admitted feedback")
+                    #expect(
+                        action?.delay == delays[attempt + 1],
+                        "F2B: signals cannot reset convergence into a new admission")
+                    if action?.delay != delays[attempt + 1] {
+                        for gate in gates { await gate.open() }
+                        for task in held { await task.value }
+                        await coordinator.cancel()
+                        #expect(h.log.maximumActiveLoads == 1)
+                        return
+                    }
+                    #expect(await h.clock.waitForSleepCount(attempt + 1), "SETUP: controlled retry registered")
+                    h.clock.advance(by: delays[attempt + 1])
+                    #expect(await h.log.waitFor("auto.enter", count: attempt + 2), "SETUP: next attempt entered")
+                }
+            }
+            #expect(await h.log.waitFor("auto.observe", count: 8), "SETUP: terminal feedback completed")
+            let loads = h.log.events.filter { $0.name == "auto.enter" }
+            #expect(loads.map(\.attempt) == Array(0..<8))
+            #expect(loads.map(\.content) == Array(0..<8))
+            #expect(
+                loads.map(\.time) == [
+                    .zero, .milliseconds(350), .seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(16),
+                    .seconds(30),
+                ])
+            #expect(h.log.events.filter { $0.name == "auto.observe" }.last?.decision == .notYetVisible)
+            #expect(
+                await h.clock.waitForSleepCount(8),
+                "SETUP: unattempted latest generation waits for the original boundary")
+            #expect(h.clock.requestedSleeps.last == Duration.seconds(30))
+            let completion = AutomaticFlushCompletion()
+            let flush = Task {
+                await coordinator.flushAutomaticUploads()
+                await completion.markComplete()
+            }
+            let flushed = await completion.waitUntilComplete()
+            #expect(flushed, "SETUP: forced latest actual generation completed")
+            for gate in gates { await gate.open() }
+            for task in held { await task.value }
+            await coordinator.cancel()
+            await flush.value
+            let finalLoads = h.log.events.filter { $0.name == "auto.enter" }
+            #expect(finalLoads.count == 9)
+            #expect(finalLoads.last?.content == 8)
+            #expect(finalLoads.last?.attempt == 0)
+            #expect(finalLoads.last?.time == Duration.seconds(30))
+            #expect(h.log.maximumActiveLoads == 1)
+        }
+
+        #if DEBUG
+            @Test(.timeLimit(.minutes(1)))
+            func f2OlderSuccessDoesNotAcknowledgeTheNewerFlushTarget() async {
+                let h = F1F2Harness()
+                let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
+                let releaseA = AsyncGate()
+                let releaseB = AsyncGate()
+                let heldA = Task { await releaseA.wait() }
+                let heldB = Task { await releaseB.wait() }
+                await coordinator.requestAutomaticUpload(
+                    refresh: { attempt in
+                        h.begin("auto.enter", attempt: attempt, content: 0)
+                        await heldA.value
                         h.end()
                         return nil
-                    })
+                    },
+                    observer: { value in h.observe("a.observe", value: value, content: 0) }
+                )
+                #expect(await h.log.waitFor("auto.enter"), "SETUP: A entered")
+                h.clock.advance(by: .seconds(6))
+                await coordinator.requestAutomaticUpload(
+                    refresh: { attempt in
+                        h.begin("auto.enter", attempt: attempt, content: 1)
+                        await heldB.value
+                        h.end()
+                        return nil
+                    },
+                    observer: { value in h.observe("b.observe", value: value, content: 1) }
+                )
+                let boundary = h.log.count
+                await releaseA.open()
+                let action = await h.log.waitForScheduling(after: boundary)
+                #expect(action != nil, "SETUP: pending B reaches the interval boundary")
+                #expect(
+                    h.log.events.filter { $0.name == "a.observe" }.count == 1,
+                    "F2C: A reports its actual success without serving B")
+                #expect(action?.delay == Duration.seconds(54))
+                #expect(await h.clock.waitForSleepCount(1), "SETUP: pending B interval registered")
+                let completion = AutomaticFlushCompletion()
+                let flush = Task {
+                    await coordinator.flushAutomaticUploads()
+                    await completion.markComplete()
                 }
+                #expect(await h.log.waitFor("auto.enter", count: 2), "SETUP: forced B entered")
+                #expect(
+                    await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true),
+                    "SETUP: target B waiter registered")
+                // The held B load cannot be acknowledged by A's completed success.
+                // A's completion came before B entered, so a wrong release of the flush has happened by now: it would have
+                // removed the waiter, and the registration check above would have failed.
+                let flushReturnedWhileBWasHeld = await completion.isComplete
+                #expect(flushReturnedWhileBWasHeld == false)
+                #expect(
+                    await coordinator.testingAutomaticState().flushCount == 1, "A's success must not release target B")
+                await releaseB.open()
+                #expect(await completion.waitUntilComplete(), "SETUP: B completion released its own waiter")
+                await releaseA.open()
+                await heldA.value
+                await heldB.value
+                await coordinator.cancel()
+                await flush.value
+                #expect(h.log.events.filter { $0.name == "auto.enter" }.map(\.content) == [0, 1])
+                #expect(h.log.events.filter { $0.name == "b.observe" }.map(\.decision) == [.succeeded])
+                #expect(h.log.maximumActiveLoads == 1)
             }
-        )
-        let action = await h.log.waitForScheduling(after: 0)
-        #expect(action != nil, "SETUP: observer reentry yields an actual scheduling event")
-        #expect(action?.name == "manual.enter", "F1_REENTRY: manual entry wins after its requesting observer returns")
-        await coordinator.cancel()
-        #expect(h.log.maximumActiveLoads == 1)
+        #endif
+
+        @Test(.timeLimit(.minutes(1)))
+        func f1AlreadyAdmittedAutomaticObserverJoinsBeforeExplicitLoad() async {
+            let h = F1F2Harness()
+            let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
+            let release = AsyncGate()
+            let heldObserver = Task { await release.wait() }
+            await coordinator.requestAutomaticUpload(
+                refresh: { attempt in
+                    h.begin("auto.enter", attempt: attempt)
+                    h.end()
+                    return nil
+                },
+                observer: { value in
+                    h.observe("auto.observe", value: value)
+                    await heldObserver.value
+                }
+            )
+            #expect(await h.log.waitFor("auto.observe"), "SETUP: observer was admitted before explicit work")
+            h.clock.advance(by: .seconds(6))
+            await coordinator.request(refresh: { attempt in
+                h.begin("manual.enter", attempt: attempt)
+                h.end()
+                return nil
+            })
+            let explicitEnteredWhileObserverHeld = await h.log.appearsWithinTheObservationWindow("manual.enter")
+            #expect(explicitEnteredWhileObserverHeld == false)
+            await release.open()
+            #expect(await h.log.waitFor("manual.enter"), "SETUP: joined observer permits manual work")
+            await heldObserver.value
+            await coordinator.cancel()
+            #expect(h.log.events.filter { $0.name == "manual.enter" }.map(\.time) == [.seconds(6)])
+            #expect(h.log.maximumActiveLoads == 1)
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func f1ObserverReentrySelectsExplicitBeforeAutomaticRetry() async {
+            let h = F1F2Harness()
+            let coordinator = TimelineUploadRefreshCoordinator(clock: h.dependency)
+            await coordinator.requestAutomaticUpload(
+                refresh: { attempt in
+                    h.begin("auto.enter", attempt: attempt)
+                    h.end()
+                    return attempt == 0 ? .pendingInventoryVisibility : nil
+                },
+                observer: { value in
+                    h.observe("auto.observe", value: value)
+                    if value.attempt == 0 {
+                        await coordinator.request(refresh: { attempt in
+                            h.begin("manual.enter", attempt: attempt)
+                            h.end()
+                            return nil
+                        })
+                    }
+                }
+            )
+            let action = await h.log.waitForScheduling(after: 0)
+            #expect(action != nil, "SETUP: observer reentry yields an actual scheduling event")
+            #expect(
+                action?.name == "manual.enter", "F1_REENTRY: manual entry wins after its requesting observer returns")
+            await coordinator.cancel()
+            #expect(h.log.maximumActiveLoads == 1)
+        }
     }
-}
+#endif
 
 private struct F1F2Event: Sendable, Equatable {
     let name: String

@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 SDK_DIR="Vendor/sdk-swift"
 REPO="https://github.com/ProtonDriveApps/sdk-swift.git"
-TAG="${1:-0.32.1}"
+TAG="${1:-0.33.0}"
 PATCH_DIR="$ROOT/VendorPatches/sdk-swift/$TAG"
 PIN_FILE="$PATCH_DIR/UPSTREAM_COMMIT"
 shopt -s nullglob
@@ -19,12 +19,40 @@ if [[ ! -f "$PIN_FILE" || ${#PATCHES[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# Transient GitHub connection failures must not fail a queued SDK restore. Retry a git
+# network command only for a connection or transport error (exit 128 with a matching
+# message); macOS and Linux runners report these failures with different texts. Every
+# other failure (authentication, missing ref, wrong commit, HTTP 5xx) aborts
+# immediately with its original message and exit code.
+retry_git() {
+  local output status attempt
+  for attempt in 1 2 3; do
+    status=0
+    output="$(git "$@" 2>&1)" || status=$?
+    if [[ "$status" -eq 0 ]]; then
+      [[ -n "$output" ]] && printf '%s\n' "$output"
+      return 0
+    fi
+    printf '%s\n' "$output" >&2
+    if [[ "$status" -ne 128 ]] || ! grep -Eq \
+      'Failed to connect|Could not resolve host|Connection timed out|Connection reset|early EOF|SSL_ERROR_SYSCALL|Operation timed out|Resolving timed out|Empty reply from server|transfer closed with outstanding read data|gnutls_handshake|HTTP/2 stream .* was not closed cleanly' \
+      <<<"$output"; then
+      return "$status"
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      echo "Transient connection error from 'git $*', retrying (attempt $attempt of 3)..." >&2
+      if [[ "$attempt" -eq 1 ]]; then sleep 5; else sleep 15; fi
+    fi
+  done
+  return "$status"
+}
+
 if [ ! -d "$SDK_DIR/.git" ]; then
   echo "Cloning sdk-swift..."
-  git clone "$REPO" "$SDK_DIR"
+  retry_git clone "$REPO" "$SDK_DIR"
 fi
 
-git -C "$SDK_DIR" fetch --tags --quiet "$REPO"
+retry_git -C "$SDK_DIR" fetch --tags --quiet "$REPO"
 
 EXPECTED_COMMIT="$(tr -d '[:space:]' < "$PIN_FILE")"
 [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {

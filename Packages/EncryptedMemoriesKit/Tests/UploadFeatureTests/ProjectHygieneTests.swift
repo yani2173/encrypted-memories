@@ -1,3 +1,4 @@
+import ImageIO
 import XCTest
 
 final class ProjectHygieneTests: XCTestCase {
@@ -33,6 +34,73 @@ final class ProjectHygieneTests: XCTestCase {
             return String(tail)
         }
         return String(tail[..<next])
+    }
+
+    /// The iOS catalog declares the dark rendition; both catalogs reference existing files of the declared size.
+    /// The iOS renditions must be opaque. The macOS catalog is the light fallback for the Icon Composer document.
+    func testAppIconCatalogsHaveValidRenditions() throws {
+        for platform in ["App", "iOSApp"] {
+            let directory = repoRoot.appendingPathComponent("\(platform)/Assets.xcassets/AppIcon.appiconset")
+            let data = try Data(contentsOf: directory.appendingPathComponent("Contents.json"))
+            let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let images = try XCTUnwrap(catalog["images"] as? [[String: Any]])
+            let dark = images.filter { image in
+                let appearances = image["appearances"] as? [[String: String]] ?? []
+                return appearances.contains { $0["appearance"] == "luminosity" && $0["value"] == "dark" }
+            }
+            if platform == "iOSApp" {
+                XCTAssertFalse(dark.isEmpty, "\(platform) must declare a dark app icon")
+            }
+            for image in images {
+                let filename = try XCTUnwrap(image["filename"] as? String)
+                let url = directory.appendingPathComponent(filename)
+                let bytes = try Data(contentsOf: url)
+                let source = try XCTUnwrap(CGImageSourceCreateWithData(bytes as CFData, nil), filename)
+                let decoded = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil), filename)
+                let properties = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+                let size = try XCTUnwrap(image["size"] as? String).split(separator: "x").compactMap { Int($0) }
+                let scale = try XCTUnwrap(Int((image["scale"] as? String ?? "1x").dropLast()))
+                XCTAssertEqual(size.count, 2, filename)
+                guard size.count == 2 else { continue }
+                XCTAssertEqual(properties[kCGImagePropertyPixelWidth] as? Int, size[0] * scale, filename)
+                XCTAssertEqual(properties[kCGImagePropertyPixelHeight] as? Int, size[1] * scale, filename)
+                if platform == "iOSApp" {
+                    switch decoded.alphaInfo {
+                    case .none, .noneSkipFirst, .noneSkipLast: break
+                    default: XCTFail("\(filename) must have no alpha channel")
+                    }
+                }
+            }
+        }
+    }
+
+    /// macOS 26 takes its dark icon from the Icon Composer document: one layer is visible in the default
+    /// appearance, another only in the dark appearance, and both artworks exist and differ.
+    func testMacIconComposerDocumentDeclaresDarkAppearance() throws {
+        let document = appDir.appendingPathComponent("AppIcon.icon")
+        let data = try Data(contentsOf: document.appendingPathComponent("icon.json"))
+        let icon = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let groups = try XCTUnwrap(icon["groups"] as? [[String: Any]])
+        var visibleDefault: [String] = []
+        var visibleDark: [String] = []
+        for layer in groups.flatMap({ $0["layers"] as? [[String: Any]] ?? [] }) {
+            let name = try XCTUnwrap(layer["image-name"] as? String)
+            let artwork = try Data(contentsOf: document.appendingPathComponent("Assets/\(name)"))
+            XCTAssertFalse(artwork.isEmpty, "\(name) is empty")
+            let specializations = layer["opacity-specializations"] as? [[String: Any]] ?? []
+            let defaultOpacity = specializations.first { $0["appearance"] == nil }?["value"] as? Double ?? 1
+            let darkOpacity = specializations.first { $0["appearance"] as? String == "dark" }?["value"] as? Double
+            if defaultOpacity > 0 { visibleDefault.append(name) }
+            if (darkOpacity ?? defaultOpacity) > 0 { visibleDark.append(name) }
+        }
+        XCTAssertFalse(visibleDefault.isEmpty, "the default appearance shows no layer")
+        XCTAssertFalse(visibleDark.isEmpty, "the dark appearance shows no layer")
+        XCTAssertTrue(
+            Set(visibleDefault).isDisjoint(with: visibleDark),
+            "the dark appearance must show other artwork than the default appearance")
+        let light = try Data(contentsOf: document.appendingPathComponent("Assets/\(visibleDefault[0])"))
+        let darkArtwork = try Data(contentsOf: document.appendingPathComponent("Assets/\(visibleDark[0])"))
+        XCTAssertNotEqual(light, darkArtwork)
     }
 
     /// The offline account must never enter the distributed archive.
@@ -183,8 +251,9 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(project.contains("ENCRYPTED_MEMORIES_PROTON_CHANNEL: alpha"))
     }
 
-    /// Background execution stays limited to BGProcessingTask work with the two identifiers the apps register.
-    /// App Review rejects keep-alive modes, and an undeclared identifier fails registration only at runtime.
+    /// Background execution stays limited to the two BGProcessingTask identifiers and the one BGAppRefreshTask
+    /// identifier that the app registers. A refresh task needs the `fetch` mode (BackgroundTasks BGTask.h). App Review
+    /// rejects keep-alive modes, and an undeclared identifier fails registration only at runtime.
     func testIOSBackgroundTaskDeclarationsStayMinimal() throws {
         let infoData = try Data(contentsOf: repoRoot.appendingPathComponent("iOSApp/Info.plist"))
         let info = try XCTUnwrap(
@@ -196,8 +265,10 @@ final class ProjectHygieneTests: XCTestCase {
             [
                 "at.oncloud.encryptedmemories.photo-backup.processing",
                 "at.oncloud.encryptedmemories.smart-search.processing",
+                "at.oncloud.encryptedmemories.photo-backup.refresh",
             ])
-        XCTAssertEqual(info["UIBackgroundModes"] as? [String], ["processing"], "no keep-alive background mode")
+        XCTAssertEqual(
+            info["UIBackgroundModes"] as? [String], ["fetch", "processing"], "no keep-alive background mode")
     }
 
     func testPhotoLibraryBackupAdapterStaysUIAndSDKFree() {

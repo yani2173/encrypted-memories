@@ -63,11 +63,17 @@ public final class PendingGridSession {
     }
 
     /// `files` adds the Mac's watched folders; their backup runner must record into `photoBackup.pendingRecorder`.
+    /// `restoreRecheckDelays`, `now` and `sleep` are the recheck clock seam; tests run the Restore recheck
+    /// schedule on fake time while every caller without them keeps the production timers.
+    /// `nil` delays mean the production schedule.
     public init?(
         store: PendingBackupManifestStore,
         photoBackup: PhotoLibraryBackupController,
         remote: any PendingRemoteEffects,
-        files: PendingFileSource? = nil
+        files: PendingFileSource? = nil,
+        restoreRecheckDelays: [TimeInterval]? = nil,
+        now: @Sendable @escaping () -> Date = { Date() },
+        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         guard let recorder = photoBackup.pendingRecorder,
             let queue = photoBackup.pendingQueue,
@@ -86,7 +92,10 @@ public final class PendingGridSession {
             recorder: recorder,
             replacementJournal: photoBackup.pendingReplacementJournal,
             identities: photoBackup.pendingIdentities,
-            relations: photoBackup.pendingRelations
+            relations: photoBackup.pendingRelations,
+            now: now,
+            sleep: sleep,
+            restoreRecheckDelays: restoreRecheckDelays ?? PendingBackupCoordinator.defaultRestoreRecheckDelays
         )
         presenter = PendingTimelinePresenter(replacementLookup: { [ledger = recorder.replacementLedger] in
             ledger.replacementHandoffs()
@@ -267,9 +276,6 @@ public final class PendingGridSession {
         onListsChange?()
     }
 
-    /// Whether pending photos show now (backup on, available, and allowed to read the Photos library).
-    public var isShowingPendingPhotos: Bool { showsPending }
-
     /// Favorites as the app shows them: Proton favorites plus the desired states of pending photos, which the
     /// backup applies after the upload.
     public func displayedFavorites(_ remote: Set<PhotoUID>) -> Set<PhotoUID> {
@@ -291,11 +297,14 @@ public final class PendingGridSession {
     public func restore(_ uids: [PhotoUID]) async -> Bool { await coordinator.restore(uids) }
 
     /// The person restored these Proton photos from the trash. They show at once, also when an edit's
-    /// replacement hid them while the listing still returned them. A local photo whose delete moved one of them there
-    /// returns to the backup.
-    public func photosRestored(_ uids: [PhotoUID]) async {
-        presenter.showRestored(uids)
-        await coordinator.restoreSources(ofRemote: uids)
+    /// replacement hid them while the listing still returned them.
+    public func photosRestored(_ uids: [PhotoUID]) { presenter.showRestored(uids) }
+
+    /// A Proton photo came back from the trash; a pending delete that trashed it is undone as well.
+    @discardableResult
+    public func restoreSources(ofRemote uids: [PhotoUID]) async -> PendingBackupRestoreResult {
+        photosRestored(uids)
+        return await coordinator.restoreSources(ofRemote: uids)
     }
 
     @discardableResult
@@ -354,14 +363,15 @@ public struct PendingFileSource: Sendable {
     public let metadata: any PendingSourceMetadataProviding
     /// Removes excluded files (standardized paths) from queued and in-flight backup work.
     public let removeFromBackup: @Sendable ([String]) async -> Bool
-    /// Enqueues restored files again.
-    public let returnToBackup: @Sendable ([String]) async -> Bool
+    /// Enqueues restored files again and returns the paths whose return is settled. Every other path keeps its
+    /// queue duty.
+    public let returnToBackup: @Sendable ([String]) async -> Set<String>
 
     public init(
         queue: any UploadBackupSyncQueueObserving,
         metadata: any PendingSourceMetadataProviding,
         removeFromBackup: @escaping @Sendable ([String]) async -> Bool,
-        returnToBackup: @escaping @Sendable ([String]) async -> Bool
+        returnToBackup: @escaping @Sendable ([String]) async -> Set<String>
     ) {
         self.queue = queue
         self.metadata = metadata
@@ -376,13 +386,17 @@ private struct SessionMetadata: PendingSourceMetadataProviding {
     let files: (any PendingSourceMetadataProviding)?
 
     func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
+        await metadataAnswer(for: keys).metadata
+    }
+
+    func metadataAnswer(for keys: [PendingSourceKey]) async -> PendingSourceMetadataAnswer {
         let photoKeys = keys.filter { $0.kind == .photoLibraryAsset }
         let fileKeys = keys.filter { $0.kind == .fileURL }
-        var result = photoKeys.isEmpty ? [:] : await photos.metadata(for: photoKeys)
+        var answer = photoKeys.isEmpty ? PendingSourceMetadataAnswer() : await photos.metadataAnswer(for: photoKeys)
         if let files, !fileKeys.isEmpty {
-            result.merge(await files.metadata(for: fileKeys)) { current, _ in current }
+            answer.merge(await files.metadataAnswer(for: fileKeys))
         }
-        return result
+        return answer
     }
 }
 
@@ -415,13 +429,38 @@ private struct SessionEffects: PendingBackupEffects {
         }
     }
 
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
-        let photos = keys.filter { $0.kind == .photoLibraryAsset }.map(\.identifier)
-        let fileKeys = keys.filter { $0.kind == .fileURL }.map(\.identifier)
-        var succeeded = true
-        if !photos.isEmpty { succeeded = await photoBackup.returnToBackup(identifiers: photos) }
-        if !fileKeys.isEmpty, let files { succeeded = await files.returnToBackup(fileKeys) && succeeded }
-        return succeeded
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> {
+        let photoKeys = keys.filter { $0.kind == .photoLibraryAsset }
+        let fileKeys = keys.filter { $0.kind == .fileURL }
+        guard fileKeys.isEmpty || files != nil else { return [] }
+        var returned = Set<PendingSourceKey>()
+        // The photo backup answers for the whole batch.
+        if !photoKeys.isEmpty, await photoBackup.returnToBackup(identifiers: photoKeys.map(\.identifier)) {
+            returned.formUnion(photoKeys)
+        }
+        if !fileKeys.isEmpty, let files {
+            let paths = await files.returnToBackup(fileKeys.map(\.identifier))
+            returned.formUnion(fileKeys.filter { paths.contains($0.identifier) })
+        }
+        return returned
+    }
+
+    func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
+        var outcomes = await photoBackup.returnToBackup(states.filter { $0.key.kind == .photoLibraryAsset })
+        for state in states where state.key.kind == .fileURL {
+            outcomes[state.key] = .unreadable
+            guard let files, let queue = files.queue as? UploadBackupSyncQueueManifestStore, queue.isOperational(),
+                await files.returnToBackup([state.key.identifier]).contains(state.key.identifier),
+                queue.isOperational()
+            else { continue }
+            guard let rows = try? queue.decisionRows(kind: .fileURL, identifiers: [state.key.identifier]),
+                queue.isOperational(), !rows.isEmpty
+            else { continue }
+            outcomes[state.key] =
+                rows.allSatisfy { $0.state.isTerminalSuccess }
+                ? .completed : .waiting(until: Date().addingTimeInterval(30))
+        }
+        return outcomes
     }
 
     func photosVolumeID() async -> String? { volume.get() }

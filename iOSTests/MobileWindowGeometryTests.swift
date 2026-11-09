@@ -66,6 +66,9 @@ final class MobileWindowGeometryTests: XCTestCase {
         // range. This checks geometry changes, not hinge events or display handoff.
         let fractions: [CGFloat] = [1, 0.5, 0.34, 0.66, 1, 0.5, 1, 0.34, 1]
         var report: [String] = []
+        // The tile side the grid showed the first time it had a given window width. The same width must show the same
+        // density afterwards, whatever sequence of other widths came in between.
+        var tileSideAtWidth: [CGFloat: CGFloat] = [:]
         // Main-run-loop callback cadence after each resize. This includes scheduling delays and is not GPU
         // presentation timing. Actual callback arrival avoids stale display timestamps across a resize.
         let cadence = FrameCadenceProbe()
@@ -100,6 +103,12 @@ final class MobileWindowGeometryTests: XCTestCase {
                 XCTAssertEqual(
                     anchoredY, initialAnchor.topOffset, accuracy: 1,
                     "cycle \(cycle) step \(step): the original photo must keep its viewport position at \(width)")
+                let tileSide = anchoredSlot.slotRect.width
+                let firstTileSide = tileSideAtWidth[width] ?? tileSide
+                tileSideAtWidth[width] = firstTileSide
+                XCTAssertEqual(
+                    tileSide, firstTileSide, accuracy: 0.5,
+                    "cycle \(cycle) step \(step): the grid must keep its density at a width of \(width)")
                 report.append(
                     "cycle=\(cycle) step=\(step) anchor=\(anchor.itemID.nodeID) initial=\(initialAnchor.itemID.nodeID) anchored_y=\(anchoredY) initial_y=\(initialAnchor.topOffset) offset_y=\(grid.scrollView.contentOffset.y)"
                 )

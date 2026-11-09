@@ -2,8 +2,7 @@ import CoreGraphics
 
 /// Shared semantics for the viewer's one-finger drag-to-dismiss interaction.
 ///
-/// With the media unzoomed, a downward drag sticks the media to the finger (it translates and shrinks a little
-/// A downward drag translates and slightly shrinks the unzoomed media while the backdrop dims.
+/// With the media unzoomed, a downward drag sticks the media to the finger: it translates and shrinks a little.
 /// On release, the policy chooses between restoring the position and closing the viewer.
 /// Platform adapters own recognizers and transforms; this type owns thresholds and release decisions.
 public enum ViewerDragDismissPolicy {
@@ -23,10 +22,6 @@ public enum ViewerDragDismissPolicy {
 
     /// The media never shrinks below this while attached to the finger (so it stays clearly the same photo).
     public static let minimumDisplayScale: CGFloat = 0.6
-
-    /// How far the black backdrop dims at full drag (1 = opaque, this = most transparent) - a subtle "peeling
-    /// away toward the grid" cue.
-    public static let minimumBackdropOpacity: CGFloat = 0.5
 
     /// Spring-back animation parameters (duration seconds, damping 0…1) for a below-threshold release.
     public static let springBackDuration: Double = 0.32
@@ -61,12 +56,6 @@ public enum ViewerDragDismissPolicy {
     public static func displayScale(progress: CGFloat) -> CGFloat {
         let p = min(1, max(0, progress))
         return max(minimumDisplayScale, 1 - p * (1 - minimumDisplayScale))
-    }
-
-    /// The backdrop opacity while attached, from one toward ``minimumBackdropOpacity`` as the drag grows.
-    public static func backdropOpacity(progress: CGFloat) -> CGFloat {
-        let p = min(1, max(0, progress))
-        return max(minimumBackdropOpacity, 1 - p * (1 - minimumBackdropOpacity))
     }
 
     /// The release decision: dismiss when the drag travelled far enough downward OR was flicked down fast enough.

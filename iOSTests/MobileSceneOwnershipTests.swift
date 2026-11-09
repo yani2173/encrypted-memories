@@ -1,4 +1,7 @@
+import AppleSecurityCore
 import PhotosCore
+import ProtonAuth
+import Security
 import SwiftUI
 import Testing
 import UIKit
@@ -20,6 +23,62 @@ import UIKit
         #expect(MobileAccountRuntime.shared === MobileAccountRuntime.shared)
         #expect(MobileAccountRuntime.shared.sessionModel === MobileAccountRuntime.shared.sessionModel)
         #expect(MobileAccountRuntime.shared.libraryModel === MobileAccountRuntime.shared.libraryModel)
+    }
+
+    /// A session model around a test item, so no test configures a second owner around the saved session.
+    private static func isolatedSessionModel() -> MobileSessionModel {
+        MobileSessionModel(
+            isolatedStore: SessionKeychainStore(
+                service: "scene-ownership-tests-\(UUID().uuidString)", account: "default",
+                accessibility: .afterFirstUnlockThisDeviceOnly))
+    }
+
+    @Test func theAppSavesTheSessionReadableAfterTheFirstUnlock() {
+        #expect(MobileAccountRuntime.shared.sessionModel.sessionStore.accessibility == .afterFirstUnlockThisDeviceOnly)
+    }
+
+    @Test func authenticationFactoryUsesTheProductionProtectedDataPolicy() {
+        let factory = MobileSessionModel.AuthenticationFactory()
+        #expect(factory.lockedReadIsChecking)
+        #expect(factory.protectedDataSource == \UIApplication.isProtectedDataAvailable)
+        #expect(
+            UIApplication.shared[keyPath: factory.protectedDataSource] == UIApplication.shared.isProtectedDataAvailable)
+    }
+
+    @Test func authenticationFactoryKeepsALockedSessionReadChecking() {
+        let store = SessionKeychainStore(
+            service: "factory-locked-read-tests", account: "default", keychain: LockedReadKeychain(),
+            accessibility: .afterFirstUnlockThisDeviceOnly)
+        let authentication = MobileSessionModel.AuthenticationFactory().make(store: store)
+        #expect(authentication.controller.bootstrap() == .checking, "the factory passes the locked-read policy")
+    }
+
+    /// A runtime without scenes whose Smart Search state changes are recorded, so a test reaches no shared coordinator.
+    private static func isolatedRuntime(recording states: ValueRecorder<Bool>) -> MobileAccountRuntime {
+        MobileAccountRuntime(
+            sessionModel: isolatedSessionModel(), libraryModel: MobileLibraryModel(), connectedScenes: { [] },
+            smartSearchForegroundChanged: { states.append($0) })
+    }
+
+    @Test func aStartWithoutASceneIsNotForegroundActivity() {
+        let states = ValueRecorder<Bool>()
+        let runtime = Self.isolatedRuntime(recording: states)
+        runtime.start()
+        #expect(!runtime.libraryModel.applicationIsActive, "a background window starts no foreground polling")
+        #expect(states.values == [false], "Smart Search learns that the app is not in the foreground")
+        #expect(runtime.appliedOpportunity == nil, "the first scene applies its phase")
+    }
+
+    @Test func aSecondStartFromABackgroundWindowStartsNothingAgain() {
+        // A background window and a scene both start the account; only the first start installs anything.
+        let runtime = Self.isolatedRuntime(recording: ValueRecorder<Bool>())
+        runtime.start()
+        let observers = runtime.sceneObserverCount
+        #expect(runtime.isStarted)
+        #expect(observers > 0)
+
+        runtime.start()
+        #expect(runtime.sceneObserverCount == observers, "the second start installs no second set of observers")
     }
 
     @Test func aggregateSceneActivityReachesTheSharedRuntimeOnlyOnChange() {
@@ -103,8 +162,9 @@ import UIKit
         #expect(!second.settingsPresented)
     }
 
-    /// Opens a real second window scene of the production app in the iPad simulator, verifies that it attaches
-    /// to the one account runtime, then closes it and verifies that the account survives the closed window.
+    /// Opens a real second window scene of the production app, verifies that it attaches to the one account
+    /// runtime, then closes it and verifies that the account survives the closed window. Where the platform
+    /// cannot close the scene, the test keeps every attach assertion and skips only the ledger departure.
     @Test func secondWindowSceneAttachesToAndDetachesFromTheSharedAccount() async throws {
         guard UIApplication.shared.supportsMultipleScenes else {
             return
@@ -126,7 +186,7 @@ import UIKit
                 .compactMap { $0 as? UIWindowScene }
                 .first { !existing.contains($0.session.persistentIdentifier) }
         }
-        let secondScene = try #require(second, "the iPad simulator must connect a second window scene")
+        let secondScene = try #require(second, "the platform must connect a second window scene")
         let secondID = secondScene.session.persistentIdentifier
         defer { UIApplication.shared.requestSceneSessionDestruction(secondScene.session, options: nil) }
         try await Task.sleep(for: .seconds(2))
@@ -149,11 +209,17 @@ import UIKit
             writeSnapshot(of: firstWindow, name: "first-window-scene")
         }
 
-        UIApplication.shared.requestSceneSessionDestruction(secondScene.session, options: nil)
-        for _ in 0..<50 where runtime.sceneLedger.phase(of: secondID) != nil {
-            try await Task.sleep(for: .milliseconds(200))
+        // The attach assertions above hold wherever a second scene connects. A closed window can be checked only
+        // where the platform closes the scene; the platform's answer decides, never the device idiom.
+        switch await MobileSceneCloser.close(secondScene) {
+        case .closed:
+            for _ in 0..<50 where runtime.sceneLedger.phase(of: secondID) != nil {
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            #expect(runtime.sceneLedger.phase(of: secondID) == nil, "a closed window leaves the ledger")
+        case .refused(let reason):
+            print("scene destruction refused by the platform, ledger departure not checked: \(reason)")
         }
-        #expect(runtime.sceneLedger.phase(of: secondID) == nil, "a closed window leaves the ledger")
         #expect(runtime.isStarted, "closing a window must not stop the account runtime")
         #expect(MobileAccountRuntime.shared.libraryModel === libraryModel)
         // Bring the original window back to the foreground, as the user would by tapping it. The simulator does
@@ -182,5 +248,28 @@ import UIKit
         let url = URL(fileURLWithPath: directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         try? image.pngData()?.write(to: url.appendingPathComponent("\(name).png"))
+    }
+}
+
+/// Records values on the main actor.
+@MainActor private final class ValueRecorder<Value> {
+    private(set) var values: [Value] = []
+    func append(_ value: Value) { values.append(value) }
+}
+
+/// Supplies a locked read without accessing the system Keychain.
+private struct LockedReadKeychain: AppleKeychainStoring {
+    private enum UnexpectedOperation: Error { case called }
+
+    func data(for item: AppleKeychainItem) throws -> Data? {
+        throw AppleSecurityError(operation: .read, status: errSecInteractionNotAllowed)
+    }
+
+    func setData(_ data: Data, for item: AppleKeychainItem) throws { throw UnexpectedOperation.called }
+    func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data { throw UnexpectedOperation.called }
+    func removeData(for item: AppleKeychainItem) throws { throw UnexpectedOperation.called }
+    func removeAllData(service: String) throws { throw UnexpectedOperation.called }
+    func accessibility(for item: AppleKeychainItem) throws -> AppleKeychainAccessibility? {
+        throw UnexpectedOperation.called
     }
 }

@@ -36,15 +36,6 @@ public struct MLVectorBlock: Sendable {
         self.storage = []
     }
 
-    /// Convenience for tests and the default store path.
-    public init(descriptor: MLModelDescriptor, records: [MLEmbeddingRecord]) {
-        self.init(descriptor: descriptor)
-        reserveCapacity(records.count)
-        for record in records where record.descriptor == descriptor {
-            append(uid: record.uid, vector: record.vector)
-        }
-    }
-
     public mutating func reserveCapacity(_ rows: Int) {
         uids.reserveCapacity(rows)
         storage.reserveCapacity(rows * dimension)

@@ -70,32 +70,6 @@ public actor AlbumSyncRunner {
 
     public var currentProgress: AlbumSyncProgress { progress }
 
-    // MARK: - Precheck (for the UI's conflict dialog)
-
-    public enum Precheck: Sendable, Equatable {
-        /// A stored mapping exists - sync continues into that album, no questions.
-        case mapped(remoteAlbumID: String)
-        /// No mapping, and remote albums with the exact same (trimmed) name exist.
-        case nameConflict([AlbumSyncRemoteAlbum])
-        /// No mapping, no name twin - `automatic` will create a fresh album.
-        case clear
-    }
-
-    /// What starting a sync for `album` would do. UI calls this to decide whether to show the
-    /// "use existing Proton album?" dialog before `sync`.
-    public func precheck(album: LocalAlbumSummary) async throws -> Precheck {
-        guard let mappingStore, mappingStore.isOperational() else {
-            throw AlbumSyncError.mappingStoreUnavailable
-        }
-        try await ensureAlbumPresent(albumID: album.id)
-        if let mapping = mappingStore.mapping(localAlbumID: album.id) {
-            return .mapped(remoteAlbumID: mapping.remoteAlbumID)
-        }
-        guard mappingStore.isOperational() else { throw AlbumSyncError.mappingStoreUnavailable }
-        let twins = try await nameTwins(of: album.title)
-        return twins.isEmpty ? .clear : .nameConflict(twins)
-    }
-
     // MARK: - Sync
 
     /// Runs one full additive sync of `album`. Throws `AlbumSyncError.nameConflict` when
@@ -208,7 +182,9 @@ public actor AlbumSyncRunner {
                 links[identifier] = AlbumSyncRemoteLink(
                     uid: link.uid, sha1Hex: link.sha1Hex, isTrashed: true)
             case nil:
-                break
+                // A retained trash fact blocks upload, but only this read can label the copy trashed now.
+                // An uncertain link must not enter the attach or same-content adoption plan.
+                if link.isTrashed { links[identifier] = nil }
             }
         }
         let sameContent = try await membersWithSameContent(links: links, children: children)
@@ -222,7 +198,6 @@ public actor AlbumSyncRunner {
         progress.alreadyMember = plan.alreadyMember
         progress.unattachable = plan.missingRemote
         progress.trashedSkipped = plan.trashedRemote
-        progress.attachTotal = plan.toAttach.count
         publish()
         try checkStop()
 

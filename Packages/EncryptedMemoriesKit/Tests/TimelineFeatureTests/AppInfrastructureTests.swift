@@ -52,17 +52,10 @@ struct AppInfrastructureTests {
         SidebarPersistence.saveVisible(true, defaults: defaults)
         #expect(SidebarPersistence.resolvedVisible(defaults: defaults))
 
-        SidebarPersistence.saveWidth(10, defaults: defaults)
+        defaults.set(10.0, forKey: AppSettingsKey.sidebarWidth)
         #expect(SidebarPersistence.resolvedWidth(defaults: defaults) == SidebarMetrics.minWidth)
-        SidebarPersistence.saveWidth(320, defaults: defaults)
+        defaults.set(320.0, forKey: AppSettingsKey.sidebarWidth)
         #expect(SidebarPersistence.resolvedWidth(defaults: defaults) == 320)
-    }
-
-    @Test func sidebarToggleAnimationStateTest() {
-        let width: CGFloat = 260
-        #expect(SidebarMetrics.effectiveWidth(visible: true, width: width) == width)
-        #expect(SidebarMetrics.effectiveWidth(visible: false, width: width) == 0)
-        #expect(SidebarMetrics.effectiveWidth(visible: true, width: 9_000) == SidebarMetrics.maxWidth)
     }
 
     @Test func windowFrameStaysOnScreen() {
@@ -135,14 +128,13 @@ struct AppInfrastructureTests {
 
     @Test func videoLogFieldsContract() {
         let fields = videoViewerLogFields(
-            uid: PhotoUID(volumeID: "v", nodeID: "n"),
             state: .downloading(0.5),
             localURLExists: true,
             assetPlayable: false,
             playerItemStatus: 0,
             error: nil
         )
-        #expect(fields["uid"] == "v~n")
+        #expect(fields["uid"] == nil, "the diagnostic never carries the identifier of a photo")
         #expect(fields["state"] == "downloading")
         #expect(fields["progress"] == "0.50")
         #expect(fields["localURLExists"] == "true")

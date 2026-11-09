@@ -1,10 +1,11 @@
 import AlbumCore
 import Foundation
 import PhotosCore
+import ProtonAuth
 
 /// `AlbumWriteBackend` over the app's direct-HTTP album operations.
 ///
-/// SDK 0.32.1 owns listing, sharing and membership reads. This adapter intentionally contains
+/// SDK 0.33.0 owns listing, sharing and membership reads. This adapter intentionally contains
 /// only the write contracts still absent from the SDK.
 struct HTTPAlbumWriteBackend: AlbumWriteBackend {
     /// Supplied by the bridge: PUT the album's cover to an already-uploaded photo (cleartext LinkID, no crypto).
@@ -21,22 +22,31 @@ struct HTTPAlbumWriteBackend: AlbumWriteBackend {
     let removeProvider: @Sendable ([PhotoUID], AlbumID) async throws -> Void
 
     func createAlbum(name: String) async throws -> AlbumID {
-        try await createProvider(name)
+        try await write { try await createProvider(name) }
     }
 
     func deleteAlbum(albumID: AlbumID) async throws {
-        try await deleteProvider(albumID)
+        try await write { try await deleteProvider(albumID) }
     }
 
     func addPhotos(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async throws {
-        try await addProvider(photoUIDs, albumID)
+        try await write { try await addProvider(photoUIDs, albumID) }
     }
 
     func removePhotos(_ photoUIDs: [PhotoUID], from albumID: AlbumID) async throws {
-        try await removeProvider(photoUIDs, albumID)
+        try await write { try await removeProvider(photoUIDs, albumID) }
     }
 
     func setAlbumCover(albumID: AlbumID, photoUID: PhotoUID) async throws {
-        try await setCoverProvider(albumID, photoUID)
+        try await write { try await setCoverProvider(albumID, photoUID) }
+    }
+
+    private func write<T>(_ operation: () async throws -> T) async throws -> T {
+        do { return try await operation() } catch let error as ProtonAuthError {
+            if case .apiError(let code, _) = error {
+                throw AlbumError.requestFailed(AlbumWriteCause(error, httpStatus: code))
+            }
+            throw error
+        }
     }
 }

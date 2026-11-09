@@ -1,18 +1,25 @@
 import Foundation
 
-/// Defers only metadata-driven order corrections that would move a currently visible photo.
+/// Anchors provisional updates and defers metadata corrections that would move a currently visible photo.
 /// Hosts reuse their UID index and the bounded visible slots. No library-sized lookup is allocated here.
 public enum TimelineOrderRefinementPolicy {
     public enum Decision: Equatable {
         case ordinaryUpdate
         case applyCorrection
+        case applyAnchoredUpdate
         case deferVisibleCorrection
+
+        public var preservesVisibleAnchor: Bool {
+            self == .applyCorrection || self == .applyAnchoredUpdate
+        }
     }
 
     public static func decision(
         incoming: [PhotoItem], previousCount: Int, visibleIndices: Set<Int>,
+        preservingVisibleAnchor: Bool = false,
         previous: (PhotoUID) -> (index: Int, item: PhotoItem)?
     ) -> Decision {
+        if preservingVisibleAnchor { return .applyAnchoredUpdate }
         guard incoming.count == previousCount else { return .ordinaryUpdate }
         var changedMetadata = false
         var movedVisiblePhoto = false

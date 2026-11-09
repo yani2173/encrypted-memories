@@ -125,6 +125,7 @@ import UploadCore
     }
 
     private struct CountingDuplicates: ExactDuplicateMerging {
+        func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
         let checks: Count
         private let base = MobileFixtureDuplicates(groups: [], confirmsNoPendingMerges: false)
         func confirmNoPendingMerges() async -> Bool {

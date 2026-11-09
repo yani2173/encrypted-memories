@@ -38,6 +38,8 @@ final class FolderBackupController {
     @ObservationIgnored private let pendingStore: PendingBackupManifestStore?
     @ObservationIgnored private let requiresPendingStore: Bool
     @ObservationIgnored private var accessedFolders: [BackupFolder.ID: URL] = [:]
+    /// False when the saved folder list could not be read, so no path counts as outside the watched folders.
+    @ObservationIgnored private var registeredFoldersAreKnown = false
 
     private let engine: UploadBackupSyncEngine?
     private let runner: BackupSyncRunner?
@@ -184,8 +186,10 @@ final class FolderBackupController {
     }
 
     private func loadFolders() {
-        guard let raw = UserDefaults.standard.array(forKey: Self.foldersDefaultsKey) as? [Data] else { return }
-        folders = raw.compactMap { bookmark in
+        let stored = WatchedFolderScope.registeredBookmarks(
+            storedValue: UserDefaults.standard.object(forKey: Self.foldersDefaultsKey))
+        registeredFoldersAreKnown = stored != nil
+        folders = (stored ?? []).compactMap { bookmark in
             var stale = false
             guard
                 let url = try? URL(
@@ -222,7 +226,10 @@ final class FolderBackupController {
             else { continue }
             accessedFolders[folder.id] = url
         }
-        pendingAccess.setRoots(Array(accessedFolders.values))
+        pendingAccess.setScope(
+            WatchedFolderScope(
+                readable: Array(accessedFolders.values),
+                registered: registeredFoldersAreKnown ? folders.map(\.displayPath) : nil))
     }
 
     // MARK: - Pending grid
@@ -234,7 +241,7 @@ final class FolderBackupController {
             queue: queueStore,
             metadata: PendingFolderMetadataProvider(access: pendingAccess),
             removeFromBackup: { [weak self] paths in await self?.removeFromBackup(paths: paths) ?? false },
-            returnToBackup: { [weak self] paths in await self?.returnToBackup(paths: paths) ?? false }
+            returnToBackup: { [weak self] paths in await self?.returnToBackup(paths: paths) ?? [] }
         )
     }
 
@@ -242,23 +249,23 @@ final class FolderBackupController {
     private func removeFromBackup(paths: [String]) async -> Bool {
         guard let runner, queueStore?.isOperational() == true else { return false }
         _ = await runner.removeSources(kind: .fileURL, identifiers: paths)
-        return queueStore?.isOperational() == true
+        return queueStore?.holdsNoRows(kind: .fileURL, identifiers: paths) == true
     }
 
-    /// Enqueues restored files again and starts a pass. Files that are gone need nothing and count as done.
-    private func returnToBackup(paths: [String]) async -> Bool {
-        guard let engine else { return false }
-        let candidates = paths.compactMap { path in
-            pendingAccess.fileURL(forPath: path).flatMap { try? FolderBackupCatalog.candidate(for: $0) }
-        }
-        do {
-            _ = try await engine.enqueueBatch(candidates)
-        } catch {
-            return false
-        }
+    /// Enqueues restored files again, starts a pass and returns the paths that count as returned.
+    /// A file that is gone needs nothing and counts as done; a file whose attributes cannot be
+    /// read, or whose folder cannot be read now, does not count as returned, so its queue duty
+    /// stays and the next backoff tries it again.
+    private func returnToBackup(paths: [String]) async -> Set<String> {
+        guard let engine else { return [] }
+        let batch = await FolderBackupCatalog.returnToBackup(
+            paths: paths,
+            scope: pendingAccess.scope,
+            engine: engine
+        )
         refreshFromQueue()
-        if !candidates.isEmpty { syncNow() }
-        return true
+        if batch.queuedCount > 0 { syncNow() }
+        return batch.returnedPaths
     }
 
     private func persistFolders() {
@@ -383,7 +390,7 @@ final class FolderBackupController {
         stateStore?.close()
         for url in accessedFolders.values { url.stopAccessingSecurityScopedResource() }
         accessedFolders.removeAll()
-        pendingAccess.setRoots([])
+        pendingAccess.setScope(.unavailable)
     }
 
     private func markFolderNeedsRenewal(_ id: BackupFolder.ID) {

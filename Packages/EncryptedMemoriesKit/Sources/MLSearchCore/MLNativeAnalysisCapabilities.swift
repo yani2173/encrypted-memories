@@ -158,10 +158,6 @@ public struct MLNativeAnalysisCapabilitySnapshot: Codable, Equatable, Sendable {
     public func capability(for kind: MLNativeAnalysisKind) -> MLNativeAnalysisCapability? {
         capabilities.first { $0.kind == kind }
     }
-
-    public var availableKinds: [MLNativeAnalysisKind] {
-        capabilities.compactMap { $0.isAvailable ? $0.kind : nil }
-    }
 }
 
 public protocol MLNativeAnalysisCapabilityProvider: Sendable {

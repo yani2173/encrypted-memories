@@ -246,6 +246,34 @@ import Testing
         #expect(await runtime.search("grusse", scope: .text, limit: 10) == [retained.uid])
     }
 
+    @Test func completedPassWithoutDestructiveAllowanceKeepsStoredAssets() async throws {
+        let configuration = try MLNativeSearchConfiguration(
+            accountIdentifier: "account",
+            capabilitySnapshot: capabilitySnapshot(kinds: [.textRecognition])
+        )
+        let runtime = MLNativeSearchRuntime(
+            configuration: configuration,
+            store: InMemoryMLDerivedPipelineStore(),
+            executor: NativeTextTestExecutor()
+        )
+        let retained = try MLPipelineAssetRevision(uid: uid("retained"), sourceRevision: "retained")
+        let removed = try MLPipelineAssetRevision(uid: uid("removed"), sourceRevision: "removed")
+        _ = await runtime.index(assets: [retained, removed], shouldContinue: { true })
+
+        let outcome = await runtime.indexQuantum(
+            assets: [retained],
+            libraryGeneration: 2,
+            allowsDestructiveReconciliation: false,
+            destructiveReconciliationIsAuthorized: { true },
+            maximumAssets: 8,
+            maximumConcurrentAssets: 1,
+            shouldContinue: { true },
+            observer: MLDerivedPipelineObserver()
+        )
+        #expect(outcome.reason == .drained)
+        #expect(Set(await runtime.search("grusse", scope: .text, limit: 10)) == [retained.uid, removed.uid])
+    }
+
     @Test func nativeRuntimeClampsConcurrencyPerQuantumWithoutCreatingUnboundedWork() async throws {
         let configuration = try MLNativeSearchConfiguration(
             accountIdentifier: "account",
@@ -268,6 +296,8 @@ import Testing
         let first = await runtime.indexQuantum(
             assets: assets,
             libraryGeneration: 1,
+            allowsDestructiveReconciliation: true,
+            destructiveReconciliationIsAuthorized: { true },
             maximumAssets: 8,
             maximumConcurrentAssets: 1,
             shouldContinue: { true },
@@ -283,6 +313,8 @@ import Testing
         let second = await runtime.indexQuantum(
             assets: assets,
             libraryGeneration: 1,
+            allowsDestructiveReconciliation: true,
+            destructiveReconciliationIsAuthorized: { true },
             maximumAssets: 9,
             maximumConcurrentAssets: 3,
             shouldContinue: { true },

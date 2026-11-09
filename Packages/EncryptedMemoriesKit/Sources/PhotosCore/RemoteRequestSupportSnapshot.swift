@@ -6,6 +6,31 @@ import Foundation
 /// is kept when it looks like a route word (3 to 32 lowercase letters, underscores or hyphens), so a token of that
 /// shape inside a path segment would be kept.
 public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
+    /// One completed transport attempt. Admission is the start; response/error completion is the end.
+    /// Offsets use the process-wide monotonic clock, including time while the system sleeps.
+    public struct Request: Codable, Sendable, Equatable {
+        public let scope: String
+        public let method: String
+        public let endpoint: String
+        public let cause: String
+        public let status: String
+        public let startMilliseconds: Int64
+        public let endMilliseconds: Int64
+
+        public init(
+            scope: String, method: String, endpoint: String, cause: String, status: String,
+            startMilliseconds: Int64, endMilliseconds: Int64
+        ) {
+            self.scope = scope
+            self.method = method
+            self.endpoint = endpoint
+            self.cause = cause
+            self.status = status
+            self.startMilliseconds = startMilliseconds
+            self.endMilliseconds = endMilliseconds
+        }
+    }
+
     public struct Count: Codable, Sendable, Equatable {
         public let scope: String
         public let method: String
@@ -65,11 +90,34 @@ public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
     /// Requests that arrived after the bounded key table was full; they are counted here only.
     public let overflowRequests: Int
     public let scopes: [Scope]
+    /// Newest 8,192 completed attempts, in completion order. In-flight attempts are not zero-duration records.
+    public let recentRequests: [Request]
+    public let droppedRequestRecords: Int
+    public let traceCapturedAtMilliseconds: Int64
 
-    public init(counts: [Count], overflowRequests: Int, scopes: [Scope]) {
+    public init(
+        counts: [Count], overflowRequests: Int, scopes: [Scope], recentRequests: [Request] = [],
+        droppedRequestRecords: Int = 0, traceCapturedAtMilliseconds: Int64 = 0
+    ) {
         self.counts = counts
         self.overflowRequests = overflowRequests
         self.scopes = scopes
+        self.recentRequests = recentRequests
+        self.droppedRequestRecords = droppedRequestRecords
+        self.traceCapturedAtMilliseconds = traceCapturedAtMilliseconds
+    }
+}
+
+/// The apps initialize this clock at the beginning of App.init, before account composition.
+/// Its origin survives account rebuilds. It represents launch instrumentation, not kernel process creation.
+public enum RequestTraceClock {
+    private static let origin = ContinuousClock.now
+
+    public static func start() { _ = origin }
+
+    public static var milliseconds: Int64 {
+        let elapsed = origin.duration(to: .now).components
+        return elapsed.seconds * 1_000 + elapsed.attoseconds / 1_000_000_000_000_000
     }
 }
 

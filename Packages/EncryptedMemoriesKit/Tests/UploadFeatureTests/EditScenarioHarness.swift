@@ -8,6 +8,15 @@ import XCTest
 @testable import PhotoLibraryBackupAdapter
 @testable import UploadCore
 
+/// Adds tags to the scenario server after both parts of a Live Photo settle, like the app's backend adapter.
+struct HarnessTagAdder: PhotoTagAdding {
+    let server: EditScenarioServer
+
+    func addTags(_ tags: [Int], to uid: PhotoUID) async throws {
+        server.addTags(Set(tags), to: uid)
+    }
+}
+
 /// A mutable library resolves the current revision, even when the queue contains an earlier scan.
 final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnumerator, @unchecked Sendable {
     struct Asset: Sendable {
@@ -389,7 +398,7 @@ final class EditScenarioHarness {
                 let record = try XCTUnwrap(backupState.record(for: asset.source, revision: revision))
                 XCTAssertTrue(record.isComplete)
                 XCTAssertEqual(record.pendingResourceCount, 0)
-                XCTAssertEqual(catalog.entry(for: asset.identifier)?.metadataRevision, revision.rawValue)
+                XCTAssertEqual(try catalog.entry(for: asset.identifier)?.metadataRevision, revision.rawValue)
                 XCTAssertTrue(journal.entry(for: asset.source).isEmpty)
             }
             XCTAssertFalse(journalFileExists)
@@ -440,7 +449,7 @@ final class EditScenarioHarness {
             }
         }
         try openBackupStores()
-        XCTAssertEqual(queue.summary().total, 0)
+        XCTAssertEqual(queue.summary()!.total, 0)
         XCTAssertEqual(backupState.count(), 0)
     }
 
@@ -569,7 +578,7 @@ final class EditScenarioHarness {
         runner = BackupSyncRunner(
             queue: queue, preflight: preflight,
             resolver: EditScenarioResolver(library: library, clock: clock), identityResolver: pipeline,
-            uploader: deviceRemote, editReplacement: replacement,
+            uploader: deviceRemote, tagAdder: HarnessTagAdder(server: server), editReplacement: replacement,
             resourceCoordinator: coordinator,
             configuration: .init(
                 retry: .init(baseDelay: 1, maxDelay: 8, maxAttempts: 4),
@@ -664,7 +673,7 @@ final class EditScenarioHarness {
     }
 
     func state(of entry: UploadBackupSyncQueueEntry) -> UploadBackupSyncQueueState? {
-        queue.entry(for: entry.source, revision: entry.revision)?.state
+        queueEntryForTesting(in: queue, source: entry.source, revision: entry.revision)?.state
     }
 
     func primaryDecision(for entry: UploadBackupSyncQueueEntry) async throws -> UploadDuplicateDecision {
@@ -795,7 +804,7 @@ final class EditScenarioHarness {
     }
 
     func assertQuiescent(file: StaticString = #filePath, line: UInt = #line) {
-        let summary = queue.summary()
+        let summary = queue.summary()!
         check(
             summary.waiting + summary.active + summary.blocked + summary.failed == 0, "the queue must drain",
             file: file, line: line)
@@ -889,14 +898,18 @@ struct EditScenarioAlbumSource: AlbumSyncLocalAlbumSource {
 /// manifest. Then it reports the unresolved album rows.
 final class EditScenarioAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendable {
     let device: EditScenarioHarness
-    init(device: EditScenarioHarness) { self.device = device }
+    private let waitsForScheduledRetries: Bool
+    init(device: EditScenarioHarness, waitsForScheduledRetries: Bool = false) {
+        self.device = device
+        self.waitsForScheduledRetries = waitsForScheduledRetries
+    }
 
     func ensureBackedUp(
         localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
     ) async throws -> AlbumSyncBackupReport {
         try device.resetAlbumSyncScratch()
         try await device.enqueue()
-        await device.pass()
+        if waitsForScheduledRetries { await device.drain() } else { await device.pass() }
         return try AlbumSyncBackupReport.read(from: device.queue, localIdentifiers: localIdentifiers)
     }
 

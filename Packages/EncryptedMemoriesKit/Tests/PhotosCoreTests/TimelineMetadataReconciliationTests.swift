@@ -36,7 +36,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
     func testAPassRunsInABackgroundWindowUnderTheHeavyPermit() async {
         let state = runtimeState(.backgroundPermitted)
         let coordinator = await coordinator(state)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        let reconciliation = TimelineMetadataReconciliation(
+            runtimeState: state, coordinator: coordinator, taskPriority: .userInitiated)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
         await awaitWindowEvent(log.started, "the pass in the background window")
@@ -53,7 +54,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
     func testAPassWaitsWhileTheAppIsSuspended() async {
         let state = runtimeState(.suspended)
         let coordinator = await coordinator(state)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        let reconciliation = TimelineMetadataReconciliation(
+            runtimeState: state, coordinator: coordinator, taskPriority: .userInitiated)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
         await awaitHeldSnapshots(1, in: reconciliation)
@@ -72,7 +74,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         for opportunity in [LibraryExecutionOpportunity.foregroundActive, .foregroundInactive] {
             let state = runtimeState(opportunity)
             let coordinator = await coordinator(state)
-            let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+            let reconciliation = TimelineMetadataReconciliation(
+                runtimeState: state, coordinator: coordinator, taskPriority: .userInitiated)
             let log = PassLog()
             reconciliation.schedule(inventory(2)) { await log.start($0) }
             await awaitWindowEvent(log.started, "the pass in the foreground")
@@ -84,7 +87,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testAPassRunsAtOnceWhileTheAppIsInTheForegroundButInactive() async {
         // A Mac app behind another window, or an iPhone app under Control Center, is not in a background window.
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: runtimeState(.foregroundInactive))
+        let reconciliation = TimelineMetadataReconciliation(
+            runtimeState: runtimeState(.foregroundInactive), taskPriority: .userInitiated)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
         let ran = await log.started.wait(limit: .seconds(20))
@@ -99,7 +103,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         let state = LibraryRuntimeState(
             initial: LibraryRuntimeSnapshot(isLowPowerMode: true, executionOpportunity: .backgroundPermitted))
         let coordinator = await coordinator(state)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        let reconciliation = TimelineMetadataReconciliation(
+            runtimeState: state, coordinator: coordinator, taskPriority: .userInitiated)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
         let queued = await waitFor { await coordinator.waitingPermitCount == 1 }
@@ -117,7 +122,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
     func testAPendingPassRunsUnderThePermitWhenTheAppEnteredTheBackgroundDuringTheFirstPass() async {
         let state = runtimeState(.foregroundActive)
         let coordinator = await coordinator(state)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        let reconciliation = TimelineMetadataReconciliation(
+            runtimeState: state, coordinator: coordinator, taskPriority: .userInitiated)
         let log = PassLog()
         let firstRunning = AsyncTestSignal()
         let releaseFirst = AsyncTestSignal()
@@ -140,10 +146,39 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         XCTAssertEqual(acquired, 1, "only the pass in the background window took the permit")
     }
 
+    /// The tests name a higher priority because a background task can wait longer than their limits on a loaded
+    /// machine. Production keeps the background priority.
+    func testThePassRunsAtBackgroundPriorityByDefaultAndAtTheNamedPriorityOtherwise() async {
+        // The test waits for a signal, not for the task: awaiting the task would raise its priority.
+        let defaultPriority = LockedValue<TaskPriority>()
+        let defaultStarted = AsyncTestSignal()
+        let defaultReconciliation = TimelineMetadataReconciliation(runtimeState: runtimeState(.foregroundActive))
+        defaultReconciliation.schedule(inventory(2)) { _ in
+            defaultPriority.set(Task.currentPriority)
+            defaultStarted.fire()
+        }
+        await awaitEvent(defaultStarted, "the pass of the default priority")
+        await joinCurrentPass(defaultReconciliation)
+        XCTAssertEqual(defaultPriority.value, .background)
+
+        let namedPriority = LockedValue<TaskPriority>()
+        let namedStarted = AsyncTestSignal()
+        let namedReconciliation = TimelineMetadataReconciliation(
+            runtimeState: runtimeState(.foregroundActive), taskPriority: .userInitiated)
+        namedReconciliation.schedule(inventory(2)) { _ in
+            namedPriority.set(Task.currentPriority)
+            namedStarted.fire()
+        }
+        await awaitEvent(namedStarted, "the pass of the named priority")
+        await joinCurrentPass(namedReconciliation)
+        XCTAssertEqual(namedPriority.value, .userInitiated)
+    }
+
     func testABackupItemStopsTheBackgroundPassWhichRunsAgainWithTheSameInventory() async {
         let state = runtimeState(.backgroundPermitted)
         let coordinator = await coordinator(state)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        let reconciliation = TimelineMetadataReconciliation(
+            runtimeState: state, coordinator: coordinator, taskPriority: .userInitiated)
         let order = OrderLog()
         let firstRunning = AsyncTestSignal()
         reconciliation.schedule(inventory(2)) { pass in
@@ -172,7 +207,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
             directory: directory, useOrderCache: true, holdsTheSecondPageOfTheFirstPass: true)
         let state = runtimeState(.backgroundPermitted)
         let coordinator = await coordinator(state)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        let reconciliation = TimelineMetadataReconciliation(
+            runtimeState: state, coordinator: coordinator, taskPriority: .userInitiated)
         reconciliation.schedule(inventory(302)) { await fixture.run($0, reconciliation: reconciliation) }
         await awaitWindowEvent(fixture.requested, "the second page of the background pass")
 
@@ -189,7 +225,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
     }
 
     func testRetiringAWaitingPassEndsItWithoutAStart() async {
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: runtimeState(.suspended))
+        let reconciliation = TimelineMetadataReconciliation(
+            runtimeState: runtimeState(.suspended), taskPriority: .userInitiated)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
         await awaitHeldSnapshots(1, in: reconciliation)
@@ -201,7 +238,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testALibraryReplacementWhileAPassWaitsStartsOnlyTheNewLibrary() async {
         let state = runtimeState(.suspended)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, taskPriority: .userInitiated)
         let log = PassLog()
         reconciliation.schedule(inventory(2, library: "first")) { await log.start($0) }
         await awaitHeldSnapshots(1, in: reconciliation)
@@ -217,7 +254,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testAHeldPassResumesWhenTheAppReturnsToAnInactiveForeground() async {
         let state = runtimeState(.suspended)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, taskPriority: .userInitiated)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
         await awaitHeldSnapshots(1, in: reconciliation)
@@ -232,7 +269,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testAPassThatEndsInTheBackgroundLeavesNoWaiterBehind() async {
         let state = runtimeState(.foregroundActive)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, taskPriority: .userInitiated)
         let running = AsyncTestSignal()
         let release = AsyncTestSignal()
         reconciliation.schedule(inventory(2)) { _ in
@@ -264,7 +301,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testFrequentChangesPublishTheActiveSnapshotAndOnlyOneLatestFollowUp() async throws {
         let fixture = try fixture()
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { pass in
             await fixture.run(pass)
         }
@@ -295,7 +332,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let fixture = try MIMEReconciliationFixture(directory: directory, useOrderCache: useOrderCache)
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         let initial = inventory(302)
         let latest = inventory(303)
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = {
@@ -324,7 +361,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testReturningToTheActiveInventoryDropsAnObsoleteFollowUp() async throws {
         let fixture = try fixture()
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { await fixture.run($0) }
         reconciliation.schedule(inventory(2), operation: operation)
         await awaitEvent(fixture.started, "the first pass reaching the network phase")
@@ -341,7 +378,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testRepeatedIdenticalInventoriesKeepTheHeldRequest() async throws {
         let fixture = try fixture()
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { await fixture.run($0) }
         let initial = inventory(2)
         reconciliation.schedule(initial, operation: operation)
@@ -360,7 +397,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testNewPhotosStayVisibleInFallbackOrderBeforePublication() async throws {
         let fixture = try fixture()
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         let initial = inventory(2)
         let latest = inventory(5)
         reconciliation.schedule(initial) { await fixture.run($0) }
@@ -384,7 +421,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
     func testAccountReplacementCancelsTheOldPassAndDiscardsItsPendingInventory() async throws {
         try await assertRetirement()
         let replacement = try fixture()
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         await replacement.release()
         reconciliation.schedule(inventory(2, library: "replacement")) { await replacement.run($0) }
         await reconciliation.waitForCurrentPass()
@@ -396,7 +433,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     private func assertRetirement() async throws {
         let fixture = try fixture()
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { await fixture.run($0) }
         reconciliation.schedule(inventory(2), operation: operation)
         await awaitEvent(fixture.started, "the first pass reaching the network phase")
@@ -423,7 +460,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
     }
 
     private func assertCancellationOutsideLock(replacingLibrary: Bool) async {
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         let started = AsyncTestSignal()
         let finished = AsyncTestSignal()
         reconciliation.schedule(inventory(2)) { pass in
@@ -455,7 +492,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     func testLibraryReplacementCancelsThePassAndDropsTheOldFollowUp() async throws {
         let fixture = try fixture()
-        let reconciliation = TimelineMetadataReconciliation()
+        let reconciliation = TimelineMetadataReconciliation(taskPriority: .userInitiated)
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { await fixture.run($0) }
         reconciliation.schedule(inventory(2), operation: operation)
         await awaitEvent(fixture.started, "the first pass reaching the network phase")

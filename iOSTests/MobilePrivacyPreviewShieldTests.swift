@@ -9,7 +9,7 @@ import XCTest
 final class MobilePrivacyPreviewShieldTests: XCTestCase {
     @MainActor func testInactivePreviewBlursContentWithoutTurningBlack() async throws {
         let scene = try XCTUnwrap(
-            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 200, height: 200)
         window.overrideUserInterfaceStyle = .dark
@@ -41,7 +41,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
 
     @MainActor func testProductionMetalGridRetainsItsColorsInTheBlurredPreview() async throws {
         let scene = try XCTUnwrap(
-            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            UIApplication.shared.foregroundWindowScene)
         let fixture = try await MobileSignedInFixture(itemsPerSection: 6)
         defer { fixture.removeCache() }
         // Put distinct fixture colors next to each other, starting with the brightest thumbnails.
@@ -70,7 +70,10 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
             {
                 probes = plan.visibleSlots.compactMap { slot in
                     let rect = grid.metalView.convert(slot.viewportRect, to: window)
-                    guard rect.minY > 140, rect.maxY < window.bounds.height - 100 else { return nil }
+                    // The probe reads the pixel at the center of the tile, so that point must lie clear of the bars.
+                    // A tile taller than the clear band, like 233 pt tiles on the 678 pt outer display of iPhone Duo,
+                    // still gives a probe when its center is clear.
+                    guard rect.midY > 140, rect.midY < window.bounds.height - 100 else { return nil }
                     let item = items[slot.index]
                     guard let section = fixture.sections.firstIndex(where: { $0.items.contains(item) }),
                         let index = fixture.sections[section].items.firstIndex(of: item)
@@ -177,19 +180,50 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
         return (values.reduce(0, +) / Double(values.count), profile)
     }
 
-    /// The fade lasts 160 ms. A busy test machine can wake a 40 ms sleep after the fade ended; the opacity is then
-    /// final and says nothing about the fade, whose start the animation check above already proved.
+    /// Reads the paused fade's on-screen opacity. The caller must pause the fade first; a paused fade holds
+    /// this value between its start and end, so the check is deterministic even on a loaded test machine.
     @MainActor private func assertMidFade(
-        _ cover: UIView, since start: ContinuousClock.Instant, file: StaticString = #filePath, line: UInt = #line
+        _ cover: UIView, file: StaticString = #filePath, line: UInt = #line
     ) throws {
         let opacity = try XCTUnwrap(cover.layer.presentation(), file: file, line: line).opacity
-        guard ContinuousClock.now - start < .milliseconds(120) else { return }
         XCTAssertGreaterThan(opacity, 0, file: file, line: line)
         XCTAssertLessThan(opacity, 1, "the cover must be between its start and end", file: file, line: line)
     }
 
+    /// Waits until the cover's presentation layer exists. The layer materializes only after the runloop
+    /// committed the animation and rendered the first frame. The caller must pause the fade first, so the
+    /// polls below cannot let the fade complete the way the old fixed sleeps did on loaded hosted runners.
+    @MainActor private func waitForFirstFrame(of cover: UIView) async throws {
+        let deadline = ContinuousClock.now + .milliseconds(300)
+        while cover.layer.presentation() == nil {
+            if ContinuousClock.now > deadline {
+                XCTFail("The cover never rendered its first frame")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    /// Pauses the active fade at half progress so a test can react mid-fade without wall-clock sleeps.
+    @MainActor private func pauseFadeMidway(_ shield: MobilePrivacyPreviewShield) throws {
+        let fade = try XCTUnwrap(shield.animator, "The fade must still be running when the test interrupts it")
+        fade.pauseAnimation()
+        fade.fractionComplete = 0.5
+    }
+
+    /// Delivers the fade's natural completion immediately: the fade jumps to its end state and its completion
+    /// handler runs synchronously. This models a runner whose sleep returns after the fade already finished.
+    /// A bare stopAnimation(false) leaves the animator un-finalized and throws when it is released, so the
+    /// finishAnimation(at:) call is required.
+    @MainActor private func finishFade(_ fade: UIViewPropertyAnimator) {
+        fade.pauseAnimation()
+        fade.fractionComplete = 1.0
+        fade.stopAnimation(false)
+        fade.finishAnimation(at: .end)
+    }
+
     @MainActor func testPreviewFadesInAndOutAndSurvivesRapidReactivation() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let previous = scene.windows.first(where: \.isKeyWindow)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = UIViewController()
@@ -202,36 +236,73 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
             previous?.makeKey()
         }
 
-        let enteringStart = ContinuousClock.now
         shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
         let cover = try XCTUnwrap(window.subviews.compactMap { $0 as? UIImageView }.first)
         XCTAssertFalse(
             cover.layer.animationKeys()?.isEmpty ?? true, "Deactivation must fade instead of appearing instantly")
-        try await Task.sleep(for: .milliseconds(40))
-        try assertMidFade(cover, since: enteringStart)
+        // Pause synchronously, before any await: a 5 ms poll on a loaded runner can wake after the 160 ms
+        // fade finished, and a completed fade clears the animator the pause below needs.
+        try pauseFadeMidway(shield)
+        try await waitForFirstFrame(of: cover)
+        try assertMidFade(cover)
         shield.prepareForSnapshot()
         XCTAssertEqual(cover.alpha, 1)
         XCTAssertTrue(cover.layer.animationKeys()?.isEmpty ?? true)
 
-        let leavingStart = ContinuousClock.now
         shield.update(enabled: true, isSceneActive: true, window: window, animated: true)
         XCTAssertNotNil(cover.superview, "Activation must keep the cover until its fade finishes")
         XCTAssertFalse(cover.layer.animationKeys()?.isEmpty ?? true, "Activation must fade the cover out")
-        try await Task.sleep(for: .milliseconds(40))
-        try assertMidFade(cover, since: leavingStart)
+        try pauseFadeMidway(shield)
+        try await waitForFirstFrame(of: cover)
+        try assertMidFade(cover)
         shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
         shield.prepareForSnapshot()
-        try await Task.sleep(for: .milliseconds(220))
+        // prepareForSnapshot stops the running fade-in, so no delayed completion can remove this cover later.
         XCTAssertTrue(cover.superview === window, "An old fade-out must not remove a new privacy cover")
         XCTAssertEqual(cover.alpha, 1)
 
         shield.update(enabled: true, isSceneActive: true, window: window, animated: true)
-        try await Task.sleep(for: .milliseconds(220))
+        finishFade(try XCTUnwrap(shield.animator, "Activation must start a fade-out"))
         XCTAssertNil(cover.superview)
     }
 
+    /// When re-deactivation arrives after the fade-out already finished, the old cover was removed and a new
+    /// cover takes its place. The window must still end up covered; the old reference is stale by design.
+    @MainActor func testRedeactivationAfterCompletedFadeOutReplacesTheCover() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = UIViewController()
+        window.rootViewController?.view.backgroundColor = .red
+        window.makeKeyAndVisible()
+        let shield = MobilePrivacyPreviewShield()
+        defer {
+            shield.remove()
+            window.isHidden = true
+            previous?.makeKey()
+        }
+
+        shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
+        let cover = try XCTUnwrap(window.subviews.compactMap { $0 as? UIImageView }.first)
+        shield.prepareForSnapshot()
+        XCTAssertEqual(cover.alpha, 1)
+
+        // Finish the fade-out before the scene is deactivated again.
+        shield.update(enabled: true, isSceneActive: true, window: window, animated: true)
+        let fadeOut = try XCTUnwrap(shield.animator, "Activation must start a fade-out")
+        finishFade(fadeOut)
+        XCTAssertNil(cover.superview, "A completed fade-out must remove its cover")
+
+        shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
+        let replacement = try XCTUnwrap(window.subviews.compactMap { $0 as? UIImageView }.first)
+        XCTAssertFalse(replacement === cover, "Re-deactivation after a completed fade-out must install a new cover")
+        shield.prepareForSnapshot()
+        XCTAssertTrue(replacement.superview === window, "The new cover must cover the window")
+        XCTAssertEqual(replacement.alpha, 1, "The new cover must be fully opaque before a snapshot")
+    }
+
     @MainActor func testBackgroundNotificationFinishesTheFadeBeforeTheSnapshot() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let previous = scene.windows.first(where: \.isKeyWindow)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = UIViewController()
@@ -314,7 +385,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
 
     @MainActor func testSceneLifecycleCoversAndRestoresTheRegisteredWindow() throws {
         let scene = try XCTUnwrap(
-            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = UIViewController()
         let original = UserDefaults.standard.object(forKey: AppSettingsKey.blurAppPreview)

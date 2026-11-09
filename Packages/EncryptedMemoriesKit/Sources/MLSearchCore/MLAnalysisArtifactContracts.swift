@@ -682,44 +682,6 @@ public struct MLGeometryArtifact: Codable, Equatable, Sendable {
     }
 }
 
-public struct MLMaskDescriptor: Codable, Equatable, Sendable {
-    public let context: MLNativeResultContext
-    public let format: MLMaskFormat
-    public let width: Int
-    public let height: Int
-    public let byteCount: Int
-
-    public init(
-        context: MLNativeResultContext,
-        format: MLMaskFormat,
-        width: Int,
-        height: Int,
-        byteCount: Int
-    ) throws {
-        guard width > 0, height > 0, byteCount > 0 else {
-            throw MLAnalysisContractError.invalidMaskDescriptor
-        }
-        self.context = context
-        self.format = format
-        self.width = width
-        self.height = height
-        self.byteCount = byteCount
-    }
-
-    private enum CodingKeys: String, CodingKey { case context, format, width, height, byteCount }
-
-    public init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(
-            context: values.decode(MLNativeResultContext.self, forKey: .context),
-            format: values.decode(MLMaskFormat.self, forKey: .format),
-            width: values.decode(Int.self, forKey: .width),
-            height: values.decode(Int.self, forKey: .height),
-            byteCount: values.decode(Int.self, forKey: .byteCount)
-        )
-    }
-}
-
 public enum MLArtifactProducerIdentity: Codable, Equatable, Hashable, Sendable {
     case model(id: MLModelID, revision: String, role: MLModelRole)
     case native(providerIdentifier: String, kind: MLNativeAnalysisKind, requestRevision: String)
@@ -834,13 +796,4 @@ public enum MLAnalysisContractError: Error, Equatable {
     case invalidArtifactLimits
     case nativeKindMismatch
     case dimensionMismatch(expected: Int, actual: Int)
-}
-
-public enum MLDerivedStateResetScope: Codable, Equatable, Hashable, Sendable {
-    case pipeline(MLPipelineID)
-    case artifact(MLDerivedArtifactIdentity)
-}
-
-public enum MLDerivedStateCompatibilityError: Error, Equatable {
-    case resetRequired(scope: MLDerivedStateResetScope, storedSchemaVersion: Int, supportedSchemaVersion: Int)
 }

@@ -1,4 +1,3 @@
-import AppleSecurityCore
 import Foundation
 import PhotosCore
 import ProtonAuth
@@ -224,7 +223,7 @@ struct DriveSDKRelatedFileTransferTests {
         let session = DriveSession(
             session: ProtonSession(uid: "fixture", accessToken: "", refreshToken: "", keyPassword: ""),
             store: SessionKeychainStore(
-                service: "related-file-fixture", account: "fixture", keychain: RelatedFileDenyKeychain()),
+                service: "related-file-fixture", account: "fixture", keychain: DenyingKeychainStore()),
             accountCacheDirectory: directory, urlProtocolClasses: [RelatedFileBlockHTTP.self])
         _ = try await session.fetchBlock(url: "https://fixture.invalid/block", token: nil)
         _ = try await session.fetchBlock(
@@ -523,7 +522,7 @@ struct DriveSDKRelatedFileTransferTests {
         let session = DriveSession(
             session: ProtonSession(uid: "fixture", accessToken: "", refreshToken: "", keyPassword: ""),
             store: SessionKeychainStore(
-                service: "related-file-fixture", account: "fixture", keychain: RelatedFileDenyKeychain()),
+                service: "related-file-fixture", account: "fixture", keychain: DenyingKeychainStore()),
             accountCacheDirectory: directory, urlProtocolClasses: [RelatedFileBlockHTTP.self])
         let stream = PhotoVideoStreamSource(session: session, crypto: crypto, shareID: "fixture")
         let bytes = RelatedFileStreamBytes()
@@ -706,7 +705,7 @@ struct DriveSDKRelatedFileTransferTests {
         DriveSession(
             session: ProtonSession(uid: "related-fixture", accessToken: "", refreshToken: "", keyPassword: ""),
             store: SessionKeychainStore(
-                service: "related-file-fixture", account: "fixture", keychain: RelatedFileDenyKeychain()),
+                service: "related-file-fixture", account: "fixture", keychain: DenyingKeychainStore()),
             accountCacheDirectory: directory,
             requestGovernor: governor,
             urlProtocolClasses: [RelatedFileDenyHTTP.self])
@@ -739,14 +738,6 @@ private final class RelatedFileDenyHTTP: URLProtocol {
         client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
     }
     override func stopLoading() {}
-}
-
-private struct RelatedFileDenyKeychain: AppleKeychainStoring {
-    func data(for item: AppleKeychainItem) throws -> Data? { throw CocoaError(.userCancelled) }
-    func setData(_ data: Data, for item: AppleKeychainItem) throws { throw CocoaError(.userCancelled) }
-    func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data { throw CocoaError(.userCancelled) }
-    func removeData(for item: AppleKeychainItem) throws { throw CocoaError(.userCancelled) }
-    func removeAllData(service: String) throws { throw CocoaError(.userCancelled) }
 }
 
 private actor RelatedFileBridgeProbe {

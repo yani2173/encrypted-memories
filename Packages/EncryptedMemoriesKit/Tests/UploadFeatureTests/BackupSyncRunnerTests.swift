@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
@@ -567,17 +568,33 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private let failsRunnableDateRead: Bool
     private let lock = NSLock()
     private var readFailed = false
-    private var beforeRemoteCommitMark: (@Sendable (UploadRemoteCommitReconciliation) -> Void)?
+    private var unknownEntryReads: Int
+    var refusesMissingRemoval = false
+    private var unknownEntryReadCount = 0
+    var failedEntryReads: Int { lock.withLock { unknownEntryReadCount } }
+    private var reconciliationHook: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)?
+
+    /// Runs before each receipt reaches the row, after the upload returned its uid. False fails the write as a broken
+    /// store does.
+    var beforeReconciliationMark: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)? {
+        get { lock.withLock { reconciliationHook } }
+        set { lock.withLock { reconciliationHook = newValue } }
+    }
 
     /// With `failsRunnableDateRead`, the read of the next due date fails as a broken SQLite read does: it returns nil
     /// and leaves the store not operational.
-    init(inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog, failsRunnableDateRead: Bool = false) {
+    init(
+        inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog, failsRunnableDateRead: Bool = false,
+        unknownEntryReads: Int = 0
+    ) {
         self.inner = inner
         self.log = log
         self.failsRunnableDateRead = failsRunnableDateRead
+        self.unknownEntryReads = unknownEntryReads
     }
 
     func isOperational() -> Bool { lock.withLock { !readFailed } }
+    func recordedFailureCount() -> UInt64 { inner.recordedFailureCount() }
 
     func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
 
@@ -587,11 +604,22 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         return inner.upsert(entry)
     }
 
-    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry? {
-        inner.entry(for: source, revision: revision)
+    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry? {
+        let unknown = lock.withLock {
+            guard unknownEntryReads > 0 else { return false }
+            unknownEntryReads -= 1
+            unknownEntryReadCount += 1
+            return true
+        }
+        if unknown { throw SQLiteStoreUnknownReadError() }
+        return try inner.entry(for: source, revision: revision)
     }
 
-    func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
+    func containsAny(in states: [UploadBackupSyncQueueState]) throws -> Bool {
+        try inner.containsAny(in: states)
+    }
+
+    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? { inner.earliestRunnableEntry() }
 
     func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
         if failsRunnableDateRead {
@@ -603,7 +631,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
-    ) -> [UploadBackupSyncQueueEntry] {
+    ) -> [UploadBackupSyncQueueEntry]? {
         log.append("queue.claimRunnable")
         return inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
     }
@@ -614,7 +642,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     }
 
     @discardableResult
-    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int {
+    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int? {
         log.append("queue.requeueStaleActive")
         return inner.requeueStaleActive(before: cutoff, updatedAt: updatedAt)
     }
@@ -637,6 +665,10 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         inner.remove(source: source, revision: revision)
     }
+    func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        !refusesMissingRemoval && remove(source: source, revision: revision)
+    }
+
     func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
         inner.removeSettledRevisions(of: source, except: revision)
     }
@@ -645,13 +677,6 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         inner.removeSources(kind: kind, identifiers: identifiers)
     }
 
-    /// Runs `hook` before the receipt of each finished upload is marked, after the upload passed its removal check.
-    func setBeforeRemoteCommitMark(_ hook: (@Sendable (UploadRemoteCommitReconciliation) -> Void)?) {
-        lock.withLock { beforeRemoteCommitMark = hook }
-    }
-
-    /// The protocol's default write, after the hook.
-    @discardableResult
     func markNeedsRemoteReconciliation(
         source: UploadSourceIdentity,
         revision: UploadBackupRevision,
@@ -659,17 +684,14 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         lastError: String?,
         updatedAt: Date
     ) -> Bool {
-        lock.withLock { beforeRemoteCommitMark }?(reconciliation)
-        guard var entry = entry(for: source, revision: revision) else { return false }
-        entry.state = .needsRemoteReconciliation
-        entry.lastError = lastError
-        entry.remoteCommitReconciliation = reconciliation
-        entry.updatedAt = updatedAt
-        return upsert(entry)
+        guard beforeReconciliationMark?(reconciliation) ?? true else { return false }
+        return inner.markNeedsRemoteReconciliation(
+            source: source, revision: revision, reconciliation: reconciliation,
+            lastError: lastError, updatedAt: updatedAt)
     }
 
-    func summary() -> UploadBackupSyncQueueSummary { inner.summary() }
-    func count() -> Int { inner.count() }
+    func summary() -> UploadBackupSyncQueueSummary? { inner.summary() }
+    func count() -> Int? { inner.count() }
 }
 
 extension SpyQueueStore: UploadBackupSyncQueueObserving {
@@ -677,12 +699,14 @@ extension SpyQueueStore: UploadBackupSyncQueueObserving {
         inner.setChangeObserver(observer)
     }
     func changes() -> AsyncStream<UploadBackupSyncQueueChange> { inner.changes() }
-    func unsettledRows() -> [UploadBackupQueueRowState] { inner.unsettledRows() }
+    func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] { try inner.decisionUnsettledRows() }
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
         inner.backedUpRevisions(kind: kind)
     }
-    func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
-        inner.rows(kind: kind, identifiers: identifiers)
+    func decisionRows(
+        kind: UploadSourceIdentity.Kind, identifiers: Set<String>
+    ) throws -> [UploadBackupQueueRowState] {
+        try inner.decisionRows(kind: kind, identifiers: identifiers)
     }
 }
 
@@ -700,25 +724,30 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     }
 
     func isOperational() -> Bool { inner.isOperational() }
+    func recordedFailureCount() -> UInt64 { inner.recordedFailureCount() }
     func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
     func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool { inner.upsert(entry) }
-    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry? {
-        inner.entry(for: source, revision: revision)
+    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry? {
+        try inner.entry(for: source, revision: revision)
     }
-    func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
+    func containsAny(in states: [UploadBackupSyncQueueState]) throws -> Bool {
+        try inner.containsAny(in: states)
+    }
+
+    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? { inner.earliestRunnableEntry() }
     func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
         inner.nextRunnableDate(excludingSourcesOf: excludedSources)
     }
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
-    ) -> [UploadBackupSyncQueueEntry] {
+    ) -> [UploadBackupSyncQueueEntry]? {
         inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
     }
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
     {
         inner.entries(in: state, updatedBefore: updatedBefore, limit: limit)
     }
-    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int {
+    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int? {
         inner.requeueStaleActive(before: cutoff, updatedAt: updatedAt)
     }
     func updateState(
@@ -745,7 +774,7 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
             return true
         }
         guard shouldReenqueue,
-            var entry = inner.entry(for: source, revision: revision)
+            var entry = queueEntryForTesting(in: inner, source: source, revision: revision)
         else { return true }
         entry.state = .discovered
         entry.attempts = 0
@@ -762,8 +791,8 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         inner.removeSources(kind: kind, identifiers: identifiers)
     }
-    func summary() -> UploadBackupSyncQueueSummary { inner.summary() }
-    func count() -> Int { inner.count() }
+    func summary() -> UploadBackupSyncQueueSummary? { inner.summary() }
+    func count() -> Int? { inner.count() }
 }
 
 final class BackupThrottleSequence: @unchecked Sendable {
@@ -836,17 +865,19 @@ private final class TransportCancellingStageResolver: UploadIdentityResolving, @
     let inner: UploadDedupePipeline
     let stage: String
     let failure: any Error
+    let cancelledName: String
     private let lock = NSLock()
     private var names: [String] = []
     var resolvedNames: [String] { lock.withLock { names } }
-    init(inner: UploadDedupePipeline, stage: String, failure: any Error) {
+    init(inner: UploadDedupePipeline, stage: String, failure: any Error, cancelledName: String) {
         self.inner = inner
         self.stage = stage
         self.failure = failure
+        self.cancelledName = cancelledName
     }
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         lock.withLock { names.append(descriptor.filename) }
-        if stage == "primary", descriptor.source.resource == .primary { throw failure }
+        if stage == "primary", descriptor.filename == cancelledName { throw failure }
         if stage == "secondary", descriptor.filename == "cancel.mov" { throw failure }
         let result = try await inner.resolve(descriptor)
         if stage == "revalidation", descriptor.filename == "cancel.mov" {
@@ -903,17 +934,20 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
     private var _recordCalls = 0
     private let failure: any Error
     private let failureFilename: String?
+    private let onRecordFailure: (@Sendable () -> Void)?
 
     var recordCalls: Int { lock.withLock { _recordCalls } }
 
     init(
         inner: UploadDedupePipeline, failures: Int,
-        failure: any Error = UploadError.backend("simulated manifest failure"), failureFilename: String? = nil
+        failure: any Error = UploadError.backend("simulated manifest failure"), failureFilename: String? = nil,
+        onRecordFailure: (@Sendable () -> Void)? = nil
     ) {
         self.inner = inner
         remainingFailures = failures
         self.failure = failure
         self.failureFilename = failureFilename
+        self.onRecordFailure = onRecordFailure
     }
 
     func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
@@ -948,6 +982,7 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
         }
         if shouldFail {
             await inner.remoteCommitNeedsReconciliation(descriptor)
+            onRecordFailure?()
             throw failure
         }
         try await inner.recordUploaded(
@@ -1336,12 +1371,12 @@ final class BackupSyncRunnerTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempDir)
     }
 
-    func testTransportCancellationAtPrimarySecondaryAndRevalidationKeepsRetryBudgetAndStopsResources() async throws {
+    func testItemCancellationAtPrimarySecondaryAndRevalidationRetriesOnlyItsItem() async throws {
         let errors: [any Error] = [
             CancellationError(), URLError(.cancelled), UploadError.cancelled,
             UploadError.transport(code: -999, message: "cancelled"),
         ]
-        for stage in ["primary", "secondary", "revalidation"] {
+        for stage in ["materialization", "primary", "secondary", "revalidation"] {
             for (index, failure) in errors.enumerated() {
                 let queue = try XCTUnwrap(
                     UploadBackupSyncQueueManifestStore(
@@ -1353,7 +1388,15 @@ final class BackupSyncRunnerTests: XCTestCase {
                     revision: UploadBackupRevision(date: resolver.defaultModified), originalFilename: name,
                     byteCount: 4, state: .discovered, attempts: 0, updatedAt: clock.now.addingTimeInterval(-60))
                 XCTAssertTrue(queue.upsert(entry))
-                if stage != "primary" {
+                let laterName = "later-\(stage)-\(index).jpg"
+                let later = UploadBackupSyncQueueEntry(
+                    source: .file(URL(fileURLWithPath: "/backup/\(laterName)")),
+                    revision: entry.revision, originalFilename: laterName, byteCount: 4,
+                    state: .discovered, attempts: 0, updatedAt: clock.now.addingTimeInterval(-30))
+                XCTAssertTrue(queue.upsert(later))
+                if stage == "materialization" {
+                    resolver.set(.failure(failure, times: 1), for: entry.source.identifier)
+                } else if stage != "primary" {
                     resolver.setSecondaries(["cancel.mov", "later.mov"], for: entry.source.identifier)
                     resolver.setSecondaryResource(.photoKit(role: "test", ordinal: 1), forName: "later.mov")
                 }
@@ -1361,11 +1404,11 @@ final class BackupSyncRunnerTests: XCTestCase {
                 let identity = TransportCancellingStageResolver(
                     inner: UploadDedupePipeline(
                         store: FakeIdentityStore(), hasher: FakeHasher(), checker: FakeChecker()),
-                    stage: stage, failure: failure)
+                    stage: stage, failure: failure, cancelledName: name)
                 let runner = makeRunner(
                     uploader: localUploader, identityResolver: identity, queue: queue,
                     throttle: BackupThrottlePolicy(baseConcurrency: 1))
-                let finished = expectation(description: "transport cancellation ends the pass")
+                let finished = expectation(description: "item cancellation leaves later work runnable")
                 let progressBox = BackupProgressBox()
                 let drain = Task {
                     let result = await runner.runUntilDrained(mode: .eligibleOnly)
@@ -1380,19 +1423,199 @@ final class BackupSyncRunnerTests: XCTestCase {
                 }
                 let progress = await drain.value
                 let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
-                XCTAssertEqual(row.attempts, 0, "\(stage) cancellation must not consume retry budget")
-                XCTAssertNil(row.lastError, "cancellation cannot become an ordinary row failure")
+                XCTAssertEqual(row.attempts, 0, "an environmental cancellation must not spend the item budget")
+                let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+                XCTAssertEqual(issue.kind, .unknown)
+                XCTAssertEqual(issue.detail, UploadError.cancelled.errorDescription)
+                XCTAssertEqual(issue.automaticRetryAttempt, 1)
+                XCTAssertNotNil(issue.nextAttemptAt)
+                XCTAssertEqual(row.state, .discovered)
                 XCTAssertEqual(progress.failed, 0)
+                XCTAssertTrue(identity.resolvedNames.contains(laterName), "one item cannot stop later work")
+                XCTAssertTrue(localUploader.requests.map(\.name).contains(laterName))
                 XCTAssertFalse(identity.resolvedNames.contains("later.mov"), "no later resource after cancellation")
                 XCTAssertFalse(localUploader.requests.map(\.name).contains("later.mov"))
+                XCTAssertEqual(try queue.entry(for: later.source, revision: later.revision)?.state, .completed)
                 do {
                     try await runner.checkCancellation()
-                    XCTFail("the operation owner must receive the transport cancellation")
                 } catch {
-                    XCTAssertTrue(UploadError.isCancellation(error))
-                    XCTAssertFalse(Task.isCancelled)
+                    XCTFail("item cancellation must not cancel the operation: \(error)")
                 }
             }
+        }
+    }
+
+    func testEnvironmentalCancellationKeepsBudgetAndCapsBackoffAcrossDrains() async throws {
+        let entry = seedEntry("interrupted.heic", attempts: 2)
+        resolver.set(.failure(CancellationError(), times: 34), for: entry.source.identifier)
+        let runner = makeRunner(
+            retry: BackupRetryPolicy(baseDelay: 1, maxDelay: 900, maxAttempts: 4),
+            throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        for attempt in 1...34 {
+            let before = clock.now
+            _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+            let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(
+                resolver.resolveCount(for: entry.source.identifier), attempt, "one interrupted attempt per drain")
+            XCTAssertEqual(row.state, .discovered)
+            XCTAssertEqual(row.attempts, 2)
+            let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+            XCTAssertEqual(issue.kind, .unknown)
+            XCTAssertEqual(issue.detail, UploadError.cancelled.errorDescription)
+            XCTAssertEqual(issue.automaticRetryAttempt, min(32, attempt))
+            let delay = min(900, max(30, pow(2, Double(min(32, attempt) - 1))))
+            XCTAssertEqual(row.updatedAt, before.addingTimeInterval(delay))
+            XCTAssertEqual(issue.nextAttemptAt, row.updatedAt)
+            XCTAssertTrue(uploader.requests.isEmpty)
+            try await runner.checkCancellation()
+            clock.advance(by: 1000)
+        }
+        _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    func testInterruptedSourceLimitEndsTheDrainAndRetainsEveryRowForTheNextDrain() async throws {
+        let entries = (0..<70).map { seedEntry("interrupted-limit-\($0).heic") }
+        for entry in entries {
+            resolver.set(.failure(CancellationError(), times: 1), for: entry.source.identifier)
+        }
+        let runner = makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        let startedAt = clock.now
+        _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+        XCTAssertTrue(queueStore.isOperational())
+        XCTAssertEqual(
+            entries.reduce(0) { $0 + resolver.resolveCount(for: $1.source.identifier) }, 64,
+            "the drain must stop admitting sources at the exclusion limit")
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(clock.now, startedAt, "the bounded drain must not wait for deferred rows")
+        XCTAssertEqual(queueStore.summary()!.checkingActive, 0)
+        for entry in entries {
+            let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(row.state, .discovered)
+            XCTAssertEqual(row.attempts, 0)
+            if resolver.resolveCount(for: entry.source.identifier) == 1 {
+                XCTAssertEqual(row.updatedAt, startedAt.addingTimeInterval(30))
+                XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.nextAttemptAt, row.updatedAt)
+            } else {
+                XCTAssertEqual(row.updatedAt, entry.updatedAt)
+            }
+            resolver.set(.standard, for: entry.source.identifier)
+        }
+        try await runner.checkCancellation()
+        clock.advance(by: 30)
+        _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+        XCTAssertTrue(queueStore.isOperational())
+        for entry in entries {
+            XCTAssertEqual(state(of: entry), .completed)
+            XCTAssertEqual(uploader.requests.filter { $0.name == entry.originalFilename }.count, 1)
+        }
+        XCTAssertEqual(uploader.requests.count, entries.count)
+        XCTAssertEqual(queueStore.summary()!.checkingActive, 0)
+        try await runner.checkCancellation()
+    }
+
+    func testCancelledSourceCannotBeReclaimedAfterScanUpsertInTheSameDrain() async throws {
+        let entry = seedEntry("scan-race.heic")
+        resolver.set(.failure(CancellationError(), times: 2), for: entry.source.identifier)
+        let queue = ReenqueueOnFirstRetryQueueStore(inner: queueStore, now: { [clock] in clock!.now })
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+        XCTAssertEqual(
+            resolver.resolveCount(for: entry.source.identifier), 1,
+            "a scan cannot restart interrupted work in its drain")
+        XCTAssertEqual(state(of: entry), .discovered)
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(queueStore.summary()!.checkingActive, 0)
+    }
+
+    func testCancellationDefersAlreadyClaimedRevisionsWithoutLeavingActiveRows() async throws {
+        let first = seedEntry("claimed-revisions.heic", attempts: 2)
+        let second = seedEntry("claimed-revisions.heic", revisionOffset: 1)
+        resolver.set(.failure(CancellationError(), times: 2), for: first.source.identifier)
+        let runner = makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+        XCTAssertEqual(resolver.resolveCount(for: first.source.identifier), 1)
+        XCTAssertEqual(state(of: first), .discovered)
+        XCTAssertEqual(state(of: second), .discovered)
+        XCTAssertEqual(try queueStore.entry(for: first.source, revision: first.revision)?.attempts, 2)
+        XCTAssertEqual(try queueStore.entry(for: second.source, revision: second.revision)?.attempts, 0)
+        XCTAssertEqual(queueStore.summary()!.checkingActive, 0)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testSettlementFailureDefersOnlyMetadataOncePerDrainAndKeepsItsCause() async throws {
+        let entry = seedEntry("settlement-cause.heic")
+        let identity = RecordFailingIdentityResolver(
+            inner: makePipeline(), failures: 2, failure: UploadError.backend("manifest write rejected"))
+        let runner = makeRunner(identityResolver: identity, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        var receipt: UploadRemoteCommitReconciliation?
+        for attempt in 1...2 {
+            let before = clock.now
+            _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+            let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(identity.recordCalls, attempt, "settlement must return after its first metadata failure")
+            XCTAssertEqual(row.state, .needsRemoteReconciliation)
+            XCTAssertEqual(row.attempts, 0)
+            let current = try XCTUnwrap(row.remoteCommitReconciliation)
+            if let receipt { XCTAssertEqual(current, receipt) } else { receipt = current }
+            let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+            XCTAssertEqual(issue.detail, "manifest write rejected")
+            XCTAssertEqual(issue.automaticRetryAttempt, attempt)
+            XCTAssertEqual(row.updatedAt, before.addingTimeInterval(30))
+            XCTAssertEqual(issue.nextAttemptAt, row.updatedAt)
+            XCTAssertEqual(uploader.requests.count, 1)
+            clock.advance(by: 1000)
+        }
+        _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+        XCTAssertTrue([.completed, .alreadyBackedUp].contains(try XCTUnwrap(state(of: entry))))
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    func testMissingPersistedReceiptDiagnosesAndRefusesFurtherWork() async throws {
+        for removeRow in [false, true] {
+            let entry = seedEntry("missing-receipt-\(removeRow).heic", ageSeconds: 120)
+            let later = seedEntry("after-missing-receipt-\(removeRow).heic")
+            let diagnostic = "backup.remoteCommitReconciliationUnavailable"
+            let before = PhotoDiagnostics.shared.counter(diagnostic)
+            let hashes = expectedHashes(id: entry.originalFilename)
+            let identity = RecordFailingIdentityResolver(
+                inner: makePipeline(), failures: 1,
+                onRecordFailure: { [queueStore, clock, checker] in
+                    // The upload committed before local settlement failed. The remote lookup sees that copy.
+                    checker!.remoteItemsByNameHash[hashes.nameHash] = [
+                        RemotePhotoDuplicate(
+                            nameHash: hashes.nameHash, contentHash: hashes.contentHash,
+                            linkState: .active, linkID: testUID(entry.originalFilename).nodeID)
+                    ]
+                    if removeRow {
+                        XCTAssertTrue(queueStore!.remove(source: entry.source, revision: entry.revision))
+                    } else {
+                        XCTAssertTrue(
+                            queueStore!.updateState(
+                                source: entry.source, revision: entry.revision, state: .discovered,
+                                attempts: nil, lastError: nil, updatedAt: clock!.now))
+                    }
+                })
+            let runner = makeRunner(identityResolver: identity, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            XCTAssertEqual(PhotoDiagnostics.shared.counter(diagnostic), before + 1)
+            XCTAssertEqual(identity.recordCalls, 1)
+            XCTAssertEqual(uploader.requests.filter { $0.name == entry.originalFilename }.count, 1)
+            XCTAssertFalse(uploader.requests.contains { $0.name == later.originalFilename })
+            XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+            if removeRow { XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)) }
+            let lookupsBefore = checker.nameLookupAttemptCount
+            if removeRow { XCTAssertTrue(queueStore.upsert(entry)) }
+            _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+            XCTAssertGreaterThan(checker.nameLookupAttemptCount, lookupsBefore)
+            XCTAssertEqual(state(of: entry), .alreadyBackedUp)
+            XCTAssertEqual(state(of: later), .completed)
+            XCTAssertEqual(uploader.requests.filter { $0.name == entry.originalFilename }.count, 1)
+            XCTAssertEqual(uploader.requests.filter { $0.name == later.originalFilename }.count, 1)
+            XCTAssertTrue(queueStore.isOperational())
+            _ = queueStore.remove(source: entry.source, revision: entry.revision)
+            _ = queueStore.remove(source: later.source, revision: later.revision)
         }
     }
 
@@ -1408,11 +1631,28 @@ final class BackupSyncRunnerTests: XCTestCase {
             try await runner.checkCancellation()
             XCTFail("explicit Stop must retain operation cancellation")
         } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
         XCTAssertEqual(state(of: entry), .queuedForUpload)
     }
 
-    func testCancelledCommittedReceiptRetainsReconciliationAndOperationSignal() async throws {
+    func testCancelledPassRetainsOperationCancellation() async throws {
+        let entry = seedEntry("cancelled-pass.heic")
+        let running = RunningUntilCancelledUploader()
+        let runner = makeRunner(uploader: running)
+        let drain = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
+        await running.started.wait()
+        drain.cancel()
+        _ = await drain.value
+        do {
+            try await runner.checkCancellation()
+            XCTFail("a cancelled pass must retain operation cancellation")
+        } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        XCTAssertEqual(state(of: entry), .queuedForUpload)
+        XCTAssertEqual(running.cancellations, 1)
+    }
+
+    func testItemCancelledCommittedReceiptRetainsReconciliationWithoutCancellingThePass() async throws {
         for secondary in [false, true] {
             for failure in [
                 CancellationError() as any Error, URLError(.cancelled), UploadError.cancelled,
@@ -1442,12 +1682,16 @@ final class BackupSyncRunnerTests: XCTestCase {
                     _ = await runner.runUntilDrained(mode: .eligibleOnly)
                     do {
                         try await runner.checkCancellation()
-                        XCTFail("receipt cancellation reaches owner on pass \(pass)")
-                    } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
+                    } catch { XCTFail("receipt cancellation belongs to its item on pass \(pass): \(error)") }
                     let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
                     XCTAssertEqual(row.state, .needsRemoteReconciliation)
                     XCTAssertNotNil(row.remoteCommitReconciliation)
                     XCTAssertEqual(row.attempts, 0)
+                    let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+                    XCTAssertEqual(
+                        issue.detail, (failure as? LocalizedError)?.errorDescription ?? failure.localizedDescription)
+                    XCTAssertEqual(issue.automaticRetryAttempt, pass + 1)
+                    XCTAssertEqual(row.updatedAt, issue.nextAttemptAt)
                     clock.advance(by: 1000)
                 }
                 _ = await runner.runUntilDrained(mode: .eligibleOnly)
@@ -1508,7 +1752,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let secondStarted = await waitUntil { transfers.started.contains("second.jpg") }
+        let secondStarted = await pollUntil { transfers.started.contains("second.jpg") }
         transfers.releaseAll()
         let progress = await pass.value
 
@@ -1516,7 +1760,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.uploaded, 4)
         for entry in waiting + [first, second] {
             XCTAssertEqual(state(of: entry), .completed)
-            XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+            XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
         }
     }
 
@@ -1559,7 +1803,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         for (checks, wait) in [(1, 3600.0), (2, 7200)] {
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
             let row = try XCTUnwrap(
-                queueStore.entry(for: entry.source, revision: entry.revision),
+                try queueStore.entry(for: entry.source, revision: entry.revision),
                 "a short iCloud fault must not drop the photo from the backup")
             XCTAssertEqual(row.state, .discovered)
             XCTAssertEqual(row.attempts, 0)
@@ -1587,12 +1831,12 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         for wait in [3600.0, 7200, 14_400] {
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
-            XCTAssertNotNil(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertNotNil(try queueStore.entry(for: entry.source, revision: entry.revision))
             clock.advance(by: wait)
         }
         let progress = await runner.runUntilDrained(mode: .eligibleOnly)
 
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.state, .sourceMissing)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.state, .sourceMissing)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4)
         XCTAssertEqual(progress.needsAttention, 1)
         XCTAssertTrue(uploader.requests.isEmpty)
@@ -1614,7 +1858,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         }
 
         let row = try XCTUnwrap(
-            queueStore.entry(for: entry.source, revision: entry.revision), "only checks hours apart remove the photo")
+            try queueStore.entry(for: entry.source, revision: entry.revision),
+            "only checks hours apart remove the photo")
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4)
         XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.automaticRetryAttempt, 1)
         XCTAssertEqual(row.updatedAt, planned, "the planned check keeps its time")
@@ -1762,13 +2007,13 @@ final class BackupSyncRunnerTests: XCTestCase {
             return true
         }
         XCTAssertTrue(listed.isEmpty, "Needs Attention lists nothing")
-        let summary = queue.summary()
+        let summary = queue.summary()!
         XCTAssertEqual(summary.uploaded, 1)
         XCTAssertEqual(summary.sourceMissing, 0)
         XCTAssertEqual(summary.failed, 0)
         XCTAssertEqual(summary.dismissedFailures, 0)
         XCTAssertEqual(summary.pendingSourceRechecks, 0)
-        XCTAssertFalse(summary.hasWork)
+        XCTAssertEqual(summary.total, 1)
         XCTAssertFalse(row.isDismissedSourceRecheck)
     }
 
@@ -1841,6 +2086,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: first.source.identifier)
         _ = await omittingRunner(harness).runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(state(of: first), .completed)
+        // The still that this device uploaded is in the library; a state read says so.
+        harness.remote.active = [testUID("live.heic")]
         let changed = resolver.defaultModified.addingTimeInterval(60)
         resolver.setModified(changed, for: first.source.identifier)
         var later = first
@@ -1959,7 +2206,8 @@ final class BackupSyncRunnerTests: XCTestCase {
             queueStore.updateState(
                 source: entry.source, revision: entry.revision, state: .discovered, attempts: 0,
                 lastError: missingPairedVideoRecord.persistedValue, updatedAt: clock.now.addingTimeInterval(-60)))
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.isDismissedSourceRecheck, true)
+        XCTAssertEqual(
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.isDismissedSourceRecheck, true)
         resolver.setSecondaries(["IMG_1.MOV"], for: entry.source.identifier)
         resolver.setPairedVideoReportedMissing("IMG_1.MOV", for: entry.source.identifier)
         resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: entry.source.identifier)
@@ -1967,7 +2215,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await omittingRunner(try makeReplacementHarness()).runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [false])
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.state, .dismissedFailure)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.state, .dismissedFailure)
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
@@ -2045,15 +2293,6 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolved?.secondaries.map(\.descriptor.filename), ["live.mov"])
         XCTAssertEqual(
             resolver.omissionRequests(for: entry.source.identifier), [], "the default resolves the whole entry")
-
-        // The composite forwards the runner's permission to the resolver of the source kind.
-        resolver.setPairedVideoReportedMissing("live.mov", for: entry.source.identifier)
-        let composite = CompositeBackupResourceResolver([.fileURL: resolver])
-        let omitted = try await composite.resolve(
-            entry, onPreparationProgress: { _ in }, readAdmission: {}, omittingMissingPairedVideo: true)
-        XCTAssertEqual(omitted?.omitsMissingPairedVideo, true)
-        XCTAssertEqual(omitted?.secondaries.isEmpty, true)
-        XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [true])
     }
 
     // MARK: - The first index build and the timeline order pass
@@ -2067,6 +2306,152 @@ final class BackupSyncRunnerTests: XCTestCase {
         let resolver = SpyIdentityResolver(inner: makePipeline(), log: log)
         let runner = makeRunner(identityResolver: resolver, queue: queue, throttleInputs: { throttleInputs })
         return (runner, { log.events.filter { $0 == "manifest.remoteIndexPreparationNotNeeded" }.count })
+    }
+
+    func testB1UnknownRunnerSummariesPreservePublishedCounts() async throws {
+        let entry = seedEntry("unknown-summary.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog())
+        let runner = makeRunner(queue: queue)
+        let recorder = BackupProgressRecorder()
+        await runner.setOnProgress { recorder.append($0) }
+        let previous = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(previous.total, 1)
+        let publishedBeforeFaults = recorder.snapshots.count
+        for occurrence in [1, 2] {
+            let fault = try SQLiteReadInterrupt(
+                in: inner, matching: "SELECT state, source_kind", occurrence: occurrence)
+            let result = await runner.runUntilDrained()
+            fault.stop()
+            XCTAssertTrue(fault.fired, "summary occurrence \(occurrence)")
+            XCTAssertTrue(queue.isOperational())
+            XCTAssertEqual(result.total, previous.total, "Unknown summary must retain counts: \(occurrence)")
+            XCTAssertEqual(result.uploaded, previous.uploaded, "Unknown summary must retain completion: \(occurrence)")
+        }
+        XCTAssertFalse(
+            recorder.snapshots.dropFirst(publishedBeforeFaults).contains { $0.total == 0 },
+            "An unknown initial summary must not publish empty progress")
+        let fault = try SQLiteReadInterrupt(in: inner, matching: "SELECT state, source_kind")
+        _ = await runner.removeSources(kind: entry.source.kind, identifiers: [entry.source.identifier])
+        fault.stop()
+        let afterRemoval = await runner.currentProgress()
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(afterRemoval.total, previous.total, "Unknown refresh must retain the last count")
+        XCTAssertNil(try inner.entry(for: entry.source, revision: entry.revision))
+    }
+
+    func testB1UnknownErrorStateDoesNotRevertOrRetryTheRow() async throws {
+        let row = seedEntry("unknown-error-state.jpg", ageSeconds: 120)
+        let next = seedEntry("after-unknown-error.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        let events = BackupEventLog()
+        let queue = SpyQueueStore(inner: inner, log: events, unknownEntryReads: 1)
+        let identity = TransportCancellingStageResolver(
+            inner: makePipeline(), stage: "primary", failure: UploadError.backend("read failed"),
+            cancelledName: row.originalFilename)
+        _ = await makeRunner(
+            identityResolver: identity, queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1)
+        )
+        .runUntilDrained(mode: .eligibleOnly)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(resolver.resolveCount(for: next.source.identifier), 0)
+        XCTAssertEqual(kept.state, .checking, "Unknown current state must not authorize a retry")
+        XCTAssertEqual(kept.attempts, row.attempts)
+        XCTAssertEqual(kept.lastError, row.lastError)
+        XCTAssertFalse(events.events.contains("queue.state:discovered"))
+    }
+
+    func testB1UnknownReceiptPresenceStopsBeforeCancellationReversion() async throws {
+        let row = seedEntry("unknown-receipt.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownEntryReads: 1)
+        queue.beforeReconciliationMark = { _ in false }
+        let runner = makeRunner(queue: queue)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        do { try await runner.checkCancellation() } catch {
+            XCTFail("Unknown presence must not become a removal cancellation: \(error)")
+        }
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(kept.state, .uploading, "Unknown presence is not proof that the row was removed")
+        XCTAssertEqual(kept.attempts, row.attempts)
+        XCTAssertEqual(kept.lastError, row.lastError)
+    }
+
+    func testB1UnknownDeferredStateDoesNotRevertTheRow() async throws {
+        let row = seedEntry("unknown-deferred.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        resolver.setDeferredMaterialization(for: row.source.identifier, mismatchOnce: true)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownEntryReads: 1)
+        _ = await makeRunner(queue: queue).runUntilDrained(mode: .eligibleOnly)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(kept.state, .checking, "Unknown state cannot authorize policy reversion")
+        XCTAssertEqual(kept.attempts, row.attempts)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testB1UnknownSecondaryStateRetainsTheReceiptAndPendingPreflight() async throws {
+        let row = seedEntry("unknown-secondary.jpg", ageSeconds: 120)
+        let next = seedEntry("after-unknown-secondary.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        resolver.setSecondaries(["paired.mov"], for: row.source.identifier)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownEntryReads: 1)
+        _ = await makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1)).runUntilDrained(
+            mode: .eligibleOnly)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(
+            resolver.resolveCount(for: next.source.identifier), 0,
+            "Unknown secondary state must stop further source admission")
+        XCTAssertEqual(kept.state, .needsRemoteReconciliation, "Unknown settlement state must retain the receipt")
+        XCTAssertNotNil(kept.remoteCommitReconciliation)
+        XCTAssertNotEqual(stateStore.record(for: row.source, revision: row.revision)?.isComplete, true)
+    }
+
+    func testB1UnknownSecondaryReceiptPresenceDoesNotRevertTheRow() async throws {
+        let row = seedEntry("unknown-secondary-receipt.jpg", ageSeconds: 120)
+        let next = seedEntry("after-unknown-secondary-receipt.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        resolver.setSecondaries(["paired.mov"], for: row.source.identifier)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownEntryReads: 1)
+        queue.beforeReconciliationMark = { $0.source == row.source }
+        _ = await makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1)).runUntilDrained(
+            mode: .eligibleOnly)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(
+            resolver.resolveCount(for: next.source.identifier), 0,
+            "Unknown secondary state must stop further source admission")
+        XCTAssertEqual(kept.state, .uploading, "Unknown secondary presence cannot authorize reversion")
+        XCTAssertNotEqual(stateStore.record(for: row.source, revision: row.revision)?.isComplete, true)
+    }
+
+    func testB1UnknownDiscardReadStopsBeforeAnotherSourceStarts() async throws {
+        let row = seedEntry("missing-unknown.jpg", ageSeconds: 120)
+        let next = seedEntry("after-missing.jpg")
+        resolver.set(.missing, for: row.source.identifier)
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog(), unknownEntryReads: 1)
+        queue.refusesMissingRemoval = true
+        _ = await makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+            .runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(
+            resolver.resolveCount(for: next.source.identifier), 0,
+            "An unknown discard read must stop the pass before another source starts")
+        XCTAssertNotNil(try queueStore.entry(for: row.source, revision: row.revision))
+    }
+
+    func testB1UnknownDraftPresenceCannotCertifyNoUploadWork() async throws {
+        let inner = try XCTUnwrap(queueStore)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog())
+        let fault = try SQLiteReadInterrupt(in: inner, matching: "SELECT 1 FROM backup_sync_queue WHERE state IN")
+        defer { fault.stop() }
+        let result = await makeRunner(queue: queue).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(queue.isOperational())
+        XCTAssertFalse(result.leavesNoUploadWork, "An unknown draft read cannot certify a completed queue")
     }
 
     func testAPassWithNothingQueuedLeavesNoUploadWork() async {
@@ -2418,7 +2803,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(progress.isPausedByPolicy)
         XCTAssertTrue(progress.isWaitingForWiFi)
         XCTAssertEqual(state(of: due), .discovered)
-        XCTAssertEqual(queueStore.entry(for: due.source, revision: due.revision)?.attempts, 0)
+        XCTAssertEqual(try queueStore.entry(for: due.source, revision: due.revision)?.attempts, 0)
         XCTAssertEqual(resolver.resolveCount(for: due.source.identifier), 0)
         XCTAssertTrue(uploader.requests.isEmpty)
         XCTAssertEqual(BackupStatus(progress: progress, isScanning: false).phase, .waitingForWiFi)
@@ -2496,7 +2881,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(preparing.cleanupCount, 1, "the photo was claimed and prepared")
         XCTAssertTrue(uploader.requests.isEmpty, "no backup bytes on cellular data")
         XCTAssertEqual(state(of: due), .discovered)
-        XCTAssertEqual(queueStore.entry(for: due.source, revision: due.revision)?.attempts, 0)
+        XCTAssertEqual(try queueStore.entry(for: due.source, revision: due.revision)?.attempts, 0)
         XCTAssertTrue(progress.isPausedByPolicy)
         XCTAssertTrue(progress.isWaitingForWiFi)
         XCTAssertEqual(BackupStatus(progress: progress, isScanning: false).phase, .waitingForWiFi)
@@ -2700,7 +3085,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 0)
         XCTAssertEqual(uploader.admission.waitingCount, 0, "the wait ended")
         XCTAssertNotEqual(state(of: entry), .completed)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
     }
 
     func testAnExpiringWindowEndsAWaitForTheNetworkWithoutAnUpload() async throws {
@@ -2721,7 +3106,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 0)
         XCTAssertEqual(uploader.admission.waitingCount, 0, "the wait ended")
         XCTAssertNotEqual(state(of: entry), .completed)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
     }
 
     func testADeletedPhotoEndsItsWaitForTheNetworkWithoutAnUpload() async throws {
@@ -2845,7 +3230,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             uploader.requests.map(\.allowsExpensiveNetwork), [false],
             "the upload runs with the kind that the setting has now: no cellular access")
         XCTAssertEqual(uploader.reserveCalls, 2, "the first reservation ended unused and the next claim reserved again")
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
         XCTAssertEqual(uploader.uploadsWithoutTheirReservation, [])
     }
 
@@ -2896,7 +3281,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: b), .discovered)
         let issue = try XCTUnwrap(
             BackupIssueRecord.decode(
-                queueStore.entry(for: a.source, revision: a.revision)?.lastError
+                try queueStore.entry(for: a.source, revision: a.revision)?.lastError
             ))
         XCTAssertEqual(issue.kind, .deviceStorage)
         XCTAssertNotNil(issue.nextAttemptAt)
@@ -2911,7 +3296,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(count, 1, "only the failed row is requeued")
         XCTAssertEqual(state(of: failed), .discovered)
         XCTAssertEqual(
-            queueStore.entry(for: failed.source, revision: failed.revision)?.attempts, 0,
+            try queueStore.entry(for: failed.source, revision: failed.revision)?.attempts, 0,
             "requeue grants a fresh retry budget")
         XCTAssertEqual(state(of: done), .completed, "terminal-success rows are untouched")
     }
@@ -2972,7 +3357,9 @@ final class BackupSyncRunnerTests: XCTestCase {
 
     private func makeRunner(
         uploader: (any PhotoUploading)? = nil,
-        tagAdder: (any PhotoTagAdding)? = nil,
+        // Production always wires a tag adder; the default spy mirrors that. Tests that
+        // need the nil path pass an explicit `tagAdder: nil`.
+        tagAdder: (any PhotoTagAdding)? = SpyTagAdder(),
         identityResolver: (any UploadIdentityResolving)? = nil,
         editReplacement: EditedPhotoReplacement? = nil,
         resolver: (any BackupResourceResolving)? = nil,
@@ -3209,7 +3596,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await drain.value
 
         XCTAssertEqual(state(of: entry), .completed)
-        XCTAssertEqual(queueStore.summary().uploaded, 1)
+        XCTAssertEqual(queueStore.summary()!.uploaded, 1)
         XCTAssertEqual(gated.uploads, [name], "Proton has the photo: no second upload")
         XCTAssertEqual(gated.cancellations, 1)
         XCTAssertEqual(identity.recordCalls, 1)
@@ -3241,7 +3628,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             XCTFail("explicit Stop retains its signal when the committed upload succeeds")
         } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
         XCTAssertEqual(state(of: entry), .completed)
-        XCTAssertEqual(queueStore.summary().uploaded, 1)
+        XCTAssertEqual(queueStore.summary()!.uploaded, 1)
         XCTAssertEqual(gated.uploads, [name], "a committed upload must not repeat")
         XCTAssertEqual(gated.cancellations, 1)
         XCTAssertEqual(identity.recordCalls, 1)
@@ -3286,7 +3673,7 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         XCTAssertEqual(state(of: entry), .needsRemoteReconciliation, "the receipt keeps the committed uid")
         XCTAssertEqual(
-            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation?.receipt
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation?.receipt
                 .remoteLinkID, testUID(name).nodeID)
 
         _ = await runner.runUntilDrained()
@@ -3383,7 +3770,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await removal.value
         let progress = await drain.value
 
-        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertNil(try queueStore.entry(for: removed.source, revision: removed.revision))
         XCTAssertNil(identityStore.record(for: removed.source)?.remoteLinkID)
         XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
         XCTAssertEqual(progress.failed, 0)
@@ -3404,71 +3791,18 @@ final class BackupSyncRunnerTests: XCTestCase {
         let removal = Task {
             await runner.removeSources(kind: removed.source.kind, identifiers: [removed.source.identifier])
         }
-        let rowRemoved = await waitUntil { queueStore.entry(for: removed.source, revision: removed.revision) == nil }
+        let rowRemoved = await pollUntil {
+            queueEntryForTesting(in: queueStore, source: removed.source, revision: removed.revision) == nil
+        }
         await gated.returnGate.signal()
         _ = await removal.value
         let progress = await drain.value
 
         XCTAssertTrue(rowRemoved)
-        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertNil(try queueStore.entry(for: removed.source, revision: removed.revision))
         XCTAssertNil(identityStore.record(for: removed.source)?.remoteLinkID)
         XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
         XCTAssertEqual(progress.failed, 0)
-    }
-
-    /// A deletion or exclusion lands after the upload passed its removal check, while its commit settles. The receipt
-    /// of the removed row cannot be marked; only the work of that photo ends, and the pass goes on (#756).
-    func testARemovalWhileTheCommitSettlesEndsOnlyThatPhoto() async throws {
-        let removed = seedEntry("removed-while-settling.jpg", ageSeconds: 600)
-        let next = seedEntry("after-the-settlement.jpg")
-        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
-        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
-        let removals = removeBeforeTheCommitMark(of: removed.source, row: removed.source, on: queue, runner: runner)
-
-        let progress = await runner.runUntilDrained()
-
-        XCTAssertEqual(removals.events, ["removed"], "the removal must land during the settlement")
-        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
-        XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
-        XCTAssertEqual(progress.failed, 0)
-    }
-
-    /// The same removal while the video of a Live Photo settles.
-    func testARemovalWhileALivePhotoVideoSettlesEndsOnlyThatPhoto() async throws {
-        let removed = seedEntry("removed-live.heic", ageSeconds: 600)
-        resolver.setSecondaries(["removed-live.mov"], for: removed.source.identifier)
-        let next = seedEntry("after-the-live-photo.jpg")
-        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
-        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
-        let video = UploadSourceIdentity(
-            kind: removed.source.kind, identifier: removed.source.identifier, resource: .livePairedVideo)
-        let removals = removeBeforeTheCommitMark(of: video, row: removed.source, on: queue, runner: runner)
-
-        let progress = await runner.runUntilDrained()
-
-        XCTAssertEqual(removals.events, ["removed"], "the removal must land while the video settles")
-        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
-        XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
-        XCTAssertEqual(progress.failed, 0)
-    }
-
-    /// Removes `row` through the runner right before the commit of `resource` is marked. The mark runs off the runner
-    /// actor and waits there until the removal finished, so the order does not depend on scheduling.
-    private func removeBeforeTheCommitMark(
-        of resource: UploadSourceIdentity, row: UploadSourceIdentity, on queue: SpyQueueStore, runner: BackupSyncRunner
-    ) -> BackupEventLog {
-        let removals = BackupEventLog()
-        queue.setBeforeRemoteCommitMark { reconciliation in
-            guard reconciliation.source == resource else { return }
-            let done = DispatchSemaphore(value: 0)
-            Task {
-                _ = await runner.removeSources(kind: row.kind, identifiers: [row.identifier])
-                removals.append("removed")
-                done.signal()
-            }
-            _ = done.wait(timeout: .now() + 5)
-        }
-        return removals
     }
 
     func testStopAfterUploadDecisionSettlesClaimBeforeRevertingQueueRow() async throws {
@@ -3509,12 +3843,19 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 1, "the server commit happened exactly once")
 
         clock.advance(by: 2)
+        _ = await makeRunner(identityResolver: pipeline).runUntilDrained(mode: .eligibleOnly)
+        let notDue = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(notDue.remoteCommitReconciliation, pending.remoteCommitReconciliation)
+        XCTAssertEqual(notDue.updatedAt, pending.updatedAt)
+        XCTAssertGreaterThan(notDue.updatedAt, clock.now, "metadata retry must respect the backoff floor")
+        XCTAssertEqual(uploader.requests.count, 1)
+        clock.advance(by: max(0, notDue.updatedAt.timeIntervalSince(clock.now)))
         let progress = await makeRunner(identityResolver: pipeline).runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(progress.uploaded, 1)
         XCTAssertEqual(uploader.requests.count, 1, "reconciliation must never upload committed bytes again")
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     private func seedEntry(
@@ -3553,7 +3894,7 @@ final class BackupSyncRunnerTests: XCTestCase {
     }
 
     private func state(of entry: UploadBackupSyncQueueEntry) -> UploadBackupSyncQueueState? {
-        queueStore.entry(for: entry.source, revision: entry.revision)?.state
+        queueEntryForTesting(in: queueStore, source: entry.source, revision: entry.revision)?.state
     }
 
     func testRemoteIndexPreparationFailureLeavesQueueRunnableAndFailsClosed() async throws {
@@ -3597,7 +3938,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let runner = makeRunner(identityResolver: SpyIdentityResolver(inner: makePipeline(), log: log))
         await runner.invalidateRemoteStateForUserRetry()
         XCTAssertEqual(log.events, ["manifest.invalidateCachedRemoteState"])
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision), before)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision), before)
     }
 
     func testManualRetryClearsPersistedRemoteIndexBackoff() async throws {
@@ -3670,7 +4011,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(terminal.state, .sourceMissing)
         XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 0)
         try await sync.reconcileMissingSources(engine: engine)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision), terminal)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision), terminal)
         XCTAssertEqual(catalog.reconciledMissingSourceGeneration(), 0)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4, "Recovery reads only local stores")
         XCTAssertTrue(uploader.requests.isEmpty)
@@ -3684,7 +4025,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(queueStore.upsert(entry))
         resolver.set(.missing, for: source.identifier)
         let progress = await makeRunner().runUntilDrained()
-        XCTAssertNil(queueStore.entry(for: source, revision: entry.revision))
+        XCTAssertNil(try queueStore.entry(for: source, revision: entry.revision))
         XCTAssertEqual(progress.total, 0)
         XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 1)
         _ = await makeRunner().runUntilDrained()
@@ -3699,7 +4040,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let runner = makeRunner()
         let progress = await runner.runUntilDrained()
 
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(progress.total, 0)
         XCTAssertEqual(progress.sourceMissing, 0)
         XCTAssertEqual(progress.backedUp, 0)
@@ -3709,7 +4050,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         // A second pass has no row to resurrect or re-resolve.
         _ = await runner.runUntilDrained()
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision))
     }
 
     func testPhotoLibraryDeletionCancelsInFlightUploadAndDoesNotRecreateQueueRow() async throws {
@@ -3745,7 +4086,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         await stalledUploader.cancelStarted.wait()
 
         XCTAssertNil(
-            queueStore.entry(for: source, revision: entry.revision),
+            try queueStore.entry(for: source, revision: entry.revision),
             "local deletion must become authoritative before native cancellation returns")
         let progressWhileNativeCancellationIsPending = await runner.currentProgress()
         XCTAssertEqual(progressWhileNativeCancellationIsPending.total, 0)
@@ -3757,10 +4098,469 @@ final class BackupSyncRunnerTests: XCTestCase {
         let progress = await drain.value
 
         XCTAssertEqual(stalledUploader.cancellations, 1)
-        XCTAssertNil(queueStore.entry(for: source, revision: entry.revision))
+        XCTAssertNil(try queueStore.entry(for: source, revision: entry.revision))
         XCTAssertEqual(progress.total, 0)
         XCTAssertEqual(progress.failed, 0)
         XCTAssertEqual(progress.sourceMissing, 0)
+    }
+
+    // MARK: - A removal during the settlement of a finished upload (#756)
+
+    /// Removes `source` through the runner and holds the calling settlement until the removal returns. The settlement
+    /// runs off the runner actor, so the removal lands after the runner's removed-source check.
+    private static func removeWhileSettling(_ source: UploadSourceIdentity, from runner: BackupSyncRunner) {
+        let removed = DispatchSemaphore(value: 0)
+        Task {
+            _ = await runner.removeSources(kind: source.kind, identifiers: [source.identifier])
+            removed.signal()
+        }
+        removed.wait()
+    }
+
+    func testARemovalDuringTheSettlementOfAFinishedUploadEndsOnlyThatPhoto() async throws {
+        let removed = seedEntry("removed-while-settling.jpg", ageSeconds: 120)
+        let next = seedEntry("next.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let events = SpyBackupItemEvents(queue: queueStore)
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1), events: events)
+        queue.beforeReconciliationMark = { [runner] reconciliation in
+            if reconciliation.source == removed.source { Self.removeWhileSettling(removed.source, from: runner) }
+            return true
+        }
+
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["removed-while-settling.jpg", "next.jpg"])
+        XCTAssertEqual(state(of: next), .completed, "the removal of one photo must not end the pass")
+        XCTAssertNil(try queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertEqual(progress.failed, 0)
+        // The photo is on Proton. Its handoff stays: for an exclusion it schedules that photo for the Proton trash.
+        XCTAssertTrue(
+            events.events.contains {
+                guard case .handoff(let id, _, .uploaded, _) = $0 else { return false }
+                return id == removed.source.identifier
+            })
+    }
+
+    func testARemovalDuringTheSettlementOfALivePhotoVideoEndsOnlyThatPhoto() async throws {
+        let removed = seedEntry("removed-live.heic", ageSeconds: 120)
+        resolver.setSecondaries(["removed-live.mov"], for: removed.source.identifier)
+        let next = seedEntry("next.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        queue.beforeReconciliationMark = { [runner] reconciliation in
+            if reconciliation.source.identifier == removed.source.identifier,
+                reconciliation.source.resource != .primary
+            {
+                Self.removeWhileSettling(removed.source, from: runner)
+            }
+            return true
+        }
+
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["removed-live.heic", "removed-live.mov", "next.jpg"])
+        XCTAssertEqual(state(of: next), .completed, "the removal of one Live Photo must not end the pass")
+        XCTAssertNil(try queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertEqual(progress.failed, 0)
+    }
+
+    func testAFailedReceiptWriteForAPhotoThatIsStillQueuedEndsThePass() async throws {
+        let failing = seedEntry("receipt-write-fails.jpg", ageSeconds: 120)
+        let next = seedEntry("next.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        // Only the first write fails, so a runner that kept the pass running finishes instead of retrying forever.
+        queue.beforeReconciliationMark = { [weak queue] reconciliation in
+            guard reconciliation.source == failing.source else { return true }
+            queue?.beforeReconciliationMark = nil
+            return false
+        }
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["receipt-write-fails.jpg"], "a failed local store ends the pass")
+        XCTAssertNotNil(try queueStore.entry(for: failing.source, revision: failing.revision))
+        XCTAssertEqual(state(of: next), .discovered)
+    }
+
+    func testAFailedHandoffWriteEndsThePassEvenWhenTheSourceWasRemoved() async throws {
+        let removed = seedEntry("handoff-write-fails.jpg", ageSeconds: 120)
+        let next = seedEntry("next.jpg")
+        let events = SpyBackupItemEvents(queue: queueStore)
+        events.handoffOutcome = .failed
+        let runner = makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 1), events: events)
+        // Only the removed photo's handoff fails, so a runner that kept the pass running finishes the next photo.
+        events.beforeHandoff = { [runner, weak events] source in
+            if source == removed.source {
+                Self.removeWhileSettling(removed.source, from: runner)
+            } else {
+                events?.handoffOutcome = .recorded
+            }
+        }
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["handoff-write-fails.jpg"], "a failed local store ends the pass")
+        XCTAssertNil(try queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertEqual(state(of: next), .discovered)
+    }
+
+    // MARK: - A pending row that this build cannot read (#982)
+
+    /// A photo was claimed, and a newer build then wrote its pending row with a value that this build does not know
+    /// while the photo was read. The check before the transfer lets it wait without an attempt; its rows, including a
+    /// parked receipt of an earlier upload, stay; the next photo backs up.
+    func testAQueuedPhotoWithAnUnreadablePendingRowWaitsAndKeepsItsRows() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let parked = seedEntry("waiting.jpg", ageSeconds: 300)
+        let receipt = UploadRemoteCommitReconciliation(
+            source: parked.source,
+            identity: UploadIdentity(
+                correctedName: "waiting.jpg", nameHash: "nh", sha1Hex: String(repeating: "0", count: 40),
+                sha1Digest: Data(repeating: 0, count: 20), contentHash: "ch"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "vol", remoteLinkID: "earlier-upload"))
+        XCTAssertTrue(
+            queueStore.markNeedsRemoteReconciliation(
+                source: parked.source, revision: parked.revision, reconciliation: receipt, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(-300)))
+        let parkedBefore = try XCTUnwrap(queueStore.entry(for: parked.source, revision: parked.revision))
+        let waiting = seedEntry("waiting.jpg", ageSeconds: 120, revisionOffset: 1)
+        let next = seedEntry("next.jpg")
+        let key = PendingSourceKey(waiting.source)
+        XCTAssertNotNil(
+            pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
+        XCTAssertNotNil(pending.include([key], at: clock.now))
+        let resolving = SourceRemovedDuringResolveResolver(inner: resolver)
+        let path = pendingURL.path
+        resolving.onResolve = { entry in
+            guard entry.source == waiting.source else { return }
+            var handle: OpaquePointer?
+            XCTAssertEqual(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+            XCTAssertEqual(
+                sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
+                SQLITE_OK)
+            sqlite3_close(handle)
+        }
+        let recorder = PendingBackupEventRecorder(store: pending)
+        let runner = makeRunner(
+            resolver: resolving, throttle: BackupThrottlePolicy(baseConcurrency: 1), events: recorder)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["next.jpg"], "only the photo with a readable row uploads")
+        XCTAssertEqual(state(of: next), .completed)
+        let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision), "the row stays")
+        XCTAssertFalse(kept.state.isTerminalSuccess)
+        XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+        XCTAssertEqual(
+            try queueStore.entry(for: parked.source, revision: parked.revision)?.remoteCommitReconciliation,
+            parkedBefore.remoteCommitReconciliation, "the parked receipt stays")
+    }
+
+    /// A drain that waits for scheduled retries ends while a photo waits for its unreadable pending row; it does not
+    /// check that photo again and again within the drain (#982).
+    func testADrainThatWaitsForRetriesEndsWhileAPhotoWaitsForItsUnreadableRow() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-drain.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let waiting = seedEntry("waiting.jpg")
+        let key = PendingSourceKey(waiting.source)
+        XCTAssertNotNil(
+            pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
+        XCTAssertNotNil(pending.include([key], at: clock.now))
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(pendingURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
+            SQLITE_OK)
+        sqlite3_close(handle)
+        let recorder = PendingBackupEventRecorder(store: pending)
+        let runner = makeRunner(events: recorder)
+
+        let finished = expectation(description: "the drain ends")
+        let drain = Task {
+            _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 10)
+        await runner.stop()  // Ends a drain that never ends on its own after the failed wait.
+        _ = await drain.value
+        recorder.finish()
+
+        XCTAssertTrue(uploader.requests.isEmpty)
+        let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision))
+        XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+    }
+
+    /// A photo whose pending row this build cannot read waits at its claim, before its file is exported or hashed,
+    /// without an attempt. Once the row reads again, the next claim uploads it (#982).
+    func testAPhotoWithAnUnreadablePendingRowWaitsBeforeItsFileIsReadAndUploadsOnceTheRowReads() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-claim.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let waiting = seedEntry("waiting.jpg")
+        try makePendingRowUnreadable(waiting.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(resolver.resolveCount(for: waiting.source.identifier), 0, "no export")
+        XCTAssertEqual(hasher.hashCount, 0, "no hash")
+        XCTAssertFalse(
+            checker.findBatches.joined().contains(expectedHashes(id: "waiting.jpg").nameHash),
+            "its name does not go to Proton")
+        XCTAssertTrue(uploader.requests.isEmpty)
+        let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision))
+        XCTAssertEqual(kept.state, .discovered, "the claim is released")
+        XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+
+        try withRawDatabase(at: pendingURL) {
+            XCTAssertEqual(sqlite3_exec($0, "UPDATE source_state SET desired='included';", nil, nil, nil), SQLITE_OK)
+        }
+        clock.advance(by: kept.updatedAt.timeIntervalSince(clock.now) + 1)
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["waiting.jpg"], "the next claim uploads the photo")
+        XCTAssertEqual(state(of: waiting), .completed)
+    }
+
+    /// Proton already holds a copy of a photo whose pending row this build cannot read. The photo waits; nothing
+    /// adopts the copy, and the pending store stays unchanged byte for byte (#982).
+    func testARemoteCopyNeverChangesAnUnreadablePendingRow() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-proof.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let waiting = seedEntry("waiting.jpg")
+        let hashes = expectedHashes(id: "waiting.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .active, linkID: "remote-1")
+        ]
+        try makePendingRowUnreadable(waiting.source, in: pending, at: pendingURL)
+        let before = try pendingStoreRows(at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(try pendingStoreRows(at: pendingURL), before, "the pending store stays unchanged")
+        XCTAssertNotEqual(state(of: waiting), .alreadyBackedUp)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    /// A photo that the person dismissed after Photos reported it missing keeps its check while its pending row cannot
+    /// be read; its file is not exported (#982).
+    func testADismissedPhotoWithAnUnreadablePendingRowKeepsItsCheckWithoutAnExport() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-recheck.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let entry = seedLibraryEntry("IMG_1.HEIC")
+        let reason = BackupIssueRecord(kind: .sourceMissing, detail: "backup.issue_source_missing").persistedValue
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0, lastError: reason,
+                updatedAt: clock.now.addingTimeInterval(-60)))
+        try makePendingRowUnreadable(entry.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 0, "no export")
+        let kept = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertTrue(kept.isDismissedSourceRecheck, "the dismissed photo keeps its check")
+        XCTAssertEqual(BackupIssueRecord.decode(kept.lastError)?.kind, .sourceMissing)
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the check waits")
+    }
+
+    /// A drain that waits for scheduled retries ends while a dismissed photo waits for its unreadable pending row; it
+    /// does not check that photo again and again (#982).
+    func testADrainThatWaitsForRetriesEndsWhileADismissedPhotoWaitsForItsUnreadableRow() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-recheck-drain.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let entry = seedLibraryEntry("IMG_1.HEIC")
+        let reason = BackupIssueRecord(kind: .sourceMissing, detail: "backup.issue_source_missing").persistedValue
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0, lastError: reason,
+                updatedAt: clock.now.addingTimeInterval(-60)))
+        try makePendingRowUnreadable(entry.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+        let runner = makeRunner(events: recorder)
+
+        let finished = expectation(description: "the drain ends")
+        let drain = Task {
+            _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 10)
+        await runner.stop()  // Ends a drain that never ends on its own after the failed wait.
+        _ = await drain.value
+        recorder.finish()
+
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 0, "no export")
+        let kept = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertTrue(kept.isDismissedSourceRecheck, "the dismissed photo keeps its check")
+    }
+
+    /// Every revision of a photo whose pending row cannot be read waits without a problem; none of them shows under
+    /// Needs attention (#982).
+    func testEveryRevisionOfAPhotoWithAnUnreadableRowWaitsWithoutAProblem() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-revisions.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let first = seedEntry("waiting.jpg", ageSeconds: 120)
+        let second = seedEntry("waiting.jpg", ageSeconds: 60, revisionOffset: 1)
+        try makePendingRowUnreadable(first.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        // Two photo slots let one claim return both revisions; the second then follows the first in the same worker.
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(resolver.resolveCount(for: first.source.identifier), 0, "no export")
+        for entry in [first, second] {
+            let kept = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(kept.state, .discovered)
+            XCTAssertEqual(kept.attempts, entry.attempts)
+            XCTAssertNil(BackupIssueRecord.decode(kept.lastError), "waiting is no problem")
+        }
+        var problems = 0
+        queueStore.forEachProblemEntry { _ in
+            problems += 1
+            return true
+        }
+        XCTAssertEqual(problems, 0, "nothing under Needs attention")
+    }
+
+    /// A photo whose pending row becomes unreadable while it is read, and whose copy Proton already holds, waits
+    /// without an attempt: the store refuses its upload record and stays unchanged (#982).
+    func testARefusedRecordOfAPhotoWithAnUnreadableRowSpendsNoAttempt() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-refused.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let waiting = seedEntry("waiting.jpg")
+        let hashes = expectedHashes(id: "waiting.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .active, linkID: "remote-1")
+        ]
+        let key = PendingSourceKey(waiting.source)
+        XCTAssertNotNil(
+            pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
+        XCTAssertNotNil(pending.include([key], at: clock.now))
+        let resolving = SourceRemovedDuringResolveResolver(inner: resolver)
+        let path = pendingURL.path
+        resolving.onResolve = { _ in
+            var handle: OpaquePointer?
+            XCTAssertEqual(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+            XCTAssertEqual(
+                sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
+                SQLITE_OK)
+            sqlite3_close(handle)
+        }
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(resolver: resolving, events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+        let rows = try pendingStoreRows(at: pendingURL)
+
+        let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision))
+        XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
+        XCTAssertNotEqual(kept.state, .alreadyBackedUp)
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(rows["handoff"] ?? [], [], "no upload record")
+    }
+
+    /// A photo with a saved upload receipt whose pending row cannot be read keeps its receipt and is not exported
+    /// again (#982).
+    func testASavedReceiptOfAPhotoWithAnUnreadableRowStaysWithoutAnExport() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-receipt.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let parked = seedEntry("waiting.jpg", ageSeconds: 300)
+        let receipt = UploadRemoteCommitReconciliation(
+            source: parked.source,
+            identity: UploadIdentity(
+                correctedName: "waiting.jpg", nameHash: "nh", sha1Hex: String(repeating: "0", count: 40),
+                sha1Digest: Data(repeating: 0, count: 20), contentHash: "ch"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "vol", remoteLinkID: "earlier-upload"))
+        XCTAssertTrue(
+            queueStore.markNeedsRemoteReconciliation(
+                source: parked.source, revision: parked.revision, reconciliation: receipt, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(-300)))
+        try makePendingRowUnreadable(parked.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(resolver.resolveCount(for: parked.source.identifier), 0, "no export")
+        let kept = try XCTUnwrap(queueStore.entry(for: parked.source, revision: parked.revision))
+        XCTAssertEqual(kept.remoteCommitReconciliation, receipt, "the receipt stays")
+        XCTAssertEqual(kept.attempts, parked.attempts, "waiting spends no attempt")
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+    }
+
+    /// Excludes and includes the source, then writes a `desired` value that this build cannot read.
+    private func makePendingRowUnreadable(
+        _ source: UploadSourceIdentity, in pending: PendingBackupManifestStore, at url: URL
+    ) throws {
+        let key = PendingSourceKey(source)
+        XCTAssertNotNil(
+            pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
+        XCTAssertNotNil(pending.include([key], at: clock.now))
+        try withRawDatabase(at: url) {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
+                SQLITE_OK)
+        }
+    }
+
+    private func withRawDatabase(at url: URL, _ body: (OpaquePointer) throws -> Void) throws {
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        defer { sqlite3_close(db) }
+        try body(db)
+    }
+
+    /// Every row of every table of the pending store, as text.
+    private func pendingStoreRows(at url: URL) throws -> [String: [[String?]]] {
+        var tables: [String: [[String?]]] = [:]
+        try withRawDatabase(at: url) { db in
+            var names: [String] = []
+            var list: OpaquePointer?
+            XCTAssertEqual(
+                sqlite3_prepare_v2(
+                    db, "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;", -1, &list, nil), SQLITE_OK)
+            while sqlite3_step(list) == SQLITE_ROW { names.append(String(cString: sqlite3_column_text(list, 0))) }
+            sqlite3_finalize(list)
+            for name in names {
+                var stmt: OpaquePointer?
+                XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT * FROM \"\(name)\";", -1, &stmt, nil), SQLITE_OK)
+                var rows: [[String?]] = []
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    rows.append(
+                        (0..<sqlite3_column_count(stmt)).map { column in
+                            sqlite3_column_text(stmt, column).map { String(cString: $0) }
+                        })
+                }
+                sqlite3_finalize(stmt)
+                tables[name] = rows.sorted { $0.description < $1.description }
+            }
+        }
+        return tables
     }
 
     func testPhotoDeletedDuringItsIdentityPassReleasesItsTempFiles() async throws {
@@ -3774,7 +4574,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await runner.runUntilDrained()
 
         XCTAssertEqual(removing.cleanupCount, 1, "a staged iCloud original must not outlive a deleted photo")
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision))
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
@@ -3799,12 +4599,12 @@ final class BackupSyncRunnerTests: XCTestCase {
         let runner = makeRunner(uploader: stalledUploader, schedulerClock: BackupContinuousClock())
 
         let drain = Task { await runner.runUntilDrained() }
-        let uploadStarted = await waitUntil { stalledUploader.uploadAttempts == 1 }
+        let uploadStarted = await pollUntil { stalledUploader.uploadAttempts == 1 }
         let beforeRemoval = await runner.currentProgress()
 
         // The removal refreshes the progress from the queue before it waits for native cancellation.
         let removal = Task { await runner.removePhotoLibraryAssets([source.identifier]) }
-        let cancelStarted = await waitUntil { stalledUploader.cancellations == 1 }
+        let cancelStarted = await pollUntil { stalledUploader.cancellations == 1 }
         let afterRemoval = await runner.currentProgress()
 
         await stalledUploader.cancelRelease.signal()
@@ -3896,7 +4696,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             } catch {
                 XCTAssertTrue(UploadError.isCancellation(error))
             }
-            XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+            XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
             XCTAssertEqual(uploader.requests.count, 0)
         }
     }
@@ -3959,14 +4759,14 @@ final class BackupSyncRunnerTests: XCTestCase {
         let progress = await runner.runUntilDrained()
 
         XCTAssertEqual(state(of: entry), .blockedByDraft)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 1)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 1)
         XCTAssertEqual(progress.blocked, 1)
         XCTAssertEqual(progress.backedUp, 0)
         XCTAssertTrue(uploader.requests.isEmpty)
         XCTAssertLessThan(progress.fraction, 1.0, "a blocked row must keep the fraction honest")
         let issue = try XCTUnwrap(
             BackupIssueRecord.decode(
-                queueStore.entry(for: entry.source, revision: entry.revision)?.lastError
+                try queueStore.entry(for: entry.source, revision: entry.revision)?.lastError
             ))
         XCTAssertEqual(issue.kind, .remoteDraft)
         XCTAssertNotNil(issue.nextAttemptAt)
@@ -3977,7 +4777,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await runner.runUntilDrained()
         XCTAssertGreaterThan(checker.findCallCount, findsBefore, "the draft must be re-checked")
         XCTAssertEqual(state(of: entry), .blockedByDraft)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 2)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 2)
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
@@ -4027,8 +4827,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertGreaterThan(checker.findCallCount, findsBefore, "manual retry must bypass the cached draft answer")
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.state, .blockedByDraft)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 2)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.state, .blockedByDraft)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 2)
         XCTAssertTrue(uploader.requests.isEmpty, "a repeated draft must remain fail-closed")
     }
 
@@ -4124,9 +4924,9 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: current), activeDuplicate ? .alreadyBackedUp : .completed)
         XCTAssertEqual(uploader.requests.count, activeDuplicate ? 0 : 1)
         for entry in old {
-            XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision))
         }
-        XCTAssertEqual(queueStore.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queueStore.entry(for: pending.source, revision: pending.revision), pending)
         XCTAssertEqual(queueStore.count(), 2)
         XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 0)
     }
@@ -4254,6 +5054,42 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(stateStore.count(), 0, "no preflight completeness record may exist for skipped deletions")
     }
 
+    /// The person deleted a backed-up photo in Proton, and the trash was emptied later. Each later check finds no copy:
+    /// the photo stays deleted in Proton, uploads nothing, spends no attempt and needs no attention (#984).
+    func testAPhotoDeletedInProtonStaysDeletedAfterItsTrashIsEmptied() async throws {
+        let entry = seedEntry("emptied.jpg")
+        let hashes = expectedHashes(id: "emptied.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .trashed, linkID: "t-1")
+        ]
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(state(of: entry), .skippedRemoteDeletion)
+
+        checker.remoteItemsByNameHash[hashes.nameHash] = []
+        for _ in 0..<3 {
+            clock.advance(by: 60)
+            let lookups = checker.nameLookupAttemptCount
+            _ = seedEntry("emptied.jpg", ageSeconds: 0)  // A rescan checks the photo again.
+            let progress = await makeRunner().runUntilDrained()
+
+            XCTAssertGreaterThan(checker.nameLookupAttemptCount, lookups, "the check reads Proton again")
+            let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(row.state, .skippedRemoteDeletion)
+            XCTAssertEqual(row.attempts, 0)
+            XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.kind, .remoteDeletion)
+            XCTAssertEqual(progress.skippedRemoteDeletions, 1)
+            XCTAssertEqual(progress.needsAttention, 0)
+            var problems = 0
+            queueStore.forEachProblemEntry { _ in
+                problems += 1
+                return true
+            }
+            XCTAssertEqual(problems, 0, "no failure under Needs attention")
+            XCTAssertTrue(uploader.requests.isEmpty)
+        }
+    }
+
     func testUploadRecordsManifestBeforeQueueCompletion() async throws {
         let log = BackupEventLog()
         let spyQueue = SpyQueueStore(inner: queueStore, log: log)
@@ -4312,7 +5148,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let progress = await runner.runUntilDrained()
 
         XCTAssertEqual(state(of: entry), .failed)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 3)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 3)
         XCTAssertEqual(
             resolver.resolveCount(for: entry.source.identifier), 3, "parked items must stop consuming attempts")
         XCTAssertEqual(progress.failed, 1)
@@ -4337,7 +5173,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(flakyUploader.requests.count, 6)
         XCTAssertEqual(progress.failed, 0, "temporary service failures must never strand valid media")
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
         XCTAssertEqual(
             clock.sleeps.filter { $0 >= 1 }, [1, 2, 4, 8, 16],
             "service retries use durable capped backoff without consuming the item budget")
@@ -4389,7 +5225,7 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(progress.failed, 0)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
         XCTAssertEqual(
             clock.sleeps.filter { $0 >= 1 }, [1, 2],
             "switching from a timeout to a Proton 503 must not reset automatic backoff")
@@ -4408,7 +5244,7 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(progress.failed, 0)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
         XCTAssertEqual(clock.sleeps.filter { $0 >= 1 }, [1, 2, 4, 4, 4, 4, 4])
     }
 
@@ -4540,8 +5376,9 @@ final class BackupSyncRunnerTests: XCTestCase {
     func testLivePhotoCompoundUploadsPairedVideoWithPrimaryReference() async throws {
         let entry = seedEntry("live.heic")
         resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        let tagAdder = SpyTagAdder()
 
-        let runner = makeRunner()
+        let runner = makeRunner(tagAdder: tagAdder)
         let progress = await runner.runUntilDrained()
 
         XCTAssertEqual(
@@ -4550,9 +5387,12 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(
             uploader.requests.map(\.tags),
             [
-                [PhotoTag.livePhotos.rawValue],
-                [PhotoTag.livePhotos.rawValue],
-            ], "both resources must carry Proton's Live Photo classification")
+                [],
+                [],
+            ], "neither part carries the Live Photo tag at upload; the tag is added after settlement")
+        XCTAssertEqual(tagAdder.calls.map(\.tags), [[PhotoTag.livePhotos.rawValue]])
+        XCTAssertEqual(tagAdder.calls.first?.uid.nodeID, testUID("live.heic").nodeID)
+        XCTAssertEqual(tagAdder.calls.count, 1, "the still earns the Live Photo tag once, after both parts settle")
         let pairedRequest = try XCTUnwrap(uploader.requests.last)
         XCTAssertEqual(
             pairedRequest.mainPhotoUID, testUID("live.heic"),
@@ -4575,7 +5415,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let replacement: EditedPhotoReplacement
     }
 
-    func testReplacementReadCancellationReachesRunnerWithoutRetiringTheJournal() async throws {
+    func testItemReplacementReadCancellationRetriesWithoutRetiringTheJournalOrCancellingThePass() async throws {
         let harness = try makeReplacementHarness()
         let entry = seedLibraryEntry("replacement-cancel.heic")
         resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: entry.source.identifier)
@@ -4589,12 +5429,17 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         do {
             try await runner.checkCancellation()
-            XCTFail("replacement cancellation must reach the operation owner")
-        } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
+        } catch { XCTFail("replacement cancellation belongs to its item: \(error)") }
         XCTAssertEqual(harness.journal.entry(for: entry.source).allSuperseded, [old])
         XCTAssertTrue(harness.remote.trashCalls.isEmpty)
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        let deferred = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(deferred.attempts, 0)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(deferred.lastError))
+        XCTAssertEqual(issue.detail, UploadError.cancelled.errorDescription)
+        XCTAssertEqual(issue.automaticRetryAttempt, 1)
+        XCTAssertEqual(deferred.updatedAt, issue.nextAttemptAt)
         XCTAssertEqual(uploader.requests.map(\.name), ["replacement-cancel.heic"])
+        clock.advance(by: 1000)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(uploader.requests.map(\.name), ["replacement-cancel.heic"], "retry keeps the committed upload")
     }
@@ -4614,8 +5459,13 @@ final class BackupSyncRunnerTests: XCTestCase {
         checker.relatedLinkIDsProvider = { [uploader] mainLinkID in
             Set(uploader!.uploaded.filter { $0.request.mainPhotoUID?.nodeID == mainLinkID }.map(\.uid.nodeID))
         }
-        // The duplicate check reads link states from the same fake that the replacement trashes in.
-        checker.linkActivityProvider = { [remote] linkID in remote.active.contains { $0.nodeID == linkID } }
+        // The duplicate check reads link states from the same fake that the replacement trashes in. A copy that this
+        // run uploaded is active until the replacement trashes it, as on the server.
+        checker.linkActivityProvider = { [remote, uploader] linkID in
+            if remote.active.contains(where: { $0.nodeID == linkID }) { return true }
+            let uploaded = uploader!.uploaded.contains { $0.uid.nodeID == linkID }
+            return uploaded && !remote.trashCalls.joined().contains { $0.nodeID == linkID }
+        }
         return ReplacementHarness(journal: journal, pipeline: pipeline, remote: remote, replacement: replacement)
     }
 
@@ -4992,6 +5842,24 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertFalse(harness.journal.entry(for: edited.source).lastUploadWasEdit)
     }
 
+    func testCompoundSecondariesReceiveTheCurrentQueueRevision() async throws {
+        let entry = seedEntry("restore-revision.heic")
+        resolver.setSecondaries(["restore-revision.mov"], for: entry.source.identifier)
+        let pipeline = UploadDedupePipeline(store: identityStore, hasher: hasher, checker: checker)
+        let observed = RestoreRevisionRecordingResolver(inner: pipeline)
+
+        _ = await makeRunner(identityResolver: observed).runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.map(\.name), ["restore-revision.heic", "restore-revision.mov"])
+        let descriptors = observed.descriptors
+        XCTAssertEqual(descriptors.count, 2, "the real pipeline must resolve both compound resources")
+        XCTAssertEqual(
+            descriptors.map(\.backupRevision), [entry.revision, entry.revision],
+            "a restored secondary must use the same exact queue revision as its primary")
+        XCTAssertEqual(uploader.requests.last?.mainPhotoUID, testUID("restore-revision.heic"))
+    }
+
     func testSeriesUploadsMembersAsRelatedPhotosWithTheBurstsTag() async throws {
         let entry = seedEntry("IMG_0001.HEIC")
         resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
@@ -5255,6 +6123,82 @@ final class BackupSyncRunnerTests: XCTestCase {
             ))
     }
 
+    /// A foreign draft blocks the name, and the content lookup of the check times out. The photo waits like after any
+    /// passing network failure, without an attempt; it is not parked as blocked by the draft (#877).
+    func testATimeoutWhileADraftBlocksTheNameSpendsNoAttempt() async throws {
+        let entry = seedEntry("drafted.jpg")
+        let hashes = expectedHashes(id: "drafted.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: "other-content", linkState: .draft, linkID: "foreign-draft",
+                clientUID: "other-client")
+        ]
+        checker.contentFindError = UploadError.transport(code: NSURLErrorTimedOut, message: "timed out")
+
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.attempts, 0, "a passing network failure spends no attempt")
+        XCTAssertNotEqual(row.state, .blockedByDraft)
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.kind, .network)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    /// The person trashed a Live Photo's video in Proton, and the trash was emptied later. The photo stays deleted in
+    /// Proton like while its video was in the trash: nothing uploads and it does not end as a failure (#984).
+    func testALivePhotoWhoseTrashedVideoIsEmptiedStaysDeletedInProton() async throws {
+        let entry = seedEntry("live.heic")
+        resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(live.heic)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(live.heic)", contentHash: expectedContentHash(path: "/backup/live.heic"),
+                linkState: .active, linkID: "existing-main")
+        ]
+        checker.remoteItemsByNameHash["nh(live.mov)"] = [trashedPairedVideo()]
+        checker.relatedLinkIDsByMainLinkID["existing-main"] = ["trashed-paired"]
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(state(of: entry), .skippedRemoteDeletion)
+
+        checker.remoteItemsByNameHash["nh(live.mov)"] = []
+        checker.relatedLinkIDsByMainLinkID["existing-main"] = []
+        clock.advance(by: 60)
+        _ = seedEntry("live.heic", ageSeconds: 0)  // A rescan checks the photo again.
+        let progress = await makeRunner().runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty, "nothing uploads")
+        XCTAssertEqual(state(of: entry), .skippedRemoteDeletion)
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(progress.needsAttention, 0)
+    }
+
+    /// The person trashed one photo of a series in Proton, and the trash was emptied later. A later version of the
+    /// series does not upload that photo again and does not end as a failure (#984).
+    func testASeriesPhotoWhoseTrashIsEmptiedIsNotUploadedAgain() async throws {
+        let entry = seedEntry("IMG_0001.HEIC")
+        resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(IMG_0002.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_0002.HEIC)",
+                contentHash: expectedContentHash(path: "/backup/IMG_0001.HEIC#IMG_0002.HEIC"),
+                linkState: .trashed,
+                linkID: "trashed-pick"
+            )
+        ]
+        _ = await makeRunner(tagAdder: SpyTagAdder()).runUntilDrained()
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0003.HEIC"])
+
+        checker.remoteItemsByNameHash["nh(IMG_0002.HEIC)"] = []
+        clock.advance(by: 60)
+        let later = seedEntry("IMG_0001.HEIC", ageSeconds: 0, revisionOffset: 1)
+        let progress = await makeRunner(tagAdder: SpyTagAdder()).runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0003.HEIC"], "nothing uploads again")
+        XCTAssertNotNil(state(of: later))
+        XCTAssertEqual(state(of: later)?.isTerminalSuccess, true)
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(progress.needsAttention, 0)
+    }
+
     func testDraftSecondaryParksLivePhotoInsteadOfClaimingSuccess() async throws {
         let entry = seedEntry("live.heic")
         resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
@@ -5363,7 +6307,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(flaky.requests.filter { $0.name == "network-live.heic" }.count, 1)
         XCTAssertEqual(flaky.requests.filter { $0.name == "network-live.mov" }.count, 7)
         XCTAssertEqual(
-            queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0,
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0,
             "transient network retries must not burn the compound retry budget")
         XCTAssertEqual(
             clock.sleeps.filter { $0 >= 1 }, [1, 2, 4, 8, 16, 32],
@@ -5483,24 +6427,6 @@ final class BackupSyncRunnerTests: XCTestCase {
         )
     }
 
-    func testCompositeResolverRoutesAndRejectsUnknownKinds() async throws {
-        let composite = CompositeBackupResourceResolver([.fileURL: resolver])
-        let fileEntry = seedEntry("routed.jpg")
-        let resolved = try await composite.resolve(fileEntry)
-        XCTAssertEqual(resolved?.descriptor.filename, "routed.jpg")
-
-        let photoEntry = UploadBackupSyncQueueEntry(
-            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-1"),
-            revision: UploadBackupRevision(rawValue: 1),
-            originalFilename: "IMG.HEIC",
-            updatedAt: clock.now
-        )
-        do {
-            _ = try await composite.resolve(photoEntry)
-            XCTFail("unregistered source kinds must fail loudly, not guess")
-        } catch {}
-    }
-
     func testUploadConcurrencyRespectsThrottleLimit() async throws {
         for index in 0..<8 { _ = seedEntry("file-\(index).jpg") }
         let slowUploader = MockUploader(workDuration: .milliseconds(30), deliverProgress: false)
@@ -5521,7 +6447,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await runner.runUntilDrained()
 
         XCTAssertEqual(state(of: entry), .completed, "the scanned row must not linger as runnable")
-        let driftedRow = queueStore.entry(for: entry.source, revision: UploadBackupRevision(date: newModified))
+        let driftedRow = try queueStore.entry(for: entry.source, revision: UploadBackupRevision(date: newModified))
         XCTAssertEqual(driftedRow?.state, .completed, "the resolved revision must get its own truthful row")
         let record = stateStore.record(for: entry.source, revision: UploadBackupRevision(date: newModified))
         XCTAssertEqual(record?.isComplete, true, "backed-up proof must be recorded for the revision that was uploaded")
@@ -5544,6 +6470,8 @@ private final class SpyBackupItemEvents: BackupItemEventSink, @unchecked Sendabl
     var excluded: Set<String> = []
     var exclusionsUnknown = false
     var handoffOutcome = PendingHandoffOutcome.recorded
+    /// Runs inside the settlement of a committed upload, before its handoff is recorded.
+    var beforeHandoff: (@Sendable (UploadSourceIdentity) -> Void)?
 
     init(queue: UploadBackupSyncQueueManifestStore) {
         self.queue = queue
@@ -5567,13 +6495,14 @@ private final class SpyBackupItemEvents: BackupItemEventSink, @unchecked Sendabl
         remote: PhotoUID,
         kind: PendingHandoffKind
     ) -> PendingHandoffOutcome {
-        let state = queue.entry(for: source, revision: revision)?.state
+        beforeHandoff?(source)
+        let state = queueEntryForTesting(in: queue, source: source, revision: revision)?.state
         lock.withLock { recorded.append(.handoff(source.identifier, remote, kind, queueState: state)) }
         return handoffOutcome
     }
 
-    func isExcluded(source: UploadSourceIdentity) -> Bool? {
-        lock.withLock { exclusionsUnknown ? nil : excluded.contains(source.identifier) }
+    func exclusion(of source: UploadSourceIdentity) -> BackupSourceExclusion? {
+        lock.withLock { exclusionsUnknown ? nil : excluded.contains(source.identifier) ? .excluded : .included }
     }
 
     func reportProgress(source: UploadSourceIdentity, revision: UploadBackupRevision, step: Int?) {
@@ -5816,15 +6745,6 @@ final class RecordHoldingIdentityResolver: UploadIdentityResolving, @unchecked S
 
 /// The drain starts the next item as soon as one ends, instead of waiting for a whole group (#310).
 extension BackupSyncRunnerTests {
-    private func waitUntil(timeout: Duration = .seconds(5), _ predicate: () -> Bool) async -> Bool {
-        let deadline = ContinuousClock.now.advanced(by: timeout)
-        while ContinuousClock.now < deadline {
-            if predicate() { return true }
-            try? await Task.sleep(for: .milliseconds(5))
-        }
-        return predicate()
-    }
-
     private static let wiFi = LibraryNetworkState(
         path: LibraryNetworkPath(isSatisfied: true, availableInterfaces: [.wifi]))
 
@@ -5836,9 +6756,9 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let started = await waitUntil { transfers.started.contains("edited.jpg") }
+        let started = await pollUntil { transfers.started.contains("edited.jpg") }
         let olderWasClaimed = state(of: older) == .checking
-        let othersFinished = await waitUntil { others.allSatisfy { self.state(of: $0) == .completed } }
+        let othersFinished = await pollUntil { others.allSatisfy { self.state(of: $0) == .completed } }
         let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
         let slowStillRunning = !transfers.finished.contains("edited.jpg")
         transfers.releaseAll()
@@ -5854,7 +6774,7 @@ extension BackupSyncRunnerTests {
         XCTAssertEqual(state(of: newer)?.isTerminalSuccess, true)
         XCTAssertEqual(state(of: older)?.isTerminalSuccess, true)
         XCTAssertEqual(progress.backedUp, 6, "the drain settles every claimed revision")
-        XCTAssertEqual(queueStore.summary().active, 0)
+        XCTAssertEqual(queueStore.summary()!.active, 0)
     }
 
     func testFastItemsKeepTheFreeSlotsBusyWhileASlowItemUploads() async throws {
@@ -5864,7 +6784,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let fastFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        let fastFinished = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
         let slowStillRunning = !transfers.finished.contains("slow.mov")
         transfers.releaseAll()
         let progress = await pass.value
@@ -5896,7 +6816,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let engine = UploadBackupSyncEngine(preflight: preflight, queue: queueStore, now: { [clock] in clock!.now })
         let pass = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
-        let initialFinished = await waitUntil { self.state(of: initial) == .completed }
+        let initialFinished = await pollUntil { self.state(of: initial) == .completed }
         XCTAssertTrue(initialFinished)
         // Let the settlement wake finish before inserting work into the otherwise idle queue.
         for _ in 0..<100 { await Task.yield() }
@@ -5911,8 +6831,8 @@ extension BackupSyncRunnerTests {
         } else {
             _ = try await engine.enqueueBatch([candidate])
         }
-        let newFinished = await waitUntil(timeout: .seconds(2)) {
-            self.queueStore.entry(for: source, revision: revision)?.state == .completed
+        let newFinished = await pollUntil(timeout: .seconds(2)) {
+            queueEntryForTesting(in: self.queueStore, source: source, revision: revision)?.state == .completed
         }
         let slowStillRunning = !transfers.finished.contains("slow.mov")
         let waits = clock.sleeps
@@ -5935,7 +6855,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(schedulerClock: heldClock)
         let engine = UploadBackupSyncEngine(preflight: preflight, queue: queueStore, now: { [clock] in clock!.now })
         let pass = Task { await runner.runUntilDrained() }
-        let waiting = await waitUntil { heldClock.isWaiting }
+        let waiting = await pollUntil { heldClock.isWaiting }
         XCTAssertTrue(waiting)
 
         let source = UploadSourceIdentity.file(URL(fileURLWithPath: "/backup/now.jpg"))
@@ -5945,8 +6865,8 @@ extension BackupSyncRunnerTests {
                 snapshot: UploadBackupAssetSnapshot(source: source, revision: revision, resourceCount: 1),
                 originalFilename: "now.jpg", byteCount: 4)
         ])
-        let newFinished = await waitUntil(timeout: .seconds(2)) {
-            self.queueStore.entry(for: source, revision: revision)?.state == .completed
+        let newFinished = await pollUntil(timeout: .seconds(2)) {
+            queueEntryForTesting(in: self.queueStore, source: source, revision: revision)?.state == .completed
         }
         let delayedStillWaiting = state(of: delayed) == .discovered
         await runner.stop()
@@ -5967,10 +6887,10 @@ extension BackupSyncRunnerTests {
             finished.append("finished")
             return result
         }
-        let waiting = await waitUntil { heldClock.isWaiting }
+        let waiting = await pollUntil { heldClock.isWaiting }
         XCTAssertTrue(waiting)
         pass.cancel()
-        let endedBeforeTheRetry = await waitUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
+        let endedBeforeTheRetry = await pollUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
         heldClock.releaseAll()
         _ = await pass.value
 
@@ -5985,7 +6905,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let othersFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        let othersFinished = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
         transfers.releaseAll()
         let progress = await pass.value
 
@@ -6004,7 +6924,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let retriedWhileSlowRuns = await waitUntil { self.state(of: failing) == .completed }
+        let retriedWhileSlowRuns = await pollUntil { self.state(of: failing) == .completed }
         let slowStillRunning = !transfers.finished.contains("slow.mov")
         let waitsWhileSlowRuns = clock.sleeps
         transfers.releaseAll()
@@ -6031,9 +6951,9 @@ extension BackupSyncRunnerTests {
         let pass = Task { await runner.runUntilDrained() }
         let claims = { log.events.filter { $0 == "queue.claimRunnable" }.count }
 
-        _ = await waitUntil { self.state(of: fast) == .completed }
+        _ = await pollUntil { self.state(of: fast) == .completed }
         // Give a wrong wake time to claim again.
-        let claimedAgain = await waitUntil(timeout: .milliseconds(200)) { claims() > 2 }
+        let claimedAgain = await pollUntil(timeout: .milliseconds(200)) { claims() > 2 }
         let sleepsWhileSlowRuns = clock.sleeps
         transfers.releaseAll()
         _ = await pass.value
@@ -6053,7 +6973,7 @@ extension BackupSyncRunnerTests {
         }
         let transfers = HeldTransferUploader(durations: durations)
         let activeRows = ActiveRowSamples()
-        transfers.onStart = { [queueStore] in activeRows.append(queueStore!.summary().active) }
+        transfers.onStart = { [queueStore] in activeRows.append(queueStore!.summary()!.active) }
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 3))
 
         let progress = await runner.runUntilDrained()
@@ -6077,12 +6997,12 @@ extension BackupSyncRunnerTests {
             throttleInputs: { throttle.current })
         let pass = Task { await runner.runUntilDrained() }
 
-        let allStarted = await waitUntil { transfers.started.count == 6 }
+        let allStarted = await pollUntil { transfers.started.count == 6 }
         throttle.set(BackupThrottleInputs(thermalLevel: .critical))
         transfers.release(held[0])
-        _ = await waitUntil { transfers.finished.contains(held[0]) }
+        _ = await pollUntil { transfers.finished.contains(held[0]) }
         // Give a wrongly started item time to appear.
-        let startedTooEarly = await waitUntil(timeout: .milliseconds(200)) { transfers.started.count > 6 }
+        let startedTooEarly = await pollUntil(timeout: .milliseconds(200)) { transfers.started.count > 6 }
         let cancellationsWhileLowered = transfers.cancellations
         transfers.releaseAll()
         let progress = await pass.value
@@ -6107,10 +7027,10 @@ extension BackupSyncRunnerTests {
             runtimeChanges: { runtime.updates() })
         let pass = Task { await runner.runUntilDrained() }
 
-        let slowStarted = await waitUntil { transfers.started.contains("slow.mov") }
+        let slowStarted = await pollUntil { transfers.started.contains("slow.mov") }
         let othersWaited = transfers.started == ["slow.mov"]
         runtime.update { $0.thermalLevel = .nominal }
-        let fastFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        let fastFinished = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
         transfers.releaseAll()
         let progress = await pass.value
 
@@ -6129,8 +7049,8 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        _ = await waitUntil { self.state(of: other) == .completed }
-        let claimedTooEarly = await waitUntil(timeout: .milliseconds(200)) { self.state(of: older) != .discovered }
+        _ = await pollUntil { self.state(of: other) == .completed }
+        let claimedTooEarly = await pollUntil(timeout: .milliseconds(200)) { self.state(of: older) != .discovered }
         let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
         transfers.releaseAll()
         _ = await pass.value
@@ -6140,7 +7060,7 @@ extension BackupSyncRunnerTests {
         XCTAssertEqual(transfers.started.filter { $0 == "edited.jpg" }.count, 1, "the same bytes upload once")
         XCTAssertEqual(state(of: newer)?.isTerminalSuccess, true)
         XCTAssertEqual(state(of: older)?.isTerminalSuccess, true)
-        XCTAssertEqual(queueStore.summary().active, 0)
+        XCTAssertEqual(queueStore.summary()!.active, 0)
     }
 
     /// Between the upload and its manifest record, the row is runnable (`needsRemoteReconciliation`), so a crash
@@ -6152,9 +7072,9 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(identityResolver: identities, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let recordStarted = await waitUntil { identities.holds }
+        let recordStarted = await pollUntil { identities.holds }
         let rowDuringTheRecord = state(of: slow)
-        _ = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        _ = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
         identities.releaseAll()
         let progress = await pass.value
 
@@ -6175,7 +7095,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        _ = await waitUntil { transfers.started.contains("edited.jpg") }
+        _ = await pollUntil { transfers.started.contains("edited.jpg") }
         let olderWasClaimed = state(of: older) == .checking
         let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
         pass.cancel()
@@ -6183,11 +7103,11 @@ extension BackupSyncRunnerTests {
 
         XCTAssertTrue(olderWasClaimed, "both revisions came in one claim")
         XCTAssertEqual(resolvesWhileHeld, 1, "the second revision waits for the first")
-        XCTAssertEqual(queueStore.summary().active, 0, "every claimed row returns to the queue")
+        XCTAssertEqual(queueStore.summary()!.active, 0, "every claimed row returns to the queue")
         XCTAssertFalse(state(of: newer)?.isTerminalSuccess ?? true)
         XCTAssertFalse(state(of: older)?.isTerminalSuccess ?? true)
-        XCTAssertEqual(queueStore.entry(for: newer.source, revision: newer.revision)?.attempts, 0)
-        XCTAssertEqual(queueStore.entry(for: older.source, revision: older.revision)?.attempts, 0)
+        XCTAssertEqual(try queueStore.entry(for: newer.source, revision: newer.revision)?.attempts, 0)
+        XCTAssertEqual(try queueStore.entry(for: older.source, revision: older.revision)?.attempts, 0)
     }
 
     func testStopWhileItemsFlowRevertsTheRunningItemAndStartsNoNewOne() async throws {
@@ -6199,18 +7119,18 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        _ = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
-        _ = await waitUntil { transfers.started.contains("slow.mov") }
+        _ = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        _ = await pollUntil { transfers.started.contains("slow.mov") }
         // Every slot now holds a transfer that waits, so nothing else can start before the stop.
-        _ = await waitUntil(timeout: .seconds(1)) { transfers.started.count == 5 }
+        _ = await pollUntil(timeout: .seconds(1)) { transfers.started.count == 5 }
         let startedBeforeStop = transfers.started.count
         await runner.stop()
         let progress = await pass.value
 
         XCTAssertEqual(transfers.started.count, startedBeforeStop, "no new item starts after the stop")
         XCTAssertEqual(state(of: slow), .queuedForUpload, "the running item returns to the queue")
-        XCTAssertEqual(queueStore.entry(for: slow.source, revision: slow.revision)?.attempts, 0)
-        XCTAssertEqual(queueStore.summary().active, 0, "no claimed row stays active")
+        XCTAssertEqual(try queueStore.entry(for: slow.source, revision: slow.revision)?.attempts, 0)
+        XCTAssertEqual(queueStore.summary()!.active, 0, "no claimed row stays active")
         XCTAssertEqual(progress.checking, 0)
         XCTAssertTrue(transfers.finished.allSatisfy { $0.hasPrefix("fast-") })
         XCTAssertGreaterThanOrEqual(transfers.cancellations, 1)
@@ -6264,7 +7184,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(
             throttleInputs: signals.current, runtimeChanges: signals.updates, schedulerClock: heldClock)
         let pass = Task { await runner.runUntilDrained() }
-        let waiting = await waitUntil { heldClock.isWaiting }
+        let waiting = await pollUntil { heldClock.isWaiting }
         XCTAssertTrue(waiting, "the drain waits for Wi-Fi")
         return (runner, heldClock, pass)
     }
@@ -6276,7 +7196,7 @@ extension BackupSyncRunnerTests {
         XCTAssertTrue(uploader.requests.isEmpty)
 
         runtime.update { $0.network = Self.wiFi }
-        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        let uploaded = await pollUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
         await runner.stop()
         heldClock.releaseAll()
         _ = await pass.value
@@ -6292,10 +7212,10 @@ extension BackupSyncRunnerTests {
 
         runtime.update { $0.network = Self.offline }
         runtime.update { $0.network = Self.cellular }
-        let uploadedEarly = await waitUntil(timeout: .milliseconds(300)) { !self.uploader.requests.isEmpty }
+        let uploadedEarly = await pollUntil(timeout: .milliseconds(300)) { !self.uploader.requests.isEmpty }
         let row = try XCTUnwrap(queueStore.entry(for: due.source, revision: due.revision))
         runtime.update { $0.network = Self.wiFi }
-        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        let uploaded = await pollUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
         await runner.stop()
         heldClock.releaseAll()
         _ = await pass.value
@@ -6319,11 +7239,11 @@ extension BackupSyncRunnerTests {
             finished.append("finished")
             return result
         }
-        let waiting = await waitUntil { heldClock.isWaiting }
+        let waiting = await pollUntil { heldClock.isWaiting }
         XCTAssertTrue(waiting)
 
         pass.cancel()
-        let ended = await waitUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
+        let ended = await pollUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
         heldClock.releaseAll()
         _ = await pass.value
 
@@ -6342,7 +7262,7 @@ extension BackupSyncRunnerTests {
 
         // The settings toggle writes this preference; no runtime change accompanies it.
         defaults.set(true, forKey: AppSettingsKey.backupUsesMobileData)
-        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        let uploaded = await pollUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
         await runner.stop()
         heldClock.releaseAll()
         _ = await pass.value
@@ -6388,5 +7308,280 @@ extension BackupSyncRunnerTests {
         XCTAssertTrue(progress.isWaitingForWiFi)
         XCTAssertEqual(progress.failed, 0)
         try await runner.checkCancellation()
+    }
+}
+
+/// Observes the real pipeline's descriptors without replacing any duplicate decision or upload settlement.
+private final class RestoreRevisionRecordingResolver: UploadIdentityResolving, @unchecked Sendable {
+    let inner: UploadDedupePipeline
+    private let lock = NSLock()
+    private var recorded: [UploadResourceDescriptor] = []
+    var descriptors: [UploadResourceDescriptor] { lock.withLock { recorded } }
+
+    init(inner: UploadDedupePipeline) { self.inner = inner }
+
+    func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
+        lock.withLock { recorded.append(descriptor) }
+        return try await inner.resolve(descriptor)
+    }
+
+    func prime(_ descriptors: [UploadResourceDescriptor]) async { await inner.prime(descriptors) }
+    func recordUploaded(
+        _ descriptor: UploadResourceDescriptor, identity: UploadIdentity,
+        remoteVolumeID: String, remoteLinkID: String
+    ) async throws {
+        try await inner.recordUploaded(
+            descriptor, identity: identity, remoteVolumeID: remoteVolumeID, remoteLinkID: remoteLinkID)
+    }
+    func uploadDidFail(_ descriptor: UploadResourceDescriptor) async { await inner.uploadDidFail(descriptor) }
+    func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord? {
+        await inner.identityRecord(for: source)
+    }
+}
+
+// MARK: - #1004 B2: the runner decides only from complete queue reads
+
+extension BackupSyncRunnerTests {
+    /// After a transient failure is forgotten, an unknown next date must not certify that no upload work is left.
+    func testAnUnknownRunnableDateCannotCertifyNoUploadWorkAfterRecovery() async throws {
+        _ = seedEntry("waiting.jpg")
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT MIN(updated_at) FROM backup_sync_queue")
+        defer { fault.stop() }
+        let runner = makeRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(fault.fired)
+        XCTAssertFalse(progress.leavesNoUploadWork, "an unknown date proves no empty queue")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "the pass that could not read its queue reports it unknown")
+    }
+
+    /// An unknown wait date ends the pass as unknown, never as a drained queue that a caller may trust.
+    func testAnUnknownWaitDateEndsThePassAsUnknownAfterRecovery() async throws {
+        let entry = seedEntry("later.jpg")
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 1, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(600)))
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT MIN(updated_at) FROM backup_sync_queue")
+        defer { fault.stop() }
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained()
+        XCTAssertTrue(fault.fired)
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "the drain did not finish; it could not read when its retries are due")
+        XCTAssertEqual(state(of: entry), .discovered)
+        fault.stop()
+        // The next pass reads the queue again and answers for itself.
+        _ = await runner.runUntilDrained()
+        let operationalAgain = await runner.isQueueOperational()
+        XCTAssertTrue(operationalAgain, "an unknown read of an earlier pass does not stop the next one")
+    }
+
+    /// The due draft re-check must not be skipped silently when its read fails.
+    func testAnUnknownDraftRecheckReadEndsThePassAsUnknownAfterRecovery() async throws {
+        let issue = BackupIssueRecord(
+            kind: .remoteService, detail: "draft", nextAttemptAt: clock.now.addingTimeInterval(-60))
+        let entry = seedEntry("draft.jpg", state: .blockedByDraft)
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .blockedByDraft, attempts: 0,
+                lastError: issue.persistedValue, updatedAt: clock.now.addingTimeInterval(-60)))
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "WHERE state = ? AND updated_at < ?")
+        defer { fault.stop() }
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(state(of: entry), .blockedByDraft)
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "the due re-check did not run, so the pass is unknown")
+    }
+
+    /// A failed read of the stored retry ordinal must not restart the backoff from its first, shortest step.
+    func testAFailedRetryOrdinalReadKeepsTheStoredBackoff() async throws {
+        _ = seedEntry("waiting.jpg")
+        let stored = BackupIssueRecord(
+            kind: .remoteService, detail: "index", nextAttemptAt: clock.now.addingTimeInterval(-1),
+            automaticRetryAttempt: 3)
+        XCTAssertTrue(queueStore.setRuntimeIssue(stored, for: .remoteIndexPreparation))
+        let store = try XCTUnwrap(queueStore)
+        // The pass reads the issue once for its status, then once more as the previous ordinal of the new failure.
+        let fault = try SQLiteReadInterrupt(
+            in: store, matching: "SELECT value FROM backup_sync_runtime_issue", occurrence: 2)
+        defer { fault.stop() }
+        _ = await makeRunner(identityResolver: PreparationFailingIdentityResolver(inner: makePipeline()))
+            .runUntilDrained()
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(try XCTUnwrap(queueStore.runtimeIssue(for: .remoteIndexPreparation)), stored)
+    }
+
+    /// The person's retry clears the stored backoff also when the read of that backoff fails.
+    func testAFailedRetryIssueReadStillClearsTheBackoffOnManualRetry() async throws {
+        XCTAssertTrue(
+            queueStore.setRuntimeIssue(
+                BackupIssueRecord(
+                    kind: .remoteService, detail: "index", nextAttemptAt: clock.now.addingTimeInterval(64),
+                    automaticRetryAttempt: 7),
+                for: .remoteIndexPreparation))
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT value FROM backup_sync_runtime_issue")
+        defer { fault.stop() }
+        _ = await makeRunner().makeRetryableWorkEligibleNow()
+        XCTAssertTrue(fault.fired)
+        XCTAssertNil(queueStore.runtimeIssue(for: .remoteIndexPreparation), "the retry runs without the old backoff")
+    }
+}
+
+extension BackupSyncRunnerTests {
+    /// The final drain of a scan stops at a due draft read that fails. It must not hand back the earlier drain's
+    /// "no upload work": the controller would then skip the first index build although photos wait (#1004 B2).
+    func testAnUnknownFinalDrainNeverReportsTheEarlierNoUploadWork() async throws {
+        let store = try XCTUnwrap(queueStore)
+        let runner = makeRunner()
+        let scanDone = BackupScanSignal()
+        await scanDone.markDone()
+        // The first drain finds nothing to upload; the second, final drain cannot read its due drafts.
+        let fault = try SQLiteReadInterrupt(in: store, matching: "WHERE state = ? AND updated_at < ?", occurrence: 2)
+        defer { fault.stop() }
+        let final = await PhotoLibraryBackupController.reconcileWhileScanning(
+            runner: runner, scanDone: scanDone, workIntent: .automatic, queue: store)
+        XCTAssertTrue(fault.fired, "the final drain's draft read must actually fail")
+        XCTAssertFalse(final.leavesNoUploadWork, "an unknown final drain proves no empty queue")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational)
+    }
+}
+
+// MARK: - #1004 B2c: recovery from transient queue failures
+
+extension BackupSyncRunnerTests {
+    /// A transient failure stops only the read that hit it. Once the database answers, the next pass backs up.
+    func testATransientQueueFailureDoesNotStopTheNextPass() async throws {
+        let entry = seedEntry("waiting.jpg")
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT COUNT(*) FROM backup_sync_queue;")
+        XCTAssertNil(store.count(), "the interrupted read is unknown")
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed, "the next pass backs up once the database answers")
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    /// A lasting failure still stops backup: a row that does not decode is no passing failure.
+    func testAnUndecodableQueueRowStillStopsTheNextPass() async throws {
+        let entry = seedEntry("waiting.jpg")
+        XCTAssertTrue(queueStore.synchronizeToDisk())
+        var handle: OpaquePointer?
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil),
+            SQLITE_OK)
+        XCTAssertThrowsError(try queueStore.entry(for: entry.source, revision: entry.revision))
+
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertTrue(uploader.requests.isEmpty, "a lasting failure keeps every upload stopped")
+        // This assertion pins the guard: the health check keeps a lasting failure after the database answers again.
+        // The empty upload list alone does not prove it, because a pass can also end without uploading for other
+        // reasons.
+        XCTAssertFalse(queueStore.isOperational(), "a decode failure stays recorded after the database answers")
+    }
+
+    /// A pass whose requeue of stale active rows failed must not report that no upload work is left. The rows wait
+    /// for the next pass, which requeues and backs them up.
+    func testAFailedStaleRequeueNeverReportsNoUploadWork() async throws {
+        let entry = seedEntry("stale.jpg", state: .checking)
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "WHEN 'checking' THEN CASE")
+        let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+        XCTAssertFalse(progress.leavesNoUploadWork, "the stale row still waits for its requeue")
+        XCTAssertEqual(state(of: entry), .checking, "the failed requeue changed nothing")
+
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed, "the next pass requeues and backs up the row")
+    }
+
+    /// A failed claim ends the pass as unknown. A later health check can pass again, so a claim retried at once would
+    /// run again and again for as long as the write keeps failing, for example on a full disk.
+    func testAFailedClaimEndsThePassInsteadOfRetryingIt() async throws {
+        let entry = seedEntry("waiting.jpg")
+        let store = try XCTUnwrap(queueStore)
+        let faults = try SQLiteStatementFaults(in: store, failures: 3) { $0.contains("SET state='checking'") }
+        defer { faults.stop() }
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(faults.firedCount, 1, "a failed claim ends the pass; it is not retried at once")
+        XCTAssertEqual(state(of: entry), .discovered, "the failed claim changed nothing")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "the pass that could not claim reports it unknown")
+
+        faults.stop()
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed, "the next pass claims and backs up the row")
+    }
+
+    /// "No upload work is left" needs a pass without a recorded failure. A failure that another reader of the same
+    /// connection records while the pass reads its last answer is forgotten by the health check at once, so only the
+    /// pass's own failure count shows it.
+    func testAFailureRecordedWhileTheLastReadRunsNeverReportsNoUploadWork() async throws {
+        let control = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(control.leavesNoUploadWork, "fixture control: an empty queue leaves no upload work")
+
+        let mark = try SQLiteRecordedFailure(
+            in: queueStore!, matching: "SELECT 1 FROM backup_sync_queue WHERE state IN")
+        defer { mark.stop() }
+        let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(mark.recorded, "the failure was recorded while the last read ran")
+        XCTAssertTrue(queueStore.isOperational(), "the health check forgot it, because the database answers")
+        XCTAssertFalse(progress.leavesNoUploadWork, "a pass with a recorded failure proves no empty queue")
+    }
+
+    /// A pass that ends because its queue summary could not be read is unknown, also after the database answers
+    /// again: a caller that drains again at once would read the same failure about once per second.
+    func testAFailedSummaryReadEndsThePassAsUnknown() async throws {
+        let entry = seedEntry("waiting.jpg")
+        let fault = try SQLiteReadInterrupt(in: queueStore!, matching: "GROUP BY state, source_kind, check_reason")
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained()
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(state(of: entry), .discovered, "the pass ended before it claimed anything")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "a pass that could not read its summary reports it unknown")
+    }
+
+    /// A pass whose cleared remote-index issue could not be written is unknown, also after the database answers.
+    func testAFailedClearOfTheRemoteIndexIssueEndsThePassAsUnknown() async throws {
+        _ = seedEntry("waiting.jpg")
+        let faults = try SQLiteStatementFaults(in: queueStore!, failures: 1) {
+            $0.contains("DELETE FROM backup_sync_runtime_issue")
+        }
+        defer { faults.stop() }
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(faults.firedCount, 1, "the write that clears the issue failed")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "a pass that could not clear its issue reports it unknown")
+    }
+
+    /// A pass whose remote-index issue could not be saved is unknown, also after the database answers.
+    func testAFailedSaveOfTheRemoteIndexIssueEndsThePassAsUnknown() async throws {
+        _ = seedEntry("waiting.jpg")
+        let faults = try SQLiteStatementFaults(in: queueStore!, failures: 1) {
+            $0.contains("INSERT INTO backup_sync_runtime_issue")
+        }
+        defer { faults.stop() }
+        let runner = makeRunner(identityResolver: PreparationFailingIdentityResolver(inner: makePipeline()))
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(faults.firedCount, 1, "the write that saves the issue failed")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "a pass that could not save its issue reports it unknown")
     }
 }

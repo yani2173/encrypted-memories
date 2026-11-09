@@ -382,6 +382,30 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         XCTAssertEqual(model.allItems.map(\.uid), [a.uid], "a later listing must not show the trashed photo")
     }
 
+    @MainActor
+    func testTrashByIdentityGivesRecentlyDeletedTheKnownPhotosInTimelineOrder() async {
+        let a = photo("a", seconds: 1)
+        let b = photo("b", seconds: 2)
+        let c = photo("c", seconds: 3)
+        let d = photo("d", seconds: 4)
+        let unknown = photo("unknown", seconds: 5)
+        let model = TimelineViewModel(
+            repository: RefreshRepository(timelines: [[section([a, b, c, d])]]),
+            feed: makeFeed().feedCore,
+            library: FakeLibrary(sections: [section([d])])
+        )
+        await model.load()
+        await model.select(.trash)
+        XCTAssertEqual(model.allItems.map(\.uid), [d.uid])
+
+        await model.commitTrash(uids: [c.uid, unknown.uid, a.uid])
+
+        XCTAssertEqual(model.wholeLibraryUIDs, [b.uid, d.uid], "known photos leave All Photos only")
+        XCTAssertEqual(
+            model.allItems.map(\.uid), [a.uid, c.uid, d.uid],
+            "Recently Deleted gets exactly the known photos, in timeline order, and not the unknown identity")
+    }
+
     func testSingleClickSelectsAndDoesNotOpenViewer() {
         let decision = GridInteractionPolicy.decision(click: .single, selectionMode: false)
         XCTAssertFalse(decision.opensViewer)

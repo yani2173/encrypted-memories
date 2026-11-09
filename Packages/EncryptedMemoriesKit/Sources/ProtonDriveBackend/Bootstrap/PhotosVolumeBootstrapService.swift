@@ -1,4 +1,6 @@
 import Foundation
+import PhotosCore
+import ProtonAuth
 
 /// The identifiers shared by every Photos operation after the account's photo volume exists.
 struct PhotosShareContext: Sendable, Equatable {
@@ -9,10 +11,12 @@ struct PhotosShareContext: Sendable, Equatable {
 
 enum PhotosVolumeBootstrapError: LocalizedError {
     case missingSigner
+    case creationFailed(underlying: any Error)
 
+    /// One generic text for every creation failure: the screen names no cause and stays retryable.
     var errorDescription: String? {
         switch self {
-        case .missingSigner: "The Proton account has no usable address key for the photo library."
+        case .missingSigner, .creationFailed: L10n.string("error.library_creation_failed")
         }
     }
 }
@@ -36,7 +40,11 @@ actor PhotosVolumeBootstrapService {
 
     func resolve() async throws -> PhotosShareContext {
         if let cachedContext { return cachedContext }
-        if let resolutionTask { return try await resolutionTask.value }
+        if let resolutionTask {
+            let context = try await resolutionTask.value
+            try Task.checkCancellation()
+            return context
+        }
 
         let session = self.session
         let crypto = self.crypto
@@ -44,13 +52,20 @@ actor PhotosVolumeBootstrapService {
             if let existing = try await Self.fetchActiveContext(session: session) {
                 return existing
             }
-            return try await Self.createContext(session: session, crypto: crypto)
+            do {
+                return try await Self.createContext(session: session, crypto: crypto)
+            } catch {
+                if Task.isCancelled || ProtonRequestStatusClass.isCancellation(error) { throw error }
+                if case .apiError? = error as? ProtonAuthError { throw error }
+                throw PhotosVolumeBootstrapError.creationFailed(underlying: error)
+            }
         }
         resolutionTask = task
         defer { resolutionTask = nil }
 
         do {
             let context = try await task.value
+            try Task.checkCancellation()
             cachedContext = context
             return context
         } catch {
@@ -126,15 +141,26 @@ actor PhotosVolumeBootstrapService {
                 body: body
             )
             let response = try JSONDecoder().decode(CreatePhotosVolumeResponse.self, from: data)
+            try Task.checkCancellation()
             DebugLog.log("photos bootstrap: created photo volume ✓")
             return response.volume.context
         } catch {
             // Another signed-in client may have won the cross-device creation race. Accept only
             // an active server result; otherwise preserve the original creation failure.
-            if let existing = try? await fetchActiveContext(session: session) {
-                return existing
+            let creationError = error
+            if Task.isCancelled || ProtonRequestStatusClass.isCancellation(creationError) {
+                throw CancellationError()
             }
-            throw error
+            let existing: PhotosShareContext?
+            do {
+                existing = try await fetchActiveContext(session: session)
+            } catch {
+                if Task.isCancelled || ProtonRequestStatusClass.isCancellation(error) { throw CancellationError() }
+                existing = nil
+            }
+            try Task.checkCancellation()
+            if let existing { return existing }
+            throw creationError
         }
     }
 }

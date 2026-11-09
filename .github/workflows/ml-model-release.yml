@@ -10,6 +10,7 @@ on:
       - "scripts/install-rclone.sh"
       - "scripts/prepare-ml-model-release.swift"
       - "scripts/prepare-ml-model-rollback.swift"
+      - "scripts/r2_request.py"
       - "scripts/rollback-ml-model-release.sh"
       - "scripts/verify-ml-catalog-signature.swift"
       - "scripts/tests/**"
@@ -65,6 +66,7 @@ jobs:
           xcrun swiftc -typecheck scripts/prepare-ml-model-rollback.swift
           xcrun swiftc -typecheck scripts/verify-ml-catalog-signature.swift
           python3 -m py_compile scripts/extract-ml-release-candidate.py
+          python3 -m py_compile scripts/r2_request.py
           python3 -m py_compile scripts/verify-ml-release-pair.py
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
           bash -n scripts/install-rclone.sh

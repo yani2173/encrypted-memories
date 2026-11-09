@@ -17,10 +17,12 @@ struct SidebarView: View {
     let albums: [AlbumSummary]
     let isLoadingAlbums: Bool
     let albumCatalogFailed: Bool
+    let albumLoadFailure: AlbumFailurePresentation?
     let sharedAlbums: [SharedAlbumSummary]
     let sharedAlbumPresentation: (SharedAlbumSummary) -> SharedAlbumPresentation
     let isLoadingSharedAlbums: Bool
     let sharedAlbumCatalogFailed: Bool
+    let sharedAlbumLoadFailure: AlbumFailurePresentation?
     let canLeaveSharedAlbum: Bool
     let canCreateAlbum: Bool
     let canAddPhotos: Bool
@@ -62,20 +64,22 @@ struct SidebarView: View {
                     .foregroundStyle(.secondary)
                     .disabled(true)
                 } else if albumCatalogFailed, albums.isEmpty {
-                    Button(action: onRetryAlbums) {
-                        Label("sidebar.albums_failed", systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
+                    albumFailureRow(
+                        albumLoadFailure,
+                        retryTitle: String(localized: "sidebar.albums_failed"),
+                        onRetry: onRetryAlbums
+                    )
                 } else if albums.isEmpty {
                     Label("sidebar.no_albums", systemImage: "tray")
                         .foregroundStyle(.secondary)
                         .disabled(true)
                 }
                 if albumCatalogFailed, !albums.isEmpty {
-                    Button(action: onRetryAlbums) {
-                        Label("sidebar.albums_failed", systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
+                    albumFailureRow(
+                        albumLoadFailure,
+                        retryTitle: String(localized: "sidebar.albums_failed"),
+                        onRetry: onRetryAlbums
+                    )
                 }
                 ForEach(albums) { album in
                     OwnedAlbumSidebarRow(
@@ -110,10 +114,11 @@ struct SidebarView: View {
                     .foregroundStyle(.secondary)
                     .disabled(true)
                 } else if sharedAlbumCatalogFailed, sharedAlbums.isEmpty {
-                    Button(action: onRetrySharedAlbums) {
-                        Label(L10n.string("albums.shared_load_failed"), systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
+                    albumFailureRow(
+                        sharedAlbumLoadFailure,
+                        retryTitle: L10n.string("albums.shared_load_failed"),
+                        onRetry: onRetrySharedAlbums
+                    )
                 } else if sharedAlbums.isEmpty {
                     Label(L10n.string("collections.empty_shared_albums"), systemImage: "person.2.crop.square.stack")
                         .foregroundStyle(.secondary)
@@ -182,6 +187,21 @@ struct SidebarView: View {
             }
         } message: {
             Text(L10n.string("albums.leave_shared_message"))
+        }
+    }
+
+    @ViewBuilder
+    private func albumFailureRow(
+        _ failure: AlbumFailurePresentation?, retryTitle: String, onRetry: @escaping () -> Void
+    ) -> some View {
+        if let failure, !failure.canRetry {
+            Text(failure.message)
+                .foregroundStyle(.secondary)
+        } else {
+            Button(action: onRetry) {
+                Label(retryTitle, systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.plain)
         }
     }
 }

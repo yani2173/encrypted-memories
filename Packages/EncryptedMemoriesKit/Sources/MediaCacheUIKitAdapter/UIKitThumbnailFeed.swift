@@ -24,7 +24,6 @@
         public init(
             cache: ThumbnailCache,
             loader: ThumbnailBatchLoader,
-            dimensions: PhotoDimensionCoalescer? = nil,
             targetPixels: CGFloat = 320,
             concurrency: Int = UIKitMediaCachePolicy.downloadConcurrencyLimit(),
             batch: Int = 6,
@@ -57,11 +56,7 @@
                     directory: cache.coverageCheckpointDirectory(),
                     scope: cache.coverageCheckpointScope()
                 ),
-                clock: clock,
-                onDecoded: { uid, decoded in
-                    // Same DB-backed dimension pipeline as the macOS feed - batched, off this path.
-                    dimensions?.record(uid, width: decoded.pixelWidth, height: decoded.pixelHeight)
-                }
+                clock: clock
             )
         }
 
@@ -72,10 +67,6 @@
         public nonisolated func applyMemoryPressure(scale: Double, purge: Bool) {
             imageWrappers.applyMemoryPressure(scale: scale, purge: purge)
             core.applyDecodedMemoryPressure(scale: scale, purge: purge)
-        }
-
-        public static func decodedCost(_ image: UIImage) -> Int {
-            UIKitThumbnailImageDecoder.decodedCost(image)
         }
 
         public func cachedImage(for uid: PhotoUID) async -> UIImage? {
@@ -208,7 +199,7 @@
             ticket: WrapperImageCache<UIImage>.InsertionTicket
         ) -> UIImage? {
             guard let decoded = core.memoryDecoded(for: uid) else { return nil }
-            let key = Self.key(uid)
+            let key = uid.cacheKey
             return imageWrappers.resolvePairedImage(
                 forKey: key,
                 cost: decoded.decodedCostBytes,
@@ -221,10 +212,6 @@
                     UIKitThumbnailImageDecoder.image(from: decoded)
                 }
             )
-        }
-
-        private static func key(_ uid: PhotoUID) -> NSString {
-            "\(uid.volumeID)~\(uid.nodeID)" as NSString
         }
     }
 

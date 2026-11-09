@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import Testing
 
 @testable import ProtonDriveBackend
@@ -132,5 +133,32 @@ struct BurstFrameVerdictsTests {
         }
         #expect(requested == [["frame", "edit-data"]])
         #expect(second.frames == ["main", "frame"])
+    }
+
+    /// The bursts listing names the photo and the adjustment data of its edit.
+    private static let photoWithEditData = PhotosListEntry(
+        linkID: "main", captureTime: 700, tags: [PhotosCore.PhotoTag.bursts.rawValue],
+        relatedPhotos: [.init(linkID: "edit-data")])
+
+    @Test("a photo whose only other related file is no frame answers as itself")
+    func loneFrameAnswersWithThePhoto() async {
+        let checked = await BurstFrameVerdicts.frames(
+            of: ["main", "edit-data"], listed: ["main"], verdicts: BurstFrameVerdicts()
+        ) { _ in Self.typed(["edit-data": "application/xml"]) }
+        #expect(checked.frames == ["main"])
+
+        let answer = DriveSDKBridge.seriesAnswer(
+            frames: checked.frames, containing: "main", entriesByID: ["main": Self.photoWithEditData],
+            burstEntries: [Self.photoWithEditData], volumeID: "v")
+        #expect(answer.map(\.uid) == [PhotoUID(volumeID: "v", nodeID: "main")])
+        #expect(answer.first?.burstMemberIDs == ["main"])
+    }
+
+    @Test("no answer when no frame of the photo is left")
+    func noFrameOfThePhotoAnswersNothing() {
+        let answer = DriveSDKBridge.seriesAnswer(
+            frames: [], containing: "main", entriesByID: ["main": Self.photoWithEditData],
+            burstEntries: [Self.photoWithEditData], volumeID: "v")
+        #expect(answer.isEmpty)
     }
 }

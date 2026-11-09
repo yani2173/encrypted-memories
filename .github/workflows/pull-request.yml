@@ -150,6 +150,7 @@ jobs:
           python3 .github/scripts/test_require_merge_queue.py
           python3 .github/scripts/test_cancel_superseded_queue_run.py
           python3 -B .github/scripts/test_collect_ui_wait_diagnostics.py
+          python3 .github/scripts/test_list_retried_tests.py
           python3 .github/scripts/test_ios_test_commands.py
           python3 .github/scripts/test_report_build_storage.py
           python3 .github/scripts/test_remind_llm_key_expiry.py
@@ -160,6 +161,8 @@ jobs:
           bash .github/scripts/test_run_ui_tests_with_retry.sh
           python3 .github/scripts/test_swift_style_scripts.py
           python3 scripts/tests/test_verify_tests_script.py
+          python3 .github/scripts/test_upgrade_checkpoints.py
+          python3 -B scripts/tests/test_update_proton_sdk.py
 
       - name: Lint GitHub Actions workflows
         env:
@@ -236,7 +239,7 @@ jobs:
     timeout-minutes: 90
     outputs:
       style: ${{ steps.style.outcome }}
-      tests: ${{ steps.tests.outcome }}
+      tests: ${{ steps.tests.outcome == 'success' && steps.release-test-build.outcome == 'success' && 'success' || 'failure' }}
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -264,6 +267,22 @@ jobs:
         id: tests
         if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.prepare.outcome == 'success' }}
         run: bash ./scripts/verify-tests.sh
+      # The Debug tests do not see a test that uses a Debug-only seam outside `#if DEBUG` (#1101). This step compiles
+      # the same tests in Release. `swift test -c release` alone does not build (ModuleNotTestable), so it builds
+      # with -Xswiftc -enable-testing. It uses the scratch and cache of the Debug tests, and it runs after them,
+      # also when they fail, so one run reports both results. The `tests` output below requires both.
+      - name: Build the package tests in the Release configuration
+        id: release-test-build
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.prepare.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          source ./scripts/build-paths.sh
+          xcrun swift build \
+            --package-path Packages/EncryptedMemoriesKit \
+            --scratch-path "$ENCRYPTED_MEMORIES_SPM_SCRATCH" \
+            --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+            --force-resolved-versions \
+            --build-tests -c release -Xswiftc -enable-testing
       - if: ${{ always() && github.event_name != 'pull_request' }}
         run: bash ./scripts/report-build-storage.sh
 
@@ -281,13 +300,11 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Start the simulator
+      - name: Record the runner state at the start
+        if: ${{ !cancelled() }}
         continue-on-error: true
         timeout-minutes: 2
-        env:
-          IOS_TEST_ACTION: boot-simulator
-          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
-        run: bash ./scripts/verify-ios-app-tests.sh
+        run: bash .github/scripts/runner_state.sh start
       - uses: ./.github/actions/prepare-apple-build
         id: prepare
         with:
@@ -295,6 +312,13 @@ jobs:
           # A queue run saves to its own temporary branch (gh-readonly-queue/...), which no other run can read.
           save-cache: ${{ github.event_name != 'merge_group' }}
           measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
+      - name: Start the simulator
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          IOS_TEST_ACTION: boot-simulator
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash ./scripts/verify-ios-app-tests.sh
       - name: Verify iOS shared architecture
         id: architecture
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
@@ -340,7 +364,10 @@ jobs:
     name: iOS UI verification
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: xcode-27
-    timeout-minutes: 90
+    # The slowest finished queue run took 88 minutes, and another was cancelled at the 90-minute
+    # job limit although no test failed; the merge queue then removed the pull request. 120 minutes
+    # gives a slow runner the same limit as ios-verification. Refs #1197.
+    timeout-minutes: 120
     outputs:
       ui: ${{ steps.ui.outcome }}
     steps:
@@ -353,6 +380,14 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         run: bash .github/scripts/runner_state.sh start
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          save-cache: "false"
+      # The simulator boots after prepare (#1165): the UI job's prepare step took 12.9, 9.1 and 11.0 minutes while
+      # it started the simulator before prepare, and 2.7 to 3.8 minutes in the job that boots after prepare.
+      # The order is the one difference between those measurements.
       - name: Start the simulator
         continue-on-error: true
         timeout-minutes: 2
@@ -360,11 +395,6 @@ jobs:
           IOS_TEST_ACTION: boot-simulator
           IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
         run: bash ./scripts/verify-ios-app-tests.sh
-      - uses: ./.github/actions/prepare-apple-build
-        id: prepare
-        with:
-          build-profile: app
-          save-cache: "false"
       - name: Build the app and both simulator test bundles once
         id: test-build
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
@@ -492,9 +522,9 @@ jobs:
     name: Cancel a queue run after a failure
     if: ${{ github.event_name == 'merge_group' }}
     runs-on: ubuntu-24.04
-    # The longest queue runs took 123 minutes, because the macOS jobs wait for a runner. The loop ends by itself after
-    # 165 minutes, and the job limit is only the backstop.
-    timeout-minutes: 175
+    # The longest queue runs took 123 minutes, because the macOS jobs wait for a runner. A late UI run can take
+    # about 215 minutes, so the loop ends by itself after 235 minutes, and the job limit is only the backstop.
+    timeout-minutes: 240
     permissions:
       actions: write
     steps:
@@ -506,7 +536,7 @@ jobs:
           set -uo pipefail
           workers=("Repository hygiene" "Package verification and style" "iOS verification" "iOS UI verification" "macOS verification")
           own="Cancel a queue run after a failure"
-          deadline=$((SECONDS + 9900))
+          deadline=$((SECONDS + 14100))
           read_errors=0
           while (( SECONDS < deadline )); do
             if ! lines="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs" --paginate \
@@ -557,8 +587,8 @@ jobs:
     name: Cancel a superseded queue run
     if: ${{ github.event_name == 'merge_group' }}
     runs-on: ubuntu-24.04
-    # The same limits as the failure watchdog: the loop of the script ends by itself after 165 minutes.
-    timeout-minutes: 175
+    # The same limits as the failure watchdog: the loop of the script ends by itself after 235 minutes.
+    timeout-minutes: 240
     permissions:
       actions: write
       contents: read

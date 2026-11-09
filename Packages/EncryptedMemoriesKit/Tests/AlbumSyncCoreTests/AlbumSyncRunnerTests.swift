@@ -211,6 +211,90 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
 
     private let album = LocalAlbumSummary(id: "local-1", title: "Urlaub", assetCount: 3)
 
+    private func expectedAddedText(_ count: Int) -> String {
+        if L10n.resourceBundle.preferredLocalizations.first == "de" {
+            return count == 1 ? "1 Foto zum Album hinzugefügt" : "\(count) Fotos zum Album hinzugefügt"
+        }
+        return count == 1 ? "1 photo added to album" : "\(count) photos added to album"
+    }
+
+    @Test(arguments: [0, 1, 3, 4])
+    func newAlbumProgressCountsOnlyItsNewPhotos(count: Int) async throws {
+        let identifiers = Array(["a", "b", "c", "d"].prefix(count))
+        let links = Dictionary(uniqueKeysWithValues: identifiers.map { ($0, link("l-\($0)")) })
+        let (runner, remote, _, store) = makeRunner(
+            contents: ["album": identifiers], links: links)
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: count))
+        let attaching = progress.snapshot().filter { $0.phase == .attaching }
+        let first = try #require(attaching.first)
+        let last = try #require(attaching.last)
+        #expect(attaching.allSatisfy { $0.localizedDetail == expectedAddedText($0.attachDone) })
+        #expect(first.attachDone == 0)
+        #expect(first.localizedDetail == expectedAddedText(0))
+        #expect(last.attachDone == count)
+        #expect(last.localizedDetail == expectedAddedText(count))
+        #expect(report.attached == count)
+        #expect(report.alreadyMember == 0)
+        #expect(remote.attachedBatches.flatMap { $0 } == identifiers.map { "l-\($0)" })
+    }
+
+    @Test(arguments: [false, true])
+    func retryProgressCountsOnlyNewPhotosWithExistingMembers(newPhotoAlreadyAttached: Bool) async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["l-a", "l-b", "l-c"]
+        if newPhotoAlreadyAttached { remote.alreadyMemberOf = ["l-d"] }
+        let (runner, _, _, store) = makeRunner(
+            contents: ["album": ["a", "b", "c", "d"]],
+            links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c"), "d": link("l-d")],
+            remote: remote)
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 4))
+        let attaching = progress.snapshot().filter { $0.phase == .attaching }
+        let first = try #require(attaching.first)
+        #expect(first.attachDone == 0)
+        #expect(first.alreadyMember == 3)
+        #expect(first.localizedDetail == expectedAddedText(0))
+        #expect(
+            attaching.allSatisfy { $0.localizedDetail == expectedAddedText($0.attachDone) },
+            "an existing member must not increase the newly added count")
+        let last = try #require(attaching.last)
+        #expect(last.attachDone + last.alreadyMember == 4)
+        #expect(last.attachDone == (newPhotoAlreadyAttached ? 0 : 1))
+        #expect(last.localizedDetail == expectedAddedText(newPhotoAlreadyAttached ? 0 : 1))
+        #expect(report.attached == (newPhotoAlreadyAttached ? 0 : 1))
+        #expect(report.alreadyMember == (newPhotoAlreadyAttached ? 4 : 3))
+        #expect(report.isFullySynced)
+        #expect(remote.attachedBatches == [["l-d"]], "only the new photo is sent for attachment")
+    }
+
+    @Test func retryWithoutNewPhotosReportsZeroNewlyAdded() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["l-a", "l-b", "l-c"]
+        let (runner, _, _, store) = makeRunner(
+            contents: ["album": ["a", "b", "c"]],
+            links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c")], remote: remote)
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+        let attaching = try #require(progress.snapshot().first { $0.phase == .attaching })
+        #expect(attaching.attachDone == 0)
+        #expect(attaching.alreadyMember == 3)
+        #expect(attaching.localizedDetail == expectedAddedText(0))
+        #expect(report.attached == 0)
+        #expect(report.alreadyMember == 3)
+        #expect(report.isFullySynced)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
     @Test func freshExplicitTrashIsReportedWithoutAnAttach() async throws {
         let remote = FakeRemoteOps()
         remote.deletionStates = ["trash": .trashed]
@@ -220,6 +304,25 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(remote.attachedBatches.isEmpty)
         #expect(report.trashedSkipped == 1)
         #expect(report.problems.first?.issue == .remoteDeletion)
+        #expect(!report.isFullySynced)
+    }
+
+    @Test func retainedTrashWithoutFreshStateCannotAttachOrAdopt() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["same-content"]
+        remote.sameContent = ["sha-trash": ["same-content"]]
+        let (runner, _, backup, _) = makeRunner(
+            contents: ["album": ["photo"]], links: ["photo": link("trash", trashed: true)], remote: remote)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+        #expect(remote.deletionRequests == [["trash"]])
+        #expect(remote.attachedBatches.isEmpty)
+        #expect(remote.sameContentRequests.isEmpty)
+        #expect(backup.runs == [["photo"]])
+        #expect(report.attached == 0)
+        #expect(report.alreadyMember == 0)
+        #expect(report.trashedSkipped == 0)
+        #expect(report.unattachable == 1)
+        #expect(!report.problems.contains { $0.issue == .remoteDeletion })
         #expect(!report.isFullySynced)
     }
 
@@ -326,6 +429,7 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         let (runner, remote, _, _) = makeRunner(
             contents: ["album": ["known", "missing", "trashed"]],
             links: ["known": link("existing"), "trashed": link("deleted", trashed: true)], backup: backup)
+        remote.deletionStates = ["deleted": .trashed]
         let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
         #expect(backup.proofRuns == [["missing"]])
         #expect(remote.attachedBatches.flatMap { $0 } == ["existing", "proven"])
@@ -621,6 +725,38 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(report.unattachable == 1)
         #expect(report.problems.map { $0.source?.identifier } == ["missing"])
         #expect(report.problems.allSatisfy { $0.isRetryable })
+        // An unknown queue read never becomes proof: the photo stays out of the album and the run is not complete.
+        #expect(!report.isFullySynced)
+    }
+
+    /// The attach plan comes from the links, the album members and the same-content evidence, never from the backup
+    /// report: an open backup reason only labels the photo as incomplete (#1004 B2, row 8).
+    @Test func theAttachPlanDoesNotDependOnTheBackupReport() async throws {
+        var batches: [[[String]]] = []
+        for reportsProblem in [false, true] {
+            let remote = FakeRemoteOps()
+            remote.children = ["l-c"]
+            let backup = FakeBackupExecutor()
+            if reportsProblem {
+                backup.problems = [
+                    "a": BackupFailedItem(
+                        id: "queue-a", filename: "a.heic", reason: "still finishing", isPermanent: false,
+                        issue: .remoteDraft, source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "a"),
+                        category: .automatic)
+                ]
+            }
+            let (runner, _, _, store) = makeRunner(
+                contents: ["album": ["a", "b", "c"]], links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c")],
+                remote: remote, backup: backup)
+            defer { store.close() }
+            let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+            batches.append(remote.attachedBatches)
+            #expect(report.attached == 2)
+            #expect(report.alreadyMember == 1)
+            #expect(report.incomplete == (reportsProblem ? 1 : 0))
+        }
+        #expect(batches[0] == batches[1], "the backup report changes no attach")
+        #expect(batches[0].flatMap { $0 } == ["l-a", "l-b"])
     }
 
     @Test func cancelledProofCallerWithOrdinaryErrorAdmitsNoFurtherWork() async throws {
@@ -912,20 +1048,6 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(store.mapping(localAlbumID: album.id) == nil)
     }
 
-    @Test func missingLocalAlbumPrecheckDoesNoRemoteResolution() async throws {
-        let source = ScriptedLocalAlbumSource(contents: .missing)
-        let (runner, remote, _, _) = makeRunner(
-            contents: [:],
-            links: [:],
-            localSource: source
-        )
-
-        await #expect(throws: AlbumSyncError.localAlbumMissing) {
-            try await runner.precheck(album: album)
-        }
-        #expect(remote.listCount == 0)
-    }
-
     @Test func albumDisappearingAfterScanStopsBeforeRemoteMutation() async throws {
         let source = ScriptedLocalAlbumSource(
             contents: .present([]),
@@ -1069,6 +1191,7 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
             contents: ["local-1": ["a", "b"]],
             links: ["a": link("l-a"), "b": link("l-b", trashed: true)]
         )
+        remote.deletionStates = ["l-b": .trashed]
         let report = try await runner.sync(album: album)
         #expect(remote.attachedBatches.flatMap(\.self) == ["l-a"])
         #expect(report.trashedSkipped == 1)
@@ -1145,6 +1268,38 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         // Only Sync now runs the album scratch queue again, so no item promises an automatic retry.
         #expect(report.problems.allSatisfy { $0.category == .userResolvable && $0.nextAttemptAt == nil })
         #expect(report.problems.count == store.mapping(localAlbumID: album.id)?.lastFailedCount)
+    }
+
+    @Test func mixedFinishedReportKeepsDistinctProblemIdentitiesForTheCompleteList() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["l-incomplete"]
+        remote.failAttachOf = ["l-attach"]
+        remote.deletionStates = ["l-trash": .trashed]
+        let backup = FakeBackupExecutor()
+        for identifier in ["incomplete", "attach"] {
+            backup.problems[identifier] = BackupFailedItem(
+                id: "queue-\(identifier)", filename: "\(identifier).heic", reason: "network reason",
+                isPermanent: false, issue: .network,
+                source: .init(kind: .photoLibraryAsset, identifier: identifier))
+        }
+        let (runner, _, _, store) = makeRunner(
+            contents: ["local-1": ["missing", "attach", "trash", "incomplete"]],
+            links: [
+                "attach": link("l-attach"), "trash": link("l-trash", trashed: true),
+                "incomplete": link("l-incomplete"),
+            ], remote: remote, backup: backup)
+        defer { store.close() }
+        let report = try await runner.sync(album: .init(id: "local-1", title: "Mixed", assetCount: 4))
+        #expect(report.incomplete == 1)
+        #expect(report.unattachable == 1)
+        #expect(report.trashedSkipped == 1)
+        #expect(report.attachFailed == 1)
+        #expect(report.problems.count == 4)
+        #expect(Set(report.problems.map(\.id)).count == 4)
+        #expect(report.problems.map(\.source?.identifier) == ["incomplete", "missing", "trash", "attach"])
+        let snapshot = try #require(BackupProblemSnapshot.album(items: report.problems))
+        #expect(snapshot.rows.count == 4)
+        #expect(Set(snapshot.rows.map(\.id)).count == 4)
     }
 
     @Test func attachFailuresAreListedForEachPhoto() async throws {
@@ -1408,6 +1563,37 @@ private final class ProgressBox: @unchecked Sendable {
         #expect(try Data(contentsOf: url) == original)
     }
 
+    @Test func aHealthyStoreReopensWithItsMapping() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-sync-reopen-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let mapping = AlbumSyncMapping(
+            localAlbumID: "kept", remoteAlbumID: "R", title: "A", createdAt: Date(timeIntervalSinceReferenceDate: 100))
+        let store = try #require(AlbumSyncMappingStore(url: url))
+        #expect(store.upsert(mapping))
+        store.close()
+
+        let reopened = try #require(AlbumSyncMappingStore(url: url))
+        defer { reopened.close() }
+        #expect(reopened.mapping(localAlbumID: "kept") == mapping)
+    }
+
+    @Test func anotherSchemaVersionFailsClosedAndKeepsTheMapping() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-sync-version-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try #require(AlbumSyncMappingStore(url: url))
+        #expect(store.upsert(AlbumSyncMapping(localAlbumID: "kept", remoteAlbumID: "R", title: "A", createdAt: Date())))
+        store.close()
+        var db: OpaquePointer?
+        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        #expect(sqlite3_exec(db, "UPDATE mapping_info SET value=99 WHERE key='schema';", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+
+        #expect(AlbumSyncMappingStore(url: url) == nil)
+        #expect(sqliteCount(url: url, table: "album_sync_mapping") == 1)
+    }
+
     @Test func markerlessMappingShapeFailsClosedWithoutRepairingIt() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("album-sync-markerless-\(UUID().uuidString).sqlite")
@@ -1457,7 +1643,7 @@ private final class ProgressBox: @unchecked Sendable {
         #expect(store.mapping(localAlbumID: "L1")?.remoteAlbumID == "R1")
     }
 
-    @Test func upsertReadRemoveRoundTrip() throws {
+    @Test func upsertReadRoundTrip() throws {
         let store = makeStore()
         let mapping = AlbumSyncMapping(
             localAlbumID: "L1", remoteAlbumID: "R1", title: "Urlaub",
@@ -1474,9 +1660,6 @@ private final class ProgressBox: @unchecked Sendable {
         store.upsert(updated)
         #expect(store.mapping(localAlbumID: "L1")?.lastAttachedCount == 9)
         #expect(store.allMappings().count == 1)
-
-        store.removeMapping(localAlbumID: "L1")
-        #expect(store.mapping(localAlbumID: "L1") == nil)
     }
 
     private func sqliteCount(url: URL, table: String) -> Int {

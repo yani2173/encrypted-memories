@@ -4,17 +4,38 @@ import Testing
 import UploadCore
 
 @Suite @MainActor struct TrashEmptyingTests {
-    @Test func pendingRemovalPrecedesGuardedTrashAndCommit() async throws {
+    @Test func failureMessagesMatchFailureReasons() {
+        let cases: [(any Error, String)] = [
+            (RecentlyDeletedEmptying.PendingMergeCheck(reason: .mergeWaits), "trash.empty_blocked_merge_message"),
+            (
+                RecentlyDeletedEmptying.PendingMergeCheck(reason: .journalUnreadable),
+                "trash.empty_blocked_journal_message"
+            ),
+            (RecentlyDeletedEmptying.PendingMergeCheck(reason: .unknown), "trash.empty_failed_message"),
+            (CancellationError(), "trash.empty_failed_message"),
+        ]
+        for (error, key) in cases { #expect(RecentlyDeletedEmptying.failureMessageKey(for: error) == key) }
+    }
+
+    @Test func blockedMergeKeepsPendingAndRemoteTrash() async {
+        let fixture = Fixture(confirmsNoPendingMerges: false)
+        await #expect(throws: RecentlyDeletedEmptying.PendingMergeCheck.self) { try await fixture.empty() }
+        #expect(fixture.pending == [fixture.uid])
+        #expect(fixture.removed.isEmpty)
+        #expect(fixture.events.values == ["exclude", "check", "release", "reload"])
+    }
+
+    @Test func pendingRemovalFollowsMergeCheckAndPrecedesTrashAndCommit() async throws {
         let fixture = Fixture()
 
         try await fixture.empty()
 
         #expect(fixture.pending.isEmpty)
         #expect(fixture.removed == [fixture.uid])
-        #expect(fixture.events.values == ["pending", "exclude", "check", "trash", "release", "commit"])
+        #expect(fixture.events.values == ["exclude", "check", "pending", "trash", "release", "commit"])
     }
 
-    @Test func mergeContextIsReadAfterPendingRemoval() async throws {
+    @Test func mergeContextIsReadBeforePendingRemoval() async throws {
         let fixture = Fixture()
         func merger() -> Merger {
             fixture.events.add("merger-context")
@@ -36,7 +57,7 @@ import UploadCore
 
         #expect(
             fixture.events.values
-                == ["pending", "merger-context", "directory-context", "exclude", "check", "trash", "release", "commit"])
+                == ["merger-context", "directory-context", "exclude", "check", "pending", "trash", "release", "commit"])
     }
 
     @Test func pendingOnlySkipsProtonAndCommit() async throws {
@@ -75,12 +96,12 @@ import UploadCore
         await #expect(throws: CancellationError.self) { try await fixture.empty() }
 
         #expect(fixture.pending == [fixture.uid])
-        #expect(fixture.events.values == ["pending"])
+        #expect(fixture.events.values == ["exclude", "check", "pending", "release"])
     }
 
     @Test func missingMacPendingSessionStopsBeforeProton() async {
         let fixture = Fixture()
-        let remove: ([PhotoUID]) async -> Bool = { _ in
+        let remove: @MainActor ([PhotoUID]) async -> Bool = { _ in
             let session: PendingRemoval? = nil
             return await session?.remove() == true
         }
@@ -93,7 +114,7 @@ import UploadCore
                 recoverFromTrashFailure: { _ in fixture.events.add("reload") })
         }
 
-        #expect(fixture.events.values.isEmpty)
+        #expect(fixture.events.values == ["exclude", "check", "release"])
     }
 
     @Test func failedMergeCheckKeepsTrashAndRecoversWithoutCommit() async {
@@ -101,8 +122,8 @@ import UploadCore
 
         await #expect(throws: RecentlyDeletedEmptying.PendingMergeCheck.self) { try await fixture.empty() }
 
-        #expect(fixture.pending.isEmpty, "successful local removal is not rolled back")
-        #expect(fixture.events.values == ["pending", "exclude", "check", "release", "reload"])
+        #expect(fixture.pending == [fixture.uid])
+        #expect(fixture.events.values == ["exclude", "check", "release", "reload"])
         #expect(fixture.recoveredError is RecentlyDeletedEmptying.PendingMergeCheck)
     }
 
@@ -111,8 +132,8 @@ import UploadCore
 
         await #expect(throws: Failure.exclusion) { try await fixture.empty() }
 
-        #expect(fixture.pending.isEmpty)
-        #expect(fixture.events.values == ["pending", "exclude", "reload"])
+        #expect(fixture.pending == [fixture.uid])
+        #expect(fixture.events.values == ["exclude", "reload"])
         #expect(fixture.recoveredError as? Failure == .exclusion)
     }
 
@@ -122,7 +143,7 @@ import UploadCore
         await #expect(throws: Failure.trash) { try await fixture.empty() }
 
         #expect(fixture.pending.isEmpty)
-        #expect(fixture.events.values == ["pending", "exclude", "check", "trash", "release", "reload"])
+        #expect(fixture.events.values == ["exclude", "check", "pending", "trash", "release", "reload"])
         #expect(fixture.recoveredError as? Failure == .trash)
     }
 
@@ -170,7 +191,7 @@ import UploadCore
 
         await #expect(throws: CancellationError.self) { try await fixture.empty() }
 
-        #expect(fixture.events.values == ["pending", "exclude", "check", "trash", "release", "reload"])
+        #expect(fixture.events.values == ["exclude", "check", "pending", "trash", "release", "reload"])
         #expect(fixture.recoveredError is CancellationError)
     }
 
@@ -243,7 +264,7 @@ private enum Failure: Error, Equatable { case exclusion, trash }
     }
 
     func empty(includesProtonTrash: Bool = true, hasPendingAdapter: Bool = true) async throws {
-        let remove: ([PhotoUID]) async -> Bool = { uids in
+        let remove: @MainActor ([PhotoUID]) async -> Bool = { uids in
             self.events.add("pending")
             self.removed = uids
             guard self.removalSucceeds else { return false }

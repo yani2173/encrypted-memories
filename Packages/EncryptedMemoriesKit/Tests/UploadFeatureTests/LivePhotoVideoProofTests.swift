@@ -254,14 +254,75 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "own-trashed-video"))
     }
 
-    func testATrashedFileWithoutAStatedRoleKeepsItsEarlierMeaning() async throws {
+    func testATrashedFileWithoutAStatedRoleDoesNotProveDeletion() async throws {
         checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("trashed-video")]
         checker.linkVisibilityByID["trashed-video"] = RemoteLinkVisibility(
             isActive: false, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
 
         let result = try await pipeline.resolve(video())
 
-        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-video"))
+        XCTAssertEqual(result.decision, .upload)
+    }
+
+    func testATrashedCopyWithAStatedRoleUnderThisLivePhotoStillProvesDeletion() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("own-trashed-video")]
+        checker.linkVisibilityByID["own-trashed-video"] = RemoteLinkVisibility(
+            isActive: false, mainPhotoLinkID: "live-main", hasExplicitPhotoState: true)
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "own-trashed-video"))
+        XCTAssertEqual(store.record(for: video().source)?.outcome, "duplicateTrashed")
+        XCTAssertTrue(checker.relatedLookups.isEmpty)
+    }
+
+    func testATrashedCopyOmittedFromTheRoleAnswerDoesNotProveDeletion() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("trashed-video")]
+        checker.linkVisibilityByID["trashed-video"] = .some(nil)
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertNil(store.record(for: video().source)?.outcome)
+    }
+
+    func testATrashedContentMatchWithoutAStatedRoleDoesNotProveDeletion() async throws {
+        checker.remoteItemsByContentHash[videoContentHash] = trashedRow("trashed-video")
+        checker.linkVisibilityByID["trashed-video"] = RemoteLinkVisibility(
+            isActive: false, mainPhotoLinkID: "live-main", hasExplicitPhotoState: false)
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertEqual(checker.contentFindCallCount, 1)
+        XCTAssertNil(store.record(for: video().source)?.outcome)
+    }
+
+    func testATrashedCopyWithoutAStatedRoleLeavesAForeignDraftProtected() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("trashed-video"), foreignDraft()]
+        checker.linkVisibilityByID["trashed-video"] = RemoteLinkVisibility(
+            isActive: false, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: "foreign-draft"))
+        XCTAssertEqual(checker.contentFindCallCount, 0)
+        XCTAssertNil(store.record(for: video().source)?.outcome)
+    }
+
+    func testAnActiveCopyWithoutAStatedRoleKeepsTheExistingError() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("own-video")]
+        checker.linkVisibilityByID["own-video"] = RemoteLinkVisibility(
+            isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+
+        do {
+            let result = try await pipeline.resolve(video())
+            XCTFail("an active copy without a stated role must fail: \(result.decision)")
+        } catch let error as UploadError {
+            XCTAssertEqual(error, .backend("The role of a copy with these bytes is unavailable"))
+        }
+        XCTAssertNil(store.record(for: video().source)?.outcome)
+        try await assertTheClaimsOfTheVideoAreReleased()
     }
 
     func testATrashedFileWithoutAStatedRoleDoesNotHideTheOwnActiveCopy() async throws {
@@ -526,6 +587,7 @@ final class LivePhotoVideoProofRunnerTests: XCTestCase {
             identityResolver: UploadDedupePipeline(
                 store: identityStore, hasher: hasher, checker: checker, now: { [clock] in clock!.now }),
             uploader: uploader,
+            tagAdder: SpyTagAdder(),
             configuration: BackupSyncRunner.Configuration(
                 uploadStallTimeout: 180, uploadStallPollInterval: 5,
                 retry: BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 4),
@@ -552,7 +614,7 @@ final class LivePhotoVideoProofRunnerTests: XCTestCase {
     }
 
     private func state(of entry: UploadBackupSyncQueueEntry) -> UploadBackupSyncQueueState? {
-        queueStore.entry(for: entry.source, revision: entry.revision)?.state
+        queueEntryForTesting(in: queueStore, source: entry.source, revision: entry.revision)?.state
     }
 
     func testAnUnrelatedMainFileDoesNotMakeTheLivePhotoCountAsSaved() async throws {

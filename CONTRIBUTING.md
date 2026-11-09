@@ -76,7 +76,15 @@ You own your pull request until a maintainer merges or closes it. A review can t
 
 ## Local verification
 
-Run focused tests while you work. Run these gates before requesting review:
+Run focused tests while you work. Before you request review, run these local checks:
+
+- the focused tests of the code that you changed;
+- the style check of the changed files: `BASE_SHA=<base> HEAD_SHA=<head> ./scripts/verify-swift-style.sh`;
+- the shell build of each app that your change touches (see below);
+- the device runs that CI does not do: the iPhone Duo simulator, iPad, repeated runs of a flaky test,
+  macOS runtime behavior, and mutation runs.
+
+Run the full local gates only when your change touches storage, a migration, backup, or deletion:
 
 ```bash
 ./scripts/verify-tests.sh
@@ -84,6 +92,14 @@ Run focused tests while you work. Run these gates before requesting review:
 ./scripts/verify-ios-app-tests.sh ui
 ./scripts/verify-universal-core.sh fast
 ```
+
+A pull request runs repository hygiene and the Swift style check on Linux. The merge queue runs the package
+tests, the iOS app and UI tests, and both platform builds before the merge. For every gate that you did not run
+locally, write "covered by the merge queue" in the pull request.
+
+A pull request that changes `iOSApp`, `iOSUITests`, `project.yml`, or the UI test scripts also runs the iOS UI tests
+on the iPhone Duo simulator of a hosted runner. The job takes about 40 to 60 minutes and stops after 75 minutes. It is advice, not a gate:
+it is not a required check, and its result never blocks the merge queue. A red Duo job still shows on the pull request.
 
 `ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=1 ./scripts/verify-tests.sh` skips the vendored SDK tests for a quick local run.
 CI refuses this switch, and the gate before review runs without it.
@@ -262,6 +278,10 @@ the immediate tap-to-SIGKILL case is a known historical limit and is not covered
 
 Each source runs its own `scripts/update-proton-sdk.sh` in separate source and SDK scratch directories.
 The `v1.0.5` overlay is pinned to its published commit and must apply cleanly.
+A source without its own test entry also receives the candidate's five test-entry files. Each of these files must compile
+against that source's protocols. When a candidate file needs a type that the source lacks, pin the older file as
+`scripts/upgrade-test/overlays/<tag>.payload/<path below Sources>`. `v1.0.5` pins `UpgradeTestBackend.swift` from before #711.
+The build fails for a pinned file outside the five paths and for a pin on a release with its own test entry.
 Later releases carry their inactive test entry and require no overlay, with one exception:
 `v1.1.0-beta.3` predates the hosted Metal admission, so its pinned overlay adds only that test-only admission.
 Only completed builds enter the cache, keyed by source, toolchain, architecture, platform, and test-build inputs.
@@ -291,6 +311,13 @@ source the generator plans two iOS jobs of six points (about 60 planned minutes 
 build (12 minutes) of runner time than one job of twelve points (about 108 planned minutes), and about half the wall-clock
 time. With three sources it plans three iOS jobs of four points (about 132 minutes each) and one macOS job; a fourth source
 makes it plan four iOS jobs. The macOS gate keeps one job as long as it fits.
+Each case ends with `simctl delete` of its simulator. macOS moves that device's data into `Deleting-<uuid>` directories
+of TMPDIR, which a system process empties asynchronously (#1008). The journey keeps nothing in TMPDIR and must not remove
+these directories, because the system owns them. A hosted runner under load emptied them too slowly: in run 41098205915
+a shard grew TMPDIR from 0 to 8.6 GiB and lost 10.9 GiB of free disk over its 24 cases (about 0.5 GiB per case; #498
+measured up to 0.9 GiB per case), starting from 26.0 to 26.5 GiB free after the builds. About 28 cases therefore fill the
+runner disk; the time model stays below that with at most 19, 16, 15 or 12 cases per job for one to four sources. An idle
+local host empties the directories within minutes, so a rehearsal cannot show the hosted growth.
 A failing case keeps the app's system log. The evidence also holds the runner load, the free disk and the size of
 the large build and Simulator directories, and each case's timing and free disk.
 The job summary shows the free disk at the start and the end. The journey step prints only result, timing and disk

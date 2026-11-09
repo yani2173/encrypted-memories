@@ -31,9 +31,6 @@ final class MetalGridScrollHost: NSView {
     var documentSpacer: NSView { spacer }
     private weak var wiredImageAvailabilitySource: MetalGridDataSource?
 
-    var onHUD: ((MetalGridHUD) -> Void)? {
-        didSet { coordinator.onHUD = onHUD }
-    }
     /// Production click routing (content point, click count, modifiers).
     var onCellClick: ((CGPoint, Int, GridClickModifiers) -> Void)?
     /// Routes drag selection in engine layout coordinates.
@@ -325,17 +322,32 @@ final class MetalGridScrollHost: NSView {
             self, selector: #selector(userDidEndScroll),
             name: NSScrollView.didEndLiveScrollNotification, object: scrollView
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(accessibilityDisplayOptionsChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil
+        )
+    }
+
+    @objc private func accessibilityDisplayOptionsChanged() {
+        coordinator.setPlaceholderReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
 
     @objc private func userWillScroll() {
         stickToBottom = false
+        coordinator.beginPlaceholderScroll()
         liveScrollInputActive = true
         updateFeedInteractionState()
     }
 
     @objc private func userDidEndScroll() {
         liveScrollInputActive = false
+        endPlaceholderScroll()
         updateFeedInteractionState()
+    }
+
+    private func endPlaceholderScroll() {
+        coordinator.endPlaceholderScroll(
+            isVisible: framePump.isActive && window?.occlusionState.contains(.visible) == true)
     }
 
     /// A user-initiated live resize detaches the bottom pin so viewport anchoring can rebase the camera.
@@ -796,7 +808,7 @@ final class MetalGridScrollHost: NSView {
         setLevel(target)
     }
 
-    /// Toolbar/keyboard command entry point. Start the renderer-owned click transition immediately,
+    /// Toolbar command entry point. Start the renderer-owned click transition immediately,
     /// then mirror its committed level back to SwiftUI; waiting for an updateNSView round-trip could
     /// expose a settled target frame before the transition was armed.
     func performDiscreteZoom(to target: Int) {
@@ -806,7 +818,7 @@ final class MetalGridScrollHost: NSView {
     }
 
     /// Reconcile a SwiftUI `level`-binding value delivered to `updateNSView` against the host's authoritative
-    /// `coordinator.level`. Drives `animateToLevel` for a genuine external (+/- / keyboard / programmatic)
+    /// `coordinator.level`. Drives `animateToLevel` for a genuine external (+/- / programmatic)
     /// change; IGNORES a stale echo of a host-led pinch commit (which would otherwise re-issue a viewport-centre
     /// zoom and jump a different photo under the cursor). Pure decision in `LevelBindingReconciler`.
     func reconcileLevelBinding(_ bindingLevel: Int) {
@@ -848,6 +860,7 @@ final class MetalGridScrollHost: NSView {
         // The callback captures this host weakly. Deinit cannot synchronously mutate the main-actor
         // data-source property, and the weak capture makes the orphaned callback a no-op until replacement.
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     /// True while scroll must be frozen: the live pinch (scrub or settle), the commit bridge, or a short
@@ -1043,6 +1056,7 @@ final class MetalGridScrollHost: NSView {
             requestFrame()
             _ = applyResolvedGridProfileIfNeeded(oldFrame: lastViewportScreenFrame, newFrame: viewportScreenFrame())
         } else {
+            coordinator.presentationSuspended()
             liveScrollInputActive = false
             pinchActive = false
             marqueeInputActive = false
@@ -1057,7 +1071,10 @@ final class MetalGridScrollHost: NSView {
         let wasActive = framePump.isActive
         framePump.setActive(window?.occlusionState.contains(.visible) == true)
         if framePump.isActive { requestFrame() }
-        if wasActive, !framePump.isActive { coordinator.retireLocalDemand() }
+        if wasActive, !framePump.isActive {
+            coordinator.presentationSuspended()
+            coordinator.retireLocalDemand()
+        }
         updateDisplayLinkIdleState()
     }
 
@@ -1455,9 +1472,11 @@ final class MetalGridScrollHost: NSView {
     /// Scroll to the newest (bottom) and re-arm the bottom pin. Resets the camera to the canonical bottom-right
     /// phase so the newest view always has the newest item in the corner (no trailing black at the bottom-right).
     func scrollToBottom() {
+        coordinator.beginPlaceholderScroll()
         stickToBottom = true
         coordinator.resetCommittedPhase()
         applyContentSize(coordinator.contentSize())  // resize for the canonical phase, then pin to bottom
+        endPlaceholderScroll()
     }
 
     /// Scroll a specific photo to vertical center (detaches the bottom pin - the user navigated to it).
@@ -1467,8 +1486,10 @@ final class MetalGridScrollHost: NSView {
         let clipH = scrollView.contentView.bounds.height
         let maxY = max(0, spacer.frame.height - clipH)
         let targetY = min(max(0, rect.midY - clipH / 2), maxY)
+        coordinator.beginPlaceholderScroll()
         scrollView.contentView.scroll(to: CGPoint(x: 0, y: targetY))
         scrollView.reflectScrolledClipView(scrollView.contentView)
+        endPlaceholderScroll()
         requestFrame()
     }
 
@@ -1480,8 +1501,10 @@ final class MetalGridScrollHost: NSView {
         let clipH = scrollView.contentView.bounds.height
         let maxY = max(0, spacer.frame.height - clipH)
         let targetY = min(max(0, rect.minY - 24), maxY)
+        coordinator.beginPlaceholderScroll()
         scrollView.contentView.scroll(to: CGPoint(x: 0, y: targetY))
         scrollView.reflectScrolledClipView(scrollView.contentView)
+        endPlaceholderScroll()
         requestFrame()
         onViewportChanged?()
     }

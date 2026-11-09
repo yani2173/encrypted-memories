@@ -128,7 +128,8 @@ public enum BackupDisplayWakePolicy {
 }
 
 /// Optional backend capability: report how many photo rows the local metadata store (the SQLite
-/// timeline cache) currently holds. Surfaced as "metadata rows" on the Developer/Cache page.
+/// timeline cache) currently holds. The offline manager stores it in `OfflineCacheStatus.metadataRows`;
+/// no screen shows it.
 public protocol LibraryStatsProvider: Sendable {
     func metadataRowCount() async -> Int
 }

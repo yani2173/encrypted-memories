@@ -29,7 +29,7 @@ final class MobileEmptyLibraryUITests: XCTestCase {
         attachScreen("Empty library")
         backup.tap()
         XCTAssertTrue(app.buttons["Enable Photos backup…"].waitForExistence(timeout: 20))
-        XCTAssertTrue(app.buttons["Done"].exists)
+        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 20))
         attachScreen("Backup settings from the empty library")
         app.buttons["Done"].tap()
         XCTAssertTrue(app.staticTexts["No photos yet"].waitForExistence(timeout: 20))
@@ -92,9 +92,9 @@ final class MobileEmptyLibraryUITests: XCTestCase {
 
     private func assertFailedWithoutEmpty() {
         XCTAssertTrue(app.staticTexts["Couldn’t load your library"].waitForExistence(timeout: 60))
-        XCTAssertTrue(app.staticTexts["Fixture first load failed"].exists)
+        XCTAssertTrue(app.staticTexts["Fixture first load failed"].waitForExistence(timeout: 60))
+        XCTAssertTrue(app.buttons["Try again"].waitForExistence(timeout: 60))
         XCTAssertFalse(app.staticTexts["No photos yet"].exists)
-        XCTAssertTrue(app.buttons["Try again"].exists)
         attachScreen("Failed first load")
     }
 

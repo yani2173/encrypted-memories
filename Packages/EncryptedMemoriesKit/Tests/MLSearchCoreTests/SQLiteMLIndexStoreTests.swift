@@ -50,6 +50,27 @@ struct TestMLVectorCipher: MLVectorCipher {
             .appendingPathComponent(SQLiteMLIndexStore.databaseFileName)
     }
 
+    /// `indexed_at` and `capture_time` of one persisted row, as seconds since 1970. Only a test reads them.
+    private func persistedTimes(at url: URL, of uid: PhotoUID) throws -> (indexedAt: Double, captureTime: Double?) {
+        var handle: OpaquePointer?
+        try #require(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        var stmt: OpaquePointer?
+        try #require(
+            sqlite3_prepare_v2(
+                handle,
+                "SELECT indexed_at, capture_time FROM ml_embeddings WHERE volume_id=? AND node_id=?;",
+                -1, &stmt, nil
+            ) == SQLITE_OK)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, uid.volumeID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(stmt, 2, uid.nodeID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        try #require(sqlite3_step(stmt) == SQLITE_ROW)
+        let captureTime: Double? =
+            sqlite3_column_type(stmt, 1) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 1)
+        return (sqlite3_column_double(stmt, 0), captureTime)
+    }
+
     private func withStore(_ body: (SQLiteMLIndexStore, URL) throws -> Void) throws {
         let url = makeTempURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -119,21 +140,21 @@ struct TestMLVectorCipher: MLVectorCipher {
     }
 
     @Test func roundTripsOneEmbedding() throws {
-        try withStore { store, _ in
+        try withStore { store, url in
             let capture = Date(timeIntervalSince1970: 555)
             store.upsert([record("a0", descriptorV1, [0.1, 0.2, 0.3, 0.4], captureTime: capture)])
 
-            let loaded = try #require(store.allRecords(for: descriptorV1).first)
-            #expect(loaded.uid == uid("a0"))
-            #expect(loaded.descriptor == descriptorV1)
+            let loaded = store.vectorBlock(for: descriptorV1)
+            #expect(loaded.uids == [uid("a0")])
             // Rows persist as binary16: the round trip returns the fp16-quantized values.
             let expected = ContiguousArray<Float32>([0.1, 0.2, 0.3, 0.4].map(MLFloat16Codec.quantized))
-            #expect(loaded.vector == expected)
-            for (stored, original) in zip(loaded.vector, [0.1, 0.2, 0.3, 0.4] as [Float32]) {
+            #expect(loaded.vectors == [expected])
+            for (stored, original) in zip(loaded.vector(at: 0), [0.1, 0.2, 0.3, 0.4] as [Float32]) {
                 #expect(abs(stored - original) <= abs(original) * 0.001)
             }
-            #expect(loaded.timestamp == Date(timeIntervalSince1970: 1_000))
-            #expect(loaded.captureTime == capture)
+            let (indexedAt, captureTime) = try persistedTimes(at: url, of: uid("a0"))
+            #expect(indexedAt == 1_000)
+            #expect(captureTime == capture.timeIntervalSince1970)
             let readResult1 = try store.contains(uid: uid("a0"), descriptor: descriptorV1)
             #expect(readResult1)
         }
@@ -157,7 +178,7 @@ struct TestMLVectorCipher: MLVectorCipher {
             #expect(report.skippedAlreadyIndexed == 1)
             #expect(store.count(for: descriptorV1) == 1)
             // The stored vector is the first write, so the report and data agree.
-            #expect(store.allRecords(for: descriptorV1).first?.vector == ContiguousArray<Float32>([1, 0, 0, 0]))
+            #expect(store.vectorBlock(for: descriptorV1).vectors == [ContiguousArray<Float32>([1, 0, 0, 0])])
         }
     }
 
@@ -279,8 +300,8 @@ struct TestMLVectorCipher: MLVectorCipher {
             store.upsert([record("a0", descriptorV2, [2, 0, 0, 0])])
             #expect(store.count(for: descriptorV1) == 1)
             #expect(store.count(for: descriptorV2) == 1)
-            #expect(store.allRecords(for: descriptorV1).first?.vector.first == 1)
-            #expect(store.allRecords(for: descriptorV2).first?.vector.first == 2)
+            #expect(store.vectorBlock(for: descriptorV1).vectors.first?.first == 1)
+            #expect(store.vectorBlock(for: descriptorV2).vectors.first?.first == 2)
         }
     }
 
@@ -290,7 +311,7 @@ struct TestMLVectorCipher: MLVectorCipher {
                 record("a0", descriptorV1, [1, 0, 0, 0]),
                 record("a1", descriptorV1, [0, 1, 0, 0]),
             ])
-            store.remove(uid: uid("a0"), descriptor: descriptorV1)
+            store.remove(uids: [uid("a0")], descriptor: descriptorV1)
             let readResult4 = try store.contains(uid: uid("a0"), descriptor: descriptorV1) == false
             #expect(readResult4)
             let readResult5 = try store.contains(uid: uid("a1"), descriptor: descriptorV1)
@@ -317,13 +338,15 @@ struct TestMLVectorCipher: MLVectorCipher {
                         attempts: 1
                     )
                 ]))
-            #expect(Set(store.allTrackedUIDs(for: descriptorV1)) == [uid("a0"), uid("a1"), uid("keep"), failed])
+            #expect(Set(store.vectorBlock(for: descriptorV1).uids) == [uid("a0"), uid("a1"), uid("keep")])
+            let trackedFailure = try store.failureRecords(for: descriptorV1, from: [failed])[failed] != nil
+            #expect(trackedFailure)
             let generation = store.generation(for: descriptorV1)
 
             store.remove(uids: [uid("a0"), uid("a1"), failed], descriptor: descriptorV1)
 
             #expect(store.generation(for: descriptorV1) == generation + 1)
-            #expect(store.allIndexedUIDs(for: descriptorV1) == [uid("keep")])
+            #expect(store.vectorBlock(for: descriptorV1).uids == [uid("keep")])
             let readResult6 = try store.failureRecords(for: descriptorV1, from: [failed]).isEmpty
             #expect(readResult6)
         }
@@ -361,7 +384,7 @@ struct TestMLVectorCipher: MLVectorCipher {
                     previousAuthoritativeUIDs: nil,
                     descriptor: descriptorV1
                 ))
-            #expect(Set(store.allIndexedUIDs(for: descriptorV1)) == Set(firstInventory))
+            #expect(Set(store.vectorBlock(for: descriptorV1).uids) == Set(firstInventory))
             let readResult7 = try store.failureRecords(for: descriptorV1, from: [failed]).isEmpty
             #expect(readResult7)
             #expect(store.generation(for: descriptorV1) == beforeColdReconciliation + 1)
@@ -384,7 +407,7 @@ struct TestMLVectorCipher: MLVectorCipher {
                     previousAuthoritativeUIDs: previousInventory,
                     descriptor: descriptorV1
                 ))
-            #expect(store.allIndexedUIDs(for: descriptorV1) == nextInventory)
+            #expect(store.vectorBlock(for: descriptorV1).uids == nextInventory)
             #expect(store.generation(for: descriptorV1) == beforeDeltaReconciliation + 1)
 
             let beforeNoOp = store.generation(for: descriptorV1)
@@ -485,7 +508,9 @@ struct TestMLVectorCipher: MLVectorCipher {
         #expect(sqlite3_exec(handle, "DROP TRIGGER reject_failure_cleanup;", nil, nil, nil) == SQLITE_OK)
         sqlite3_close(handle)
         #expect(store.removeAll(for: descriptorV1))
-        #expect(store.allTrackedUIDs(for: descriptorV1).isEmpty)
+        #expect(store.vectorBlock(for: descriptorV1).isEmpty)
+        let readResult10 = try store.failureRecords(for: descriptorV1, from: [failed]).isEmpty
+        #expect(readResult10)
         #expect(store.generation(for: descriptorV1) == generation + 1)
     }
 
@@ -530,7 +555,7 @@ struct TestMLVectorCipher: MLVectorCipher {
         defer { reopened.close() }
         #expect(reopened.count(for: descriptorV1) == 2)
         #expect(try reopened.contains(uid: uid("a0"), descriptor: descriptorV1))
-        #expect(reopened.allRecords(for: descriptorV1).map(\.uid.nodeID) == ["a0", "a1"])
+        #expect(reopened.vectorBlock(for: descriptorV1).uids.map(\.nodeID) == ["a0", "a1"])
         // Idempotent replay after restart: no duplicates.
         let replay = reopened.upsert([record("a0", descriptorV1, [1, 2, 3, 4])])
         #expect(replay.skippedAlreadyIndexed == 1)
@@ -700,7 +725,7 @@ struct TestMLVectorCipher: MLVectorCipher {
         let reopened = try #require(SQLiteMLIndexStore(url: url, cipher: cipher))
         defer { reopened.close() }
         #expect(reopened.generation(for: descriptorV1) == insertedGeneration)
-        reopened.remove(uid: uid("a0"), descriptor: descriptorV1)
+        reopened.remove(uids: [uid("a0")], descriptor: descriptorV1)
         #expect(reopened.generation(for: descriptorV1) > insertedGeneration)
     }
 

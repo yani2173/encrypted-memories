@@ -189,6 +189,7 @@ public struct GridFramePlan: Equatable, Sendable {
     public let viewportRect: CGRect
     public let visibleSlots: [GridSlot]
     public let visibleHeaders: [GridSectionHeader]
+    package let columnGeometry: GridColumnGeometry
 
     public var pitch: CGFloat { slotSide + gap }
 }
@@ -324,6 +325,11 @@ public struct SquareTileGridEngine: Equatable, Sendable {
             defaultContentMode: .squareFillCrop, transitionKindToNext: nil, monthLabels: true),
     ]
 
+    /// The constant outer gutter (points) for the normal photo levels. It stays the same across those levels so a
+    /// transition does not change layout width while computing its anchor. It also sizes the breathing room reserved
+    /// below transient chrome above the grid (the iOS search scope picker), so all sides keep one visual rhythm.
+    public static let standardOuterMargin: CGFloat = 12
+
     /// The width-filling square side for a column count + gap - the resolution-independent slot size. Levels
     /// are defined by columns; this derives the pixel side at the current width: `(width − gap·(cols−1))/cols`.
     /// Feeding this back into the column-from-side resolve returns exactly `columns`, so the live-zoom lattice
@@ -374,6 +380,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     /// The fully-resolved grid for one set of metrics + width: column count, exact (width-filling) square
     /// side, and per-section top offsets / header rects / rows. Everything else is a query against this.
     struct ResolvedGrid: Equatable {
+        let columnGeometry: GridColumnGeometry
         let columns: Int
         let slotSide: CGFloat
         let gap: CGFloat
@@ -401,7 +408,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
             let row = slot / columns
             let col = slot % columns
             let rect = CGRect(
-                x: CGFloat(col) * pitch, y: sectionContentTop[section] + CGFloat(row) * pitch,
+                x: columnGeometry.origin(of: col), y: sectionContentTop[section] + CGFloat(row) * pitch,
                 width: slotSide, height: slotSide)
             return (rect, section, item, row, col)
         }
@@ -448,7 +455,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
                         let item = slot - emptyTopLeft
                         guard item >= 0, item < count else { continue }
                         let frame = CGRect(
-                            x: CGFloat(col) * pitch, y: contentTop + CGFloat(row) * pitch,
+                            x: columnGeometry.origin(of: col), y: contentTop + CGFloat(row) * pitch,
                             width: slotSide, height: slotSide)
                         guard frame.intersects(rect) else { continue }
                         let vp = CGRect(
@@ -504,14 +511,13 @@ public struct SquareTileGridEngine: Equatable, Sendable {
         // A fixed column count is used for settled levels and integer pinch detents. The live over-zoom path
         // derives a count from the target side. Both paths fill the available width.
         let columns: Int
-        let side: CGFloat
         if let fc = fixedColumns {
             columns = max(1, fc)
-            side = Self.nominalSlotSide(columns: columns, gap: g, width: w)
         } else {
             columns = Self.columnsForFixedSide(side: target, gap: g, width: w, maxColumns: maxColumns)
-            side = Self.nominalSlotSide(columns: columns, gap: g, width: w)
         }
+        let geometry = GridColumnGeometry(columns: columns, gap: g, width: w)
+        let side = geometry.side
         let pitch = side + g
         let singleSection = sectionCounts.count == 1
         var headerTop = [CGFloat](repeating: 0, count: sectionCounts.count)
@@ -545,6 +551,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
         }
         let contentHeight = max(y - interSectionSpacing, 1)
         return ResolvedGrid(
+            columnGeometry: geometry,
             columns: columns, slotSide: side, gap: g, headerHeight: headerHeight,
             interSectionSpacing: interSectionSpacing, width: w, sectionCounts: sectionCounts,
             sectionFlatStart: sectionFlatStart, sectionHeaderTop: headerTop,
@@ -606,7 +613,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
         return GridFramePlan(
             levelID: levelID, columns: grid.columns, slotSide: grid.slotSide, gap: grid.gap,
             contentSize: grid.contentSize, viewportRect: viewportRect,
-            visibleSlots: slots, visibleHeaders: headers)
+            visibleSlots: slots, visibleHeaders: headers, columnGeometry: grid.columnGeometry)
     }
 
     // MARK: Single-item / section queries (settled level)
@@ -691,15 +698,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     /// within the ladder it interpolates the bracketing detents; past the largest end it grows with
     /// diminishing return; past the densest end it clamps (never over-shrink below fill).
     public func apparentSlotSide(at x: CGFloat, width: CGFloat) -> CGFloat {
-        let maxIndex = levels.count - 1
-        // Use the settled width-filled side at each detent so a pinch commit does not change slot size.
-        func side(_ i: Int) -> CGFloat {
-            Self.nominalSlotSide(columns: levels[i].nominalColumns, gap: levels[i].gap, width: width)
-        }
-        if x <= 0 { return side(0) * (1 - x * 0.6) }
-        if x >= CGFloat(maxIndex) { return side(maxIndex) }
-        let lo = Int(x)
-        return lerp(side(lo), side(lo + 1), smoothstep(x - CGFloat(lo)))
+        GridApparentMetrics.slotSide(at: x, width: width, levels: levels)
     }
 
     /// The apparent gap for a continuous level position (first-class: scales smoothly through the pinch).
@@ -791,9 +790,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     /// commits to is `columnPhase(forItem: anchor, targetColumn: cursorColumn(...))` - so the anchor settles
     /// exactly where the live transaction held it.
     public func cursorColumn(viewportX: CGFloat, level: Int, width: CGFloat) -> Int {
-        let m = resolvedMetrics(level: level, width: width)
-        guard m.pitch > 0 else { return 0 }
-        return min(max(Int(viewportX / m.pitch), 0), m.columns - 1)
+        resolvedForLevel(level, width: width).columnGeometry.column(at: viewportX)
     }
 
     /// Captures the item under the cursor at `sourceLevel` and returns the target scroll Y that keeps

@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// Platform-neutral local photo-library inventory. This is the persistent index of what the device
 /// currently exposes for backup discovery (one row per logical asset), not a record of what is
@@ -174,6 +175,91 @@ public struct PhotoLibraryCatalogSnapshot: Sendable, Equatable {
     }
 }
 
+/// A keyed presence read. An identifier in neither set is absent or removed; an unknown one is neither (#1004).
+public struct PhotoLibraryCatalogPresence: Sendable, Equatable {
+    public var present: [String: PhotoLibraryCatalogEntry] = [:]
+    /// Identifiers whose own row could not be read.
+    public var unknown = Set<String>()
+
+    public init(present: [String: PhotoLibraryCatalogEntry] = [:], unknown: Set<String> = []) {
+        self.present = present
+        self.unknown = unknown
+    }
+}
+
+/// A stored catalog row exists, but its content could not be decoded. The row is unknown for that row only (#1160):
+/// the store stays operational, and each caller decides what an unknown row means for its own work (#1212).
+public struct PhotoLibraryCatalogUndecodableRowError: Error, Equatable, Sendable {
+    public init() {}
+}
+
+public extension PhotoLibraryCatalogStore {
+    /// The cloud identifier that the catalog holds for `localIdentifier`, or nil when it holds none. An unknown row
+    /// also answers nil: the upload metadata then asks Photos, which owns the identifier, so an unknown row never
+    /// stands for a missing identifier (#1212).
+    func cachedCloudIdentifier(for localIdentifier: String) -> String? {
+        (try? entry(for: localIdentifier))?.cloudIdentifier
+    }
+}
+
+/// One stable keyset page of present inventory rows: the rows that decoded, plus the readable identifiers whose
+/// own row could not be decoded. Each undecodable identifier is unknown for that row only and is retried by the
+/// next pass that scans it (#1160). An identifier in neither list is absent or removed.
+public struct PhotoLibraryCatalogPage: Sendable, Equatable {
+    /// Decoded rows, ordered by local identifier.
+    public var entries: [PhotoLibraryCatalogEntry] = []
+    /// Readable identifiers whose own row content could not be decoded.
+    public var undecodableIdentifiers: [String] = []
+
+    public init(entries: [PhotoLibraryCatalogEntry] = [], undecodableIdentifiers: [String] = []) {
+        self.entries = entries
+        self.undecodableIdentifiers = undecodableIdentifiers
+    }
+
+    /// The greatest local identifier on the page, decoded or unknown. Keys order the page, so this is the next cursor.
+    public var lastLocalIdentifier: String? {
+        [entries.last?.localIdentifier, undecodableIdentifiers.last].compactMap { $0 }.max()
+    }
+}
+
+/// The position of one pass over catalog pages that steps past unknown rows (#1160). The pass offers a resume point
+/// to save only while no page so far held an unknown row, so a later pass reads the first such page again and retries
+/// the row. The pass may record itself complete only when no page held an unknown row.
+public struct PhotoLibraryCatalogPassProgress: Sendable, Equatable {
+    /// The result of stepping past one page.
+    public enum Step: Sendable, Equatable {
+        /// The page produced no key at all: the pass reached the end of the catalog.
+        case end
+        /// The pass moved past the page. `resumePoint` is the key that may be saved, or nil while a row is unknown.
+        case advanced(resumePoint: String?)
+    }
+
+    /// The key after which the next page starts.
+    public private(set) var cursor: String?
+    /// Whether a page of this pass held a row that could not be decoded.
+    public private(set) var sawUnknownRows = false
+
+    public init(after cursor: String? = nil) {
+        self.cursor = cursor
+    }
+
+    /// Steps past `page`. A page of only unknown rows is not the end of the catalog.
+    public mutating func advance(past page: PhotoLibraryCatalogPage) -> Step {
+        guard let lastKey = page.lastLocalIdentifier else { return .end }
+        cursor = lastKey
+        sawUnknownRows = sawUnknownRows || !page.undecodableIdentifiers.isEmpty
+        return .advanced(resumePoint: sawUnknownRows ? nil : lastKey)
+    }
+
+    /// Whether the pass may record itself complete. While a row stayed unknown, the pass stays owed, and this call
+    /// counts it once under `counter`, without any identifier.
+    public func mayComplete(countingUnknownRowsAs counter: String) -> Bool {
+        guard sawUnknownRows else { return true }
+        PhotoDiagnostics.shared.increment(counter)
+        return false
+    }
+}
+
 /// Result of a catalog mutation where zero affected rows is a valid success. Keeping the success
 /// bit separate prevents SQLite failures from being mistaken for an empty removal set.
 public struct PhotoLibraryCatalogMutationResult: Sendable, Equatable {
@@ -193,21 +279,23 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// False after a persistence failure or close. Empty read results are trustworthy only while
     /// this remains true; scanners must stop rather than advance a cursor on a failed read.
     func isOperational() -> Bool
-    func entry(for localIdentifier: String) -> PhotoLibraryCatalogEntry?
+    /// Reads one row. Throws `SQLiteStoreUnknownReadError` when the read could not run, so a caller never mistakes
+    /// a failed read for a real absence (#1004). Throws `PhotoLibraryCatalogUndecodableRowError` when the row exists
+    /// but its content could not be decoded (#1212).
+    func entry(for localIdentifier: String) throws -> PhotoLibraryCatalogEntry?
     /// Stable keyset page of present inventory rows. Used to rebuild or enrich the durable backup
     /// queue without touching PhotoKit bytes when the queue is incomplete after an app upgrade.
-    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry]
-    /// Read-only classification of an observation against the stored row, without writing. The sync
+    /// Nil means the page is unknown, not empty; a caller must not treat it as the end of the catalog (#1004).
+    /// Rows whose content could not be decoded are reported per row in `undecodableIdentifiers` (#1160).
+    /// A row whose key is not exact text makes its page unknown. A NULL, INTEGER or REAL key also makes the empty
+    /// last page of a pass with a cursor unknown (#1212).
+    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage?
+    /// Read-only classification of observations against the stored rows, without writing. The sync
     /// driver uses this to decide whether to enqueue a backup candidate before it advances the
-    /// catalog, so the durable queue row is always written first.
-    func classify(_ entry: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange
-    /// Batched form used by large scans. Stores should reuse one prepared statement and avoid
-    /// decoding complete rows when only fingerprint, revision, and removal state are needed.
+    /// catalog, so the durable queue row is always written first. Stores should reuse one prepared
+    /// statement and avoid decoding complete rows when only fingerprint, revision, and removal state
+    /// are needed. An answer shorter than `entries` means a read failed; the caller must stop (#1004).
     func classifyBatch(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange]
-    /// Records one observation, preserving `firstSeenAt` and clearing any removed marker, and
-    /// returns how it classified against the prior row.
-    @discardableResult
-    func upsert(_ entry: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange
     /// Persists batched observations in one transaction. False means no catalog advancement was
     /// committed; callers must stop before advancing a scan cursor or change token.
     @discardableResult
@@ -218,8 +306,8 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// Marks removed every present row not touched since `cutoff` (full-scan mark-and-sweep).
     @discardableResult
     func sweepRemoved(notSeenAfter cutoff: Date, removedAt: Date) -> PhotoLibraryCatalogMutationResult
-    func snapshot() -> PhotoLibraryCatalogSnapshot
-    func count() -> Int
+    func snapshot() -> PhotoLibraryCatalogSnapshot?
+    func count() -> Int?
 
     // MARK: Resumable full-scan state
     /// True once a full-library scan has completed at least once. An incremental (change-token) scan
@@ -235,8 +323,9 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// The in-progress full-scan epoch, or nil if none is underway (the next full scan starts fresh).
     /// A full scan of a large library rarely finishes in one foreground/BG window; persisting this lets
     /// an interrupted scan resume from `cursor` instead of restarting, so it converges instead of
-    /// looping forever and never marking itself complete.
-    func fullScanProgress() -> PhotoLibraryFullScanProgress?
+    /// looping forever and never marking itself complete. Throws when the progress could not be read, so a caller
+    /// never starts a new epoch over an unknown one (#1004).
+    func fullScanProgress() throws -> PhotoLibraryFullScanProgress?
     /// Persists mid-scan progress so a resumed scan continues within the same epoch.
     @discardableResult
     func recordFullScanProgress(_ progress: PhotoLibraryFullScanProgress) -> Bool
@@ -278,8 +367,10 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// Publishes the completely-built snapshot and creates its cursor at zero.
     @discardableResult
     func finishFullScanSnapshot() -> Bool
-    func fullScanSnapshotIdentifiers(startingAt position: Int, limit: Int) -> [String]
-    func fullScanSnapshotCount() -> Int
+    /// A nil page is an unknown read, not the end of the snapshot (#1004).
+    func fullScanSnapshotIdentifiers(startingAt position: Int, limit: Int) -> [String]?
+    /// A nil count is an unknown read, not an empty snapshot (#1004).
+    func fullScanSnapshotCount() -> Int?
 }
 
 public extension PhotoLibraryCatalogStore {
@@ -290,11 +381,8 @@ public extension PhotoLibraryCatalogStore {
 
     func isOperational() -> Bool { true }
 
-    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry] { [] }
-
-    func classifyBatch(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] {
-        entries.map(classify)
-    }
+    /// An unimplemented page reader cannot prove the catalog empty; nil reports unknown, not absence (#1004).
+    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage? { nil }
 
     /// Photos lists no asset for this source any more: the person deleted it, or it lies outside a narrowed
     /// limited-access selection. The entry leaves the present inventory, so missing-source recovery does not queue it

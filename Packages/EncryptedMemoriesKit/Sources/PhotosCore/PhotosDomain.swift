@@ -10,6 +10,11 @@ public struct PhotoUID: Hashable, Sendable, Codable {
         self.volumeID = volumeID
         self.nodeID = nodeID
     }
+
+    /// This photo with `volumeID` when it names no volume. An empty volume ID means the person's photos volume.
+    public func inVolume(_ volumeID: String) -> PhotoUID {
+        self.volumeID.isEmpty ? PhotoUID(volumeID: volumeID, nodeID: nodeID) : self
+    }
 }
 
 // MARK: - Models
@@ -162,16 +167,20 @@ public struct RemoteLinkVisibility: Equatable, Sendable {
     public var isActive: Bool
     /// Nil for a main photo or unavailable role data.
     public var mainPhotoLinkID: String?
+    /// Whether the answer explicitly includes the link's State (present even when the role Photo object is omitted).
+    public var hasExplicitState: Bool
     /// Whether the answer explicitly includes the state and revision Photo role data.
     public var hasExplicitPhotoState: Bool
     /// The server time of the move to the trash, in seconds. Nil for a link that is not in the trash.
     public var trashTime: Int64?
 
     public init(
-        isActive: Bool, mainPhotoLinkID: String?, trashTime: Int64? = nil, hasExplicitPhotoState: Bool = true
+        isActive: Bool, mainPhotoLinkID: String?, hasExplicitState: Bool = false, trashTime: Int64? = nil,
+        hasExplicitPhotoState: Bool = true
     ) {
         self.isActive = isActive
         self.mainPhotoLinkID = mainPhotoLinkID
+        self.hasExplicitState = hasExplicitState
         self.trashTime = trashTime
         self.hasExplicitPhotoState = hasExplicitPhotoState
     }
@@ -183,6 +192,10 @@ public protocol PhotosRepository: Sendable {
     /// Loads one authoritative inventory and its paired server revision as a single result. Repositories that
     /// cannot expose a revision may use the default nil token; cache validation will then fail closed.
     func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot
+    /// Reports known photos while loading, without granting the authority of a completed snapshot.
+    func loadTimelineSnapshot(
+        onProvisional: @escaping @Sendable (ProvisionalTimelineSnapshot) async -> Void
+    ) async throws -> TimelineLoadSnapshot
     /// Last-known timeline persisted to disk, for instant startup (nil if none). `loadTimeline()`
     /// then refreshes in the background - stale-while-revalidate, so there's no spinner on relaunch.
     func cachedTimeline() async -> [TimelineSection]?
@@ -190,12 +203,15 @@ public protocol PhotosRepository: Sendable {
     /// photos, tags, or series read returns nil, so the caller uses the server load. Implementations that cannot provide an
     /// atomic pair should return a nil token so validation fails closed.
     func cachedTimelineSnapshot() async -> CachedTimelineSnapshot?
-    /// Opaque server revision captured atomically with the cached timeline. A caller may present the
-    /// cached frame as authoritative only after this equals the provider's current change token.
-    func cachedTimelineValidationToken() async -> String?
 }
 
 public extension PhotosRepository {
+    func loadTimelineSnapshot(
+        onProvisional: @escaping @Sendable (ProvisionalTimelineSnapshot) async -> Void
+    ) async throws -> TimelineLoadSnapshot {
+        try await loadTimelineSnapshot()
+    }
+
     func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot {
         TimelineLoadSnapshot(sections: try await loadTimeline(), validationToken: nil)
     }
@@ -204,7 +220,6 @@ public extension PhotosRepository {
         guard let sections = await cachedTimeline() else { return nil }
         return CachedTimelineSnapshot(sections: sections, validationToken: nil)
     }
-    func cachedTimelineValidationToken() async -> String? { nil }
 }
 
 /// Cheap, opaque server-side library revision used to notice changes made by another device.
@@ -213,8 +228,7 @@ public protocol LibraryChangeTokenProvider: Sendable {
     func libraryChangeToken() async throws -> String
     /// Same opaque token, requested on the user-visible launch path. Backends with a shared request governor
     /// may raise this above speculative/background traffic; providers without priorities use the default.
-    func launchValidationToken() async throws -> String
-    /// Allows a backend to use scope already present in the cached inventory (for example its volume ID),
+    /// A backend may use scope already present in the cached inventory (for example its volume ID),
     /// avoiding an unrelated root-discovery request on the user-visible launch path.
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String
     /// Adapts a validated persisted revision without another listing. The validated remote cursor remains the baseline.
@@ -235,12 +249,8 @@ public extension LibraryChangeTokenProvider {
             validatedRemoteRevision: remoteRevision, observedMonitorToken: observed)
     }
 
-    func launchValidationToken() async throws -> String {
-        try await libraryChangeToken()
-    }
-
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String {
-        try await launchValidationToken()
+        try await libraryChangeToken()
     }
 }
 
@@ -297,6 +307,13 @@ public protocol PriorityThumbnailBatchLoader: ThumbnailBatchLoader {
     ) async -> ThumbnailBatchLoadResult
 }
 
+/// Temporary thumbnail access for a presentation that cannot certify inventory completeness.
+public protocol ProvisionalThumbnailAuthorizing: Sendable {
+    func beginProvisionalThumbnailAccess() async -> UUID?
+    func updateProvisionalThumbnailAccess(_ uids: [PhotoUID], using lease: UUID) async
+    func endProvisionalThumbnailAccess(_ lease: UUID) async
+}
+
 /// Loads full-resolution original bytes without creating an app-owned plaintext cache file.
 public protocol FullMediaProvider: Sendable {
     /// Larger preview image bytes (shown immediately in the viewer before the original arrives).
@@ -341,5 +358,11 @@ public extension FullMediaProvider {
 /// Optional metadata provider for Proton burst/series groups. The viewer calls this lazily only when
 /// an item is tagged/enriched as a burst candidate, so the main timeline path stays fast and SDK-agnostic.
 public protocol BurstGroupProvider: Sendable {
+    /// Reads the series of the photo `uid`.
+    ///
+    /// - Returns: every frame of the series in presentation order when it has two or more frames. When
+    ///   one frame is left after the related files that are no frames are dropped (such as the
+    ///   adjustment data of an edit), the photo alone, with `burstMemberIDs` that name only that frame.
+    ///   An empty list when the read knows no series for the photo.
     func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem]
 }

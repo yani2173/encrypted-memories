@@ -9,6 +9,7 @@ import SwiftUI
 import TimelineCore
 import TimelineUIKitFeature
 import UIKit
+import UploadCore
 
 /// Hosts smart filters, albums, and Trash through the shared `PhotoFilter` routes. Each route opens the
 /// shared timeline grid; a new smart filter adds a row instead of another screen.
@@ -18,6 +19,8 @@ struct MobileCollectionsScreen: View {
     /// `@Environment` over the `@Observable` model: Collections reads only `backend`/`thumbnailFeed`, so a
     /// timeline snapshot change no longer re-renders this list.
     @Environment(MobileLibraryModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var showCreateAlbum = false
     @State private var pendingSharedAlbumLeave: SharedAlbumSummary?
 
@@ -131,6 +134,8 @@ struct MobileCollectionsScreen: View {
                 if let coordinator = model.albumActions {
                     AlbumCreationSheet(
                         coordinator: coordinator,
+                        regularPresentation: AlbumPresentationTraits.usesRegularSizing(
+                            horizontal: horizontalSizeClass, vertical: verticalSizeClass),
                         onAlbumsChanged: { model.noteAlbumsChanged() },
                         onCompleted: { _ in showCreateAlbum = false }
                     )
@@ -148,9 +153,10 @@ struct MobileCollectionsScreen: View {
                 }
             } else if let message = coordinator.loadErrorMessage, coordinator.albums.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("albums.load_failed").foregroundStyle(ProtonColor.textNorm)
-                    Text(message).font(.caption).foregroundStyle(ProtonColor.textWeak)
-                    RetryButton(.compact) { Task { await loadAlbums() } }
+                    Text(message).foregroundStyle(ProtonColor.textNorm)
+                    if coordinator.loadFailure?.canRetry == true {
+                        RetryButton(.compact) { Task { await loadAlbums() } }
+                    }
                 }
             } else if coordinator.albums.isEmpty {
                 Text("collections.empty_albums").foregroundStyle(ProtonColor.textWeak)
@@ -176,9 +182,10 @@ struct MobileCollectionsScreen: View {
                 }
             } else if let message = coordinator.sharedLoadErrorMessage, coordinator.sharedAlbums.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(L10n.string("albums.shared_load_failed"))
-                    Text(message).font(.caption).foregroundStyle(ProtonColor.textWeak)
-                    RetryButton(.compact) { Task { await coordinator.refreshSharedAlbums() } }
+                    Text(message).foregroundStyle(ProtonColor.textNorm)
+                    if coordinator.sharedLoadFailure?.canRetry == true {
+                        RetryButton(.compact) { Task { await coordinator.refreshSharedAlbums() } }
+                    }
                 }
             } else if coordinator.sharedAlbums.isEmpty {
                 Text(L10n.string("collections.empty_shared_albums"))
@@ -518,8 +525,10 @@ private struct MobileFilterGridScreen: View {
     }
 
     @ToolbarContentBuilder private func routeToolbarContent() -> some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) { topTrailingToolbarAction }
-            .mobileVisibilityPriority(.high)
+        ProminentToolbarItem(placement: .topBarTrailing, isProminent: selection.isSelecting) {
+            topTrailingToolbarAction
+        }
+        .mobileVisibilityPriority(.high)
         if filter == .trash {
             ToolbarItem(placement: .bottomBar) {
                 Button {
@@ -551,11 +560,12 @@ private struct MobileFilterGridScreen: View {
                         showAlbumPhotoActions = true
                     }
                 },
-                albumPicker: {
+                albumPicker: { regularPresentation in
                     if let coordinator = model.albumActions {
                         AlbumDestinationPicker(
                             coordinator: coordinator,
                             photoUIDs: snapshot.orderedUIDs(including: selection.selected),
+                            regularPresentation: regularPresentation,
                             onAlbumsChanged: { model.noteAlbumsChanged() },
                             onCompleted: { _ in
                                 showAlbumPicker = false
@@ -570,7 +580,11 @@ private struct MobileFilterGridScreen: View {
 
     @ViewBuilder private var topTrailingToolbarAction: some View {
         if selection.isSelecting {
-            Button(L10n.string("action.done")) { selection.finish() }
+            Button {
+                selection.finish()
+            } label: {
+                MobileSelectionModeLabel(isSelecting: true)
+            }
         } else if case .album = filter {
             albumActionsMenu
         } else if filter == .trash, isEmptyingTrash {
@@ -767,7 +781,7 @@ private struct MobileFilterGridScreen: View {
             phase = .loaded
         } catch {
             actionErrorTitle = L10n.string("trash.empty_failed_title")
-            actionError = L10n.string("trash.empty_failed_message")
+            actionError = L10n.string(dynamicKey: RecentlyDeletedEmptying.failureMessageKey(for: error))
         }
     }
 }

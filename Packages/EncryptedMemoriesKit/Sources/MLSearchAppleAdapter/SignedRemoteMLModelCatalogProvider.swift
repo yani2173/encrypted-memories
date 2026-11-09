@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MLSearchCore
+import PhotosCore
 
 public enum MLRemoteCatalogTransportError: Error, Equatable {
     case notHTTPS
@@ -97,6 +98,9 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
     private let publicKey: Data
     private let usesAtomicPointer: Bool
     private let pointerCacheURL: URL?
+    /// The directories of the cached catalog files. The legacy directory is the Smart Search root.
+    private let catalogCacheDirectory: URL
+    private let legacyCatalogCacheDirectory: URL
     private let releaseTrackOverride: MLModelReleaseTrack?
 
     public init(
@@ -215,6 +219,8 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         self.legacyCacheURL = legacyDirectory.appendingPathComponent("catalog-v1.json")
         self.legacySignatureCacheURL = legacyDirectory.appendingPathComponent("catalog-v1.sig")
         self.acceptedStateURL = cacheDirectory.appendingPathComponent("catalog-v2.accepted.json")
+        self.catalogCacheDirectory = cacheDirectory
+        self.legacyCatalogCacheDirectory = legacyDirectory
         self.session = session
         self.remoteCatalogURL = catalogURL
         self.remoteSignatureURL = signatureURL
@@ -238,6 +244,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
     var sessionConfiguration: URLSessionConfiguration { session.configuration }
 
     public func catalog() async throws -> MLModelCatalog {
+        upgradeCachedFileProtectionIfNeeded()
         switch catalogVersion {
         case .v1:
             return try await fetchV1OrCached()
@@ -723,11 +730,138 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         )
     }
 
+    /// A Smart Search window on a locked device reads these files after the first unlock since a restart. They hold
+    /// signed public catalog data only.
     private static var cacheWritingOptions: Data.WritingOptions {
         #if os(iOS)
-            [.atomic, .completeFileProtectionUnlessOpen]
+            [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
         #else
             .atomic
         #endif
     }
+
+    /// Catalog files written before 1.2.0 have "complete unless open", which a locked device cannot open again. Once
+    /// per process and per pair of cache directories, while the files can be changed, they move to the class of new
+    /// writes. Only a walk without any failure counts as done; otherwise the next call tries again.
+    private func upgradeCachedFileProtectionIfNeeded() {
+        #if os(iOS)
+            Self.upgradeFileProtection(
+                cacheDirectory: catalogCacheDirectory, legacyDirectory: legacyCatalogCacheDirectory,
+                state: Self.fileProtectionUpgrade
+            ) { url, protection in
+                try FileManager.default.setAttributes([.protectionKey: protection], ofItemAtPath: url.path)
+            }
+        #endif
+    }
+
+    private static let fileProtectionUpgrade = FileProtectionUpgradeState()
+    /// Exported in the support diagnostics: a fixed name, without a path.
+    static let fileProtectionFailureCounter = "smartSearch.catalogProtectionFailed"
+
+    /// Moves the catalog files of one pair of directories to "until first user authentication" unless `state` already
+    /// records them as done. A walk with a failure counts once in the support diagnostics and stays open.
+    static func upgradeFileProtection(
+        cacheDirectory: URL, legacyDirectory: URL, state: FileProtectionUpgradeState,
+        setProtection: (URL, FileProtectionType) throws -> Void
+    ) {
+        let key = [cacheDirectory, legacyDirectory].map(\.standardizedFileURL.path)
+        guard !state.isDone(key) else { return }
+        let failures = applyFileProtection(cacheDirectory: cacheDirectory, legacyDirectory: legacyDirectory) { url in
+            try setProtection(url, .completeUntilFirstUserAuthentication)
+        }
+        if failures == 0 {
+            state.markDone(key)
+        } else {
+            PhotoDiagnostics.shared.increment(fileProtectionFailureCounter)
+        }
+    }
+
+    /// The names of the files this provider writes into a cache directory and into each pair directory.
+    private static let cacheFileNames = [
+        "catalog-v1.json", "catalog-v1.sig", "catalog-v2.json", "catalog-v2.sig", "catalog-v2.accepted.json",
+    ]
+    private static let legacyFileNames = ["catalog-v1.json", "catalog-v1.sig"]
+    private static let pairFileNames = [
+        "catalog-v1.json", "catalog-v1.sig", "catalog-v2.json", "catalog-v2.sig", "release-pair.json",
+    ]
+
+    /// Calls `protect` for each catalog file that this provider writes, and for no other file: the legacy directory is
+    /// the Smart Search root, which also holds the private index, state and models. Every directory and file is
+    /// inspected without following links: a link where a catalog directory or file belongs is never followed and counts
+    /// as a failure. A missing item is skipped; every other failure, to inspect or to protect, is counted and stops no
+    /// other file.
+    static func applyFileProtection(
+        cacheDirectory: URL, legacyDirectory: URL, protect: (URL) throws -> Void
+    ) -> Int {
+        var failures = 0
+        func visitFile(_ url: URL) {
+            switch itemType(url, failures: &failures) {
+            case .typeRegular?: do { try protect(url) } catch { failures += 1 }
+            case nil: return
+            default: failures += 1
+            }
+        }
+        func isRealDirectory(_ url: URL) -> Bool {
+            switch itemType(url, failures: &failures) {
+            case .typeDirectory?: return true
+            case nil: return false
+            default:
+                failures += 1
+                return false
+            }
+        }
+        let cacheIsDirectory = isRealDirectory(cacheDirectory)
+        if cacheIsDirectory {
+            Self.cacheFileNames.forEach { visitFile(cacheDirectory.appendingPathComponent($0)) }
+        }
+        if legacyDirectory.standardizedFileURL != cacheDirectory.standardizedFileURL, isRealDirectory(legacyDirectory) {
+            Self.legacyFileNames.forEach { visitFile(legacyDirectory.appendingPathComponent($0)) }
+        }
+        let pairs = cacheDirectory.appendingPathComponent("active-pair", isDirectory: true)
+        guard cacheIsDirectory, isRealDirectory(pairs) else { return failures }
+        visitFile(pairs.appendingPathComponent("active-pair.json"))
+        let entries: [URL]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(at: pairs, includingPropertiesForKeys: nil)
+        } catch {
+            if !isMissing(error) { failures += 1 }
+            return failures
+        }
+        // A pair is a real directory; the pointer and other plain files beside the pairs are no pairs.
+        for entry in entries {
+            switch itemType(entry, failures: &failures) {
+            case .typeDirectory?: Self.pairFileNames.forEach { visitFile(entry.appendingPathComponent($0)) }
+            case .typeRegular?, nil: continue
+            default: failures += 1
+            }
+        }
+        return failures
+    }
+
+    /// The type of the item at `url` itself, never of a link's target; nil when it does not exist or cannot be
+    /// inspected, which counts as a failure.
+    private static func itemType(_ url: URL, failures: inout Int) -> FileAttributeType? {
+        do {
+            return try FileManager.default.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
+        } catch {
+            if !isMissing(error) { failures += 1 }
+            return nil
+        }
+    }
+
+    private static func isMissing(_ error: Error) -> Bool {
+        let error = error as NSError
+        return error.domain == NSCocoaErrorDomain
+            && (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError)
+    }
+}
+
+/// The pairs of cache directories whose catalog files this process already moved to their current protection class.
+final class FileProtectionUpgradeState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done: Set<[String]> = []
+
+    func isDone(_ key: [String]) -> Bool { lock.withLock { done.contains(key) } }
+
+    func markDone(_ key: [String]) { _ = lock.withLock { done.insert(key) } }
 }

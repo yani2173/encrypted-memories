@@ -102,6 +102,33 @@ public protocol PendingSourceMetadataProviding: Sendable {
     /// Metadata of the sources that are still accessible. A missing key means not accessible (deleted,
     /// or outside a limited Photos selection).
     func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata]
+    /// The same metadata plus the sources whose own read failed. An unknown source is neither accessible nor gone, so
+    /// it keeps its earlier answer (#1004).
+    func metadataAnswer(for keys: [PendingSourceKey]) async -> PendingSourceMetadataAnswer
+}
+
+public extension PendingSourceMetadataProviding {
+    /// A provider without failed reads answers every key it does not list as not accessible.
+    func metadataAnswer(for keys: [PendingSourceKey]) async -> PendingSourceMetadataAnswer {
+        PendingSourceMetadataAnswer(metadata: await metadata(for: keys))
+    }
+}
+
+public struct PendingSourceMetadataAnswer: Sendable, Equatable {
+    public var metadata: [PendingSourceKey: PendingPresentationMetadata]
+    /// Requested sources whose read failed: neither accessible nor proven gone.
+    public var unknown: Set<PendingSourceKey>
+
+    public init(metadata: [PendingSourceKey: PendingPresentationMetadata] = [:], unknown: Set<PendingSourceKey> = []) {
+        self.metadata = metadata
+        self.unknown = unknown
+    }
+
+    /// Joins the answers of separate providers; the first answer keeps a key that both list.
+    public mutating func merge(_ other: PendingSourceMetadataAnswer) {
+        metadata.merge(other.metadata) { current, _ in current }
+        unknown.formUnion(other.unknown.filter { metadata[$0] == nil })
+    }
 }
 
 /// Outcome of one remote effect.
@@ -134,14 +161,23 @@ public struct PendingBatchEffectResult: Sendable, Equatable {
 public protocol PendingBackupEffects: Sendable {
     /// Removes the sources from queued and in-flight backup work.
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool
-    /// Enqueues the sources again after a restore.
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool
+    /// Enqueues the sources again after a restore. Returns the keys whose return is settled; every other key
+    /// keeps its queue duty and is tried again.
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey>
+    /// Settles the exact included decisions, including their restored-photo provenance.
+    func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome]
     /// The account's photos volume, used for link-only handoffs. Nil while unknown.
     func photosVolumeID() async -> String?
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult
     func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult
+}
+
+public extension PendingBackupEffects {
+    func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
+        Dictionary(uniqueKeysWithValues: states.map { ($0.key, .unreadable) })
+    }
 }
 
 /// The Proton side of pending decisions, implemented by the backend. Each call reports whether to retry.

@@ -114,19 +114,3 @@ private final class PublicationLog {
     private(set) var values: [String] = []
     func append(_ value: String) { values.append(value) }
 }
-
-private actor Gate {
-    private var isOpen = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func wait() async {
-        guard !isOpen else { return }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-
-    func open() {
-        isOpen = true
-        waiters.forEach { $0.resume() }
-        waiters.removeAll()
-    }
-}

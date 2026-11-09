@@ -37,7 +37,7 @@ final class UploadBackupSyncQueueDurabilityTests: XCTestCase {
         assertFullSyncs(WALSyncRecorder.syncs(ofWALFor: queueURL), "upsert")
 
         WALSyncRecorder.reset()
-        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 2_000)).count, 1)
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 2_000))?.count, 1)
         XCTAssertTrue(
             store.updateState(
                 source: source("A"), revision: revision, state: .uploading, attempts: 1, lastError: nil,

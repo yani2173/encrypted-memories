@@ -17,8 +17,9 @@ final class PhotoLibraryBackupSharedRef {
     private init() {}
 
     /// A BG task can launch the process before SwiftUI finishes restoring the account/backend.
-    /// Suspend without polling until configuration publishes the controller or the launch window times out.
-    func controllerWhenReady(timeout: Duration) async -> PhotoLibraryBackupController? {
-        await reference.whenReady(timeout: timeout)
+    /// Suspend without polling until configuration publishes the controller or the launch window times out; end
+    /// earlier when the reads of the saved sign-in show that no account can come.
+    func controllerWhenReady(timeout: Duration) async -> BackgroundAccountWait<PhotoLibraryBackupController> {
+        await BackgroundAccountReadiness.shared.wait(for: reference, timeout: timeout)
     }
 }

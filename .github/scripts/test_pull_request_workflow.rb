@@ -23,7 +23,7 @@ class PullRequestWorkflowTests < Minitest::Test
     # These workflow expressions contain only context lookups and boolean operators.
     source = expression.sub(/\A\$\{\{\s*/, "").sub(/\s*\}\}\z/, "")
     source = source.gsub("always()", "true").gsub("!cancelled()", "true")
-    source = source.gsub(/(?:github|inputs|runner|needs)\.[a-z_.\-]+/) { |path| context.fetch(path, nil).inspect }
+    source = source.gsub(/(?:github|inputs|runner|needs|steps)\.[a-z_.\-]+/) { |path| context.fetch(path, nil).inspect }
     eval(source)
   end
 
@@ -83,12 +83,14 @@ class PullRequestWorkflowTests < Minitest::Test
       refute_includes REQUIRED_CHECKS, jobs.fetch(watchdog_id).fetch("name"), watchdog_id
     end
     assert_equal "ubuntu-24.04", watchdog.fetch("runs-on")
-    # The longest queue run took 123 minutes. The loop ends before the job limit, which stays below the 180 minute
-    # check timeout of the queue.
+    # The longest queue run took 123 minutes, and a late UI run can take longer: the loop ends by itself before
+    # the job limit, which stays below the 360 minute check timeout of the queue.
     limit = watchdog.fetch("timeout-minutes")
-    assert_operator limit, :>=, 150
-    assert_operator limit, :<=, 180
-    assert_operator watchdog.fetch("steps").first.fetch("run")[/deadline=\$\(\(SECONDS \+ (\d+)\)\)/, 1].to_i, :<, limit * 60
+    assert_equal 240, limit, "The failure watchdog must keep its 240 minute job limit"
+    deadline = watchdog.fetch("steps").first.fetch("run")[/deadline=\$\(\(SECONDS \+ (\d+)\)\)/, 1].to_i
+    assert_equal 14100, deadline, "The failure watchdog loop must end after 14100 seconds"
+    # One iteration of the loop can take up to 300 seconds of gh calls, so the loop must still end in time.
+    assert_operator deadline + 300, :<=, limit * 60, "The loop must end before the job limit"
     {"merge_group" => true, "pull_request" => false, "workflow_dispatch" => false}.each do |event, expected|
       assert_equal expected, evaluate(watchdog.fetch("if"), {"github.event_name" => event}), event
     end
@@ -118,8 +120,16 @@ class PullRequestWorkflowTests < Minitest::Test
     end
     assert_equal "ubuntu-24.04", job.fetch("runs-on")
     limit = job.fetch("timeout-minutes")
-    assert_operator limit, :>=, 150
-    assert_operator limit, :<=, 180
+    assert_equal 240, limit, "The superseded-run watchdog must keep its 240 minute job limit"
+    # This watchdog ends by the LOOP_DEADLINE_SECONDS of the decision script, which the job fetches from the
+    # merge base. The failure watchdog computes the same number inline, so the two copies must not drift.
+    python = File.read(File.expand_path("cancel_superseded_queue_run.py", __dir__))
+    script_deadline = python[/^LOOP_DEADLINE_SECONDS = (\d+)/, 1].to_i
+    failure_deadline = @workflow.fetch("jobs").fetch(WATCHDOG).fetch("steps").first
+                             .fetch("run")[/deadline=\$\(\(SECONDS \+ (\d+)\)\)/, 1].to_i
+    assert_equal 14100, script_deadline, "The decision script must end its loop after 14100 seconds"
+    assert_equal failure_deadline, script_deadline, "Both watchdogs must share one deadline number"
+    assert_operator script_deadline + 300, :<=, limit * 60, "The loop must end before the job limit"
     steps = job.fetch("steps")
     assert_equal 1, steps.length
     step = steps.first
@@ -448,6 +458,27 @@ class PullRequestWorkflowTests < Minitest::Test
       refute (YAML.load_file(path)["on"] || YAML.load_file(path).fetch(true)).key?("merge_group"), File.basename(path)
     end
   end
+
+  # The iPhone Duo UI tests give advice on pull requests that change UI code; they never block a merge.
+  def test_the_duo_ui_tests_run_only_for_ui_pull_requests_and_never_block
+    workflow = YAML.load_file(File.join(WORKFLOWS, "duo-ui-tests.yml"))
+    events = workflow["on"] || workflow.fetch(true)
+    assert_equal ["pull_request"], events.keys
+    paths = events.fetch("pull_request").fetch("paths")
+    %w[iOSApp/** iOSUITests/** project.yml scripts/verify-ios-app-tests.sh scripts/build-paths.sh
+       .github/scripts/run_ui_tests_with_retry.sh .github/workflows/duo-ui-tests.yml].each do |path|
+      assert_includes paths, path
+    end
+    assert_equal ["duo-ui"], workflow.fetch("jobs").keys
+    job = workflow.fetch("jobs").fetch("duo-ui")
+    assert_equal true, job.fetch("continue-on-error")
+    refute job.key?("if"), "the job runs for every matching pull request"
+    # A run takes about 40 to 60 minutes; the limit is 75 minutes.
+    assert_equal 75, job.fetch("timeout-minutes")
+    refute_includes REQUIRED_CHECKS, job.fetch("name")
+    assert_equal({"contents" => "read"}, workflow.fetch("permissions"))
+    assert_equal @workflow.fetch("env").fetch("DEVELOPER_DIR"), workflow.fetch("env").fetch("DEVELOPER_DIR")
+  end
   def test_full_verification_uses_four_mac_runners_without_hygiene_waits
     mac_jobs = @workflow.fetch("jobs").select { |_, job| job["runs-on"] == "xcode-27" }
     assert_equal ["ios-ui-verification", "ios-verification", "macos-verification", "package-verification"], mac_jobs.keys.sort
@@ -479,6 +510,46 @@ class PullRequestWorkflowTests < Minitest::Test
     refute evaluate(package.fetch("if"), {"github.event_name" => "pull_request"})
     tests = package.fetch("steps").find { |step| step["id"] == "tests" }
     refute evaluate(tests.fetch("if"), {"github.event_name" => "pull_request"})
+  end
+
+  # `swift test -c release` alone does not build (ModuleNotTestable), so the release compile of the tests needs
+  # `-Xswiftc -enable-testing`. A test that uses a Debug-only seam outside `#if DEBUG` breaks only this build (#1101),
+  # and every other gate builds Debug.
+  def test_the_package_job_compiles_the_package_tests_in_release_and_its_result_requires_it
+    package = @workflow.fetch("jobs").fetch("package-verification")
+    steps = package.fetch("steps")
+    build = steps.find { |step| step["id"] == "release-test-build" }
+    refute_nil build, "The package job must build the package tests in the Release configuration"
+    command = build.fetch("run").gsub(/\s*\\\n\s*/, " ")
+    assert_includes command, "xcrun swift build --package-path Packages/EncryptedMemoriesKit"
+    # The scratch and cache of the package tests, so that the job creates no second build directory.
+    assert_includes command, '--scratch-path "$ENCRYPTED_MEMORIES_SPM_SCRATCH" --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE"'
+    assert_includes command, "--force-resolved-versions"
+    assert_includes command, "--build-tests -c release -Xswiftc -enable-testing"
+    refute_includes command, "swift test"
+    # A red Release build turns the step red: strict shell, no swallowed exit status, no continue-on-error.
+    assert_includes build.fetch("run"), "set -euo pipefail"
+    refute_match(/\|\||;\s*true/, command)
+    refute build.key?("continue-on-error"), "The Release build must not continue on error"
+    # It runs after a failed Debug run too, so one run reports both results.
+    assert_includes build.fetch("if"), "!cancelled()"
+    # It builds after the dependencies are ready and after the Debug tests, and it runs even when those tests fail.
+    assert_operator steps.index { |step| step["id"] == "prepare" }, :<, steps.index(build)
+    assert_operator steps.index { |step| step["id"] == "tests" }, :<, steps.index(build)
+    {"merge_group" => true, "workflow_dispatch" => true, "pull_request" => false}.each do |event, expected|
+      [["success", expected], ["failure", false]].each do |prepared, runs|
+        context = {"github.event_name" => event, "steps.prepare.outcome" => prepared}
+        assert_equal runs, evaluate(build.fetch("if"), context), "#{event}, prepare #{prepared}"
+      end
+    end
+    # The required check "Swift package tests" and the architecture check read this one output. A red Release
+    # build must turn it red, and a red Debug run must keep it red.
+    outcomes = %w[success failure skipped cancelled]
+    outcomes.product(outcomes).each do |debug, release|
+      context = {"steps.tests.outcome" => debug, "steps.release-test-build.outcome" => release}
+      verdict = evaluate(package.fetch("outputs").fetch("tests"), context)
+      assert_equal debug == "success" && release == "success", verdict == "success", "Debug #{debug}, Release #{release}"
+    end
   end
 
   def test_simulator_build_includes_both_test_bundles
@@ -539,7 +610,7 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal "${{ steps.ui.outcome }}", job.fetch("outputs").fetch("ui")
     # The wrapper keeps the first attempt next to this bundle, under the name that the upload step collects.
     assert_equal "${{ runner.temp }}/ios-ui.xcresult", ui.fetch("env").fetch("IOS_TEST_RESULT_BUNDLE_PATH")
-    assert_equal 90, job.fetch("timeout-minutes")
+    assert_equal 120, job.fetch("timeout-minutes")
     # The runner state is informational: it never decides the result, and it runs at the start and at the end.
     start = steps.find { |step| step["name"] == "Record the runner state at the start" }
     finish = steps.find { |step| step["name"] == "Record the runner state at the end" }
@@ -571,7 +642,7 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_includes hygiene.fetch("run"), "bash .github/scripts/test_run_ui_tests_with_retry.sh"
   end
 
-  def test_both_simulator_jobs_start_the_simulator_before_the_dependencies_and_never_depend_on_it
+  def test_both_simulator_jobs_boot_the_simulator_after_prepare_and_never_depend_on_it
     %w[ios-verification ios-ui-verification].each do |name|
       job = @workflow.fetch("jobs").fetch(name)
       steps = job.fetch("steps")
@@ -588,14 +659,34 @@ class PullRequestWorkflowTests < Minitest::Test
       assert_equal 2, boot.fetch("timeout-minutes"), name
       refute boot.key?("id"), "No step may depend on the start of the simulator in #{name}"
       assert_nil boot["if"], name
-      # The boot runs while the dependencies and the test bundles build.
-      prepare = steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+      # The boot finishes before the test bundles build, in both jobs.
       build = steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "build-for-testing" }
-      assert_operator steps.index(boot), :<, prepare, name
       assert_operator steps.index(boot), :<, build, name
       job.fetch("outputs", {}).each_value { |value| refute_includes value, boot.fetch("name"), name }
       steps.each { |step| refute_includes step["if"].to_s, "Start the simulator", name }
     end
+
+    # Both jobs boot the simulator after prepare (#1165): the UI job's prepare step took 12.9, 9.1 and 11.0
+    # minutes while it started the simulator before prepare, and 2.7 to 3.8 minutes in the job that boots after
+    # prepare. The order is the one difference between those measurements.
+    ios_steps = @workflow.fetch("jobs").fetch("ios-verification").fetch("steps")
+    ios_boot = ios_steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "boot-simulator" }
+    ios_prepare = ios_steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+    assert_operator ios_prepare, :<, ios_boot, "The iOS job starts the simulator after prepare"
+
+    ui_steps = @workflow.fetch("jobs").fetch("ios-ui-verification").fetch("steps")
+    ui_boot = ui_steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "boot-simulator" }
+    ui_prepare = ui_steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+    assert_operator ui_prepare, :<, ui_boot, "The UI job starts the simulator after prepare"
+
+    # The iOS job records the runner state before it boots, like the UI job.
+    ios_start = ios_steps.find { |step| step["name"] == "Record the runner state at the start" }
+    refute_nil ios_start, "The iOS job must record the runner state at the start"
+    assert_equal "bash .github/scripts/runner_state.sh start", ios_start.fetch("run")
+    assert_equal "${{ !cancelled() }}", ios_start.fetch("if")
+    assert_equal true, ios_start.fetch("continue-on-error")
+    assert_equal 2, ios_start.fetch("timeout-minutes")
+    assert_operator ios_steps.index(ios_start), :<, ios_prepare, "The iOS job records the runner state before prepare"
   end
 
   def test_the_test_steps_keep_a_result_bundle_so_that_a_run_without_tests_fails

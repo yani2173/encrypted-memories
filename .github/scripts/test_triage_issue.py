@@ -3,7 +3,7 @@ import json
 import pathlib
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.request import Request
 
 
@@ -108,6 +108,29 @@ class LLMConfigurationTests(unittest.TestCase):
         )
 
         self.assertNotIn("reasoning_effort", payload)
+
+    def test_every_issue_kind_must_receive_a_priority_from_the_schema(self) -> None:
+        for title, labels, kind in (
+            ("[Bug]: Backup stalls", [{"name": "bug"}], "bug"),
+            ("[Feature]: Add albums", [{"name": "enhancement"}], "feature_or_other"),
+        ):
+            with self.subTest(kind=kind):
+                payload = triage_issue.llm_payload(
+                    {"number": 23, "title": title, "body": "Steps", "labels": labels},
+                    [],
+                    model="custom-model",
+                )
+                schema = payload["response_format"]["json_schema"]["schema"]
+                system = payload["messages"][0]["content"]
+                user = json.loads(payload["messages"][1]["content"])
+
+                self.assertEqual(schema["properties"]["priority"]["enum"], ["P0", "P1", "P2", "P3"])
+                self.assertIn("priority", schema["required"])
+                self.assertEqual(user["new_issue"]["kind"], kind)
+                self.assertIn("Never answer NONE", system)
+                self.assertNotIn("Use NONE for every feature", system)
+                self.assertIn("P2 for a normal feature or improvement", system)
+                self.assertIn("P1 only for work that a release cannot ship without", system)
 
 
 class AuthenticatedRequestTests(unittest.TestCase):
@@ -383,6 +406,19 @@ class LLMResponseTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid priority"):
             triage_issue.parse_decision(json.dumps(decision), {17})
 
+    def test_none_priority_is_rejected_for_every_issue(self) -> None:
+        decision = triage_decision(priority="NONE", priority_reason="Not a bug.")
+
+        with self.assertRaisesRegex(RuntimeError, "invalid priority"):
+            triage_issue.parse_decision(json.dumps(decision), set())
+
+    def test_missing_priority_is_rejected(self) -> None:
+        decision = triage_decision()
+        del decision["priority"]
+
+        with self.assertRaisesRegex(RuntimeError, "invalid priority"):
+            triage_issue.parse_decision(json.dumps(decision), set())
+
     def test_non_string_priority_is_rejected(self) -> None:
         decision = triage_decision(priority=["P0"])
 
@@ -411,16 +447,16 @@ class LLMResponseTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "actionable issue"):
             triage_issue.parse_decision(json.dumps(decision), set())
 
-    def test_feature_request_receives_no_priority(self) -> None:
-        issue = {"title": "[Feature]: Add shared libraries", "labels": [{"name": "enhancement"}]}
+    def test_a_valid_priority_is_enforced_as_proposed(self) -> None:
+        for priority in ("P0", "P1", "P2", "P3"):
+            with self.subTest(priority=priority):
+                self.assertEqual(triage_issue.enforced_priority(priority), priority)
 
-        self.assertIsNone(triage_issue.enforced_priority(issue, "P0"))
-
-    def test_bug_must_receive_a_bug_priority(self) -> None:
-        issue = {"title": "[Bug]: Backup stalls", "labels": [{"name": "bug"}]}
-
-        with self.assertRaisesRegex(RuntimeError, "priority for a bug"):
-            triage_issue.enforced_priority(issue, "NONE")
+    def test_no_priority_is_never_invented(self) -> None:
+        for proposed in ("NONE", "", "p2", "priority:P2", "urgent"):
+            with self.subTest(proposed=proposed):
+                with self.assertRaisesRegex(RuntimeError, "did not return a priority"):
+                    triage_issue.enforced_priority(proposed)
 
     def test_comment_neutralizes_mentions(self) -> None:
         comment = triage_issue.triage_comment(
@@ -533,6 +569,23 @@ class MainFlowTests(unittest.TestCase):
 
         self.assertEqual(label, "priority:P0")
 
+    def test_existing_plain_priority_label_is_detected_and_wins_over_the_legacy_name(self) -> None:
+        for names, expected in (
+            ([{"name": "enhancement"}, {"name": "P1"}], "P1"),
+            ([{"name": "priority:P3"}, {"name": "P2"}], "P2"),
+            ([{"name": "enhancement"}], None),
+        ):
+            with self.subTest(expected=expected):
+                with patch.object(triage_issue, "github_request", return_value={"labels": names}):
+                    label = triage_issue.current_priority_label(
+                        "example/repo",
+                        23,
+                        token="token",
+                        api_url="https://api.github.test",
+                    )
+
+                self.assertEqual(label, expected)
+
     def test_concurrent_label_creation_accepts_another_run_winning_the_race(self) -> None:
         with patch.object(
             triage_issue,
@@ -607,23 +660,18 @@ class MainFlowTests(unittest.TestCase):
         self.assertEqual(add_labels.call_args.args[:2], ("example/repo", 23))
         self.assertEqual(
             add_labels.call_args.args[2],
-            ["triage:checked", "priority:P1", "possible duplicate"],
+            ["triage:checked", "P1", "possible duplicate"],
         )
         upsert_comment.assert_called_once()
         comment = upsert_comment.call_args.args[2]
         self.assertIn("A maintainer must confirm", comment)
 
-    def test_feature_request_never_receives_a_priority_label(self) -> None:
-        issue = {
-            "number": 24,
-            "title": "[Feature]: Add shared libraries",
-            "body": acknowledged_body("Use case"),
-            "labels": [{"name": "enhancement"}],
-        }
-        decision = triage_decision(
-            priority="NONE",
-            priority_reason="Priorities apply only to bugs.",
-        )
+    def run_main(
+        self,
+        issue: dict[str, object],
+        decision: dict[str, object],
+        current_labels: set[str],
+    ) -> tuple[int, MagicMock, MagicMock, MagicMock]:
         environment = {
             "GH_TOKEN": "github-test-token",
             "LLM_API_KEY": "llm-test-token",
@@ -633,7 +681,6 @@ class MainFlowTests(unittest.TestCase):
             "GITHUB_EVENT_PATH": "/tmp/test-event.json",
             "GITHUB_API_URL": "https://api.github.test",
         }
-
         with (
             patch.dict("os.environ", environment, clear=True),
             patch.object(triage_issue, "load_event", return_value=issue),
@@ -642,18 +689,84 @@ class MainFlowTests(unittest.TestCase):
             patch.object(triage_issue, "request_validated_llm_result", return_value=decision),
             patch.object(triage_issue, "ensure_label") as ensure_label,
             patch.object(triage_issue, "add_labels") as add_labels,
-            patch.object(triage_issue, "current_issue_labels", return_value={"enhancement"}),
-            patch.object(triage_issue, "current_priority_label") as current_priority_label,
+            patch.object(triage_issue, "current_issue_labels", return_value=current_labels),
             patch.object(triage_issue, "upsert_comment") as upsert_comment,
         ):
             result = triage_issue.main()
+        return result, ensure_label, add_labels, upsert_comment
+
+    def test_feature_request_receives_a_priority_label(self) -> None:
+        issue = {
+            "number": 24,
+            "title": "[Feature]: Add shared libraries",
+            "body": acknowledged_body("Use case"),
+            "labels": [{"name": "enhancement"}],
+        }
+        decision = triage_decision(priority="P2", priority_reason="A normal feature.")
+
+        result, ensure_label, add_labels, upsert_comment = self.run_main(issue, decision, {"enhancement"})
 
         self.assertEqual(result, 0)
-        ensure_label.assert_called_once()
-        current_priority_label.assert_not_called()
-        self.assertEqual(add_labels.call_args.args[2], ["triage:checked"])
-        upsert_comment.assert_called_once()
-        self.assertIn("no strong duplicate", upsert_comment.call_args.args[2])
+        self.assertEqual(
+            [call.args[1] for call in ensure_label.call_args_list],
+            ["triage:checked", "P2"],
+        )
+        add_labels.assert_called_once()
+        self.assertEqual(add_labels.call_args.args[2], ["triage:checked", "P2"])
+        comment = upsert_comment.call_args.args[2]
+        self.assertIn("Initial priority: **P2**", comment)
+        self.assertNotIn("not assigned", comment)
+
+    def test_existing_priority_label_is_kept_and_applied_once(self) -> None:
+        issue = {
+            "number": 24,
+            "title": "[Feature]: Add shared libraries",
+            "body": acknowledged_body("Use case"),
+            "labels": [{"name": "enhancement"}, {"name": "P1"}],
+        }
+        decision = triage_decision(priority="P3", priority_reason="A nicety.")
+
+        result, ensure_label, add_labels, upsert_comment = self.run_main(
+            issue, decision, {"enhancement", "P1"}
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call.args[1] for call in ensure_label.call_args_list], ["triage:checked"])
+        add_labels.assert_called_once()
+        applied = add_labels.call_args.args[2]
+        self.assertEqual(applied, ["triage:checked", "P1"])
+        self.assertEqual(len(applied), len(set(applied)))
+        self.assertIn("Initial priority: **P1**", upsert_comment.call_args.args[2])
+
+    def test_legacy_priority_label_is_kept_instead_of_adding_a_second_one(self) -> None:
+        issue = {
+            "number": 24,
+            "title": "[Bug]: Backup stalls",
+            "body": acknowledged_body("Steps"),
+            "labels": [{"name": "bug"}, {"name": "priority:P0"}],
+        }
+        decision = triage_decision(priority="P2", priority_reason="Limited impact.")
+
+        _, ensure_label, add_labels, upsert_comment = self.run_main(
+            issue, decision, {"bug", "priority:P0"}
+        )
+
+        self.assertEqual([call.args[1] for call in ensure_label.call_args_list], ["triage:checked"])
+        self.assertEqual(add_labels.call_args.args[2], ["triage:checked", "priority:P0"])
+        self.assertIn("Initial priority: **P0**", upsert_comment.call_args.args[2])
+
+    def test_unusable_priority_fails_the_job(self) -> None:
+        issue = {
+            "number": 24,
+            "title": "[Feature]: Add shared libraries",
+            "body": acknowledged_body("Use case"),
+            "labels": [{"name": "enhancement"}],
+        }
+        for priority in ("NONE", "urgent"):
+            with self.subTest(priority=priority):
+                decision = triage_decision(priority=priority)
+                with self.assertRaisesRegex(RuntimeError, "did not return a priority"):
+                    self.run_main(issue, decision, {"enhancement"})
 
     def test_duplicate_label_is_preserved_when_rerun_finds_no_strong_duplicate(self) -> None:
         issue = {
@@ -700,7 +813,7 @@ class MainFlowTests(unittest.TestCase):
         add_labels.assert_called_once_with(
             "example/repo",
             24,
-            ["triage:checked", "priority:P1"],
+            ["triage:checked", "P1"],
             token="github-test-token",
             api_url="https://api.github.test",
         )

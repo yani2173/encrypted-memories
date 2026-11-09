@@ -3,6 +3,8 @@ import SQLite3
 
 /// The step of a store check at which SQLite failed. A test names the step to supply its answer.
 public enum SQLiteCheckStep: Sendable, Equatable {
+    /// The read-write open of the store.
+    case open
     /// The read-only inspection of the file.
     case inspection
     /// The read-write inspection of the temporary copy.
@@ -11,6 +13,8 @@ public enum SQLiteCheckStep: Sendable, Equatable {
     case verification
     /// SQLite's own integrity check of a cache.
     case quickCheck
+    /// A read or write of a rebuildable cache after the store has opened.
+    case cacheOperation
 }
 
 /// SQLite's answer to a failed call on a connection: the extended result code and the operating-system error under
@@ -77,6 +81,18 @@ public struct SQLiteFailureProbe: Sendable {
     public static let live = SQLiteFailureProbe(
         failure: { db, _ in SQLiteFailure(of: db) },
         volumeIsFull: { url, _ in DeviceStorage.volumeHasNoFreeBlocks(at: url) })
+
+    func keepsFileAfterFailedOpen(closing db: OpaquePointer?) -> Bool {
+        defer { sqlite3_close(db) }
+        guard let db, SQLiteFailure(of: db).isError else { return false }
+        let answer = failure(db, .open)
+        let code = answer.code & 0xFF
+        guard code == SQLITE_FULL || code == SQLITE_CANTOPEN,
+            let path = sqlite3_db_filename(db, "main").map({ String(cString: $0) }), !path.isEmpty,
+            volumeIsFull(URL(fileURLWithPath: path), .open) == true
+        else { return false }
+        return true
+    }
 
     /// Whether the failure of `db`'s last call keeps the file. A call that did not fail never does: the connection is
     /// read first, and only a real failure reaches the answer of `failure`. Call it before any other call on `db`.

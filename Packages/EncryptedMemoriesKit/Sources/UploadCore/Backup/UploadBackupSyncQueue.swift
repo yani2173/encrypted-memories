@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 public enum UploadBackupSyncQueueState: String, Sendable, Codable, CaseIterable {
     case discovered
@@ -189,21 +190,6 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
         alreadyBackedUp + uploaded
     }
 
-    /// Successful queue outcomes, including an explicit remote deletion the backup policy respects.
-    /// `resolved` stays narrower because UI may call only actually-present items "backed up".
-    public var settledSuccessfully: Int {
-        resolved + skippedRemoteDeletions
-    }
-
-    public var progressFraction: Double {
-        guard total > 0 else { return 0 }
-        return Double(settledSuccessfully) / Double(total)
-    }
-
-    public var hasWork: Bool {
-        total > 0 && settledSuccessfully < total
-    }
-
     public mutating func include(_ state: UploadBackupSyncQueueState, count: Int = 1) {
         let count = max(0, count)
         total += count
@@ -259,9 +245,17 @@ public enum UploadBackupCatalogReplayState: Int, Sendable, Codable {
 }
 
 public protocol UploadBackupSyncQueueStore: Sendable {
+    /// Optional atomic restore recheck capability. Nil means unsupported, without changing the store.
+    /// The operation returns true after the exact terminal row reopens, false after a lost CAS, or nil on failure.
+    var restoredCompoundReopener: (@Sendable (UploadBackupSyncQueueEntry, Date) -> Bool?)? { get }
     /// False after a SQLite operation failed or the store was closed. An empty read is safe to
     /// interpret as "drained" only while this remains true.
     func isOperational() -> Bool
+    /// How many failures the store recorded so far, also the ones that its health check forgot since. The runner notes
+    /// the count when a pass starts and compares it at every health guard of the pass, so a write or read that failed
+    /// during the pass, also one of another reader of the same store, ends the pass as unknown (#1004). Every store
+    /// implements it; a store that answers a constant switches that guard off.
+    func recordedFailureCount() -> UInt64
     /// Makes every committed change survive a power loss. Returns false when that is not certain.
     func synchronizeToDisk() -> Bool
     /// Persists one row. The row survives a power loss once this returns true.
@@ -277,34 +271,39 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func updateDismissedSourceRecheck(
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
     ) -> Bool?
-    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry?
+    /// Reads one row. Throws `SQLiteStoreUnknownReadError` when the read could not run, so callers never mistake a
+    /// failed read for a real absence (#1004).
+    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry?
     /// Bounded, strict scan of every row carrying durable remote-commit evidence, independent of
     /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
     func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry]
-    func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry]
     /// Earliest persisted eligibility time for any runnable row outside `excludedSources` (same kind and identifier,
     /// as in `claimRunnable`). Retry delays survive process death, so a restarted runner can wait for due work
     /// instead of declaring the queue drained.
     func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date?
-    /// Earliest eligible/backoff row for status and scheduling. Unlike `nextRunnable(limit:)`, this
+    /// Earliest eligible/backoff row for status and scheduling. Unlike `claimRunnable`, this
     /// is ordered by eligibility rather than newest-photo execution priority.
     func earliestRunnableEntry() -> UploadBackupSyncQueueEntry?
     func earliestEntry(in state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry?
-    func containsAny(in states: [UploadBackupSyncQueueState]) -> Bool
+    /// True when any row carries one of `states`. Throws `SQLiteStoreUnknownReadError` when the read could not run,
+    /// so a caller never treats a failed read as "no such rows" (#1004).
+    func containsAny(in states: [UploadBackupSyncQueueState]) throws -> Bool
     /// Atomically reserves runnable rows for one runner. Returned entries keep their pre-claim
     /// state so the runner can mirror progress accurately; the store has already moved them to an
     /// active state, so another runner cannot take the same work. Crash recovery demotes these
     /// active rows back to runnable via `requeueStaleActive`. Rows of a source in `excludedSources` (same kind and
     /// identifier, any resource or revision) stay unclaimed: the runner passes the sources it processes, because
     /// their rows can be runnable for a moment, for example while the paired video of an uploaded photo uploads.
+    /// Nil means the claim failed and changed nothing; an empty claim is only an empty array.
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
-    ) -> [UploadBackupSyncQueueEntry]
+    ) -> [UploadBackupSyncQueueEntry]?
     /// Rows currently in `state` whose `updatedAt` is older than `updatedBefore`, oldest first.
     /// The runner uses this to find parked `blockedByDraft` rows whose re-check backoff elapsed.
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
+    /// Nil means the write failed and changed nothing; the caller must not continue as if stale rows were requeued.
     @discardableResult
-    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int
+    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int?
     /// Makes every non-active retryable row immediately eligible for an explicit user retry.
     /// Terminal successes, respected remote deletions, and missing local sources are untouched.
     @discardableResult
@@ -362,19 +361,29 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// Acknowledges one permanent failure without claiming the item was backed up.
     @discardableResult
     func dismissPermanentFailure(source: UploadSourceIdentity, revision: UploadBackupRevision, updatedAt: Date) -> Bool
-    func summary() -> UploadBackupSyncQueueSummary
-    func count() -> Int
+    /// Nil means the durable queue could not be read, not that it is empty (#1004).
+    func summary() -> UploadBackupSyncQueueSummary?
+    /// Nil means the durable queue could not be read, not that it is empty (#1004).
+    func count() -> Int?
     func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord?
     @discardableResult
     func setRuntimeIssue(_ issue: BackupIssueRecord?, for key: BackupRuntimeIssueKey) -> Bool
+    /// Complete reads for decisions. Each throws `SQLiteStoreUnknownReadError` when the read could not run completely,
+    /// so a decision never treats a failed read as "nothing waits" (#1004).
+    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date?
+    func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry?
+    func decisionEntries(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
+    ) throws -> [UploadBackupSyncQueueEntry]
+    func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord?
 }
 
 public extension UploadBackupSyncQueueStore {
+    var restoredCompoundReopener: (@Sendable (UploadBackupSyncQueueEntry, Date) -> Bool?)? { nil }
+
     func updateDismissedSourceRecheck(
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
     ) -> Bool? { nil }
-
-    func isOperational() -> Bool { true }
 
     func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         remove(source: source, revision: revision)
@@ -388,16 +397,12 @@ public extension UploadBackupSyncQueueStore {
         nextRunnableDate(excludingSourcesOf: [])
     }
 
-    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry]? {
         claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
     }
 
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         entries.allSatisfy(upsert)
-    }
-
-    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? {
-        nextRunnable(limit: Int.max).min { $0.updatedAt < $1.updatedAt }
     }
 
     func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry] {
@@ -425,11 +430,34 @@ public extension UploadBackupSyncQueueStore {
             .min { $0.updatedAt < $1.updatedAt }
     }
 
-    func containsAny(in states: [UploadBackupSyncQueueState]) -> Bool {
-        states.contains { earliestEntry(in: $0) != nil }
+    func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? { nil }
+
+    /// Stores without a complete read prove a result by their health after the read.
+    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
+        let date = nextRunnableDate(excludingSourcesOf: excludedSources)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return date
     }
 
-    func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? { nil }
+    func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
+        let entry = earliestEntry(in: state)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return entry
+    }
+
+    func decisionEntries(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
+    ) throws -> [UploadBackupSyncQueueEntry] {
+        let result = entries(in: state, updatedBefore: updatedBefore, limit: limit)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return result
+    }
+
+    func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord? {
+        let issue = runtimeIssue(for: key)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return issue
+    }
 
     @discardableResult
     func setRuntimeIssue(_ issue: BackupIssueRecord?, for key: BackupRuntimeIssueKey) -> Bool { true }
@@ -442,7 +470,7 @@ public extension UploadBackupSyncQueueStore {
         lastError: String?,
         updatedAt: Date
     ) -> Bool {
-        guard var entry = entry(for: source, revision: revision) else { return false }
+        guard var entry = (try? entry(for: source, revision: revision)) ?? nil else { return false }
         entry.state = .needsRemoteReconciliation
         entry.lastError = lastError
         entry.remoteCommitReconciliation = reconciliation
@@ -482,12 +510,6 @@ public extension UploadBackupSyncQueueStore {
         return changed
     }
 
-    func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool { false }
-
-    func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
-        true
-    }
-
     func removeUnsavedEarlierRevisions(
         of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
     ) -> Bool {
@@ -504,20 +526,21 @@ public extension UploadBackupSyncQueueStore {
         return true
     }
 
-    func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int { 0 }
-
     @discardableResult
     func dismissPermanentFailure(
         source: UploadSourceIdentity,
         revision: UploadBackupRevision,
         updatedAt: Date
     ) -> Bool {
-        updateState(
+        // The dismissed row keeps its record: a missing photo needs it to be checked again when its bytes return. A
+        // row that could not be read is not dismissed, so a failed read never writes an empty record (#1004 B2).
+        guard let current = (try? entry(for: source, revision: revision)) ?? nil else { return false }
+        return updateState(
             source: source,
             revision: revision,
             state: .dismissedFailure,
             attempts: nil,
-            lastError: entry(for: source, revision: revision)?.lastError,
+            lastError: current.lastError,
             updatedAt: updatedAt
         )
     }

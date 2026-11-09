@@ -282,7 +282,6 @@ public struct TimelineSearchQuery: Equatable, Sendable {
         let value = normalize(mediaType)
         return value.contains("raw")
             || value.contains("dng")
-            || value.contains("x-adobe-dng")
             || value.contains("x-canon-cr2")
             || value.contains("x-canon-cr3")
             || value.contains("x-nikon-nef")

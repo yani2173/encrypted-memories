@@ -6,7 +6,7 @@ import Testing
 @testable import TimelineFeature
 
 /// `hitTest(cursorViewportPoint)` must return the same item before the gesture, during the transaction,
-/// and after the first settled frame. Pinches use the cursor item; toolbar and keyboard changes use the viewport
+/// and after the first settled frame. Pinches use the cursor item; toolbar changes use the viewport
 /// center. `beginZoomTransaction` resolves against the committed column phase.
 @Suite struct GridZoomAnchorIdentityTests {
     private let viewport = CGSize(width: 900, height: 700)
@@ -211,9 +211,6 @@ import Testing
         GridZoomAnchorLog.begin(
             trigger: .pinch, cursorViewportPoint: p, cursorContentPoint: p,
             hoveredIndexAtBegin: 5, transactionAnchorIndex: 5, level: 2)
-        GridZoomAnchorLog.live(
-            levelPosition: 3.5, cursorViewportPoint: p, indexUnderCursor: 5,
-            transactionAnchorIndex: 5, focusRow: [4, 5, 6])
         GridZoomAnchorLog.release(
             targetLevel: 4, cursorViewportPoint: p, indexUnderCursorBeforeCommit: 5,
             transactionAnchorIndex: 5, committedPhase: 3, targetScrollY: 100, bridgeWillRun: true)
@@ -230,10 +227,6 @@ import Testing
         #expect(GridZoomTrigger.pinch.anchorMode == .cursor)
         #expect(GridZoomTrigger.toolbarPlus.anchorMode == .viewportCenter)
         #expect(GridZoomTrigger.toolbarMinus.anchorMode == .viewportCenter)
-        #expect(GridZoomTrigger.keyboardPlus.anchorMode == .viewportCenter)
-        #expect(GridZoomTrigger.keyboardMinus.anchorMode == .viewportCenter)
-        #expect(GridZoomTrigger.pinch.isPlusMinus == false)
-        #expect(GridZoomTrigger.keyboardMinus.isPlusMinus == true)
     }
 
     // Repeated gestures preserve the cursor item across committed phases.

@@ -17,9 +17,11 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
     private let connection: SQLiteStoreConnection
     private var db: OpaquePointer? { connection.database }
     private static let schemaVersion = 1
+    private static let schemaVersionRow = SQLiteInfoTableVersion(
+        table: "mapping_info", version: schemaVersion, stampReplacesExistingRow: true)
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
-        guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
+        guard let handle = Self.openOnce(url: url, policy: policy) else { return nil }
         connection = SQLiteStoreConnection(database: handle)
     }
 
@@ -31,12 +33,8 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
 
     // MARK: Open / schema
 
-    private static func openVerified(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        // Album mappings are authoritative state, not a rebuildable cache. A transient open,
-        // schema, or I/O failure must disable sync instead of deleting the durable mapping.
-        openOnce(url: url, policy: policy)
-    }
-
+    /// Album mappings are authoritative state, not a rebuildable cache. A transient open,
+    /// schema, or I/O failure must disable sync instead of deleting the durable mapping.
     private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
         let schema = """
             CREATE TABLE IF NOT EXISTS mapping_info(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -62,33 +60,9 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
             schemaSQL: schema,
             policy: policy,
             includeMemoryTuning: false,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
+            verifyVersion: schemaVersionRow.verify,
+            stampVersion: schemaVersionRow.stamp
         )
-    }
-
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
-        var stmt: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(handle, "SELECT value FROM mapping_info WHERE key='schema';", -1, &stmt, nil)
-                == SQLITE_OK
-        else {
-            return false
-        }
-        var onDisk: Int?
-        let result = sqlite3_step(stmt)
-        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
-        sqlite3_finalize(stmt)
-        return result == SQLITE_ROW && onDisk == schemaVersion
-    }
-
-    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
-        return sqlite3_exec(
-            handle,
-            "INSERT INTO mapping_info(key, value) VALUES('schema', \(schemaVersion)) "
-                + "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-            nil, nil, nil
-        ) == SQLITE_OK
     }
 
     // MARK: API
@@ -178,22 +152,6 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
             }
             sqlite3_bind_int64(stmt, 7, Int64(mapping.lastAttachedCount))
             sqlite3_bind_int64(stmt, 8, Int64(mapping.lastFailedCount))
-            return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
-        }
-    }
-
-    @discardableResult
-    public func removeMapping(localAlbumID: String) -> Bool {
-        connection.withLock {
-            var stmt: OpaquePointer?
-            guard
-                connection.requireOperational(
-                    sqlite3_prepare_v2(db, "DELETE FROM album_sync_mapping WHERE local_album_id=?;", -1, &stmt, nil)
-                        == SQLITE_OK
-                )
-            else { return false }
-            defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_text(stmt, 1, localAlbumID, -1, Self.transient)
             return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }

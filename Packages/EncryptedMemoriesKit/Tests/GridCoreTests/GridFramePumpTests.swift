@@ -16,6 +16,33 @@ final class GridFramePumpTests: XCTestCase {
         XCTAssertFalse(pump.beginTick())
     }
 
+    func testEncodingFailuresRetryBoundedTimesThenWaitForAnInvalidation() {
+        var pump = GridFramePump()
+        for _ in 0..<GridFramePump.maximumEncodingRetries {
+            XCTAssertTrue(pump.beginTick())
+            XCTAssertTrue(pump.completeTick(.encodingFailed))
+        }
+        XCTAssertTrue(pump.beginTick())
+        XCTAssertFalse(pump.completeTick(.encodingFailed))
+        XCTAssertFalse(pump.shouldTick)
+        pump.invalidate()
+        XCTAssertTrue(pump.beginTick())
+        XCTAssertTrue(pump.completeTick(.encodingFailed))
+    }
+
+    func testASuccessfulFrameResetsTheEncodingRetryBudget() {
+        var pump = GridFramePump()
+        for _ in 0..<GridFramePump.maximumEncodingRetries {
+            XCTAssertTrue(pump.beginTick())
+            XCTAssertTrue(pump.completeTick(.encodingFailed))
+        }
+        XCTAssertTrue(pump.beginTick())
+        XCTAssertFalse(pump.completeTick(.drawn(hasPendingWork: false)))
+        pump.invalidate()
+        XCTAssertTrue(pump.beginTick())
+        XCTAssertTrue(pump.completeTick(.encodingFailed))
+    }
+
     func testInvalidationDuringRenderSurvivesSuccessfulFrame() {
         var pump = GridFramePump()
         XCTAssertTrue(pump.beginTick())

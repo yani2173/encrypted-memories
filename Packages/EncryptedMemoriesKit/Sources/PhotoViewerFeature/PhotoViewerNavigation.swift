@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Previous, Next, Close and Show Original of the focused photo viewer, published to the scene so the app's View
+/// Previous, Next, Close, Show Original and Revert to Original of the focused photo viewer, published to the scene so the app's View
 /// menu can offer them as native commands.
 ///
 /// Close needs the menu route as well: `onExitCommand` only fires while the viewer or one of its descendants
@@ -15,6 +15,9 @@ public struct PhotoViewerNavigation {
     public let canShowOriginal: Bool
     public let isShowingOriginal: Bool
     public let toggleOriginal: () -> Void
+    /// "Revert to Original…" is available: the page is an edited photo of the own library and nothing runs.
+    public let canRevertToOriginal: Bool
+    public let revertToOriginal: () -> Void
 }
 
 extension FocusedValues {

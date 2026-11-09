@@ -1,4 +1,3 @@
-import CoreGraphics
 import Foundation
 import OSLog
 
@@ -111,122 +110,6 @@ public struct WarmDecodedResult: Equatable, Sendable {
     }
 }
 
-public enum ThumbnailVisualState: String, CaseIterable, Codable, Sendable {
-    case realImageDrawn
-    case placeholderDrawn
-    case diskMissing
-    case diskHitRamMissing
-    case ramHitGpuMissing
-    case atlasMissing
-    case geometryHole
-    case intentionallyClipped
-    case unknownBug
-}
-
-public struct ThumbnailVisualClassification: Sendable, Equatable {
-    public let uid: PhotoUID?
-    public let rect: CGRect
-    public let state: ThumbnailVisualState
-    public let phase: String
-    public let context: String
-
-    public init(
-        uid: PhotoUID?,
-        rect: CGRect,
-        state: ThumbnailVisualState,
-        phase: String,
-        context: String = ""
-    ) {
-        self.uid = uid
-        self.rect = rect
-        self.state = state
-        self.phase = phase
-        self.context = context
-    }
-}
-
-public struct ThumbnailHealthCounters: Sendable, Equatable {
-    public var visibleCount = 0
-    public var realImageDrawn = 0
-    public var placeholderDrawn = 0
-    public var diskMissing = 0
-    public var diskHitRamMissing = 0
-    public var ramHitGpuMissing = 0
-    public var atlasMissing = 0
-    public var geometryHole = 0
-    public var intentionallyClipped = 0
-    public var unknownBug = 0
-
-    public init() {}
-
-    public mutating func record(_ state: ThumbnailVisualState) {
-        visibleCount += 1
-        switch state {
-        case .realImageDrawn: realImageDrawn += 1
-        case .placeholderDrawn: placeholderDrawn += 1
-        case .diskMissing: diskMissing += 1
-        case .diskHitRamMissing: diskHitRamMissing += 1
-        case .ramHitGpuMissing: ramHitGpuMissing += 1
-        case .atlasMissing: atlasMissing += 1
-        case .geometryHole: geometryHole += 1
-        case .intentionallyClipped: intentionallyClipped += 1
-        case .unknownBug: unknownBug += 1
-        }
-    }
-}
-
-public struct GridZoomHotPathCounters: Sendable, Equatable {
-    public var dbQueryDuringPinch = 0
-    public var diskReadDuringPinch = 0
-    /// Cheap `cache.has(_)` existence probes during a pinch - not actual byte reads. Split out from
-    /// `diskReadDuringPinch` so the "disk read" stat reflects real `diskData(_)` reads only.
-    public var diskPresenceCheckDuringPinch = 0
-    public var decodeDuringPinch = 0
-    public var networkRequestDuringPinch = 0
-
-    public init() {}
-}
-
-public struct ThumbnailDecodeStats: Sendable, Equatable {
-    public var diskCacheHit = 0
-    public var diskCacheMiss = 0
-    public var ramDecodeHit = 0
-    public var ramDecodeMiss = 0
-    public var ramDecodeStarted = 0
-    public var ramDecodeCompleted = 0
-    public var ramDecodeFailed = 0
-    public var ramDecodeQueueDepth = 0
-    public var ramDecodeAverageMs: Double = 0
-    public var ramDecodeP95Ms: Double = 0
-
-    public init() {}
-}
-
-public struct DBQueryMetric: Sendable, Equatable {
-    public let queryName: String
-    public let durationMs: Double
-    public let rowsReturned: Int
-    public let ranOnMainThread: Bool
-    public let duringActivePinch: Bool
-    public let timestamp: Date
-
-    public init(
-        queryName: String,
-        durationMs: Double,
-        rowsReturned: Int,
-        ranOnMainThread: Bool,
-        duringActivePinch: Bool,
-        timestamp: Date = Date()
-    ) {
-        self.queryName = queryName
-        self.durationMs = durationMs
-        self.rowsReturned = rowsReturned
-        self.ranOnMainThread = ranOnMainThread
-        self.duringActivePinch = duringActivePinch
-        self.timestamp = timestamp
-    }
-}
-
 public struct SupportDiagnosticEvent: Codable, Sendable, Equatable {
     public let timestamp: Date
     public let category: String
@@ -282,8 +165,14 @@ public final class PhotoDiagnostics: @unchecked Sendable {
     /// useful for live diagnostics, but a future caller cannot accidentally export an asset-derived
     /// suffix merely by choosing a familiar prefix.
     private static let supportCounterKeys: Set<String> = [
+        "backgroundWindows.endWaitTimedOut",
+        "backgroundWindows.ledgerReset",
+        "backgroundWindows.requestWentAheadOfALateOne",
         "backup.metadata.equalCoordinates",
         "duplicates.thumbnail.blankOver3Seconds",
+        "folderScan.unreadableEntrySkips.missing",
+        "folderScan.unreadableEntrySkips.permissionDenied",
+        "folderScan.unreadableEntrySkips.transient",
         "metrickit.diagnosticPayloads",
         "metrickit.metricPayloads",
         "ml.suggestions.cacheReadFailed",
@@ -297,6 +186,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         "ml.suggestions.snapshotWriteSuperseded",
         "perf.videoPrefetchDeduped",
         "perf.videoPrefetchScheduled",
+        "smartSearch.catalogProtectionFailed",
         "thumb.decodedUpgrade",
         "thumb.directLoadOverlapsBatch",
         "thumb.diskCacheHit",
@@ -315,15 +205,9 @@ public final class PhotoDiagnostics: @unchecked Sendable {
     ]
 
     private let lock = NSLock()
-    private var activePinch = false
-    private var dbQueries: [DBQueryMetric] = []
     private var counters: [String: Int] = [:]
     private var eventThrottle = BoundedDiagnosticsThrottle()
     private var supportEvents: [SupportDiagnosticEvent] = []
-    private var thumbHealth = ThumbnailHealthCounters()
-    private var hotPath = GridZoomHotPathCounters()
-    private var decodeDurationsMs: [Double] = []
-    private var decodeQueueDepth = 0
     private let debugConsoleLogsAreEnabled: Bool
 
     public convenience init() {
@@ -338,16 +222,6 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         debugConsoleLogsAreEnabled = debugConsoleLogsEnabled
     }
 
-    public func setActivePinch(_ active: Bool) {
-        lock.withLock {
-            activePinch = active
-        }
-    }
-
-    public func isActivePinch() -> Bool {
-        lock.withLock { activePinch }
-    }
-
     public func increment(_ key: String, by amount: Int = 1) {
         lock.withLock {
             counters[key, default: 0] += amount
@@ -360,38 +234,15 @@ public final class PhotoDiagnostics: @unchecked Sendable {
 
     public func resetForTests() {
         lock.withLock {
-            activePinch = false
-            dbQueries.removeAll()
             counters.removeAll()
             eventThrottle.removeAll()
             supportEvents.removeAll()
-            thumbHealth = ThumbnailHealthCounters()
-            hotPath = GridZoomHotPathCounters()
-            decodeDurationsMs.removeAll()
-            decodeQueueDepth = 0
         }
     }
 
     public func recordDBQuery(queryName: String, durationMs: Double, rowsReturned: Int) {
         let ranOnMain = Thread.isMainThread
-        let duringPinch = isActivePinch()
-        if duringPinch {
-            lock.withLock { hotPath.dbQueryDuringPinch += 1 }
-        }
-        let metric = DBQueryMetric(
-            queryName: queryName,
-            durationMs: durationMs,
-            rowsReturned: rowsReturned,
-            ranOnMainThread: ranOnMain,
-            duringActivePinch: duringPinch
-        )
-        lock.withLock {
-            dbQueries.append(metric)
-            if dbQueries.count > 500 {
-                dbQueries.removeFirst(dbQueries.count - 500)
-            }
-        }
-        if duringPinch || ranOnMain || durationMs > 5 {
+        if ranOnMain || durationMs > 5 {
             emit(
                 "DBHealth",
                 [
@@ -399,110 +250,8 @@ public final class PhotoDiagnostics: @unchecked Sendable {
                     "durationMs": format(durationMs),
                     "rows": "\(rowsReturned)",
                     "main": "\(ranOnMain)",
-                    "activePinch": "\(duringPinch)",
                 ])
         }
-    }
-
-    public func classifyThumbnail(_ classification: ThumbnailVisualClassification) {
-        lock.withLock {
-            thumbHealth.record(classification.state)
-        }
-        switch classification.state {
-        case .geometryHole, .unknownBug, .atlasMissing:
-            emit(
-                "ThumbHealth",
-                [
-                    "uid": classification.uid.map { "\($0.volumeID)~\($0.nodeID)" } ?? "none",
-                    "rect": rectDescription(classification.rect),
-                    "state": classification.state.rawValue,
-                    "phase": classification.phase,
-                    "context": classification.context,
-                ], throttleSeconds: 0.10)
-        default:
-            break
-        }
-    }
-
-    public func thumbHealthCounters(reset: Bool = false) -> ThumbnailHealthCounters {
-        lock.withLock {
-            let snapshot = thumbHealth
-            if reset { thumbHealth = ThumbnailHealthCounters() }
-            return snapshot
-        }
-    }
-
-    public func recordDiskReadDuringPinch() {
-        guard isActivePinch() else { return }
-        lock.withLock { hotPath.diskReadDuringPinch += 1 }
-    }
-
-    /// Records a cheap on-disk *presence* check (`cache.has`), distinct from an actual byte read, so
-    /// presence probes don't inflate the `diskReadDuringPinch` stat.
-    public func recordDiskPresenceCheckDuringPinch() {
-        guard isActivePinch() else { return }
-        lock.withLock { hotPath.diskPresenceCheckDuringPinch += 1 }
-    }
-
-    public func recordNetworkRequestDuringPinch() {
-        guard isActivePinch() else { return }
-        lock.withLock { hotPath.networkRequestDuringPinch += 1 }
-    }
-
-    public func recordDecodeStarted(queueDepth: Int) {
-        lock.withLock {
-            counters["thumb.ramDecodeStarted", default: 0] += 1
-            decodeQueueDepth = queueDepth
-            if activePinch { hotPath.decodeDuringPinch += 1 }
-        }
-    }
-
-    public func recordDecodeCompleted(durationMs: Double, queueDepth: Int) {
-        lock.withLock {
-            counters["thumb.ramDecodeCompleted", default: 0] += 1
-            decodeQueueDepth = queueDepth
-            decodeDurationsMs.append(durationMs)
-            if decodeDurationsMs.count > 500 {
-                decodeDurationsMs.removeFirst(decodeDurationsMs.count - 500)
-            }
-        }
-    }
-
-    public func recordDecodeFailed(queueDepth: Int) {
-        lock.withLock {
-            counters["thumb.ramDecodeFailed", default: 0] += 1
-            decodeQueueDepth = queueDepth
-        }
-    }
-
-    public func decodeStats() -> ThumbnailDecodeStats {
-        lock.withLock {
-            var stats = ThumbnailDecodeStats()
-            stats.diskCacheHit = counters["thumb.diskCacheHit", default: 0]
-            stats.diskCacheMiss = counters["thumb.diskCacheMiss", default: 0]
-            stats.ramDecodeHit = counters["thumb.ramDecodedHit", default: 0]
-            stats.ramDecodeMiss = counters["thumb.ramDecodeMiss", default: 0]
-            stats.ramDecodeStarted = counters["thumb.ramDecodeStarted", default: 0]
-            stats.ramDecodeCompleted = counters["thumb.ramDecodeCompleted", default: 0]
-            stats.ramDecodeFailed =
-                counters["thumb.ramDecodeFailed", default: 0] + counters["thumb.diskDecodeFailed", default: 0]
-            stats.ramDecodeQueueDepth = decodeQueueDepth
-            stats.ramDecodeAverageMs = average(decodeDurationsMs)
-            stats.ramDecodeP95Ms = percentile(decodeDurationsMs, p: 0.95)
-            return stats
-        }
-    }
-
-    public func hotPathCounters(reset: Bool = false) -> GridZoomHotPathCounters {
-        lock.withLock {
-            let snapshot = hotPath
-            if reset { hotPath = GridZoomHotPathCounters() }
-            return snapshot
-        }
-    }
-
-    public func dbQueryCountDuringActivePinch() -> Int {
-        lock.withLock { dbQueries.filter(\.duringActivePinch).count }
     }
 
     public func emit(_ event: String, _ fields: [String: String], throttleSeconds: TimeInterval = 0) {
@@ -633,7 +382,13 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         case "MetricKit":
             allowedFields = ["diagnosticPayloads", "metricPayloads"]
         case "SearchSuggestions":
-            allowedFields = ["action", "result", "durationMs"]
+            allowedFields = [
+                "action", "result", "durationMs", "event", "outcome", "versionMatches", "modelMatches",
+                "evidenceComplete", "exactContent", "eligible", "librarySettled", "cacheContentSettled",
+                "generationAllowed", "lowPower", "thermal", "memory", "foreground", "searchCount", "transferCount",
+            ]
+        case "MediaFeed":
+            allowedFields = ["event", "items", "durationMs"]
         case "DeviceIdentityKeychain":
             allowedFields = ["operation", "status"]
         case "MLCatalogRefresh":
@@ -646,27 +401,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         return fields.filter { allowedFields.contains($0.key) }
     }
 
-    private func rectDescription(_ rect: CGRect) -> String {
-        "(\(format(rect.minX)),\(format(rect.minY)),\(format(rect.width)),\(format(rect.height)))"
-    }
-
-    private func format(_ value: CGFloat) -> String {
-        String(format: "%.2f", Double(value))
-    }
-
     private func format(_ value: Double) -> String {
         String(format: "%.2f", value)
-    }
-
-    private func average(_ values: [Double]) -> Double {
-        guard !values.isEmpty else { return 0 }
-        return values.reduce(0, +) / Double(values.count)
-    }
-
-    private func percentile(_ values: [Double], p: Double) -> Double {
-        guard !values.isEmpty else { return 0 }
-        let sorted = values.sorted()
-        let index = min(max(Int(Double(sorted.count - 1) * p), 0), sorted.count - 1)
-        return sorted[index]
     }
 }

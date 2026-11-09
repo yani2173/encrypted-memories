@@ -1,6 +1,6 @@
 // ClickZoomTransitionScheduler.swift
 //
-// Builds the immutable click plan for toolbar and keyboard zoom commands. Component windows are
+// Builds the immutable click plan for toolbar zoom commands. Component windows are
 // area-weighted, and progress is owned by the host's trapezoidal clock.
 
 import CoreGraphics

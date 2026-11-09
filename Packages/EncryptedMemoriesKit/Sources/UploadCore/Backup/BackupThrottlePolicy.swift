@@ -32,6 +32,9 @@ public struct BackupThrottleInputs: Sendable, Equatable {
     /// False until the platform reported its first network path since launch. The other network values are then only
     /// defaults.
     public var isNetworkDetermined: Bool
+    /// True while the app runs only in an OS background window: no scene is in the foreground. Nobody then watches an
+    /// automatic pass, so a background window may run it.
+    public var isAppInBackground: Bool
 
     public init(
         thermalLevel: BackupThermalLevel = .nominal,
@@ -40,7 +43,8 @@ public struct BackupThrottleInputs: Sendable, Equatable {
         isNetworkConstrained: Bool = false,
         isNetworkExpensive: Bool = false,
         usesMobileData: Bool = true,
-        isNetworkDetermined: Bool = true
+        isNetworkDetermined: Bool = true,
+        isAppInBackground: Bool = false
     ) {
         self.thermalLevel = thermalLevel
         self.isLowPowerMode = isLowPowerMode
@@ -49,6 +53,7 @@ public struct BackupThrottleInputs: Sendable, Equatable {
         self.isNetworkExpensive = isNetworkExpensive
         self.usesMobileData = usesMobileData
         self.isNetworkDetermined = isNetworkDetermined
+        self.isAppInBackground = isAppInBackground
     }
 
     /// Maps the shared runtime snapshot of a platform adapter, so every backup upload path reads the same signals.
@@ -68,7 +73,8 @@ public struct BackupThrottleInputs: Sendable, Equatable {
             isNetworkConstrained: snapshot.network.isConstrained,
             isNetworkExpensive: snapshot.network.isExpensive || (!snapshot.network.isDetermined && !usesMobileData),
             usesMobileData: usesMobileData,
-            isNetworkDetermined: snapshot.network.isDetermined
+            isNetworkDetermined: snapshot.network.isDetermined,
+            isAppInBackground: snapshot.executionOpportunity >= .backgroundPermitted
         )
     }
 

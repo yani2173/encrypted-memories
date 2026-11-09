@@ -3279,6 +3279,30 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: file), saved, "the file stays where it is")
     }
 
+    func testUnreadableMergeJournalReportsReasonAndKeepsTrash() async throws {
+        try XCTSkipIf(getuid() == 0, "root reads a file without read permission")
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        XCTAssertTrue(mergeJournal.record([pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)]))
+        let file = directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName)
+        let saved = try Data(contentsOf: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path) }
+        let trash = CountingTrash()
+        for merger in [true, false] {
+            do {
+                try await RecentlyDeletedEmptying.empty(
+                    trash, checkingMergesWith: merger ? finder : nil, accountDataDirectory: directory)
+                XCTFail("an unreadable journal must block emptying")
+            } catch {
+                XCTAssertEqual((error as? RecentlyDeletedEmptying.PendingMergeCheck)?.reason, .journalUnreadable)
+            }
+            XCTAssertEqual(trash.emptied, 0)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        XCTAssertEqual(try Data(contentsOf: file), saved)
+    }
+
     private func assertKeepsTheTrash(
         _ expression: @autoclosure () async throws -> Void, file: StaticString = #filePath, line: UInt = #line
     ) async {
@@ -3923,6 +3947,42 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(groupReads(reads, of: group), 3)
     }
 
+    /// The scan accepts an incomplete state answer and shows the copies that it names, as before #553. Only the
+    /// duplicate check of the backup requires a complete answer.
+    func testAnIncompleteStateAnswerShowsTheCopiesThatItNames() async throws {
+        let copies = (0..<3).map { _ in server.seedLink(digest: digest("incomplete-scan")) }
+        indexServer()
+        var checker = CopyBoundaryChecker(base: server)
+        checker.answersIncompletely = true
+        checker.visibilityRewrite = { _, answer in answer.filter { $0.key != copies[2].nodeID } }
+
+        do {
+            let groups = try await finder(checker: checker).duplicateGroups().groups
+            XCTAssertEqual(groups.map { Set($0.members) }, [Set(copies.prefix(2))])
+        } catch {
+            XCTFail("An incomplete state answer must not fail the scan: \(error)")
+        }
+    }
+
+    /// The merge plan reads the group like the scan: a copy that an incomplete answer omits is not merged.
+    func testAnIncompleteStateAnswerLetsTheMergePlanSkipTheOmittedCopy() async throws {
+        let kept = server.seedLink(digest: digest("incomplete-plan"))
+        let copy = server.seedLink(digest: digest("incomplete-plan"))
+        indexServer()
+        let group = try await onlyGroup()
+        var checker = CopyBoundaryChecker(base: server)
+        checker.answersIncompletely = true
+        checker.visibilityRewrite = { _, answer in answer.filter { $0.key != copy.nodeID } }
+
+        do {
+            let outcome = try await finder(checker: checker).merge(group, keeping: kept)
+            XCTAssertEqual(outcome, ExactDuplicateMergeOutcome.skipped(.noDuplicateLeft))
+        } catch {
+            XCTFail("An incomplete state answer must not fail the merge plan: \(error)")
+        }
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+    }
+
     /// Documented limit: a removal after a complete reconciliation answer is not seen by the same plan. The merge
     /// keeps the three copies as unreadable and trashes nothing; the next load shows the removal.
     func testARemovalAfterACompleteAnswerIsSeenOnlyByTheNextPlan() async throws {
@@ -4028,6 +4088,53 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(afterTrash, .skipped(.noDuplicateLeft))
         XCTAssertEqual(server.steps.count, stepsBefore)
         XCTAssertEqual(violations, [])
+    }
+
+    /// The trash of the first try moved the duplicate, but its answer and every check afterwards failed, as when the
+    /// system suspends the app during the request. Merge All tries the group once more after the return: the finder
+    /// reads the group again and trashes nothing twice.
+    @MainActor
+    func testMergeAllTriesAGroupAgainAfterTheAppWasAwayWithoutASecondTrash() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        for uid in [kept, duplicate] { server.setFingerprint(described, of: uid) }
+        indexServer()
+        var finder = finder()
+        finder.keptReadRetryDelay = .zero
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        try await waitFor("the group is ranked") { model.groups.first?.isRanked == true }
+        server.applyNextTrashThenFail()
+        server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
+        server.holdVisibilityReads()
+
+        let merge = Task { await model.mergeAll() }
+        try await waitFor("the batch reads the group") { server.heldVisibilityReads > 0 }
+        model.pauseMerging()
+        server.releaseVisibilityReads()
+        await model.runningMergeWorkEnded()
+        XCTAssertEqual(state(of: duplicate), .trashed, "the first try moved the duplicate")
+        model.resumeMerging()
+        await merge.value
+
+        XCTAssertEqual(trashCalls.count, 1, "the second try trashes nothing again")
+        XCTAssertEqual(state(of: duplicate), .trashed)
+        XCTAssertEqual(state(of: kept), .active, "one copy stays")
+        XCTAssertNil(model.notice, "no failed merge")
+        XCTAssertEqual(violations, [])
+    }
+
+    /// Waits up to ten seconds for `condition`.
+    @MainActor
+    private func waitFor(_ label: String, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Timed out: \(label)")
+                throw CancellationError()
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
     }
 
     // MARK: - Metadata
@@ -4279,12 +4386,33 @@ final class ExactDuplicateFinderTests: XCTestCase {
     func testSoleKeeperVisibilityReadFailureUsesTheExistingFailedResultWithoutClearingTheGroup() async throws {
         let result = try await memberCompoundRace(.freshReadError)
         XCTAssertEqual(result.first.groups.map(\.id), [hash("compound-race")])
-        XCTAssertEqual(result.first.notice, .failed)
+        XCTAssertEqual(result.first.notice, .partialFailure(failed: 1, total: 1, canRetry: true))
         XCTAssertEqual(state(of: result.source), .active)
         XCTAssertEqual(state(of: result.kept), .active)
         XCTAssertEqual(result.checker.freshVisibilityReads, 1)
         XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
         XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+    }
+
+    @MainActor
+    func testSoleKeeperTransientReadFailureCanRecoverThroughTheOfferedRetry() async throws {
+        let result = try await memberCompoundRace(.freshReadError)
+        XCTAssertEqual(result.first.notice, .partialFailure(failed: 1, total: 1, canRetry: true))
+        XCTAssertEqual(state(of: result.source), .active)
+        XCTAssertEqual(state(of: result.kept), .active)
+        let readsBeforeRetry = result.checker.freshVisibilityReads
+        result.checker.recoverTransientFailure()
+
+        await result.first.retryFailedMerges()
+
+        XCTAssertGreaterThan(result.checker.freshVisibilityReads, readsBeforeRetry)
+        XCTAssertEqual(result.first.groups.map(\.id), [])
+        XCTAssertNil(result.first.notice)
+        XCTAssertEqual(state(of: result.source), .trashed)
+        XCTAssertEqual(state(of: result.kept), .active)
+        XCTAssertEqual(server.steps.filter { $0.action.hasPrefix("duplicate trash ") }.count, 1)
+        XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+        XCTAssertEqual(violations, [])
     }
 
     @MainActor
@@ -5319,6 +5447,8 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
     var visibilityRead: (@Sendable ([String]) -> Void)?
     /// Replaces the answer of a link-state read, for example an answer that omits a link.
     var visibilityRewrite: (@Sendable ([String], [String: RemoteLinkVisibility]) -> [String: RemoteLinkVisibility])?
+    /// The server answers incompletely: like the Proton backend, a read that requires a complete answer throws.
+    var answersIncompletely = false
     func nameHash(forCorrectedName name: String) async throws -> String {
         try await base.nameHash(forCorrectedName: name)
     }
@@ -5332,7 +5462,15 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
         try await base.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
     }
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        try await linkVisibility(of: linkIDs, requiresCompleteResponse: true)
+    }
+    func linkVisibility(
+        of linkIDs: [String], requiresCompleteResponse: Bool
+    ) async throws -> [String: RemoteLinkVisibility] {
         visibilityRead?(linkIDs)
+        if answersIncompletely && requiresCompleteResponse {
+            throw UploadError.backend("The link visibility response is incomplete")
+        }
         let answer = try await base.linkVisibility(of: linkIDs)
         return visibilityRewrite.map { $0(linkIDs, answer) } ?? answer
     }
@@ -5423,6 +5561,7 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
     private var readHeld = false
     private var sawActive = false
     private var freshReads = 0
+    private var recovered = false
 
     init(
         base: EditScenarioServer, kept: PhotoUID, source: PhotoUID, mode: Mode, gate: MemberCompoundReadGate,
@@ -5437,6 +5576,7 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
     }
     var freshVisibilityReads: Int { lock.withLock { freshReads } }
     func arm() { lock.withLock { armed = true } }
+    func recoverTransientFailure() { lock.withLock { recovered = true } }
     var sawPositiveActiveRead: Bool { lock.withLock { sawActive } }
     var didReadHeldCompound: Bool { lock.withLock { readHeld } }
 
@@ -5457,7 +5597,9 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
         if mode == .unknownOriginalMember, lock.withLock({ armed }), let uncertain {
             visibility[uncertain.nodeID] = nil
         }
-        if afterFailure, mode == .freshReadError { throw URLError(.networkConnectionLost) }
+        if afterFailure, mode == .freshReadError, !lock.withLock({ recovered }) {
+            throw URLError(.networkConnectionLost)
+        }
         if afterFailure, mode == .freshReadCancellation { throw CancellationError() }
         if afterFailure, mode == .keeperUnknown, var keeper = visibility[kept.nodeID] {
             keeper.hasExplicitPhotoState = false
@@ -5487,7 +5629,7 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
         if shouldHold { await gate.pass() }
         let actual = try await base.compound(ofMainLink: linkID)
         let intercept = lock.withLock {
-            guard armed, linkID == source.nodeID else { return false }
+            guard armed, !recovered, linkID == source.nodeID else { return false }
             readHeld = true
             return true
         }
@@ -5540,9 +5682,6 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
     }
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
         try await base.externalIdentifier(ofMainLink: linkID)
-    }
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
-        try await base.modificationDate(ofMainLink: linkID)
     }
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         try await base.replacedLinkIDs(ofReplacingMain: linkID)

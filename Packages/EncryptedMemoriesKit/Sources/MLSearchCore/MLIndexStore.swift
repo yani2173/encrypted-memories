@@ -14,19 +14,9 @@ public protocol MLIndexStore: Sendable {
     @discardableResult
     func upsert(_ records: [MLEmbeddingRecord]) -> MLIndexBatchReport
 
-    /// `true` iff a record exists for `(uid, descriptor)`.
-    func contains(uid: PhotoUID, descriptor: MLModelDescriptor) throws -> Bool
-
     /// Bulk membership check for a model epoch. Returns the subset of `uids` already indexed.
     /// Must not load vectors or scan other epochs.
     func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) throws -> Set<PhotoUID>
-
-    /// All UIDs indexed under a model epoch (used for coverage / eviction heuristics).
-    func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID]
-
-    /// All UIDs with an embedding or persisted failure for an epoch. Used to remove state for
-    /// assets that left the library without scanning vector payloads.
-    func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID]
 
     /// Reconciles one authoritative inventory. After the first session-local baseline, callers pass
     /// the last successfully reconciled inventory so stores can remove only the exact delta.
@@ -37,28 +27,15 @@ public protocol MLIndexStore: Sendable {
         descriptor: MLModelDescriptor
     ) -> Bool
 
-    /// All embeddings for a model epoch, in the store's deterministic order.
-    /// Query paths should use `forEachVectorBlock` so vector memory stays bounded.
-    func allRecords(for descriptor: MLModelDescriptor) -> [MLEmbeddingRecord]
-
-    /// The epoch's embeddings as one packed, query-ready matrix.
-    /// This compatibility and diagnostic API may materialize the complete epoch.
-    func vectorBlock(for descriptor: MLModelDescriptor) -> MLVectorBlock
-
     /// Visit deterministic, bounded query blocks for one model epoch.
     ///
-    /// Production stores must keep each block bounded independently of epoch size. The default
-    /// implementation exists for small or legacy stores and preserves the older read APIs.
+    /// Stores must keep each block bounded independently of epoch size.
     /// A storage failure throws even if earlier blocks were delivered. Callers must discard partial results.
     func forEachVectorBlock(
         for descriptor: MLModelDescriptor,
         maximumRows: Int,
         _ body: (MLVectorBlock) throws -> Void
     ) throws
-
-    /// Remove the record for `(uid, descriptor)` when an asset is deleted or must be
-    /// re-embedded (explicit remove-then-upsert is the only reindex path).
-    func remove(uid: PhotoUID, descriptor: MLModelDescriptor)
 
     /// Remove embeddings and failure state for multiple assets in one durable operation.
     /// Implementations must bump the vector generation at most once for the batch.
@@ -72,7 +49,7 @@ public protocol MLIndexStore: Sendable {
     /// Total record count for a model epoch.
     func count(for descriptor: MLModelDescriptor) -> Int
 
-    /// Monotonic epoch generation. Search engines use it to invalidate packed vector snapshots.
+    /// Monotonic epoch generation. Callers use it to detect that an epoch's vectors changed.
     func generation(for descriptor: MLModelDescriptor) -> UInt64
 
     /// Persist retry/permanent failure state independently from embeddings.
@@ -84,33 +61,6 @@ public protocol MLIndexStore: Sendable {
 }
 
 extension MLIndexStore {
-    /// Default: build the block from `allRecords`. Persistent stores override this to stream
-    /// rows straight from disk into the packed buffer without materializing records.
-    public func vectorBlock(for descriptor: MLModelDescriptor) -> MLVectorBlock {
-        MLVectorBlock(descriptor: descriptor, records: allRecords(for: descriptor))
-    }
-
-    public func forEachVectorBlock(
-        for descriptor: MLModelDescriptor,
-        maximumRows: Int,
-        _ body: (MLVectorBlock) throws -> Void
-    ) throws {
-        guard maximumRows > 0 else { return }
-        let records = allRecords(for: descriptor)
-        var block = MLVectorBlock(descriptor: descriptor)
-        block.reserveCapacity(min(maximumRows, records.count))
-        for record in records {
-            if Task.isCancelled { return }
-            if block.count == maximumRows {
-                try body(block)
-                block = MLVectorBlock(descriptor: descriptor)
-                block.reserveCapacity(maximumRows)
-            }
-            _ = block.append(uid: record.uid, vector: record.vector)
-        }
-        if !block.isEmpty { try body(block) }
-    }
-
     public func coverage(for descriptor: MLModelDescriptor, allAssets: [PhotoUID]) throws -> MLIndexCoverage {
         let uniqueAssets = Array(Set(allAssets))
         let indexed = try indexedUIDs(for: descriptor, from: uniqueAssets)
@@ -172,32 +122,11 @@ public final class InMemoryMLIndexStore: MLIndexStore, @unchecked Sendable {
         )
     }
 
-    public func contains(uid: PhotoUID, descriptor: MLModelDescriptor) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return recordsByDescriptor[descriptor]?[uid] != nil
-    }
-
     public func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) -> Set<PhotoUID> {
         lock.lock()
         defer { lock.unlock() }
         guard let bucket = recordsByDescriptor[descriptor] else { return [] }
         return Set(uids.filter { bucket[$0] != nil })
-    }
-
-    public func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let bucket = recordsByDescriptor[descriptor] else { return [] }
-        return bucket.keys.sorted(by: Self.uidOrder)
-    }
-
-    public func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] {
-        lock.withLock {
-            let indexed = recordsByDescriptor[descriptor].map { Set($0.keys) } ?? []
-            let failed = failuresByDescriptor[descriptor].map { Set($0.keys) } ?? []
-            return indexed.union(failed).sorted(by: Self.uidOrder)
-        }
     }
 
     @discardableResult
@@ -230,17 +159,29 @@ public final class InMemoryMLIndexStore: MLIndexStore, @unchecked Sendable {
         }
     }
 
-    public func allRecords(for descriptor: MLModelDescriptor) -> [MLEmbeddingRecord] {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let bucket = recordsByDescriptor[descriptor] else { return [] }
-        // Deterministic order (dictionary order is not): sort by uid, matching the
-        // persistent store's key order.
-        return bucket.values.sorted { Self.uidOrder($0.uid, $1.uid) }
-    }
-
-    public func remove(uid: PhotoUID, descriptor: MLModelDescriptor) {
-        remove(uids: [uid], descriptor: descriptor)
+    public func forEachVectorBlock(
+        for descriptor: MLModelDescriptor,
+        maximumRows: Int,
+        _ body: (MLVectorBlock) throws -> Void
+    ) throws {
+        guard maximumRows > 0 else { return }
+        let records = lock.withLock {
+            // Deterministic order (dictionary order is not): sort by uid, matching the
+            // persistent store's key order.
+            (recordsByDescriptor[descriptor]?.values.sorted { Self.uidOrder($0.uid, $1.uid) }) ?? []
+        }
+        var block = MLVectorBlock(descriptor: descriptor)
+        block.reserveCapacity(min(maximumRows, records.count))
+        for record in records {
+            if Task.isCancelled { return }
+            if block.count == maximumRows {
+                try body(block)
+                block = MLVectorBlock(descriptor: descriptor)
+                block.reserveCapacity(maximumRows)
+            }
+            _ = block.append(uid: record.uid, vector: record.vector)
+        }
+        if !block.isEmpty { try body(block) }
     }
 
     public func remove(uids: [PhotoUID], descriptor: MLModelDescriptor) {

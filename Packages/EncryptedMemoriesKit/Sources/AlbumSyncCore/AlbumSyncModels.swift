@@ -186,7 +186,6 @@ public struct AlbumSyncProgress: Sendable, Equatable {
     public var backedUp = 0
     public var backupFailed = 0
     /// Attach sub-progress.
-    public var attachTotal = 0
     public var attachDone = 0
     public var alreadyMember = 0
     public var attachFailed = 0
@@ -227,7 +226,7 @@ public struct AlbumSyncProgress: Sendable, Equatable {
         case .checkingAlbum:
             return nil
         case .attaching:
-            return L10n.string("albumsync.detail_attached \(attachDone + alreadyMember) \(attachTotal)")
+            return L10n.string("albumsync.detail_attached \(attachDone)")
         case .completed:
             return L10n.string("albumsync.detail_completed \(attachDone + alreadyMember)")
         case .needsAttention:

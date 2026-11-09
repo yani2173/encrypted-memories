@@ -25,12 +25,16 @@ public struct LibraryChangePollingPolicy: Sendable, Equatable {
     /// Nil preserves immediate change handling for custom polling policies.
     public let trailingQuietInterval: Duration?
     public let maxTrailingInterval: Duration
+    /// The longest time that a host hold keeps a detected change from refreshing. After it, one refresh runs and the
+    /// hold applies again to the next change.
+    public let maxHoldInterval: Duration
 
     public init(
         interval: Duration, refreshRetryInterval: Duration? = nil, maxRefreshRetryInterval: Duration? = nil,
         failureInterval: Duration,
         trailingQuietInterval: Duration? = nil,
-        maxTrailingInterval: Duration = .seconds(60)
+        maxTrailingInterval: Duration = .seconds(60),
+        maxHoldInterval: Duration = .seconds(600)
     ) {
         self.interval = interval
         self.refreshRetryInterval = refreshRetryInterval ?? interval
@@ -39,6 +43,7 @@ public struct LibraryChangePollingPolicy: Sendable, Equatable {
         self.failureInterval = failureInterval
         self.trailingQuietInterval = trailingQuietInterval
         self.maxTrailingInterval = maxTrailingInterval
+        self.maxHoldInterval = maxHoldInterval
     }
 
     /// Probes every five seconds and refreshes the first isolated change immediately after detection.
@@ -106,6 +111,7 @@ public actor LibraryChangeMonitor {
         let isActive: Bool
         let resetBaseline: Bool
         let initialToken: String?
+        let holdRefresh: @Sendable () async -> Bool
         let onChange: @Sendable () async -> LibraryChangeRefreshOutcome
         let onTerminal: @Sendable (any LibraryChangeTerminalError) async -> Void
     }
@@ -145,6 +151,7 @@ public actor LibraryChangeMonitor {
         policy: LibraryChangePollingPolicy = .foreground,
         isActive: Bool = true,
         initialToken: String? = nil,
+        holdRefresh: @Sendable @escaping () async -> Bool = { false },
         onTerminal: @Sendable @escaping (any LibraryChangeTerminalError) async -> Void = { _ in },
         onChange: @Sendable @escaping () async -> LibraryChangeRefreshOutcome
     ) {
@@ -158,6 +165,7 @@ public actor LibraryChangeMonitor {
                 isActive: isActive,
                 resetBaseline: false,
                 initialToken: initialToken,
+                holdRefresh: holdRefresh,
                 onChange: onChange,
                 onTerminal: onTerminal
             ))
@@ -197,6 +205,7 @@ public actor LibraryChangeMonitor {
             var observedToken = lastToken
             var lastChangeAt: ContinuousClock.Instant?
             var firstDeferredAt: ContinuousClock.Instant?
+            var heldSince: ContinuousClock.Instant?
             /// When a pending burst of changes refreshes: after `quiet` without a change, and at the latest
             /// `maxTrailingInterval` after its first deferred change. Nil while no burst is pending.
             func burstDeadline(quiet: Duration) -> ContinuousClock.Instant? {
@@ -213,6 +222,21 @@ public actor LibraryChangeMonitor {
                             try await clock.sleep(request.policy.interval)
                             continue
                         }
+                        // The host holds refreshes while its own bulk write runs. The change stays pending and the baseline
+                        // stays unchanged. After the hold, one refresh runs for the newest token at the next probe; a burst
+                        // that was waiting or began shortly before keeps its quiet deadline. A hold that lasts
+                        // `maxHoldInterval` lets one refresh run, and the next change starts the hold again.
+                        if await request.holdRefresh() {
+                            let now = clock.now()
+                            let held = heldSince ?? now
+                            heldSince = held
+                            if now - held < request.policy.maxHoldInterval {
+                                try Task.checkCancellation()
+                                try await clock.sleep(request.policy.interval)
+                                continue
+                            }
+                        }
+                        heldSince = nil
                         if let quiet = request.policy.trailingQuietInterval {
                             let now = clock.now()
                             // A burst whose deadline has passed refreshes now. A change that arrives exactly then must
@@ -270,6 +294,7 @@ public actor LibraryChangeMonitor {
                     try Task.checkCancellation()
                     retryCount.reset()
                     firstDeferredAt = nil
+                    heldSince = nil
                     observedToken = token
                     lastToken = token
                     try await clock.sleep(request.policy.interval)
@@ -317,6 +342,7 @@ public actor LibraryChangeMonitor {
         isActive: Bool = true,
         resetBaseline: Bool = false,
         initialToken: String? = nil,
+        holdRefresh: @Sendable @escaping () async -> Bool = { false },
         onTerminal: @Sendable @escaping (any LibraryChangeTerminalError) async -> Void = { _ in },
         onChange: @Sendable @escaping () async -> LibraryChangeRefreshOutcome
     ) async {
@@ -327,6 +353,7 @@ public actor LibraryChangeMonitor {
                 isActive: isActive,
                 resetBaseline: resetBaseline,
                 initialToken: initialToken,
+                holdRefresh: holdRefresh,
                 onChange: onChange,
                 onTerminal: onTerminal
             ))

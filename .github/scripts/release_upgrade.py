@@ -36,6 +36,12 @@ PLATFORMS = ("iOS", "macOS")
 # 12.8 (iOS) and 12.4 (macOS) minutes per source, a slowest point mean of 9.2 minutes per iOS case (model.installRecord:
 # 653 and 455 seconds), and a slowest single case of 10.9 minutes. The check at 165 minutes keeps a margin against the
 # estimate only; a job that concentrates slow points, or a slower runner, can use more of its 180-minute timeout.
+# The disk bounds a job below the time budget. Each case ends with `simctl delete` of its simulator, and macOS moves that
+# device's data into `Deleting-<uuid>` directories of TMPDIR that a system process empties asynchronously (#1008). The
+# journey keeps nothing in TMPDIR. A hosted runner under load emptied them too slowly: in run 41098205915 a shard grew
+# TMPDIR from 0 to 8.6 GiB and lost 10.9 GiB of free disk over its 24 cases (about 0.5 GiB per case; #498 measured up to
+# 0.9 GiB per case), starting from 26.0 to 26.5 GiB free after the builds. About 28 cases therefore fill the disk, and
+# the time budget plans fewer: at most 19, 16, 15 or 12 cases per job for one to four sources.
 BUILD_MINUTES_PER_SOURCE = {"iOS": 12.0, "macOS": 12.0}
 CASE_MINUTES = {"iOS": 8.0, "macOS": 1.5}
 # A release with one source would fit one iOS job (about 108 planned minutes). Two jobs halve the wall-clock time of the

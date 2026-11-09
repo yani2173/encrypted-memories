@@ -458,7 +458,7 @@ public struct PhotoLocationQuerySnapshot: Sendable {
         let longitude =
             coordinate.longitude == 180
             ? 359
-            : min(359, max(0, Int(floor(normalizedLongitude(coordinate.longitude) + 180))))
+            : min(359, max(0, Int(floor(PhotoCoordinate.normalizedLongitude(coordinate.longitude) + 180))))
         return BucketID(latitude: latitude, longitude: longitude)
     }
 
@@ -478,11 +478,6 @@ public struct PhotoLocationQuerySnapshot: Sendable {
             minimum: 0,
             maximum: 359
         )
-    }
-
-    private static func normalizedLongitude(_ longitude: Double) -> Double {
-        let shifted = (longitude + 180).truncatingRemainder(dividingBy: 360)
-        return (shifted >= 0 ? shifted : shifted + 360) - 180
     }
 }
 

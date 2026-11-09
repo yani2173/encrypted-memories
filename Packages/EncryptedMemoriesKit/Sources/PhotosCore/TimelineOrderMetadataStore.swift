@@ -17,6 +17,10 @@ public final class TimelineOrderMetadataStore {
     private let policy: LibraryDatabasePolicy
     /// Remembers that a statement of this connection met a lock that did not clear within the busy timeout.
     private let busyRecorder: SQLiteBusyRecorder
+    private let probe: SQLiteFailureProbe
+    /// The last failed SQLite call of the running operation, read right after the call. SQLite overwrites the
+    /// code of the connection with the next call, so `rebuildUnlessBusy()` cannot read it later.
+    private var lastFailure: SQLiteFailure?
     private let transient = SQLiteStoreSchemaGate.transientDestructor
     private var synchronizedInventory: InventorySignature?
     private var needsPublication = true
@@ -74,9 +78,13 @@ public final class TimelineOrderMetadataStore {
     }
 
     /// `probe` answers whether a failed check says anything about the file. A test supplies it.
-    init?(url: URL, policy: LibraryDatabasePolicy, probe: SQLiteFailureProbe) {
+    init?(
+        url: URL, policy: LibraryDatabasePolicy, probe: SQLiteFailureProbe,
+        openReadWrite: SQLiteStoreSchemaGate.ReadWriteOpen = SQLiteStoreSchemaGate.liveReadWriteOpen
+    ) {
         self.url = url
         self.policy = policy
+        self.probe = probe
         let recorder = SQLiteBusyRecorder(timeoutMs: policy.busyTimeoutMs)
         busyRecorder = recorder
         func open() -> SQLiteRebuildableStoreOutcome {
@@ -91,7 +99,7 @@ public final class TimelineOrderMetadataStore {
                     return sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1
                 },
                 stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK },
-                probe: probe)
+                probe: probe, openReadWrite: openReadWrite)
         }
         switch open() {
         case .opened(let handle):
@@ -178,17 +186,49 @@ public final class TimelineOrderMetadataStore {
         return db != nil
     }
 
-    /// Rebuilds the cache after a failed read or write, unless the failure was a lock that did not clear within the
-    /// busy timeout. A lock clears by itself, so the cache and its rows stay, and the next pass tries again. Every
-    /// other failure rebuilds, as `rebuild()` does. Returns whether the cache was rebuilt and is available again.
+    /// Rebuilds the cache after a failed read or write, unless the failure says nothing about the file. Two failures
+    /// keep it: a lock that did not clear within the busy timeout, and a full disk (`SQLiteFailure.keepsFile`). Both
+    /// clear by themselves, so the cache and its rows stay, and the next pass tries again. Every other failure
+    /// rebuilds, as `rebuild()` does. Returns whether the cache was rebuilt and is available again.
     @discardableResult
     public func rebuildUnlessBusy() -> Bool {
         if busyRecorder.takeGaveUp() {
             PhotoDiagnostics.shared.increment("timeline.order.cacheKeptBusy")
             return false
         }
+        return rebuildUnlessFull()
+    }
+
+    /// Rebuilds the cache unless the failed call that led here says a full disk. The failure is judged once.
+    @discardableResult
+    private func rebuildUnlessFull() -> Bool {
+        let failure = lastFailure
+        lastFailure = nil
+        if let failure, failure.keepsFile(volumeIsFull: { probe.volumeIsFull(url, .cacheOperation) }) {
+            PhotoDiagnostics.shared.increment("timeline.order.cacheKeptFull")
+            return false
+        }
         return rebuild()
     }
+
+    /// Starts an operation: it forgets the lock and the failure of an earlier one.
+    private func beginOperation() {
+        busyRecorder.reset()
+        lastFailure = nil
+    }
+
+    /// Returns `code` and remembers the failure when `code` is one. Call it right after the SQLite call, before
+    /// any other call on the connection, also before a `sqlite3_finalize` or a rollback.
+    @discardableResult
+    private func note(_ code: Int32) -> Int32 {
+        if code != SQLITE_OK, code != SQLITE_ROW, code != SQLITE_DONE {
+            lastFailure = probe.failure(db, .cacheOperation)
+        }
+        return code
+    }
+
+    /// The open connection, so a test can limit its size (`PRAGMA max_page_count`) and get a real `SQLITE_FULL`.
+    var connectionForTesting: OpaquePointer? { db }
 
     private static let schema = """
         CREATE TABLE photo_order(
@@ -255,7 +295,7 @@ public final class TimelineOrderMetadataStore {
     }
 
     private func beginSynchronization(signature: InventorySignature) -> UInt64? {
-        busyRecorder.reset()
+        beginOperation()
         synchronizationGeneration &+= 1
         synchronization = nil
         synchronizedInventory = nil
@@ -264,7 +304,7 @@ public final class TimelineOrderMetadataStore {
             DROP TABLE IF EXISTS temp.incoming_order;
             CREATE TEMP TABLE incoming_order(vol TEXT,node TEXT,PRIMARY KEY(vol,node)) WITHOUT ROWID;
             """
-        guard sqlite3_exec(db, setup, nil, nil, nil) == SQLITE_OK else { return nil }
+        guard note(sqlite3_exec(db, setup, nil, nil, nil)) == SQLITE_OK else { return nil }
         synchronization = Synchronization(generation: synchronizationGeneration, signature: signature)
         PhotoDiagnostics.shared.increment("timeline.order.syncPass")
         return synchronizationGeneration
@@ -281,7 +321,7 @@ public final class TimelineOrderMetadataStore {
         guard db != nil, !Task.isCancelled, var progress = synchronization,
             progress.generation == generation
         else { return nil }
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return nil }
+        guard note(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)) == SQLITE_OK else { return nil }
         let complete: Bool
         if progress.offset < items.count {
             let end = min(progress.offset + Self.synchronizationChunkSize, items.count)
@@ -308,7 +348,7 @@ public final class TimelineOrderMetadataStore {
                 complete = true
             }
         }
-        guard !Task.isCancelled, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+        guard !Task.isCancelled, note(sqlite3_exec(db, "COMMIT;", nil, nil, nil)) == SQLITE_OK else {
             _ = rollback()
             return nil
         }
@@ -339,22 +379,22 @@ public final class TimelineOrderMetadataStore {
             WHERE photo_order.t IS NOT excluded.t OR photo_order.mime_seen IS NOT excluded.mime_seen;
             """
         guard
-            sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO incoming_order VALUES(?,?);", -1, &incoming, nil)
+            note(sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO incoming_order VALUES(?,?);", -1, &incoming, nil))
                 == SQLITE_OK,
-            sqlite3_prepare_v2(db, sql, -1, &upsert, nil) == SQLITE_OK
+            note(sqlite3_prepare_v2(db, sql, -1, &upsert, nil)) == SQLITE_OK
         else { return false }
         for item in items {
             if Task.isCancelled { return false }
             sqlite3_reset(incoming)
             bind(item.uid, to: incoming)
-            guard sqlite3_step(incoming) == SQLITE_DONE else { return false }
+            guard note(sqlite3_step(incoming)) == SQLITE_DONE else { return false }
             sqlite3_reset(upsert)
             bind(item.uid, to: upsert)
             let time = item.captureTime.timeIntervalSince1970
             sqlite3_bind_double(upsert, 3, time)
             sqlite3_bind_double(upsert, 4, floor(time))
             sqlite3_bind_int(upsert, 5, isClassified(item.uid) ? 1 : 0)
-            guard sqlite3_step(upsert) == SQLITE_DONE else { return false }
+            guard note(sqlite3_step(upsert)) == SQLITE_DONE else { return false }
         }
         return true
     }
@@ -362,20 +402,20 @@ public final class TimelineOrderMetadataStore {
     private func synchronizationSweepPage(after cursor: PhotoUID?) throws -> [PhotoUID] {
         var stmt: OpaquePointer?
         let sql = "SELECT vol,node FROM photo_order WHERE (vol,node)>(?1,?2) ORDER BY vol,node LIMIT ?3;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+        guard note(sqlite3_prepare_v2(db, sql, -1, &stmt, nil)) == SQLITE_OK else {
             throw TimelineOrderMetadataError.readFailed
         }
         defer { sqlite3_finalize(stmt) }
         bind(cursor ?? PhotoUID(volumeID: "", nodeID: ""), to: stmt)
         sqlite3_bind_int(stmt, 3, Int32(Self.synchronizationChunkSize))
         var result: [PhotoUID] = []
-        var step = sqlite3_step(stmt)
+        var step = note(sqlite3_step(stmt))
         while step == SQLITE_ROW {
             guard let vol = string(stmt, 0), let node = string(stmt, 1) else {
                 throw TimelineOrderMetadataError.readFailed
             }
             result.append(PhotoUID(volumeID: vol, nodeID: node))
-            step = sqlite3_step(stmt)
+            step = note(sqlite3_step(stmt))
         }
         guard step == SQLITE_DONE else { throw TimelineOrderMetadataError.readFailed }
         return result
@@ -387,12 +427,12 @@ public final class TimelineOrderMetadataStore {
             DELETE FROM photo_order WHERE (vol,node)>(?1,?2) AND (vol,node)<=(?3,?4)
               AND NOT EXISTS(SELECT 1 FROM incoming_order i WHERE i.vol=photo_order.vol AND i.node=photo_order.node);
             """
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        guard note(sqlite3_prepare_v2(db, sql, -1, &stmt, nil)) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
         bind(cursor ?? PhotoUID(volumeID: "", nodeID: ""), to: stmt)
         sqlite3_bind_text(stmt, 3, end.volumeID, -1, transient)
         sqlite3_bind_text(stmt, 4, end.nodeID, -1, transient)
-        return sqlite3_step(stmt) == SQLITE_DONE
+        return note(sqlite3_step(stmt)) == SQLITE_DONE
     }
 
     private static let collision = """
@@ -408,9 +448,9 @@ public final class TimelineOrderMetadataStore {
     /// The key frontier prevents a failed or omitted link from retrying repeatedly inside one pass.
     public func nextPage(after cursor: PhotoUID? = nil, limit: Int = pageSize) throws -> [Candidate] {
         guard db != nil else { throw TimelineOrderMetadataError.unavailable }
-        busyRecorder.reset()
+        beginOperation()
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, Self.workSQL, -1, &stmt, nil) == SQLITE_OK else {
+        guard note(sqlite3_prepare_v2(db, Self.workSQL, -1, &stmt, nil)) == SQLITE_OK else {
             throw TimelineOrderMetadataError.readFailed
         }
         defer { sqlite3_finalize(stmt) }
@@ -418,7 +458,7 @@ public final class TimelineOrderMetadataStore {
         sqlite3_bind_text(stmt, 2, cursor?.nodeID ?? "", -1, transient)
         sqlite3_bind_int(stmt, 3, Int32(max(1, min(Self.pageSize, limit))))
         var rows: [Candidate] = []
-        var step = sqlite3_step(stmt)
+        var step = note(sqlite3_step(stmt))
         while step == SQLITE_ROW {
             guard let vol = string(stmt, 0), let node = string(stmt, 1) else {
                 throw TimelineOrderMetadataError.readFailed
@@ -428,7 +468,7 @@ public final class TimelineOrderMetadataStore {
                     uid: PhotoUID(volumeID: vol, nodeID: node),
                     captureTime: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
                     needsOrder: sqlite3_column_int(stmt, 3) != 0))
-            step = sqlite3_step(stmt)
+            step = note(sqlite3_step(stmt))
         }
         guard step == SQLITE_DONE else { throw TimelineOrderMetadataError.readFailed }
         return rows
@@ -439,11 +479,12 @@ public final class TimelineOrderMetadataStore {
     public func record(_ values: [PhotoUID: TimelineOrderMetadata], classifiedUIDs: Set<PhotoUID> = []) -> Bool {
         lastRecordChangedOrder = false
         guard db != nil else { return false }
-        busyRecorder.reset()
+        beginOperation()
         var lookup: OpaquePointer?
         guard
-            sqlite3_prepare_v2(
-                db, "SELECT inspected,mime_seen FROM photo_order WHERE vol=?1 AND node=?2;", -1, &lookup, nil)
+            note(
+                sqlite3_prepare_v2(
+                    db, "SELECT inspected,mime_seen FROM photo_order WHERE vol=?1 AND node=?2;", -1, &lookup, nil))
                 == SQLITE_OK
         else { return false }
         defer { sqlite3_finalize(lookup) }
@@ -451,14 +492,14 @@ public final class TimelineOrderMetadataStore {
         for uid in values.keys {
             sqlite3_reset(lookup)
             bind(uid, to: lookup)
-            let step = sqlite3_step(lookup)
+            let step = note(sqlite3_step(lookup))
             guard step == SQLITE_ROW || step == SQLITE_DONE else { return false }
             needsWrite = needsWrite || (step == SQLITE_ROW && sqlite3_column_int(lookup, 0) == 0)
         }
         for uid in classifiedUIDs {
             sqlite3_reset(lookup)
             bind(uid, to: lookup)
-            let step = sqlite3_step(lookup)
+            let step = note(sqlite3_step(lookup))
             guard step == SQLITE_ROW || step == SQLITE_DONE else { return false }
             needsWrite = needsWrite || (step == SQLITE_ROW && sqlite3_column_int(lookup, 1) == 0)
         }
@@ -468,13 +509,14 @@ public final class TimelineOrderMetadataStore {
         // the busy handler, so the write would neither wait for the lock nor tell that it met one.
         sqlite3_finalize(lookup)
         lookup = nil
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
+        guard note(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)) == SQLITE_OK else { return false }
         var stmt: OpaquePointer?
         guard
-            sqlite3_prepare_v2(
-                db,
-                "UPDATE photo_order SET exact=?3, identity=?4, inspected=1 WHERE vol=?1 AND node=?2 AND inspected=0;",
-                -1, &stmt, nil) == SQLITE_OK
+            note(
+                sqlite3_prepare_v2(
+                    db,
+                    "UPDATE photo_order SET exact=?3, identity=?4, inspected=1 WHERE vol=?1 AND node=?2 AND inspected=0;",
+                    -1, &stmt, nil)) == SQLITE_OK
         else { return rollback() }
         defer { sqlite3_finalize(stmt) }
         var recordedOrder = false
@@ -488,22 +530,23 @@ public final class TimelineOrderMetadataStore {
                 sqlite3_bind_null(stmt, 3)
             }
             if let identity = metadata.stableIdentity { sqlite3_bind_text(stmt, 4, identity, -1, transient) }
-            guard sqlite3_step(stmt) == SQLITE_DONE else { return rollback() }
+            guard note(sqlite3_step(stmt)) == SQLITE_DONE else { return rollback() }
             recordedOrder = recordedOrder || sqlite3_changes(db) > 0
         }
         var mime: OpaquePointer?
         guard
-            sqlite3_prepare_v2(
-                db, "UPDATE photo_order SET mime_seen=1 WHERE vol=?1 AND node=?2 AND mime_seen=0;", -1, &mime, nil)
+            note(
+                sqlite3_prepare_v2(
+                    db, "UPDATE photo_order SET mime_seen=1 WHERE vol=?1 AND node=?2 AND mime_seen=0;", -1, &mime, nil))
                 == SQLITE_OK
         else { return rollback() }
         defer { sqlite3_finalize(mime) }
         for uid in classifiedUIDs {
             sqlite3_reset(mime)
             bind(uid, to: mime)
-            guard sqlite3_step(mime) == SQLITE_DONE else { return rollback() }
+            guard note(sqlite3_step(mime)) == SQLITE_DONE else { return rollback() }
         }
-        guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else { return rollback() }
+        guard note(sqlite3_exec(db, "COMMIT;", nil, nil, nil)) == SQLITE_OK else { return rollback() }
         lastRecordChangedOrder = recordedOrder
         needsPublication = needsPublication || recordedOrder
         return true
@@ -531,10 +574,10 @@ public final class TimelineOrderMetadataStore {
 
     private func publishCompletedSeconds(containing uid: PhotoUID?) throws -> Bool {
         guard db != nil else { throw TimelineOrderMetadataError.unavailable }
-        busyRecorder.reset()
+        beginOperation()
         guard inventoryComplete, needsPublication else { return false }
         PhotoDiagnostics.shared.increment(uid == nil ? "timeline.order.publishPass" : "timeline.order.publishSecond")
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+        guard note(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)) == SQLITE_OK else {
             throw TimelineOrderMetadataError.unavailable
         }
         let scope = uid == nil ? "" : "AND second=(SELECT second FROM photo_order WHERE vol=?1 AND node=?2)"
@@ -544,22 +587,22 @@ public final class TimelineOrderMetadataStore {
               AND NOT EXISTS(SELECT 1 FROM photo_order other WHERE other.second=o.second AND other.inspected=0);
             """
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+        guard note(sqlite3_prepare_v2(db, sql, -1, &statement, nil)) == SQLITE_OK else {
             _ = rollback()
             throw TimelineOrderMetadataError.readFailed
         }
         defer { sqlite3_finalize(statement) }
         if let uid { bind(uid, to: statement) }
-        guard sqlite3_step(statement) == SQLITE_DONE else {
+        guard note(sqlite3_step(statement)) == SQLITE_DONE else {
             _ = rollback()
             throw TimelineOrderMetadataError.readFailed
         }
         let changed = sqlite3_changes(db) > 0
-        if changed, sqlite3_exec(db, "UPDATE order_revision SET value=value+1;", nil, nil, nil) != SQLITE_OK {
+        if changed, note(sqlite3_exec(db, "UPDATE order_revision SET value=value+1;", nil, nil, nil)) != SQLITE_OK {
             _ = rollback()
             throw TimelineOrderMetadataError.readFailed
         }
-        guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+        guard note(sqlite3_exec(db, "COMMIT;", nil, nil, nil)) == SQLITE_OK else {
             _ = rollback()
             throw TimelineOrderMetadataError.readFailed
         }
@@ -581,18 +624,18 @@ public final class TimelineOrderMetadataStore {
         var stmt: OpaquePointer?
         let sql =
             "SELECT vol,node,t,exact,identity FROM photo_order INDEXED BY order_timeline WHERE t>=?1 AND t<=?2 AND published=1 AND exact IS NOT NULL ORDER BY t,vol,node LIMIT ?3;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+        guard note(sqlite3_prepare_v2(db, sql, -1, &stmt, nil)) == SQLITE_OK else {
             sqlite3_finalize(stmt)
-            rebuild()
+            rebuildUnlessFull()
             return items
         }
         // Execute with a zero limit to validate SQLite's schema without scanning a new cache.
         guard revision > 0 else {
             sqlite3_bind_int(stmt, 3, 0)
-            let step = sqlite3_step(stmt)
+            let step = note(sqlite3_step(stmt))
             sqlite3_finalize(stmt)
             guard step == SQLITE_DONE else {
-                rebuild()
+                rebuildUnlessFull()
                 return items
             }
             return TimelineOrder.orderedByCaptureSecond(result, by: TimelineOrder.areInIncreasingOrder)
@@ -601,12 +644,12 @@ public final class TimelineOrderMetadataStore {
         var readFailed = false
         defer {
             sqlite3_finalize(stmt)
-            if readFailed { rebuild() }
+            if readFailed { rebuildUnlessFull() }
         }
         sqlite3_bind_double(stmt, 1, result[0].captureTime.timeIntervalSince1970)
         sqlite3_bind_double(stmt, 2, result[result.count - 1].captureTime.timeIntervalSince1970)
         var index = 0
-        var step = sqlite3_step(stmt)
+        var step = note(sqlite3_step(stmt))
         while step == SQLITE_ROW {
             guard let vol = string(stmt, 0), let node = string(stmt, 1) else {
                 readFailed = true
@@ -624,7 +667,7 @@ public final class TimelineOrderMetadataStore {
                     result[index].timelineOrder = valid
                 }
             }
-            step = sqlite3_step(stmt)
+            step = note(sqlite3_step(stmt))
         }
         guard step == SQLITE_DONE else {
             readFailed = true

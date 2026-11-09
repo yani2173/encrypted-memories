@@ -183,6 +183,11 @@ def runner_trees(path, root):
             'simulator-logs': home / 'Library/Logs/CoreSimulator',
             'derived-data': home / 'Library/Developer/Xcode/DerivedData',
             # The free disk of a hosted iOS shard fell by about 0.9 GiB per case outside the trees above (#498).
+            # #1008 attributes that fall: each case ends with `simctl delete` of its simulator, and macOS moves that
+            # device's data into `Deleting-<uuid>` directories here that a system process empties asynchronously.
+            # The journey itself keeps nothing in TMPDIR and must not remove these directories, because the system owns
+            # them. A hosted runner under load emptied them too slowly (run 41098205915: `tmp` grew from 0 to
+            # 8.6 GiB over the 24 cases of one shard); an idle local host empties them within minutes.
             # `logs` contains `simulator-logs`: do not add the two.
             'tmp': temporary, 'caches': home / 'Library/Caches', 'logs': home / 'Library/Logs',
             'diagnostics': Path('/var/db/diagnostics')}

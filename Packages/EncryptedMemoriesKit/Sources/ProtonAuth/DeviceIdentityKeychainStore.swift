@@ -49,10 +49,6 @@ public struct DeviceIdentityKeychainStore: Sendable {
         return durable.flatMap { String(data: $0, encoding: .utf8) } ?? generated
     }
 
-    func clear() {
-        try? keychain.removeData(for: item)
-    }
-
     private func load() -> String? {
         do {
             guard let data = try keychain.data(for: item),

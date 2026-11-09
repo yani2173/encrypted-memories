@@ -3,22 +3,40 @@ import DesignSystemCore
 import PhotosCore
 import SwiftUI
 
+#if os(iOS)
+    /// Presentation facts are captured before opening a sheet or popover.
+    public enum AlbumPresentationTraits {
+        /// Whether an album presentation gets the bounded size. Only a compact width with a regular height, an
+        /// iPhone in portrait or a narrow iPad window, shows a sheet across the whole width. Anywhere else the fitted presentation, a popover
+        /// or a sheet in landscape, has no useful width of its own: without the bound it shrinks to its narrowest
+        /// content.
+        public static func usesRegularSizing(
+            horizontal: UserInterfaceSizeClass?, vertical: UserInterfaceSizeClass?
+        ) -> Bool {
+            horizontal == .regular || vertical == .compact
+        }
+    }
+#endif
+
 /// Shared adaptive name form. The system presentation supplied by each platform remains native;
 /// validation, progress and partial-success behavior stay identical.
 public struct AlbumCreationSheet: View {
     private let coordinator: AlbumActionCoordinator
     private let photoUIDs: [PhotoUID]
+    private let regularPresentation: Bool
     private let onAlbumsChanged: () -> Void
     private let onCompleted: (AlbumID) -> Void
 
     public init(
         coordinator: AlbumActionCoordinator,
         photoUIDs: [PhotoUID] = [],
+        regularPresentation: Bool = false,
         onAlbumsChanged: @escaping () -> Void = {},
         onCompleted: @escaping (AlbumID) -> Void = { _ in }
     ) {
         self.coordinator = coordinator
         self.photoUIDs = photoUIDs
+        self.regularPresentation = regularPresentation
         self.onAlbumsChanged = onAlbumsChanged
         self.onCompleted = onCompleted
     }
@@ -37,6 +55,10 @@ public struct AlbumCreationSheet: View {
         #if os(macOS)
             .frame(width: 360, height: photoUIDs.isEmpty ? 170 : 195)
         #else
+            .modifier(
+                AlbumRegularPresentationSize(
+                    width: 360, height: photoUIDs.isEmpty ? 210 : 250, regular: regularPresentation)
+            )
             .presentationDetents([.height(photoUIDs.isEmpty ? 210 : 250)])
             .presentationDragIndicator(.visible)
         #endif
@@ -49,6 +71,7 @@ public struct AlbumCreationSheet: View {
 public struct AlbumDestinationPicker: View {
     private let coordinator: AlbumActionCoordinator
     private let photoUIDs: [PhotoUID]
+    private let regularPresentation: Bool?
     private let onAlbumsChanged: () -> Void
     private let onCompleted: (AlbumID) -> Void
 
@@ -57,11 +80,13 @@ public struct AlbumDestinationPicker: View {
     public init(
         coordinator: AlbumActionCoordinator,
         photoUIDs: [PhotoUID],
+        regularPresentation: Bool? = nil,
         onAlbumsChanged: @escaping () -> Void = {},
         onCompleted: @escaping (AlbumID) -> Void
     ) {
         self.coordinator = coordinator
         self.photoUIDs = photoUIDs
+        self.regularPresentation = regularPresentation
         self.onAlbumsChanged = onAlbumsChanged
         self.onCompleted = onCompleted
     }
@@ -127,7 +152,11 @@ public struct AlbumDestinationPicker: View {
             #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.string("action.cancel")) { dismiss() }
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label(L10n.string("action.cancel"), systemImage: "xmark").textBarItem()
+                    }
                 }
             }
         }
@@ -135,7 +164,10 @@ public struct AlbumDestinationPicker: View {
         #if os(macOS)
             .frame(width: 330, height: pickerHeight)
         #else
-            .presentationDetents([.medium, .large])
+            .modifier(
+                AlbumRegularPresentationSize(width: 330, height: 390, regular: regularPresentation ?? false)
+            )
+            .presentationDetents(regularPresentation == true ? [.height(390)] : [.medium, .large])
             .presentationDragIndicator(.visible)
         #endif
         .task(id: photoUIDs) {
@@ -145,8 +177,8 @@ public struct AlbumDestinationPicker: View {
         }
         .albumActionFailureAlert(coordinator)
         #if os(iOS)
-            // The destination list has no useful fitted popover width on a compact iPhone. Let the native
-            // presentation become a sheet there; regular-width iPad keeps the source-anchored popover.
+            // A compact width turns the popover into the native sheet; a regular width, an iPad or a large iPhone in
+            // landscape, keeps the source-anchored popover. Both get the bounded size except a full-width sheet.
             .presentationCompactAdaptation(.sheet)
         #endif
     }
@@ -166,7 +198,9 @@ public struct AlbumDestinationPicker: View {
         } else if let message = coordinator.loadErrorMessage, coordinator.albums.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text(message).font(.caption).foregroundStyle(.secondary)
-                RetryButton(.compact) { Task { await coordinator.refresh() } }
+                if coordinator.loadFailure?.canRetry == true {
+                    RetryButton(.compact) { Task { await coordinator.refresh() } }
+                }
             }
         } else if coordinator.albums.isEmpty {
             VStack(spacing: 8) {
@@ -221,6 +255,24 @@ public struct AlbumDestinationPicker: View {
     }
 }
 
+#if os(iOS)
+    /// Give fitted presentations a bounded ideal size. Only a full-width sheet, a compact width with a regular
+    /// height, keeps its native detents.
+    private struct AlbumRegularPresentationSize: ViewModifier {
+        let width: CGFloat
+        let height: CGFloat
+        let regular: Bool
+
+        func body(content: Content) -> some View {
+            if regular {
+                content.frame(idealWidth: width, maxWidth: width, idealHeight: height)
+            } else {
+                content
+            }
+        }
+    }
+#endif
+
 private struct AlbumNameForm: View {
     let coordinator: AlbumActionCoordinator
     let photoUIDs: [PhotoUID]
@@ -243,16 +295,24 @@ private struct AlbumNameForm: View {
             .toolbar {
                 if showsCancel {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button(L10n.string("action.cancel")) { dismiss() }
+                        Button {
+                            dismiss()
+                        } label: {
+                            Label(L10n.string("action.cancel"), systemImage: "xmark").textBarItem()
+                        }
                     }
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(
-                        photoUIDs.isEmpty
-                            ? L10n.string("albums.create_action")
-                            : L10n.string("albums.create_and_add_action")
-                    ) {
+                ProminentToolbarItem(placement: .confirmationAction) {
+                    Button {
                         create()
+                    } label: {
+                        Label(
+                            photoUIDs.isEmpty
+                                ? L10n.string("albums.create_action")
+                                : L10n.string("albums.create_and_add_action"),
+                            systemImage: "plus"
+                        )
+                        .textBarItem()
                     }
                     .disabled(trimmedName.isEmpty || coordinator.isWorking)
                 }

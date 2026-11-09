@@ -98,12 +98,16 @@ final class UploadIdentityManifestTests: XCTestCase {
     func testSHA1MatchesKnownVector() throws {
         // FIPS 180 test vector: SHA1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d.
         let url = try writeFile("abc.bin", Data("abc".utf8))
-        XCTAssertEqual(try UploadContentSHA1.hexDigest(ofFileAt: url), "a9993e364706816aba3e25717850c26c9cd0d89d")
+        XCTAssertEqual(
+            UploadContentSHA1.hexString(digest: try UploadContentSHA1.digest(ofFileAt: url)),
+            "a9993e364706816aba3e25717850c26c9cd0d89d")
     }
 
     func testSHA1OfEmptyFile() throws {
         let url = try writeFile("empty.bin", Data())
-        XCTAssertEqual(try UploadContentSHA1.hexDigest(ofFileAt: url), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        XCTAssertEqual(
+            UploadContentSHA1.hexString(digest: try UploadContentSHA1.digest(ofFileAt: url)),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709")
     }
 
     func testSHA1StreamsLargeFileAcrossChunkBoundaries() throws {
@@ -117,12 +121,14 @@ final class UploadIdentityManifestTests: XCTestCase {
         }
         let url = try writeFile("large.bin", data)
         let expected = UploadContentSHA1.hexString(digest: Data(Insecure.SHA1.hash(data: data)))
-        XCTAssertEqual(try UploadContentSHA1.hexDigest(ofFileAt: url, bufferSize: 4096), expected)
+        XCTAssertEqual(
+            UploadContentSHA1.hexString(digest: try UploadContentSHA1.digest(ofFileAt: url, bufferSize: 4096)),
+            expected)
     }
 
     func testSHA1MissingFileThrows() {
         let url = tempDir.appendingPathComponent("does-not-exist.bin")
-        XCTAssertThrowsError(try UploadContentSHA1.hexDigest(ofFileAt: url))
+        XCTAssertThrowsError(try UploadContentSHA1.digest(ofFileAt: url))
     }
 
     func testSHA1HonoursTaskCancellationBetweenChunks() async throws {
@@ -151,7 +157,13 @@ final class UploadIdentityManifestTests: XCTestCase {
         for chunk in chunks { accumulator.update(chunk) }
         let whole = chunks.reduce(Data(), +)
         let expected = UploadContentSHA1.hexString(digest: Data(Insecure.SHA1.hash(data: whole)))
-        XCTAssertEqual(accumulator.finalizeHexDigest(), expected)
+        XCTAssertEqual(UploadContentSHA1.hexString(digest: accumulator.finalizeDigest()), expected)
+    }
+
+    private func identityRowCount() throws -> Int {
+        try scalarInteger(
+            at: tempDir.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
+            sql: "SELECT COUNT(*) FROM upload_identity;")
     }
 
     private func makeStore() throws -> UploadIdentityManifestStore {
@@ -287,16 +299,15 @@ final class UploadIdentityManifestTests: XCTestCase {
             store.beginRemoteContentIndexBuild(
                 hashKeyEpoch: "epoch-1", eventID: "event-1", sourceFingerprint: "source-a", total: 1,
                 updatedAt: Date(timeIntervalSince1970: 1)))
-        XCTAssertEqual(store.count(), 0)
 
         let reopened = try makeStore()
         defer { reopened.close() }
         XCTAssertEqual(reopened.record(for: uploaded.source), uploaded)
         XCTAssertNil(reopened.record(for: makeRecord(identifier: "asset-b").source))
         XCTAssertEqual(reopened.sources(withRemoteLinkID: "link-a"), [uploaded.source])
-        XCTAssertEqual(reopened.count(), 1)
+        XCTAssertEqual(try identityRowCount(), 1)
         XCTAssertTrue(reopened.upsert(makeRecord(identifier: "asset-b")))
-        XCTAssertEqual(reopened.count(), 2)
+        XCTAssertEqual(try identityRowCount(), 2)
     }
 
     func testForgettingTrashedLinksKeepsTheHashesButNoLongerProvesABackup() throws {
@@ -388,7 +399,7 @@ final class UploadIdentityManifestTests: XCTestCase {
         store.upsert(record)
         let fetched = store.record(for: record.source)
         XCTAssertEqual(fetched, record)
-        XCTAssertEqual(store.count(), 1)
+        XCTAssertEqual(try identityRowCount(), 1)
     }
 
     func testMissReturnsNil() throws {
@@ -406,7 +417,7 @@ final class UploadIdentityManifestTests: XCTestCase {
         record.remoteLinkID = "link1"
         store.upsert(record)
         XCTAssertEqual(store.record(for: record.source), record)
-        XCTAssertEqual(store.count(), 1)
+        XCTAssertEqual(try identityRowCount(), 1)
     }
 
     func testPersistsAcrossReopen() throws {
@@ -476,7 +487,7 @@ final class UploadIdentityManifestTests: XCTestCase {
         do {
             let first = try XCTUnwrap(UploadIdentityManifestStore(url: url))
             first.upsert(makeRecord())
-            XCTAssertEqual(first.count(), 1)
+            XCTAssertEqual(try identityRowCount(), 1)
             first.close()
         }
 

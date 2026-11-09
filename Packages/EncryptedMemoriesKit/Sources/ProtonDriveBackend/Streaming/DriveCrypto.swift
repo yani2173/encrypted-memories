@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import ProtonCoreCrypto
 import ProtonCoreCryptoGoInterface
 import ProtonCoreDataModel
@@ -12,6 +13,11 @@ struct UnlockableKey: Sendable {
 }
 
 enum DriveCryptoError: Error { case keyRing, badMessage, base64 }
+
+/// Each case is deterministic key or message data that a second attempt reads the same way.
+extension DriveCryptoError: VideoPlaybackClassifiable {
+    var videoPlaybackError: VideoPlaybackError? { .decryptionFailed }
+}
 
 /// Proton Drive key derivation and per-block decryption for file streaming. The chain is address key,
 /// share key, node key, content session key, then block decryption. Pure crypto;

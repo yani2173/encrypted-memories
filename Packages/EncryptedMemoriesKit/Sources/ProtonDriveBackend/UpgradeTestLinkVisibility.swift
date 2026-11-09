@@ -7,16 +7,17 @@
             Self.linkVisibility(of: linkIDs, activeLinkIDs: Set(try await links().map(\.id)))
         }
 
-        /// The synthetic server lists links without a state or role record, so no answer is explicit.
-        /// The strict draft checks of `UploadDedupePipeline` therefore treat these answers like an incomplete
-        /// response of the real service.
+        /// The synthetic server lists links without a state or role record. With the stricter root rule (#876), its
+        /// answers must carry explicit photo state, so every released version counts them as backed up roots and
+        /// avoids re-uploads that fail the duplicate-upload gate. The initializer omits `hasExplicitState` on
+        /// purpose: its fail-closed default supplies false, so no series check counts these answers.
         static func linkVisibility(of linkIDs: [String], activeLinkIDs: Set<String>) -> [String: RemoteLinkVisibility] {
             Dictionary(
                 uniqueKeysWithValues: linkIDs.map {
                     (
                         $0,
                         RemoteLinkVisibility(
-                            isActive: activeLinkIDs.contains($0), mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+                            isActive: activeLinkIDs.contains($0), mainPhotoLinkID: nil, hasExplicitPhotoState: true)
                     )
                 })
         }

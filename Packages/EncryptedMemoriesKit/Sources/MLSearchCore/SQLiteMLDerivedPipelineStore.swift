@@ -723,6 +723,43 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         }
     }
 
+    /// Token rows exist only for committed outputs, so a single row proves the index can answer a
+    /// query. Unreadable accounts or artifact mappings return `false` (unknown state = no index).
+    public func hasIndexedEntries(for key: MLPipelineExecutionKey) -> Bool {
+        lock.withLock {
+            guard
+                let accountKey = accountKeyLocked(identifier: key.accountIdentifier, create: false),
+                let artifactIDs = artifactIDsLocked(for: key, create: false),
+                !artifactIDs.isEmpty
+            else { return false }
+            let ids = artifactIDs.values.sorted()
+            var stmt: OpaquePointer?
+            guard
+                prepare(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM ml_derived_tokens t
+                        JOIN ml_derived_assets a ON a.asset_id=t.asset_id
+                        WHERE a.account_key=?
+                          AND t.artifact_id IN (\(Self.placeholders(ids.count)))
+                    );
+                    """,
+                    &stmt
+                )
+            else { return false }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, accountKey)
+            var index: Int32 = 2
+            for id in ids {
+                sqlite3_bind_int64(stmt, index, id)
+                index += 1
+            }
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
+            return sqlite3_column_int64(stmt, 0) == 1
+        }
+    }
+
     @discardableResult
     public func reconcile(liveUIDs: Set<PhotoUID>, for key: MLPipelineExecutionKey) -> Bool {
         lock.withLock {

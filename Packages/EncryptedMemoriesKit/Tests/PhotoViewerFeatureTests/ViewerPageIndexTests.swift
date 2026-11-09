@@ -18,26 +18,18 @@ final class ViewerPageIndexTests: XCTestCase {
         XCTAssertEqual(pages.index(of: otherVolumeB), 1)
     }
 
-    func testSelectedUIDSurvivesSurroundingReorder() {
-        let pages = ViewerPageIndex(orderedUIDs: [c, a, b])
-
-        XCTAssertEqual(pages.resolvedIndex(selectedUID: b, fallbackIndex: 0), 2)
-    }
-
-    func testMissingUIDUsesClampedExistingPageAsFallback() {
+    func testMissingUIDHasNoIndex() {
         let missing = PhotoUID(volumeID: "v", nodeID: "missing")
         let pages = ViewerPageIndex(orderedUIDs: [a, b])
 
         XCTAssertEqual(pages.index(of: missing), nil)
-        XCTAssertEqual(pages.resolvedIndex(selectedUID: missing, fallbackIndex: 9), 1)
-        XCTAssertEqual(pages.resolvedIndex(selectedUID: nil, fallbackIndex: -4), 0)
     }
 
     func testEmptyRouteHasNoPage() {
         let pages = ViewerPageIndex(orderedUIDs: [])
 
         XCTAssertNil(pages.uid(at: 0))
-        XCTAssertNil(pages.resolvedIndex(selectedUID: a, fallbackIndex: 0))
+        XCTAssertNil(pages.index(of: a))
     }
 
     func testCompletedTrackpadSwipeResolvesOnePortablePageDirection() {

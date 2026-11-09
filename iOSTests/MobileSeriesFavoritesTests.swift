@@ -47,6 +47,35 @@ final class MobileSeriesFavoritesTests: XCTestCase {
         XCTAssertEqual(model.operation, .idle)
     }
 
+    @MainActor func testAMemberWithoutAKnownRoleTellsThePersonThatItStayedBeforeTheModeCloses() async {
+        let probe = FlowProbe()
+        probe.keptMembersWithoutRole = 1
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[1].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertEqual(model.operation, .finishedWithKeptMembers(count: 1))
+        XCTAssertTrue(model.isPresentingKeptMembersNotice)
+        XCTAssertTrue(probe.finished.isEmpty, "the mode stays open until the person read the notice")
+
+        model.finishAfterKeptMembers()
+
+        XCTAssertEqual(model.operation, .idle)
+        XCTAssertEqual(probe.finished, [true], "after the notice the mode closes like a normal success")
+    }
+
+    @MainActor func testTheNoticeCannotBeDismissedTwice() {
+        let probe = FlowProbe()
+        probe.keptMembersWithoutRole = 2
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+
+        model.finishAfterKeptMembers()
+
+        XCTAssertEqual(model.operation, .idle, "without a notice the mode must not close twice")
+        XCTAssertTrue(probe.finished.isEmpty)
+    }
+
     @MainActor func testFailureKeepsTheModeOpenAndRetryResumes() async {
         let probe = FlowProbe()
         probe.failuresBeforeSuccess = 1
@@ -63,6 +92,125 @@ final class MobileSeriesFavoritesTests: XCTestCase {
         XCTAssertEqual(probe.keepOnlyCalls.count, 2, "the retry calls the journaled operation again")
         XCTAssertEqual(probe.finished, [true])
         XCTAssertEqual(probe.abandonCalls, 0, "a finished operation has nothing to abandon")
+    }
+
+    @MainActor func testFailureAlertUsesOnlyItsTypedReason() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = SeriesDissolutionError.copyNotConfirmed
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        let reason = SeriesDissolutionError.copyNotConfirmed.errorDescription ?? ""
+        XCTAssertEqual(model.failureMessage, reason)
+        XCTAssertEqual(model.failureAlertMessage, reason)
+        XCTAssertTrue(model.canRetryFailure)
+        XCTAssertEqual(probe.keepOnlyCalls.count, 1)
+        XCTAssertTrue(model.selection.isFavorite(probe.items[0].uid))
+        XCTAssertTrue(probe.finished.isEmpty)
+    }
+
+    @MainActor func testUnknownFailureHasAnEmptyBodyAndStillPresentsTheAlert() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = NSError(
+            domain: "ExampleSeriesFailure", code: 503,
+            userInfo: [NSLocalizedDescriptionKey: "Example service diagnostic"])
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertEqual(model.failureMessage, Optional.some(""))
+        XCTAssertNotNil(model.failureMessage)
+        XCTAssertTrue(model.failureMessage != nil)
+        XCTAssertEqual(model.failureAlertMessage, "")
+        XCTAssertTrue(model.canRetryFailure)
+        XCTAssertEqual(probe.keepOnlyCalls.count, 1)
+    }
+
+    @MainActor func testInvalidSelectionDoesNotOfferRetry() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = SeriesDissolutionError.invalidSelection
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertFalse(model.canRetryFailure)
+        XCTAssertEqual(model.failureMessage, SeriesDissolutionError.invalidSelection.errorDescription)
+        XCTAssertEqual(probe.keepOnlyCalls.count, 1)
+    }
+
+    @MainActor func testAMissingLibraryServiceReportsItsOwnReasonAndOffersNoRetry() async {
+        // The real route: a library model without a backend has no dissolution service. The failure is the
+        // missing service, not an own-library refusal, and a retry cannot bring the service back.
+        let libraryModel = MobileLibraryModel()
+        let seriesUID = PhotoUID(volumeID: "fixture", nodeID: "series-0")
+        do {
+            try await libraryModel.keepOnlySeriesFavorites(
+                seriesMainUID: seriesUID,
+                seriesUIDs: [seriesUID],
+                favoriteUIDs: [seriesUID]
+            ) { _ in }
+            XCTFail("Without a backend the operation must fail")
+        } catch {
+            let presentation = SeriesFailurePresentation(error: error)
+            XCTAssertEqual(
+                presentation.message, SeriesDissolutionError.libraryUnavailable.errorDescription
+            )
+            XCTAssertFalse(presentation.canRetry)
+        }
+    }
+
+    @MainActor func testTheOwnLibraryRefusalKeepsItsReasonAndRetry() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = SeriesDissolutionError.notOwnLibrary
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertEqual(model.failureMessage, SeriesDissolutionError.notOwnLibrary.errorDescription)
+        XCTAssertEqual(model.failureAlertMessage, SeriesDissolutionError.notOwnLibrary.errorDescription)
+        XCTAssertTrue(model.canRetryFailure)
+    }
+
+    @MainActor func testTransientAndAmbiguousFailuresKeepRetryAndMarks() async {
+        let failures: [SeriesDissolutionError] = [
+            .notOwnLibrary, .alreadyRunning, .blockedByForeignDraft("example.jpg"),
+            .copyNotConfirmed, .trashNotConfirmed,
+        ]
+        for failure in failures {
+            let probe = FlowProbe()
+            probe.injectedFailure = failure
+            let model = probe.makeModel(canKeepOnlyFavorites: true)
+            model.toggleFavorite(probe.items[0].uid)
+
+            await model.keepOnlyMarkedFavorites()
+
+            XCTAssertTrue(model.canRetryFailure)
+            XCTAssertEqual(probe.keepOnlyCalls.count, 1)
+            XCTAssertTrue(model.selection.isFavorite(probe.items[0].uid))
+            XCTAssertTrue(probe.finished.isEmpty)
+        }
+    }
+
+    @MainActor func testUnknownFailureRetriesOnlyOnRequestWithTheSameMarks() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = NSError(domain: "ExampleSeriesFailure", code: 503)
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+        XCTAssertEqual(probe.keepOnlyCalls, [[probe.items[0].uid]])
+
+        probe.injectedFailure = nil
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertEqual(probe.keepOnlyCalls, [[probe.items[0].uid], [probe.items[0].uid]])
+        XCTAssertEqual(probe.finished, [true])
+        XCTAssertEqual(probe.abandonCalls, 0)
     }
 
     @MainActor func testLeavingTheModeAfterAFailureAbandonsThePendingOperation() async {
@@ -175,6 +323,9 @@ final class MobileSeriesFavoritesTests: XCTestCase {
     var keepOnlyCalls: [[PhotoUID]] = []
     var abandonCalls = 0
     var failuresBeforeSuccess = 0
+    var injectedFailure: (any Error)?
+    /// Members without a known role that the fake backend reports as staying in the library.
+    var keptMembersWithoutRole = 0
 
     func makeModel(canKeepOnlyFavorites: Bool) -> MobileSeriesFavoritesModel {
         MobileSeriesFavoritesModel(
@@ -183,10 +334,16 @@ final class MobileSeriesFavoritesTests: XCTestCase {
             keepOnlyFavorites: { [self] favoriteUIDs, onProgress in
                 keepOnlyCalls.append(favoriteUIDs)
                 onProgress(.init(step: .copyingFavorite(index: 0, count: favoriteUIDs.count), fraction: 0.4))
+                if keptMembersWithoutRole > 0 {
+                    onProgress(.init(step: .membersStayedWithoutARole(count: keptMembersWithoutRole), fraction: 0.9))
+                }
                 if failuresBeforeSuccess > 0 {
                     failuresBeforeSuccess -= 1
                     throw SeriesDissolutionError.copyNotConfirmed
                 }
+                if let injectedFailure { throw injectedFailure }
+                // The model records each report on the main actor, so let those hops land before this call returns.
+                try? await Task.sleep(for: .milliseconds(50))
             },
             abandonKeepOnlyFavorites: { [self] in abandonCalls += 1 },
             onFinished: { [self] in finished.append($0) }

@@ -126,6 +126,13 @@ def apply_overlay(source, automation, tag, sha):
     sentinel = source / 'Packages/EncryptedMemoriesKit/Sources/PhotosCore/UpgradeTestProbe.swift'
     # A release with its own test entry needs an overlay only when its tag has a reviewed one.
     has_test_entry = sentinel.exists()
+    # A pinned test-entry file is used only for a release without its own entry, and only for a PAYLOAD path.
+    pinned = automation / 'scripts/upgrade-test/overlays' / (tag + '.payload')
+    pinned_files = sorted(str(path.relative_to(pinned)) for path in pinned.rglob('*') if path.is_file())
+    if pinned_files and has_test_entry:
+        raise JourneyError(f'{tag}: pinned test-entry files for a release that has its own test entry')
+    if set(pinned_files) - set(PAYLOAD):
+        raise JourneyError(f'{tag}: pinned file outside the test-entry payload: {sorted(set(pinned_files) - set(PAYLOAD))}')
     if has_test_entry and tag not in manifest:
         return
     if tag not in manifest or manifest[tag]['commit'] != sha:
@@ -135,9 +142,12 @@ def apply_overlay(source, automation, tag, sha):
     command(['git', 'apply', '--unidiff-zero', str(patch)], cwd=source)
     if has_test_entry:
         return
+    # The release's own protocols decide what a test file may use. A pinned file replaces the candidate's
+    # when the candidate's file needs a type that this release does not have (v1.0.5: UploadNetworkReservation).
     for relative in PAYLOAD:
         target = source / 'Packages/EncryptedMemoriesKit/Sources' / relative
-        shutil.copy2(automation / 'Packages/EncryptedMemoriesKit/Sources' / relative, target)
+        candidate = automation / 'Packages/EncryptedMemoriesKit/Sources' / relative
+        shutil.copy2(pinned / relative if (pinned / relative).is_file() else candidate, target)
 
 
 def test_project(source, automation, platform):

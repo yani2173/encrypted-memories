@@ -9,8 +9,6 @@ import CoreGraphics
 public enum GridProfileRebaseLevelMapping: Equatable, Sendable {
     /// Keep the same integer level ID, clamped to the target ladder.
     case preserveLevelID
-    /// Use the target profile's configured default level.
-    case targetDefault
     /// Use a specific target level, clamped to the target ladder.
     case explicit(Int)
     /// Choose the target level whose resolved slot side is closest to the source level at the old width.
@@ -173,8 +171,6 @@ public extension SquareTileGridEngine {
         switch mapping {
         case .preserveLevelID:
             return targetEngine.clampLevel(sourceLevel)
-        case .targetDefault:
-            return targetEngine.defaultLevel
         case .explicit(let level):
             return targetEngine.clampLevel(level)
         case .closestVisualMatch:

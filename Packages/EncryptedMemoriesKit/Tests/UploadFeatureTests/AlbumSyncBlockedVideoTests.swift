@@ -1,9 +1,10 @@
 import AlbumSyncCore
 import Foundation
 import PhotosCore
+import UploadCore
 import XCTest
 
-@testable import UploadCore
+@testable import PhotoLibraryBackupAdapter
 
 /// Album Sync reports an album as complete only when every resource of each photo is saved. A Live Photo whose
 /// video stays blocked behind a foreign draft keeps showing as a problem.
@@ -67,7 +68,7 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
             localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
         ) async throws -> AlbumSyncBackupReport {
             _ = await runner.runUntilDrained(workIntent: .userInitiated)
-            let summary = queue.summary()
+            let summary = queue.summary()!
             var problems: [String: BackupFailedItem] = [:]
             queue.forEachProblemEntry { entry in
                 if entry.source.kind == .photoLibraryAsset, problems[entry.source.identifier] == nil {
@@ -125,6 +126,7 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
             identityResolver: UploadDedupePipeline(
                 store: manifest, hasher: hasher, checker: checker, now: { [clock] in clock!.now }),
             uploader: uploader,
+            tagAdder: SpyTagAdder(),
             configuration: BackupSyncRunner.Configuration(
                 uploadStallTimeout: 180, uploadStallPollInterval: 5,
                 retry: BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 4),
@@ -156,7 +158,7 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
         let (report, remote) = try await syncAlbum([entry])
 
         // The backup keeps the video blocked and uploaded only the photo.
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.state, .blockedByDraft)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.state, .blockedByDraft)
         XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"])
         XCTAssertEqual(remote.memberLinkIDs, ["node-live.heic"], "the main photo is in the album")
         XCTAssertFalse(
@@ -192,6 +194,118 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
         let (report, _) = try await syncAlbum([entry])
 
         XCTAssertTrue(report.isFullySynced)
+        XCTAssertTrue(report.problems.isEmpty)
+    }
+
+    // MARK: - Live Photo indicator through the real album executor (issue 888)
+
+    /// Streams fixed candidates instead of scanning PhotoKit. Only this seam is faked; the executor,
+    /// its dedupe pipeline, its runner and the settle logic all run for real.
+    private struct FixedCandidates: UploadBackupAssetCatalog {
+        let items: [UploadBackupAssetCandidate]
+        func candidates() -> AsyncThrowingStream<UploadBackupAssetCandidate, any Error> {
+            AsyncThrowingStream { continuation in
+                for item in items { continuation.yield(item) }
+                continuation.finish()
+            }
+        }
+    }
+
+    /// Arms one failure of the receipt write on the executor's own queue at the first resolve, while the drain runs.
+    private final class ReceiptWriteFault: BackupResourceResolving, @unchecked Sendable {
+        let inner: ScriptedBackupResolver
+        weak var executor: PhotoAlbumBackupExecutor?
+        private let lock = NSLock()
+        private(set) var faults: SQLiteStatementFaults?
+        init(inner: ScriptedBackupResolver) { self.inner = inner }
+
+        func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+            try lock.withLock {
+                guard faults == nil, let executor else { return }
+                let runner = try XCTUnwrap(
+                    Mirror(reflecting: executor).children.first { $0.label == "activeRunner" }?.value
+                        as? BackupSyncRunner)
+                let queue = try XCTUnwrap(
+                    Mirror(reflecting: runner).children.first { $0.label == "queue" }?.value
+                        as? UploadBackupSyncQueueManifestStore)
+                faults = try SQLiteStatementFaults(in: queue, failures: 1) {
+                    $0.contains("state='needsRemoteReconciliation',")
+                }
+            }
+            return try await inner.resolve(entry)
+        }
+    }
+
+    /// A drain that ended because a write failed is no finished drain, also after the database answers again: the
+    /// album sync must not build its report from it and count the photo that did not settle as unattachable.
+    func testAFailedReceiptWriteEndsTheAlbumBackupAsUnavailable() async throws {
+        let faulting = ReceiptWriteFault(inner: resolver)
+        let executor = PhotoAlbumBackupExecutor(
+            accountDataDirectory: tempDir.appendingPathComponent("album-receipt-fault", isDirectory: true),
+            databasePolicy: .conservative,
+            identityResolver: UploadDedupePipeline(
+                store: manifest, hasher: hasher, checker: checker, now: { [clock] in clock!.now }),
+            uploader: uploader,
+            resourceResolver: faulting,
+            proofCatalog: FixedCandidates(items: [
+                UploadBackupAssetCandidate(
+                    snapshot: UploadBackupAssetSnapshot(
+                        source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "photo"),
+                        revision: UploadBackupRevision(date: resolver.defaultModified),
+                        resourceCount: 1),
+                    originalFilename: "photo.heic",
+                    byteCount: 4)
+            ]),
+            runtimeSignals: .wiFiWithMobileDataOff,
+            clock: clock)
+        faulting.executor = executor
+
+        do {
+            let report = try await executor.ensureBackedUp(localIdentifiers: ["photo"]) { _ in }
+            XCTFail("an unfinished drain must not become a report: \(report)")
+        } catch {
+            XCTAssertEqual(error as? AlbumSyncError, .mappingStoreUnavailable)
+        }
+        XCTAssertEqual(faulting.faults?.firedCount, 1, "the receipt write after the upload failed")
+        XCTAssertEqual(uploader.requests.map(\.name), ["photo.heic"])
+    }
+
+    func testTheAlbumExecutorRouteAddsTheLivePhotoTagAfterBothPartsSettle() async throws {
+        resolver.setSecondaries(["live.mov"], for: "live")
+        let tagAdder = SpyTagAdder()
+        let executor = PhotoAlbumBackupExecutor(
+            accountDataDirectory: tempDir.appendingPathComponent("album-route", isDirectory: true),
+            databasePolicy: .conservative,
+            identityResolver: UploadDedupePipeline(
+                store: manifest, hasher: hasher, checker: checker, now: { [clock] in clock!.now }),
+            uploader: uploader,
+            tagAdder: tagAdder,
+            resourceResolver: resolver,
+            proofCatalog: FixedCandidates(items: [
+                UploadBackupAssetCandidate(
+                    snapshot: UploadBackupAssetSnapshot(
+                        source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "live"),
+                        revision: UploadBackupRevision(date: resolver.defaultModified),
+                        resourceCount: 2),
+                    originalFilename: "live.heic",
+                    byteCount: 4)
+            ]),
+            runtimeSignals: .wiFiWithMobileDataOff,
+            clock: clock)
+
+        let report = try await executor.ensureBackedUp(localIdentifiers: ["live"]) { _ in }
+
+        XCTAssertEqual(
+            uploader.requests.map(\.name), ["live.heic", "live.mov"],
+            "the album route uploads the still first, then its video")
+        XCTAssertEqual(uploader.requests.map(\.tags), [[], []], "neither part carries tag 3 at creation")
+        XCTAssertEqual(
+            tagAdder.calls.map(\.tags), [[PhotoTag.livePhotos.rawValue]],
+            "the album route adds tag 3 once both parts settle")
+        XCTAssertEqual(
+            tagAdder.calls.map(\.uid.nodeID), ["node-live.heic"], "tag 3 lands on the still")
+        XCTAssertEqual(report.backedUp, 1)
+        XCTAssertEqual(report.failed, 0)
         XCTAssertTrue(report.problems.isEmpty)
     }
 }

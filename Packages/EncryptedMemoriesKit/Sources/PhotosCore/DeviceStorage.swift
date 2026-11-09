@@ -38,14 +38,13 @@ public enum LibraryStoragePressure: Int, Sendable, Equatable {
     case low
     case critical
 
-    private static let lowThreshold: Int64 = 2 << 30
-    private static let criticalThreshold: Int64 = 512 << 20
-    private static let recoveryMargin: Int64 = 256 << 20
-
     /// A level is left only after a margin above its threshold, so a device near a threshold does not flap.
-    /// An unknown capacity keeps the previous level.
-    public static func next(after previous: Self, availableBytes: Int64?) -> Self {
+    /// An unknown capacity keeps the previous level. The thresholds come from the shared disk-cache budget policy.
+    public static func next(after previous: Self, availableBytes: Int64?, policy: DiskCacheBudgetPolicy) -> Self {
         guard let availableBytes else { return previous }
+        let lowThreshold = policy.lowStorageThresholdBytes
+        let criticalThreshold = policy.criticalStorageThresholdBytes
+        let recoveryMargin = policy.storageRecoveryMarginBytes
         if availableBytes < criticalThreshold { return .critical }
         if previous == .critical, availableBytes < criticalThreshold + recoveryMargin { return .critical }
         if availableBytes < lowThreshold { return .low }

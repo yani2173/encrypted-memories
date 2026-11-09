@@ -16,7 +16,7 @@ final class DriveSession: @unchecked Sendable {
     let requestGovernor: ProtonRequestGovernor
     private let lock = NSLock()
     private var session: ProtonSession
-    private var refreshFlight = RefreshFlight()
+    private var refreshFlight = RefreshFlight<TokenRefreshOutcome>()
     /// Counts credential replacements, so a 401 for replaced credentials retries without a refresh.
     private var credentialGeneration: UInt64 = 0
 
@@ -53,9 +53,6 @@ final class DriveSession: @unchecked Sendable {
         return URL(string: config.baseURL.absoluteString + p) ?? config.baseURL
     }
 
-    /// Auth headers for an arbitrary request (used by the SDK HTTP client too).
-    func authHeaders() -> [String: String] { authorization().headers }
-
     /// Auth headers and the credential generation they belong to, read together.
     func authorization() -> (headers: [String: String], generation: UInt64) {
         let (s, generation) = lock.withLock { (session, credentialGeneration) }
@@ -71,8 +68,9 @@ final class DriveSession: @unchecked Sendable {
 
     // MARK: - Authenticated JSON
 
-    func getJSON<T: Decodable>(_ path: String, as type: T.Type) async throws -> T {
-        let data = try await authedData(path: path, method: "GET", retryOn429: true)
+    /// `retryOnRateLimit` false answers a rate limit with an error at once, for a read that has a cheaper fallback.
+    func getJSON<T: Decodable>(_ path: String, as type: T.Type, retryOnRateLimit: Bool = true) async throws -> T {
+        let data = try await authedData(path: path, method: "GET", retryOn429: retryOnRateLimit)
         return try JSONDecoder().decode(T.self, from: data)
     }
 
@@ -97,62 +95,46 @@ final class DriveSession: @unchecked Sendable {
         method: String,
         body: [String: Any]? = nil,
         retryOn401: Bool = true,
+        reportAccountRefreshFailure: Bool = false,
         retryOn429: Bool
     ) async throws -> Data {
-        var req = URLRequest(url: makeURL(path))
-        req.httpMethod = method
-        let auth = authorization()
-        for (k, v) in auth.headers { req.setValue(v, forHTTPHeaderField: k) }
-        if let body {
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        func makeRequest() throws -> BufferedHTTPExecutor.Request {
+            var request = URLRequest(url: makeURL(path))
+            request.httpMethod = method
+            let auth = authorization()
+            for (key, value) in auth.headers { request.setValue(value, forHTTPHeaderField: key) }
+            if let body {
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            }
+            return .init(request: request, credentialGeneration: auth.generation)
         }
 
-        let permit = try await requestGovernor.acquire(scope: .api, label: .api(method: method, path: path))
-        let data: Data
-        let response: URLResponse
+        let result: BufferedHTTPExecutor.Response
         do {
-            (data, response) = try await urlSession.data(for: req)
-        } catch {
-            await requestGovernor.finish(
-                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
-            throw error
-        }
-        guard let http = response as? HTTPURLResponse else {
-            await requestGovernor.finish(permit, statusCode: nil)
+            result = try await BufferedHTTPExecutor.perform(
+                try makeRequest(), urlSession: urlSession, governor: requestGovernor,
+                label: .api(method: method, path: path),
+                retryOn401: retryOn401, retryOn429: retryOn429,
+                retryAfterRateLimit: { _ in try makeRequest() },
+                refreshAfterUnauthorized: { attempt in
+                    switch await self.refreshOutcome(after: attempt.credentialGeneration) {
+                    case .refreshed:
+                        return try makeRequest()
+                    case .unavailable where reportAccountRefreshFailure:
+                        throw AccountDataRefreshError.unavailable
+                    case .rejected, .unavailable:
+                        return nil
+                    }
+                })
+        } catch BufferedHTTPExecutor.Failure.invalidResponse {
             throw ProtonAuthError.invalidResponse
         }
-        await requestGovernor.finish(
-            permit,
-            statusCode: http.statusCode,
-            retryAfter: ProtonRetryAfter.seconds(from: http)
-        )
-
-        if http.statusCode == 429, retryOn429 {
-            return try await authedData(
-                path: path,
-                method: method,
-                body: body,
-                retryOn401: retryOn401,
-                retryOn429: false
-            )
+        guard (200...299).contains(result.response.statusCode) else {
+            throw ProtonAuthError.apiError(
+                code: result.response.statusCode, message: "HTTP \(result.response.statusCode) for \(path)")
         }
-
-        if http.statusCode == 401, retryOn401 {
-            if await refreshToken(after: auth.generation) {
-                return try await authedData(
-                    path: path,
-                    method: method,
-                    body: body,
-                    retryOn401: false,
-                    retryOn429: retryOn429
-                )
-            }
-        }
-        guard (200...299).contains(http.statusCode) else {
-            throw ProtonAuthError.apiError(code: http.statusCode, message: "HTTP \(http.statusCode) for \(path)")
-        }
-        return data
+        return result.data
     }
 
     // MARK: - Token refresh
@@ -160,17 +142,21 @@ final class DriveSession: @unchecked Sendable {
     /// True when credentials newer than `generation` exist. Current credentials join the one refresh in flight
     /// or start it. Replaced credentials never start a refresh: they wait for a running one, else retry at once.
     func refreshToken(after generation: UInt64) async -> Bool {
-        let flight: (id: UInt64, task: Task<Bool, Never>)? = lock.withLock {
+        await refreshOutcome(after: generation) == .refreshed
+    }
+
+    private func refreshOutcome(after generation: UInt64) async -> TokenRefreshOutcome {
+        let flight: (id: UInt64, task: Task<TokenRefreshOutcome, Never>)? = lock.withLock {
             guard generation == credentialGeneration else { return refreshFlight.running }
-            return refreshFlight.join { Task<Bool, Never> { await self.performRefresh() } }
+            return refreshFlight.join { Task { await self.performRefresh() } }
         }
-        guard let flight else { return true }
+        guard let flight else { return .refreshed }
         let result = await flight.task.value
         lock.withLock { refreshFlight.retire(flight.id) }
         return result
     }
 
-    private func performRefresh() async -> Bool {
+    private func performRefresh() async -> TokenRefreshOutcome {
         let s = current
         var req = URLRequest(url: makeURL("/auth/v4/refresh"))
         req.httpMethod = "POST"
@@ -184,45 +170,46 @@ final class DriveSession: @unchecked Sendable {
         guard
             let permit = try? await requestGovernor.acquire(
                 scope: .api, priority: .immediate, label: .api(method: "POST", path: "/auth/v4/refresh"))
-        else { return false }
+        else { return .unavailable }
         guard let (data, response) = try? await urlSession.data(for: req),
             let http = response as? HTTPURLResponse
         else {
             await requestGovernor.finish(permit, statusCode: nil)
-            return false
+            return .unavailable
         }
         await requestGovernor.finish(
             permit,
             statusCode: http.statusCode,
             retryAfter: ProtonRetryAfter.seconds(from: http)
         )
+        if http.statusCode == 401 { return .rejected }
         guard (200...299).contains(http.statusCode),
             let body = try? JSONDecoder().decode(RefreshResponse.self, from: data),
             let at = body.accessToken
         else {
-            return false
+            return .unavailable
         }
         var refreshed = s
         refreshed.accessToken = at
         if let rt = body.refreshToken { refreshed.refreshToken = rt }
-        guard (try? store.save(refreshed)) != nil else { return false }
+        guard (try? store.save(refreshed)) != nil else { return .unavailable }
         lock.withLock {
             session = refreshed
             credentialGeneration += 1
         }
-        return true
+        return .refreshed
     }
 }
 
 /// The token refresh in flight. Callers join it instead of sending a second refresh.
-struct RefreshFlight {
-    private var current: (id: UInt64, task: Task<Bool, Never>)?
+struct RefreshFlight<Outcome: Sendable> {
+    private var current: (id: UInt64, task: Task<Outcome, Never>)?
     private var lastID: UInt64 = 0
 
-    var running: (id: UInt64, task: Task<Bool, Never>)? { current }
+    var running: (id: UInt64, task: Task<Outcome, Never>)? { current }
     var id: UInt64? { current?.id }
 
-    mutating func join(starting start: () -> Task<Bool, Never>) -> (id: UInt64, task: Task<Bool, Never>) {
+    mutating func join(starting start: () -> Task<Outcome, Never>) -> (id: UInt64, task: Task<Outcome, Never>) {
         if let current { return current }
         lastID += 1
         let flight = (id: lastID, task: start())
@@ -362,7 +349,7 @@ extension DriveSession {
         if let token {
             req.setValue(token, forHTTPHeaderField: "pm-storage-token")
         } else if isTrustedAPIURL(u) {
-            for (k, v) in authHeaders() { req.setValue(v, forHTTPHeaderField: k) }
+            for (k, v) in authorization().headers { req.setValue(v, forHTTPHeaderField: k) }
         }
         let permit = try await requestGovernor.acquire(
             scope: .storageDownload, priority: priority, priorityHandle: priorityHandle,
@@ -391,7 +378,8 @@ extension DriveSession {
         return data
     }
 
-    private func isTrustedAPIURL(_ url: URL) -> Bool {
+    /// True for an https URL on the host of the Proton API; only such a request may carry the session credentials.
+    func isTrustedAPIURL(_ url: URL) -> Bool {
         guard url.scheme == "https",
             let host = url.host?.lowercased(),
             let expected = config.baseURL.host?.lowercased()
@@ -485,26 +473,29 @@ extension DriveSession {
     /// The web client's chunk size for `links/fetch_metadata`.
     private static let metadataBatchSize = 150
 
-    /// Moves photos to trash (batch). Volume-keyed, on the `v2` path.
-    ///
-    /// This endpoint is a multistatus batch. It returns HTTP 200 with per-item result codes
-    /// in `Responses[].Response`. A failed move must be detected from the body; ignoring it turns every
-    /// failure into a silent "success" (photo gone from the grid, never in Recently Deleted).
     /// The state and the main photo of each link. A link that the server no longer knows is absent from the result.
     /// `retryOnRateLimit` false answers a rate limit with an error at once, for a read that has a cheaper fallback.
+    /// `requiresCompleteResponse` true throws on an answer that is not complete: there, an omitted link and a
+    /// deleted link look the same.
     func fetchLinkVisibility(
-        shareID: String, linkIDs: [String], retryOnRateLimit: Bool = true
+        shareID: String, linkIDs: [String], retryOnRateLimit: Bool = true, requiresCompleteResponse: Bool = false
     ) async throws -> [String: TimelineRemoteVisibilityRequirement.Link] {
         var result: [String: TimelineRemoteVisibilityRequirement.Link] = [:]
-        for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
+        for chunk in linkIDs.chunked(by: Self.metadataBatchSize) {
             try Task.checkCancellation()
             let response = try await linkVisibilityResponse(
                 shareID: shareID, linkIDs: chunk, retryOnRateLimit: retryOnRateLimit)
+            if requiresCompleteResponse {
+                guard response.code == 1000, response.envelope.isComplete else {
+                    throw UploadError.backend("The link visibility response is incomplete")
+                }
+            }
             for link in response.links {
                 guard let id = link.linkID else { continue }
                 result[id] = .init(
                     isActive: link.state == nil || link.state == 1,
                     mainPhotoLinkID: link.fileProperties?.activeRevision?.photo?.mainPhotoLinkID,
+                    hasExplicitState: link.state != nil,
                     trashTime: link.trashed,
                     hasExplicitPhotoState: link.state != nil && link.fileProperties?.activeRevision?.photo != nil)
             }
@@ -524,7 +515,7 @@ extension DriveSession {
     func fetchLinkStateSnapshot(shareID: String, linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
         var states: [String: Int] = [:]
         var complete = true
-        for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
+        for chunk in linkIDs.chunked(by: Self.metadataBatchSize) {
             try Task.checkCancellation()
             let response = try await linkVisibilityResponse(shareID: shareID, linkIDs: chunk, retryOnRateLimit: true)
             complete = complete && response.code == 1000 && response.envelope.isComplete
@@ -543,6 +534,11 @@ extension DriveSession {
         return UploadLinkStateSnapshot(states: states, complete: complete)
     }
 
+    /// Moves photos to trash (batch). Volume-keyed, on the `v2` path.
+    ///
+    /// This endpoint is a multistatus batch. It returns HTTP 200 with per-item result codes
+    /// in `Responses[].Response`. A failed move must be detected from the body; ignoring it turns every
+    /// failure into a silent "success" (photo gone from the grid, never in Recently Deleted).
     func trash(volumeID: String, linkIDs: [String]) async throws {
         try await batchLinkAction(
             "trash", volumeID: volumeID, linkIDs: linkIDs,
@@ -568,7 +564,7 @@ extension DriveSession {
         var refused = 0
         var retryable = Set<String>()
         var firstError: String?
-        let chunks = Self.chunked(linkIDs, size: Self.batchRequestSize)
+        let chunks = linkIDs.chunked(by: Self.batchRequestSize)
         for (index, chunk) in chunks.enumerated() {
             let data: Data
             do {
@@ -626,7 +622,10 @@ extension DriveSession {
     /// Pagination integrity: a full page that contributes zero new (shareID, linkID) identities is
     /// an infinite loop signal; it must fail with `DrivePaginationError.trashPageWithoutNewIDs`
     /// instead of repeating forever or returning an incomplete list.
-    func listTrash(volumeID: String, pageSize: Int = 150) async throws -> [TrashLink] {
+    ///
+    /// `retryOnRateLimit` false answers a rate limit with an error at once, for a listing that a restore reads only to
+    /// find the related photos and that must not hold the restore back.
+    func listTrash(volumeID: String, pageSize: Int = 150, retryOnRateLimit: Bool = true) async throws -> [TrashLink] {
         guard pageSize > 0 else { throw DrivePaginationError.invalidPageSize(pageSize) }
         var idsByShare: [String: [String]] = [:]
         var seenByShare: [String: Set<String>] = [:]
@@ -634,7 +633,8 @@ extension DriveSession {
         while true {
             try Task.checkCancellation()
             let r = try await getJSON(
-                "/drive/volumes/\(volumeID)/trash?Page=\(pageIndex)&PageSize=\(pageSize)", as: VolumeTrashResponse.self)
+                "/drive/volumes/\(volumeID)/trash?Page=\(pageIndex)&PageSize=\(pageSize)", as: VolumeTrashResponse.self,
+                retryOnRateLimit: retryOnRateLimit)
             try Task.checkCancellation()
             var rawCount = 0
             var newCount = 0
@@ -655,13 +655,13 @@ extension DriveSession {
         }
         var all: [TrashLink] = []
         for (shareID, ids) in idsByShare {
-            for chunk in Self.chunked(ids, size: Self.metadataBatchSize) {
+            for chunk in ids.chunked(by: Self.metadataBatchSize) {
                 try Task.checkCancellation()
                 let data = try await send(
                     "/drive/shares/\(shareID)/links/fetch_metadata",
                     method: "POST",
                     body: ["LinkIDs": chunk],
-                    retryOnRateLimit: true
+                    retryOnRateLimit: retryOnRateLimit
                 )
                 let decoded = try JSONDecoder().decode(LinkMetaBatchResponse.self, from: data)
                 all.append(contentsOf: decoded.links ?? [])
@@ -673,13 +673,10 @@ extension DriveSession {
         return all
     }
 
-    private static func chunked(_ items: [String], size: Int) -> [[String]] {
-        stride(from: 0, to: items.count, by: size).map { Array(items[$0..<min($0 + size, items.count)]) }
-    }
-
     /// Lists the photos contained in an album (same per-photo shape as the timeline).
     func fetchAlbumPhotos(volumeID: String, albumLinkID: String) async throws -> [PhotosListEntry] {
         var all: [PhotosListEntry] = []
+        var usedAnchors = Set<String>()
         var anchor: String?
         repeat {
             var path = "/drive/photos/volumes/\(volumeID)/albums/\(albumLinkID)/children?Desc=1"
@@ -687,6 +684,10 @@ extension DriveSession {
             let page = try await getJSON(path, as: AlbumPhotosResponse.self)
             all.append(contentsOf: page.photos)
             anchor = page.more == true ? page.anchorID : nil
+            // A page that points to an anchor that was already used would be requested forever.
+            if let anchor, !usedAnchors.insert(anchor).inserted {
+                throw DrivePaginationError.repeatedAlbumAnchor(anchor)
+            }
         } while anchor != nil
         return all
     }
@@ -745,8 +746,8 @@ private struct VolumeTrashResponse: Decodable {
     enum CodingKeys: String, CodingKey { case trash = "Trash" }
 }
 
-/// `POST /drive/shares/{shareID}/links/fetch_metadata` response.
-/// `links/fetch_metadata` fields that decide whether a photos listing can show a link.
+/// `POST /drive/shares/{shareID}/links/fetch_metadata` response: the fields that decide whether a
+/// photos listing can show a link.
 private struct LinkVisibilityResponse: Decodable {
     let code: Int?
     /// What the shape of the answer says about its completeness; see `protonMetadataEnvelope`.
@@ -836,12 +837,17 @@ struct DrivePaginationError: LocalizedError, Equatable {
         case repeatedPhotosCursor(String)
         /// A trash listing returned a full page that contained no new (shareID, linkID) identities.
         case trashPageWithoutNewIDs(pageIndex: Int)
+        /// An album listing page named an anchor that an earlier page of the same listing already used.
+        case repeatedAlbumAnchor(String)
     }
     static func invalidPageSize(_ pageSize: Int) -> DrivePaginationError {
         DrivePaginationError(reason: .invalidPageSize(pageSize))
     }
     static func repeatedPhotosCursor(_ cursor: String) -> DrivePaginationError {
         DrivePaginationError(reason: .repeatedPhotosCursor(cursor))
+    }
+    static func repeatedAlbumAnchor(_ anchor: String) -> DrivePaginationError {
+        DrivePaginationError(reason: .repeatedAlbumAnchor(anchor))
     }
     static func trashPageWithoutNewIDs(_ pageIndex: Int) -> DrivePaginationError {
         DrivePaginationError(reason: .trashPageWithoutNewIDs(pageIndex: pageIndex))
@@ -852,6 +858,8 @@ struct DrivePaginationError: LocalizedError, Equatable {
             return "Drive pagination requires a positive page size (got \(pageSize))."
         case .repeatedPhotosCursor:
             return "Drive photos listing did not advance. Please try again."
+        case .repeatedAlbumAnchor:
+            return "Drive album listing did not advance. Please try again."
         case .trashPageWithoutNewIDs(let pageIndex):
             return
                 "Drive trash listing page \(pageIndex) returned a full page with no new link identities; aborting to avoid an infinite pagination loop."
@@ -893,8 +901,10 @@ extension DriveSession {
     /// We decode minimal DTOs (ProtonCore's own `Codable` is stricter than the live API) and
     /// construct `ProtonCoreDataModel.Key`/`Address` via their public initialisers.
     func fetchAccountData() async throws -> AccountData {
-        async let usersData = authedData(path: "/core/v4/users", method: "GET", retryOn429: true)
-        async let addressesData = authedData(path: "/core/v4/addresses", method: "GET", retryOn429: true)
+        async let usersData = authedData(
+            path: "/core/v4/users", method: "GET", reportAccountRefreshFailure: true, retryOn429: true)
+        async let addressesData = authedData(
+            path: "/core/v4/addresses", method: "GET", reportAccountRefreshFailure: true, retryOn429: true)
         let (uData, aData) = try await (usersData, addressesData)
         // Persist (encrypted) so a later offline cold start can rebuild the crypto without the network.
         AccountDataCache.save(
@@ -991,7 +1001,6 @@ private struct UsersResponse: Decodable {
         let maxSpace: Int64?
         let usedDriveSpace: Int64?
         let maxDriveSpace: Int64?
-        let usedBaseSpace: Int64?
         let maxBaseSpace: Int64?
         enum CodingKeys: String, CodingKey {
             case keys = "Keys"
@@ -999,7 +1008,6 @@ private struct UsersResponse: Decodable {
             case maxSpace = "MaxSpace"
             case usedDriveSpace = "UsedDriveSpace"
             case maxDriveSpace = "MaxDriveSpace"
-            case usedBaseSpace = "UsedBaseSpace"
             case maxBaseSpace = "MaxBaseSpace"
         }
     }

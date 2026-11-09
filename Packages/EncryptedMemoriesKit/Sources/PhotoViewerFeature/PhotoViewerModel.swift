@@ -77,7 +77,7 @@ public final class PhotoViewerModel {
     public var placeName: String? { titleMetadataState.resolution?.placeName }
     public var isPlaceNameResolving: Bool {
         titleMetadataState.shouldReservePlaceNameLine(
-            hasKnownLocation: knownLocationUIDs.contains(current.uid)
+            hasKnownLocation: hasKnownLocation(current.uid)
         )
     }
 
@@ -91,13 +91,13 @@ public final class PhotoViewerModel {
     private let metadataProvider: PhotoMetadataProvider?
     private let albumMembershipProvider: (any PhotoAlbumMembershipProviding)?
     private let titleMetadataCoordinator: ViewerTitleMetadataCoordinator
-    private let knownLocationUIDs: Set<PhotoUID>
+    private let hasKnownLocation: @MainActor (PhotoUID) -> Bool
     private let burstProvider: BurstGroupProvider?
     private let previewCache: ThumbnailCache?
     /// Encrypted disk cache for full-resolution originals (offline library). Viewer page appearance does not read
     /// this whole-file representation; explicit unbounded fallback loads may write it when enabled.
     private let originalsCache: ThumbnailCache?
-    /// Whether to persist newly-downloaded originals through the legacy whole-file fallback.
+    /// Whether to persist newly-downloaded originals through the whole-file path of the Offline Library.
     private let cacheOriginals: Bool
     private let originalsCapBytes: Int64?
     /// Stable leases for every cache owned by this viewer. They fail closed when account configuration changes.
@@ -106,6 +106,10 @@ public final class PhotoViewerModel {
     private let sessionCache: ThumbnailCache?
     private let sessionLease: CacheWriterGeneration.SessionToken?
     private var loadTask: Task<Void, Never>?
+    /// The number of page loads that started and that ended, so a test joins every load, also one that a newer load
+    /// replaced.
+    package private(set) var startedLoadCount = 0
+    package private(set) var finishedLoadCount = 0
     private var metadataTask: Task<Void, Never>?
     private var albumMembershipTask: Task<Void, Never>?
     private var placeTask: Task<Void, Never>?
@@ -115,7 +119,19 @@ public final class PhotoViewerModel {
     private var originalLoadGeneration: UInt64 = 0
     private var burstSelection = BurstSelectionModel()
     private let editedOriginalProvider: (any EditedPhotoOriginalProviding)?
-    private let editedOriginalLookup = EditedPhotoOriginalLookup()
+    /// The waits before the silent retries of a video failure; the failure shows only after the last retry fails too.
+    private let silentRetryDelays: (VideoPlaybackError) -> [Duration]
+    /// Waits out one silent retry delay; a cancelled viewer ends the wait early.
+    private let silentRetryWait: (Duration) async -> Void
+    private let editedOriginalLookup: EditedPhotoOriginalLookup
+    /// Reverts an edited photo to its original; nil when the account cannot upload.
+    private let editedPhotoReverter: (any EditedPhotoReverting)?
+    /// The viewer's mutation for its context: only the own library ("Move to Trash") offers the revert.
+    private let mutationAction: ViewerMutationAction?
+    /// Host work after a revert, for example the removal of the edited photo from the timeline.
+    private let onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)?
+    /// The confirmation, the run and the failure of "Revert to Original".
+    public let revert = EditedPhotoRevertController()
     /// The originals of edited photos that this viewer found, and whether the page shows one.
     public private(set) var editedOriginal = EditedPhotoOriginalState()
 
@@ -128,13 +144,21 @@ public final class PhotoViewerModel {
         streamer: VideoStreamProvider? = nil, metadataProvider: PhotoMetadataProvider? = nil,
         albumMembershipProvider: (any PhotoAlbumMembershipProviding)? = nil,
         placeNameResolver: (any PlaceNameResolving)? = nil,
-        knownLocationUIDs: Set<PhotoUID> = [],
+        hasKnownLocation: @escaping @MainActor (PhotoUID) -> Bool = { _ in false },
         burstProvider: BurstGroupProvider? = nil,
         previewCache: ThumbnailCache? = nil, originalsCache: ThumbnailCache? = nil,
         cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil,
         allowsVisibleDuplicateThumbnails: Bool = false,
-        editedOriginalProvider: (any EditedPhotoOriginalProviding)? = nil
+        editedOriginalProvider: (any EditedPhotoOriginalProviding)? = nil,
+        editedPhotoReverter: (any EditedPhotoReverting)? = nil,
+        mutationAction: ViewerMutationAction? = nil,
+        onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)? = nil,
+        editedOriginalLookup: EditedPhotoOriginalLookup = EditedPhotoOriginalLookup(),
+        silentRetryDelays: @escaping (VideoPlaybackError) -> [Duration] = { $0.silentRetryDelays },
+        silentRetryWait: @escaping (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
+        self.silentRetryDelays = silentRetryDelays
+        self.silentRetryWait = silentRetryWait
         self.items = items
         self.index = index
         self.pageIndex = ViewerPageIndex(orderedUIDs: items.map(\.uid))
@@ -150,9 +174,13 @@ public final class PhotoViewerModel {
             metadataProvider: metadataProvider,
             placeNameResolver: placeNameResolver
         )
-        self.knownLocationUIDs = knownLocationUIDs
+        self.hasKnownLocation = hasKnownLocation
         self.burstProvider = burstProvider
         self.editedOriginalProvider = editedOriginalProvider
+        self.editedOriginalLookup = editedOriginalLookup
+        self.editedPhotoReverter = editedPhotoReverter
+        self.mutationAction = mutationAction
+        self.onReverted = onReverted
         self.previewCache = previewCache
         self.originalsCache = originalsCache
         self.cacheOriginals = cacheOriginals
@@ -273,6 +301,30 @@ public final class PhotoViewerModel {
     public var canShowOriginal: Bool { editedOriginal.canShowOriginal(of: baseCurrent.uid) }
     public var isShowingOriginal: Bool { editedOriginal.isShowingOriginal(of: baseCurrent.uid) }
 
+    /// The page is an edited photo whose original this viewer found, in the own library, with a backend that reverts,
+    /// and no confirmation, run or failure is open.
+    public var canRevertToOriginal: Bool {
+        revert.canStart(
+            canShowOriginal: canShowOriginal, mutationAction: mutationAction,
+            hasReverter: editedPhotoReverter != nil)
+    }
+
+    /// Opens the confirmation of "Revert to Original". Nothing is written until the person confirms.
+    public func requestRevertToOriginal() {
+        guard canRevertToOriginal else { return }
+        revert.request()
+    }
+
+    /// The person confirmed. `onSuccess` runs after the revert and its host work, while the viewer still exists.
+    public func confirmRevertToOriginal(onSuccess: @escaping @MainActor () -> Void) {
+        guard let original = editedOriginal.original(of: baseCurrent.uid), let editedPhotoReverter else {
+            return revert.cancel()
+        }
+        revert.confirm(
+            main: baseCurrent, original: original, reverter: editedPhotoReverter, onReverted: onReverted,
+            onSuccess: onSuccess)
+    }
+
     /// Switches the page between the edited version and its original.
     public func toggleOriginal() {
         guard canShowOriginal else { return }
@@ -289,11 +341,22 @@ public final class PhotoViewerModel {
     }
     public var thumbnailFeed: ThumbnailFeed { feed }
     public var hasBurstFilmstrip: Bool { burstSelection.hasFilmstrip }
+    /// What Download hands to the export. `loadCurrent` replaces the burst state on every page
+    /// change, so the state always belongs to the shown page.
     public var exportItemsForDownload: [PhotoItem] {
-        burstSelection.exportItems(current: current)
+        switch burstSelection.viewerExportDecision(current: current, page: baseCurrent, belongsToPage: true) {
+        case .success(let items, _):
+            items
+        case .burstReadFailed(let failedSources):
+            // The export reads the whole group again from the series' main photo: it exports
+            // every photo or shows the existing burst failure, never part of the series.
+            failedSources
+        case .burstLoading, .cancelled:
+            []
+        }
     }
     public var canDownloadCurrentSelection: Bool {
-        !isLoadingBurst && !exportItemsForDownload.isEmpty
+        !exportItemsForDownload.isEmpty
     }
     public var gridReturnCandidates: [PhotoItem] {
         burstSelection.gridReturnCandidates(current: current, base: baseCurrent)
@@ -314,6 +377,8 @@ public final class PhotoViewerModel {
         albumMembershipTask?.cancel()
         placeTask?.cancel()
         editedOriginalLookup.cancel()
+        // The viewer closed: a revert that ends later closes nothing. The host work of the revert still runs.
+        revert.detach()
         titleMetadataCoordinator.cancelAll()
         isLoadingOriginal = false
         video.teardown()
@@ -323,7 +388,7 @@ public final class PhotoViewerModel {
     // MARK: - Live Photo motion playback
 
     /// Plays the paired motion clip with sound. The Live badge hover and force-click actions call this method.
-    /// the E2EE-safe preload/playback logic lives in the shared `LivePhotoMotionController`.
+    /// The E2EE-safe preload/playback logic lives in the shared `LivePhotoMotionController`.
     public func playMotion() {
         let item = current
         motion.play(for: item, streamer: streamer) { [weak self] in self?.isDisplaying(item) ?? false }
@@ -433,14 +498,13 @@ public final class PhotoViewerModel {
             fullImageCacheScope = scope
         }
     }
-    private static func cacheKey(_ uid: PhotoUID) -> NSString { "\(uid.volumeID)~\(uid.nodeID)" as NSString }
 
     /// A pending photo can change in Apple Photos before it uploads, so it always reloads from the device.
     private static func cacheFullImage(_ image: NSImage, pixelSize: Int, for uid: PhotoUID) {
         guard !uid.isLocalPending else { return }
         fullImageCache.setObject(
             CachedSharpImage(image: image, pixelSize: pixelSize),
-            forKey: cacheKey(uid),
+            forKey: uid.cacheKey,
             cost: decodedImageCost(image)
         )
     }
@@ -479,7 +543,7 @@ public final class PhotoViewerModel {
         else {
             return maxPixelSize == nil ? NSImage(data: data) : nil
         }
-        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        return appKitImage(cg)
     }
 
     private nonisolated static func decodePreviewImage(_ data: Data) -> NSImage? {
@@ -489,21 +553,11 @@ public final class PhotoViewerModel {
                 maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize
             )
         else { return nil }
-        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        return appKitImage(cg)
     }
 
-    private nonisolated static func decodeStreamedImage(
-        _ provider: any OriginalByteStreamProvider,
-        uid: PhotoUID,
-        maxPixelSize: Int?,
-        onProgress: @escaping @Sendable (Double) -> Void
-    ) async throws -> CGImage? {
-        return try await ViewerFullImageDecoder.decodeStreamedCGImage(
-            from: provider,
-            uid: uid,
-            maxPixelSize: maxPixelSize,
-            onProgress: onProgress
-        )
+    private nonisolated static func appKitImage(_ cg: CGImage) -> NSImage {
+        NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
     /// Recognizes text in the displayed still once the sharp image is shown. The view restarts it whenever the
@@ -525,6 +579,7 @@ public final class PhotoViewerModel {
         burstSelection.reset()
         let item = baseCurrent
         editedOriginal.pageChanged(to: item.uid)
+        revert.pageChanged()
         editedOriginalLookup.settled(on: item, provider: editedOriginalProvider) { [weak self] base, original in
             self?.editedOriginal.record(original, of: base.uid)
         }
@@ -563,7 +618,7 @@ public final class PhotoViewerModel {
         motion.prepare(for: item, streamer: streamer) { [weak self] in self?.isDisplaying(item) ?? false }
 
         // Instant: if we already have the sharp original cached, show it - no spinner, no network.
-        if let cached = Self.fullImageCache.object(forKey: Self.cacheKey(item.uid)) {
+        if let cached = Self.fullImageCache.object(forKey: item.uid.cacheKey) {
             image = cached.image
             isSharp = true
             loadedSharpPixelSize = cached.pixelSize
@@ -580,7 +635,9 @@ public final class PhotoViewerModel {
         }
         isSharp = false
 
+        startedLoadCount += 1
         loadTask = Task {
+            defer { self.finishedLoadCount += 1 }
             try? await Task.sleep(for: .milliseconds(160))  // debounce: skip work for photos flicked past
             guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
 
@@ -667,20 +724,32 @@ public final class PhotoViewerModel {
     /// MIME type, so the streaming probe performs a lightweight metadata check and rejects images before key
     /// setup. Videos then use byte-range streaming while images continue through the original-data path.
     private func resolveMedia(for item: PhotoItem, needsDisplayFallback: Bool) async {
-        guard sessionIsCurrent() else { return }
-        let shouldLoadBoundedStill = item.isLivePhoto || needsDisplayFallback
+        var silentRetries = 0
+        while let delay = await resolveMediaOnce(
+            for: item, needsDisplayFallback: needsDisplayFallback, silentRetries: silentRetries)
+        {
+            // The failure goes away by itself, for example a rate limit: wait behind the loading indicator and ask
+            // again. A new load of the viewer cancels this task, and so does the next item.
+            video.setResolving()
+            await silentRetryWait(delay)
+            guard !Task.isCancelled, isDisplaying(item), sessionIsCurrent() else { return }
+            silentRetries += 1
+        }
+    }
+
+    /// One attempt to resolve the media. Returns the wait before another attempt when the video failure should be
+    /// retried silently, otherwise nil.
+    private func resolveMediaOnce(
+        for item: PhotoItem, needsDisplayFallback: Bool, silentRetries: Int
+    ) async -> Duration? {
+        guard sessionIsCurrent() else { return nil }
         guard let streamer else {
             if item.isVideo {
                 video.fail(.streamURLUnavailable, uid: item.uid)
-            } else if shouldLoadBoundedStill {
-                await loadOriginalBytes(
-                    for: item,
-                    expecting: .image,
-                    maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize,
-                    useOfflineOriginalCache: needsDisplayFallback
-                )
+            } else {
+                await loadBoundedStillIfNeeded(for: item, needsDisplayFallback: needsDisplayFallback)
             }
-            return
+            return nil
         }
         video.setResolving()
         logViewer(item, strategy: "resolving", kind: nil)
@@ -690,49 +759,48 @@ public final class PhotoViewerModel {
             let stream = try await streamer.makeStreamingAsset(for: item.uid)
             guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else {
                 stream.close()
-                return
+                return nil
             }
             isLoadingOriginal = false
             logViewer(item, strategy: "range", kind: .video)
             video.playStreaming(asset: stream.asset, retaining: stream, uid: item.uid)
         } catch is VideoStreamError {
             // A non-video server MIME uses the image path.
-            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
+            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return nil }
             video.reset()
             logViewer(item, strategy: "image", kind: .image)
-            if shouldLoadBoundedStill {
-                await loadOriginalBytes(
-                    for: item,
-                    expecting: .image,
-                    maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize,
-                    useOfflineOriginalCache: needsDisplayFallback
-                )
-            }
+            await loadBoundedStillIfNeeded(for: item, needsDisplayFallback: needsDisplayFallback)
         } catch {
             // A real video (or unknown) whose stream setup failed stays failed rather than writing a
             // decrypted full-video temp file.
-            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
+            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return nil }
             video.reset()
             if item.isVideo {
-                video.fail(VideoPlaybackError.classify(error), uid: item.uid)
-            } else if shouldLoadBoundedStill {
-                await loadOriginalBytes(
-                    for: item,
-                    expecting: .image,
-                    maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize,
-                    useOfflineOriginalCache: needsDisplayFallback
-                )
+                let failure = VideoPlaybackError.classify(error)
+                if let delay = silentRetryDelays(failure).dropFirst(silentRetries).first { return delay }
+                video.fail(failure, uid: item.uid)
+            } else {
+                await loadBoundedStillIfNeeded(for: item, needsDisplayFallback: needsDisplayFallback)
             }
         }
+        return nil
     }
 
-    private enum Expecting: Equatable { case unknown, image, video }
+    /// Loads the bounded still of a Live Photo or of an item that needs the display fallback; any other item keeps
+    /// its preview.
+    private func loadBoundedStillIfNeeded(for item: PhotoItem, needsDisplayFallback: Bool) async {
+        guard item.isLivePhoto || needsDisplayFallback else { return }
+        await loadOriginalBytes(
+            for: item,
+            maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize,
+            useOfflineOriginalCache: needsDisplayFallback
+        )
+    }
 
     /// Loads an original representation on demand. A byte-stream provider feeds the incremental decoder in bounded
-    /// chunks; the legacy `Data` path remains only for hosts without that capability.
+    /// chunks. The whole-file `Data` path serves hosts without that capability and the Offline Library cache.
     private func loadOriginalBytes(
         for item: PhotoItem,
-        expecting: Expecting,
         maxPixelSize: Int? = nil,
         useOfflineOriginalCache: Bool = false
     ) async {
@@ -743,17 +811,15 @@ public final class PhotoViewerModel {
         requestedSharpPixelSize = max(requestedSharpPixelSize, targetPixelSize)
         isLoadingOriginal = true
         originalLoadFailed = false
-        if expecting == .video { video.setDownloading(0) }
         let progressAdmission = ViewerProgressAdmission()
         defer { progressAdmission.close() }
-        let ref = WeakViewerRef(self)
+        let ref = Weak(self)
         // Without a writer generation, a local pending original neither reads nor fills the originals cache.
         let originalWriterGeneration = item.uid.isLocalPending ? nil : originalsCache?.captureWriterGeneration()
         do {
             let full: NSImage?
             let data: Data?
             if useOfflineOriginalCache,
-                expecting != .video,
                 let cached = await cachedOriginalImage(
                     for: item,
                     maxPixelSize: maxPixelSize,
@@ -763,35 +829,32 @@ public final class PhotoViewerModel {
                 full = cached
                 data = nil
             } else if let originalByteStreamer, !(cacheOriginals && useOfflineOriginalCache) {
-                let cg = try await Self.decodeStreamedImage(
-                    originalByteStreamer,
+                let cg = try await ViewerFullImageDecoder.decodeStreamedCGImage(
+                    from: originalByteStreamer,
                     uid: item.uid,
                     maxPixelSize: maxPixelSize,
                     onProgress: { p in
                         guard let sample = progressAdmission.admit(p) else { return }
                         Task { @MainActor in
                             guard progressAdmission.isCurrent(sample) else { return }
-                            ref.model?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
+                            ref.value?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
                         }
                     }
                 )
-                full = cg.map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) }
+                full = cg.map(Self.appKitImage)
                 data = nil
             } else {
                 let original = try await media.originalData(for: item.uid) { p in
                     guard let sample = progressAdmission.admit(p) else { return }
                     Task { @MainActor in
                         guard progressAdmission.isCurrent(sample) else { return }
-                        ref.model?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
+                        ref.value?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
                     }
                 }
                 data = original
-                full =
-                    expecting != .video
-                    ? await Task.detached(priority: .userInitiated) {
-                        Self.decodeFullImage(original, maxPixelSize: maxPixelSize)
-                    }.value
-                    : nil
+                full = await Task.detached(priority: .userInitiated) {
+                    Self.decodeFullImage(original, maxPixelSize: maxPixelSize)
+                }.value
             }
             guard !Task.isCancelled, originalLoadGeneration == generation,
                 self.isDisplaying(item), self.sessionIsCurrent()
@@ -819,8 +882,9 @@ public final class PhotoViewerModel {
                 }
             } else {
                 requestedSharpPixelSize = loadedSharpPixelSize
-                originalLoadFailed = expecting != .video
-                video.fail(.streamURLUnavailable, uid: item.uid)
+                originalLoadFailed = true
+                // A host with a streamer got here, so a later fetch or decode can still succeed: keep Retry.
+                video.fail(.unknown(detail: "originalDecodeFailed"), uid: item.uid)
                 logViewer(item, strategy: "streamRequired", kind: .video)
             }
         } catch is CancellationError {
@@ -831,12 +895,8 @@ public final class PhotoViewerModel {
             guard originalLoadGeneration == generation else { return }
             isLoadingOriginal = false
             requestedSharpPixelSize = loadedSharpPixelSize
-            originalLoadFailed = expecting != .video
-            if expecting == .video {
-                video.fail(.classify(error), uid: item.uid)
-                logViewer(item, strategy: "streamRequired", kind: .video)
-            }
-            // Image case: keep showing the best interim image (thumbnail/preview).
+            originalLoadFailed = true
+            // Keep showing the best interim image (thumbnail/preview).
         }
     }
 
@@ -876,7 +936,6 @@ public final class PhotoViewerModel {
         loadTask = Task { [weak self] in
             await self?.loadOriginalBytes(
                 for: item,
-                expecting: .image,
                 maxPixelSize: maxPixelSize,
                 useOfflineOriginalCache: true
             )
@@ -894,14 +953,12 @@ public final class PhotoViewerModel {
     private func updateDownloadProgress(_ p: Double, for item: PhotoItem, generation: UInt64) {
         guard originalLoadGeneration == generation, current.uid == item.uid else { return }
         originalProgress = p
-        if case .downloading = videoState { video.setDownloading(p) }
     }
 
     private func logViewer(_ item: PhotoItem, strategy: String, kind: MediaKind?) {
         PhotoDiagnostics.shared.emit(
             "VideoViewer",
             videoViewerLogFields(
-                uid: item.uid,
                 mime: item.mediaType,
                 detectedKind: kind,
                 state: videoState,
@@ -912,12 +969,4 @@ public final class PhotoViewerModel {
                 error: nil
             ))
     }
-}
-
-/// Sendable weak handle to the (MainActor, non-Sendable) view model, so the AVFoundation progress +
-/// KVO `@Sendable` callbacks can route back to it without capturing it directly under Swift 6
-/// concurrency. All access happens inside a `@MainActor` Task.
-private final class WeakViewerRef: @unchecked Sendable {
-    weak var model: PhotoViewerModel?
-    init(_ model: PhotoViewerModel) { self.model = model }
 }

@@ -5,8 +5,8 @@ import CoreGraphics
 // A settled frame plan cannot drive live zoom directly. Re-resolving it can change the column count and rewrap
 // flat indices, which moves the row under the cursor.
 //
-// The transaction is captured once at gesture start. It pins the anchor under the cursor and lays out nearby
-// indices relative to that anchor, so the focus row remains contiguous while the gesture changes level.
+// The transaction is captured once at gesture start. It lays out nearby indices relative to the anchor,
+// so the focus row remains contiguous while the gesture changes level.
 //
 // The settled target grid remains row-major. This type owns identity and position continuity until commit.
 //
@@ -49,12 +49,11 @@ public struct GridZoomTransactionFrame: Equatable, Sendable {
 
 public struct GridZoomTransaction: Equatable, Sendable {
     public let totalItems: Int
-    /// The anchor's identity: the item under the cursor at gesture start. The transaction pins this item
-    /// under the cursor throughout the gesture.
+    /// The anchor's identity: the item under the cursor at gesture start.
     public let anchorGlobalIndex: Int
-    /// Where the anchor's local point is held fixed (the cursor, viewport coords).
+    /// The gesture point in viewport coordinates.
     public let anchorViewportPoint: CGPoint
-    /// The cursor's unit position inside the anchor slot (kept invariant so the cursor stays pinned).
+    /// The gesture's unit position inside the anchor slot; its vertical fraction stays pinned.
     public let anchorLocalFraction: CGPoint
     /// The density ladder (for apparent-metric interpolation across the gesture).
     public let levels: [GridLevelMetrics]
@@ -79,6 +78,10 @@ public struct GridZoomTransaction: Equatable, Sendable {
     struct Lattice {
         let columns: Int, side: CGFloat, gap: CGFloat, pitch: CGFloat, anchorColumn: Int
         let gridOriginX: CGFloat, gridOriginY: CGFloat
+
+        func origin(of column: Int) -> CGFloat {
+            gridOriginX + CGFloat(column) * pitch
+        }
     }
 
     func lattice(continuousLevel x: CGFloat, width rawWidth: CGFloat) -> Lattice {
@@ -139,7 +142,7 @@ public struct GridZoomTransaction: Equatable, Sendable {
         let row = Int(floor(Double(m) / Double(l.columns)))
         let col = m - row * l.columns
         return CGRect(
-            x: l.gridOriginX + CGFloat(col) * l.pitch,
+            x: l.origin(of: col),
             y: l.gridOriginY + CGFloat(row) * l.pitch, width: l.side, height: l.side)
     }
 
@@ -151,7 +154,6 @@ public struct GridZoomTransaction: Equatable, Sendable {
         let gap = l.gap
         let pitch = l.pitch
         let cA = l.anchorColumn
-        let gridOriginX = l.gridOriginX
         let gridOriginY = l.gridOriginY
 
         let firstRow = Int(((-overscan - gridOriginY) / pitch).rounded(.down))
@@ -172,7 +174,7 @@ public struct GridZoomTransaction: Equatable, Sendable {
                 let g = anchorGlobalIndex + delta
                 guard g >= 0, g < totalItems else { continue }
                 let cell = CGRect(
-                    x: gridOriginX + CGFloat(col) * pitch,
+                    x: l.origin(of: col),
                     y: gridOriginY + CGFloat(row) * pitch, width: side, height: side)
                 guard cell.maxY > -overscan, cell.minY < viewportSize.height + overscan,
                     cell.maxX > 0, cell.minX < viewportSize.width
@@ -187,17 +189,9 @@ public struct GridZoomTransaction: Equatable, Sendable {
             anchorColumn: cA, focusRow: focusRow, visibleSlots: slots)
     }
 
-    // Apparent-metric interpolation (mirrors SquareTileGridEngine, with the soft rubber-band past the ends).
+    // Apparent metrics use the same interpolation as the settled engine.
     public func apparentSlotSide(at x: CGFloat, width: CGFloat) -> CGFloat {
-        let maxIndex = levels.count - 1
-        // Use the same width-filled side as the settled resolver at integer detents.
-        func side(_ i: Int) -> CGFloat {
-            SquareTileGridEngine.nominalSlotSide(columns: levels[i].nominalColumns, gap: levels[i].gap, width: width)
-        }
-        if x <= 0 { return side(0) * (1 - x * 0.6) }
-        if x >= CGFloat(maxIndex) { return side(maxIndex) }
-        let lo = Int(x)
-        return lerp(side(lo), side(lo + 1), smoothstep(x - CGFloat(lo)))
+        GridApparentMetrics.slotSide(at: x, width: width, levels: levels)
     }
     public func apparentGap(at x: CGFloat) -> CGFloat {
         let maxIndex = levels.count - 1

@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
@@ -237,11 +238,11 @@ final class DeletedPhotoTests: XCTestCase {
             }.count, 2)
         clock.advance(by: 120)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.updatedAt, firstCheck.addingTimeInterval(600))
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.updatedAt, firstCheck.addingTimeInterval(600))
         clock.advance(by: 479)
         _ = queue.makeRetryableWorkEligible(updatedAt: clock.now)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.updatedAt, firstCheck.addingTimeInterval(659))
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.updatedAt, firstCheck.addingTimeInterval(659))
         clock.advance(by: 60)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         let parked = try XCTUnwrap(queue.entry(for: source, revision: revision))
@@ -251,7 +252,7 @@ final class DeletedPhotoTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
         XCTAssertNil(states.record(for: source, revision: revision))
         _ = queue.makeRetryableWorkEligible(updatedAt: clock.now)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .failedPermanent)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .failedPermanent)
         XCTAssertEqual(
             trail.export(hashingWith: SupportReportIdentifierHasher()).events.filter {
                 $0.kind == .backupRowParked && $0.reason == .deletedElsewhere
@@ -284,7 +285,7 @@ final class DeletedPhotoTests: XCTestCase {
             store: identities, hasher: FakeHasher(), checker: checker, replacementJournal: journal)
         let uploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false)
         let resolver = ScriptedBackupResolver(defaultModified: date)
-        resolver.setEditRevision(.trustedNoContentEdits, for: source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(date: date)), for: source.identifier)
         let replacement = EditedPhotoReplacement(
             remote: FakeEditReplacementRemote(), albums: FakeAlbumCarryOver(), relations: checker,
             identities: identities, journal: journal)
@@ -300,18 +301,18 @@ final class DeletedPhotoTests: XCTestCase {
                     source: source, revision: revision,
                     originalFilename: "photo.heic", state: .discovered, updatedAt: date)))
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .discovered)
         let identity = try XCTUnwrap(identities.record(for: source))
         clock.advance(by: 90)
         checker.remoteItemsByNameHash[identity.nameHash] = [
             .init(nameHash: identity.nameHash, contentHash: identity.contentHash, linkState: .active, linkID: "visible")
         ]
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .discovered)
         XCTAssertTrue(uploader.requests.isEmpty)
         clock.advance(by: 30)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .alreadyBackedUp)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .alreadyBackedUp)
         XCTAssertTrue(uploader.requests.isEmpty)
         XCTAssertNil(journal.entry(for: source).deletionCheckStartedAt)
     }
@@ -331,7 +332,7 @@ final class DeletedPhotoTests: XCTestCase {
             store: identities, hasher: hasher, checker: checker, replacementJournal: journal)
         let uploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false)
         let resolver = ScriptedBackupResolver(defaultModified: date)
-        resolver.setEditRevision(.trustedNoContentEdits, for: source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(date: date)), for: source.identifier)
         let replacement = EditedPhotoReplacement(
             remote: FakeEditReplacementRemote(), albums: FakeAlbumCarryOver(), relations: checker,
             identities: identities, journal: journal)
@@ -350,7 +351,7 @@ final class DeletedPhotoTests: XCTestCase {
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(uploader.requests.count, 1)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .completed)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .completed)
         XCTAssertNil(journal.entry(for: source).backUpAgainRevision)
         XCTAssertNil(journal.entry(for: source).deletionCheckStartedAt)
         let nextDate = date.addingTimeInterval(1)
@@ -366,7 +367,7 @@ final class DeletedPhotoTests: XCTestCase {
                     source: source, revision: nextRevision,
                     originalFilename: "next.heic", state: .discovered, updatedAt: date)))
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: nextRevision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: nextRevision)?.state, .discovered)
         XCTAssertEqual(uploader.requests.count, 1)
         XCTAssertNil(journal.entry(for: source).backUpAgainRevision)
     }
@@ -390,7 +391,7 @@ final class DeletedPhotoTests: XCTestCase {
             store: identities, hasher: FakeHasher(), checker: checker, replacementJournal: journal)
         let uploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false)
         let resolver = ScriptedBackupResolver(defaultModified: date)
-        resolver.setEditRevision(.trustedNoContentEdits, for: source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(date: date)), for: source.identifier)
         let replacement = EditedPhotoReplacement(
             remote: FakeEditReplacementRemote(), albums: FakeAlbumCarryOver(), relations: checker,
             identities: identities, journal: journal)
@@ -443,8 +444,8 @@ final class DeletedPhotoTests: XCTestCase {
         // The queued revision runs, but the photo changed meanwhile: the backup holds the parked revision's bytes.
         parts.resolver.setModified(date.addingTimeInterval(60), for: source.identifier)
         _ = await parts.runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(parts.queue.entry(for: source, revision: queued)?.state, .completed)
-        XCTAssertEqual(parts.queue.entry(for: source, revision: current)?.state, .completed)
+        XCTAssertEqual(try parts.queue.entry(for: source, revision: queued)?.state, .completed)
+        XCTAssertEqual(try parts.queue.entry(for: source, revision: current)?.state, .completed)
     }
 
     #if DEBUG
@@ -467,6 +468,113 @@ final class DeletedPhotoTests: XCTestCase {
             controller.backUpAgain(item)
             XCTAssertTrue(controller.isSyncing)
             XCTAssertNotNil(controller.activeExecutionRunID)
+            await controller.shutdown()
+        }
+
+        @MainActor
+        func testBackUpAgainRefusesARejectedDecisionWithoutStartingAPass() async throws {
+            let suite = "deletion-controller-refused-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults,
+                    runtimeSignals: .wiFiWithMobileDataOff),
+                identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+            XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
+            controller.setAccessStateForTesting(.full)
+            controller.replacePassBodyForTesting {}
+            let item = try XCTUnwrap(controller.failedItems().first)
+            let rejected = BackupFailedItem(
+                id: item.id, filename: item.filename, reason: item.reason, isPermanent: item.isPermanent,
+                issue: .remoteDraftStale, source: item.source, revision: item.revision)
+            XCTAssertFalse(controller.backUpAgain(rejected))
+            XCTAssertFalse(controller.isSyncing)
+            XCTAssertNil(controller.activeExecutionRunID)
+            XCTAssertEqual(controller.failedItems(), [item])
+            XCTAssertTrue(journal.entry(for: try XCTUnwrap(item.source)).isEmpty)
+            await controller.shutdown()
+        }
+    #endif
+
+    @MainActor
+    func testPagedProblemListKeepsTheRow250DecisionAndItsOtherRows() async throws {
+        let suite = "deletion-page-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        defer { queue.close() }
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<1_000).map { index in
+                    .init(
+                        source: .init(kind: .photoLibraryAsset, identifier: "page-photo-\(index)"),
+                        revision: .init(rawValue: Int64(index)), originalFilename: "photo-\(index).heic",
+                        state: .failedPermanent,
+                        lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                        updatedAt: date)
+                }))
+        let session = controller.makeProblemListSession()
+        session.requestRefresh()
+        await session.waitUntilIdle()
+        XCTAssertEqual(session.total, 1_000)
+        XCTAssertTrue(session.requestNextPage())
+        await session.waitUntilIdle()
+        let before = session.rows.map(\.id)
+        let decision = session.rows[249].item
+        let decisionSource = try XCTUnwrap(decision.source)
+        controller.keepDeleted(decision)
+        session.requestRefresh()
+        await session.waitUntilIdle()
+        XCTAssertEqual(session.total, 999)
+        XCTAssertEqual(session.rows.count, 400, "An action keeps the loaded page progress")
+        XCTAssertEqual(Array(session.rows.prefix(399)).map(\.id), before.filter { $0 != before[249] })
+        XCTAssertTrue(journal.entry(for: decisionSource).keptDeleted == true)
+        XCTAssertEqual(
+            try queue.entry(for: decisionSource, revision: XCTUnwrap(decision.revision))?.state,
+            .skippedRemoteDeletion)
+        XCTAssertEqual(try XCTUnwrap(queue.summary()).uploaded, 0)
+        while session.rows.count < session.total {
+            XCTAssertTrue(session.requestNextPage())
+            await session.waitUntilIdle()
+        }
+        XCTAssertEqual(Set(session.rows.map(\.id)).count, 999)
+        XCTAssertFalse(session.rows.contains { $0.item.source == decisionSource })
+        await session.shutdown()
+        await controller.shutdown()
+    }
+
+    #if DEBUG
+        @MainActor
+        func testCommittedDecisionDisappearsBeforeThePacedRefresh() async throws {
+            let suite = "deletion-immediate-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+            XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting(count: 1_000))
+            let session = controller.makeProblemListSession()
+            session.requestRefresh()
+            await session.waitUntilIdle()
+            XCTAssertTrue(session.requestNextPage())
+            await session.waitUntilIdle()
+            let item = session.rows[249].item
+            let committed = session.resolveDecision(item) { controller.keepDeleted(item) }
+            XCTAssertTrue(committed)
+            XCTAssertEqual(session.rows.count, 399, "A committed row leaves before the paced refresh can run")
+            XCTAssertFalse(session.rows.contains { $0.item.id == item.id })
+            XCTAssertEqual(session.total, 999)
+            XCTAssertTrue(journal.entry(for: try XCTUnwrap(item.source)).keptDeleted == true)
+            await session.waitUntilIdle()
+            XCTAssertFalse(session.rows.contains { $0.item.id == item.id })
+            await session.shutdown()
             await controller.shutdown()
         }
     #endif
@@ -505,22 +613,547 @@ final class DeletedPhotoTests: XCTestCase {
             id: item.id, filename: item.filename, reason: item.reason, isPermanent: true,
             issue: .remoteDraftStale, source: source, revision: revision)
         controller.dismissFailedItem(stale)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .failedPermanent)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .failedPermanent)
         controller.keepDeleted(item)
         XCTAssertTrue(journal.entry(for: source).keptDeleted == true)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .skippedRemoteDeletion)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .skippedRemoteDeletion)
         XCTAssertTrue(controller.failedItems().isEmpty)
-        XCTAssertEqual(queue.summary().skippedRemoteDeletions, 1)
-        XCTAssertEqual(queue.summary().uploaded, 0)
+        XCTAssertEqual(queue.summary()!.skippedRemoteDeletions, 1)
+        XCTAssertEqual(queue.summary()!.uploaded, 0)
         let again = try seed()
         controller.backUpAgain(again)
         XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, revision)
         XCTAssertNil(journal.entry(for: source).keptDeleted)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .discovered)
-        XCTAssertNil(queue.entry(for: source, revision: revision)?.lastError)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .discovered)
+        XCTAssertNil(try queue.entry(for: source, revision: revision)?.lastError)
         await controller.shutdown()
         queue.close()
     }
+
+    func testB1ReplayReadFaultsPreserveTheIncompleteMarkerAndRows() async throws {
+        for route in ["queue-count", "catalog-count", "marker", "page"] {
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent("\(route)-queue.sqlite")))
+            let catalog = try XCTUnwrap(
+                PhotoLibraryCatalogManifestStore(url: directory.appendingPathComponent("\(route)-catalog.sqlite")))
+            let state = try XCTUnwrap(
+                UploadBackupStateManifestStore(url: directory.appendingPathComponent("\(route)-state.sqlite")))
+            defer {
+                queue.close()
+                catalog.close()
+                state.close()
+            }
+            let info = PhotoBackupAssetInfo(
+                localIdentifier: "kept", creationDate: nil, modificationDate: date,
+                pixelWidth: 10, pixelHeight: 10, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                resources: [.init(role: .originalPhoto, originalFilename: "photo.jpg", mimeType: "image/jpeg")])
+            XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)]))
+            XCTAssertTrue(queue.setCatalogReplayState(.inProgress))
+            let sql =
+                route == "queue-count"
+                ? "SELECT COUNT(*) FROM backup_sync_queue;"
+                : route == "catalog-count"
+                    ? "SELECT is_removed, COUNT(*)"
+                    : route == "marker"
+                        ? "SELECT value FROM backup_sync_queue_info"
+                        : "SELECT local_id, cloud_id, creation_date"
+            let fault = try SQLiteReadInterrupt(
+                in: route == "catalog-count" || route == "page" ? catalog as Any : queue as Any,
+                matching: sql)
+            defer { fault.stop() }
+            let engine = UploadBackupSyncEngine(preflight: .init(store: state), queue: queue)
+            do {
+                try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
+                    catalogStore: catalog, queueStore: queue, engine: engine)
+                XCTFail("An unknown \(route) must stop replay")
+            } catch {
+                XCTAssertEqual(error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")))
+            }
+            XCTAssertTrue(fault.fired, route)
+            XCTAssertEqual(queue.catalogReplayState(), .inProgress, route)
+            XCTAssertEqual(queue.count(), 0, route)
+        }
+    }
+
+    #if DEBUG
+        @MainActor
+        func testB1UnknownDismissalReasonKeepsTheDecisionRow() async throws {
+            let suite = "dismissal-unknown-reason-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            let row = UploadBackupSyncQueueEntry(
+                source: source, revision: UploadBackupRevision(date: date), originalFilename: "photo.heic",
+                state: .failedPermanent,
+                lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                updatedAt: date)
+            XCTAssertTrue(queue.upsert(row))
+            let stale = BackupFailedItem(
+                id: "stale", filename: "photo.heic", reason: "stale", isPermanent: true,
+                issue: .remoteDraftStale, source: source, revision: row.revision)
+            let fault = try SQLiteReadInterrupt(in: queue, matching: "SELECT original_filename, byte_count, state")
+            defer { fault.stop() }
+            controller.dismissFailedItem(stale)
+            XCTAssertTrue(fault.fired)
+            XCTAssertEqual(
+                try queue.entry(for: row.source, revision: row.revision), row,
+                "An unknown reason must not dismiss a deletion decision")
+            await controller.shutdown()
+        }
+    #endif
+
+    @MainActor
+    func testB1PartialRevisionReadStopsRemoteDeletionDecision() async throws {
+        try await assertRemoteDecisionReadFailure(
+            matching: "SELECT source_kind, source_id, resource, revision_us, state", afterRows: 2)
+    }
+
+    @MainActor
+    func testB1UnknownRevisionReasonStopsRemoteDeletionDecision() async throws {
+        try await assertRemoteDecisionReadFailure(
+            matching: "SELECT original_filename, byte_count, state", occurrence: 4)
+    }
+
+    @MainActor
+    private func assertRemoteDecisionReadFailure(
+        matching: String, occurrence: Int = 1, afterRows: Int = 0
+    ) async throws {
+        let suite = "deletion-partial-revisions-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+        let queue = try XCTUnwrap(
+            Mirror(reflecting: controller).children.first(where: { $0.label == "queueStore" })?.value
+                as? UploadBackupSyncQueueManifestStore)
+        let observer = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        defer { observer.close() }
+        let rows = [date, date.addingTimeInterval(60), date.addingTimeInterval(120)].map { timestamp in
+            UploadBackupSyncQueueEntry(
+                source: source, revision: UploadBackupRevision(date: timestamp), originalFilename: "photo.heic",
+                state: .failedPermanent,
+                lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                updatedAt: date)
+        }
+        for row in rows { XCTAssertTrue(queue.upsert(row)) }
+        let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == rows[0].revision })
+        let beforeJournal = journal.entry(for: source)
+        let fault = try SQLiteReadInterrupt(
+            in: queue, matching: matching, occurrence: occurrence, afterRows: afterRows)
+        defer { fault.stop() }
+
+        controller.backUpAgain(olderItem)
+
+        XCTAssertTrue(fault.fired, "The bulk statement must actually be interrupted")
+        XCTAssertEqual(fault.tracedRows, afterRows, "The requested SQL fault must fire before any decision effects")
+        XCTAssertTrue(queue.isOperational(), "The transient interrupt is forgotten once the database answers")
+        XCTAssertEqual(
+            journal.entry(for: source), beforeJournal,
+            "An incomplete inventory must not choose the clicked older revision")
+        for row in rows {
+            XCTAssertEqual(
+                try observer.entry(for: row.source, revision: row.revision), row,
+                "An incomplete revision read must preserve the queue row and its existing reason")
+        }
+        await controller.shutdown()
+    }
+
+    func testB1BulkFaultControlsProveStrictUnknown() throws {
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent("bulk-control.sqlite")))
+        defer { queue.close() }
+        let revisions = [date, date.addingTimeInterval(60), date.addingTimeInterval(120)].map {
+            UploadBackupRevision(date: $0)
+        }
+        for revision in revisions {
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: source, revision: revision, originalFilename: "photo.heic", state: .failedPermanent,
+                        lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                        updatedAt: date)))
+        }
+        let fault = try SQLiteReadInterrupt(
+            in: queue, matching: "SELECT source_kind, source_id, resource, revision_us, state", afterRows: 2)
+        defer { fault.stop() }
+        XCTAssertThrowsError(try queue.decisionRows(kind: source.kind, identifiers: [source.identifier])) {
+            XCTAssertTrue($0 is SQLiteStoreUnknownReadError)
+        }
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(fault.tracedRows, 2)
+        XCTAssertTrue(queue.isOperational(), "The transient interrupt is forgotten once the database answers")
+    }
+
+    // MARK: One decision writes all of its revisions or none (#1004)
+
+    /// The second sibling write fails once. The fault counts statements, so the result does not depend on the order
+    /// of the revisions or on timing; every run must give the same answer.
+    #if DEBUG
+        @MainActor
+        func testAFailedSiblingWriteChangesNoRevisionAndRestoresTheChoice() async throws {
+            for keepDeleted in [false, true] {
+                for run in 0..<20 {
+                    let label = "\(keepDeleted ? "keep" : "again")-\(run)"
+                    let result = try await decideWithSiblingWriteFault(
+                        keepDeleted: keepDeleted, failingWrite: 2, name: label)
+                    XCTAssertTrue(result.fired, "\(label): the second sibling write must actually fail")
+                    XCTAssertFalse(result.decided, label)
+                    XCTAssertEqual(
+                        result.rowsAfter, result.rowsBefore.map(Optional.some),
+                        "\(label): a failed decision must leave every revision and its reason unchanged")
+                    XCTAssertEqual(result.restoreAttempts, 1, label)
+                    XCTAssertEqual(result.journalAfter, result.journalBefore, "\(label): the earlier choice returns")
+                    XCTAssertEqual(
+                        result.reloadedJournal, result.journalBefore, "\(label): the restored choice is on disk")
+                    XCTAssertNotEqual(result.reloadedJournal.keptDeleted, true, label)
+                    XCTAssertEqual(result.message, L10n.string("backup.error_local_state_unavailable"), label)
+                    XCTAssertFalse(result.lines.contains { $0.hasPrefix("decision.") }, label)
+                }
+            }
+        }
+    #endif
+
+    /// When the earlier choice cannot be written back either, the decision still reports no change and the log
+    /// names only the kind of choice.
+    #if DEBUG
+        @MainActor
+        func testAFailedRestoreAfterAFailedSiblingWriteStillReportsNoChange() async throws {
+            for keepDeleted in [false, true] {
+                let label = keepDeleted ? "refused-keep" : "refused-again"
+                let result = try await decideWithSiblingWriteFault(
+                    keepDeleted: keepDeleted, failingWrite: 2, refusesRestore: true, name: label)
+                XCTAssertTrue(result.fired, label)
+                XCTAssertFalse(result.decided, "\(label): no silent success")
+                XCTAssertEqual(result.rowsAfter, result.rowsBefore.map(Optional.some), label)
+                XCTAssertEqual(result.restoreAttempts, 1, label)
+                XCTAssertEqual(result.message, L10n.string("backup.error_local_state_unavailable"), label)
+                XCTAssertEqual(
+                    result.lines.filter { $0.hasPrefix("decision.") },
+                    ["decision.choiceNotRestored choice=\(keepDeleted ? "keepDeleted" : "backUpAgain")"], label)
+                for line in result.lines {
+                    XCTAssertFalse(line.contains(source.identifier), label)
+                    XCTAssertFalse(line.contains(directory.path), label)
+                    XCTAssertFalse(line.contains("photo.heic"), label)
+                }
+                // The limit: a choice that the journal cannot take back stays until the person decides again.
+                if keepDeleted {
+                    XCTAssertEqual(result.journalAfter.keptDeleted, true, label)
+                } else {
+                    XCTAssertEqual(result.journalAfter.backUpAgainRevision, result.rowsBefore.last?.revision, label)
+                }
+            }
+        }
+    #endif
+
+    #if DEBUG
+        @MainActor
+        func testAHealthyDecisionWritesEveryRevisionWithoutRestoring() async throws {
+            for keepDeleted in [false, true] {
+                let label = keepDeleted ? "healthy-keep" : "healthy-again"
+                let result = try await decideWithSiblingWriteFault(
+                    keepDeleted: keepDeleted, failingWrite: nil, name: label)
+                XCTAssertTrue(result.decided, label)
+                XCTAssertEqual(result.restoreAttempts, 0, label)
+                XCTAssertEqual(
+                    result.rowsAfter.map { $0?.state },
+                    keepDeleted
+                        ? [.skippedRemoteDeletion, .skippedRemoteDeletion, .skippedRemoteDeletion]
+                        : [.dismissedFailure, .dismissedFailure, .discovered], label)
+                if keepDeleted {
+                    XCTAssertEqual(result.reloadedJournal.keptDeleted, true, label)
+                    XCTAssertNil(result.reloadedJournal.backUpAgainRevision, label)
+                } else {
+                    XCTAssertNil(result.reloadedJournal.keptDeleted, label)
+                    XCTAssertEqual(result.reloadedJournal.backUpAgainRevision, result.rowsBefore.last?.revision, label)
+                }
+                XCTAssertNil(result.message, label)
+                XCTAssertFalse(result.lines.contains { $0.hasPrefix("decision.") }, label)
+            }
+        }
+    #endif
+
+    /// The journal saves the choice, then its compaction fails: the saved choice is the decision, so the queue
+    /// writes follow and nothing reports a failure while `keptDeleted` stays on disk.
+    #if DEBUG
+        @MainActor
+        func testACompactionFailureAfterTheSavedChoiceStillCompletesTheDecision() async throws {
+            for keepDeleted in [true, false] {
+                let label = keepDeleted ? "compaction-keep" : "compaction-again"
+                let result = try await decideWithSiblingWriteFault(
+                    keepDeleted: keepDeleted, failingWrite: nil, name: label, journalLines: 1_000)
+                XCTAssertEqual(result.journalLines, 1_001, "\(label): the compaction must actually fail")
+                XCTAssertTrue(result.decided, "\(label): a saved choice is the decision")
+                if !result.decided {
+                    XCTAssertNotEqual(
+                        result.reloadedJournal.keptDeleted, true, "\(label): no choice outlives a refusal")
+                }
+                XCTAssertEqual(
+                    result.rowsAfter.map { $0?.state },
+                    keepDeleted
+                        ? [.skippedRemoteDeletion, .skippedRemoteDeletion, .skippedRemoteDeletion]
+                        : [.dismissedFailure, .dismissedFailure, .discovered], label)
+                XCTAssertEqual(
+                    result.reloadedJournal.deletionChoice,
+                    keepDeleted ? .keptDeleted : .backUpAgain(result.rowsBefore[2].revision), label)
+            }
+        }
+    #endif
+
+    /// The restore saves the earlier choice, then its compaction fails: the choice is back, so no line may say that
+    /// it is not.
+    #if DEBUG
+        @MainActor
+        func testACompactionFailureWhileRestoringStillRestoresWithoutAFailureLine() async throws {
+            for keepDeleted in [true, false] {
+                let label = keepDeleted ? "restore-compaction-keep" : "restore-compaction-again"
+                let result = try await decideWithSiblingWriteFault(
+                    keepDeleted: keepDeleted, failingWrite: 2, name: label, journalLines: 999)
+                XCTAssertTrue(result.fired, label)
+                XCTAssertEqual(result.journalLines, 1_001, "\(label): the restore's compaction must actually fail")
+                XCTAssertFalse(result.decided, label)
+                XCTAssertEqual(result.rowsAfter, result.rowsBefore.map(Optional.some), label)
+                XCTAssertEqual(result.reloadedJournal, result.journalBefore, "\(label): the earlier choice is back")
+                XCTAssertFalse(result.lines.contains { $0.hasPrefix("decision.") }, label)
+            }
+        }
+    #endif
+
+    /// The runner clears the choice while the failed queue write runs, for example after it backed up another
+    /// revision. The restore must not bring the earlier Keep Deleted back over that newer state.
+    #if DEBUG
+        @MainActor
+        func testARestoreKeepsANewerChoiceWrittenDuringTheFailedQueueWrite() async throws {
+            let result = try await decideWithSiblingWriteFault(
+                keepDeleted: false, failingWrite: 2, name: "newer-clear",
+                seed: { [source] journal, _ in try journal.keepDeleted(for: source) },
+                duringFailedWrite: { [source] journal in try? journal.clearDeletionChoice(for: source) })
+            XCTAssertTrue(result.fired)
+            XCTAssertFalse(result.decided)
+            XCTAssertEqual(result.rowsAfter, result.rowsBefore.map(Optional.some))
+            XCTAssertEqual(
+                result.reloadedJournal.deletionChoice,
+                EditReplacementDeletionChoice(keptDeleted: nil, backUpAgainRevision: nil, deletionCheckStartedAt: nil),
+                "the newer cleared choice stays")
+            XCTAssertFalse(result.lines.contains { $0.hasPrefix("decision.") })
+        }
+    #endif
+
+    /// Another field of the entry changes while the failed queue write runs: the restore takes back only the choice.
+    #if DEBUG
+        @MainActor
+        func testARestoreKeepsOtherFieldsWrittenDuringTheFailedQueueWrite() async throws {
+            let meanwhile = PhotoUID(volumeID: "vol", nodeID: "meanwhile")
+            let result = try await decideWithSiblingWriteFault(
+                keepDeleted: true, failingWrite: 2, name: "newer-field",
+                duringFailedWrite: { [source] journal in try? journal.addSuperseded(meanwhile, for: source) })
+            XCTAssertTrue(result.fired)
+            XCTAssertFalse(result.decided)
+            XCTAssertEqual(result.reloadedJournal.deletionChoice, result.journalBefore.deletionChoice)
+            XCTAssertTrue(result.reloadedJournal.superseded.contains(meanwhile), "the newer field stays")
+            XCTAssertEqual(
+                result.reloadedJournal.superseded.filter { $0 != meanwhile }, result.journalBefore.superseded)
+        }
+    #endif
+
+    /// An earlier Keep Deleted is the state before the decision, so a failed Back Up Again brings it back.
+    #if DEBUG
+        @MainActor
+        func testAFailedBackUpAgainRestoresAnEarlierKeepDeleted() async throws {
+            let result = try await decideWithSiblingWriteFault(
+                keepDeleted: false, failingWrite: 2, name: "earlier-keep",
+                seed: { [source] journal, _ in
+                    try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "gone"), for: source)
+                    try journal.keepDeleted(for: source)
+                })
+            XCTAssertTrue(result.fired)
+            XCTAssertFalse(result.decided)
+            XCTAssertEqual(result.journalBefore.keptDeleted, true)
+            XCTAssertEqual(result.reloadedJournal, result.journalBefore)
+            XCTAssertEqual(result.rowsAfter, result.rowsBefore.map(Optional.some))
+        }
+    #endif
+
+    private struct DecisionWriteRun {
+        let decided: Bool
+        let fired: Bool
+        let rowsBefore: [UploadBackupSyncQueueEntry]
+        let rowsAfter: [UploadBackupSyncQueueEntry?]
+        let journalBefore: EditReplacementJournalEntry
+        let journalAfter: EditReplacementJournalEntry
+        let reloadedJournal: EditReplacementJournalEntry
+        let restoreAttempts: Int
+        let message: String?
+        let lines: [String]
+        let journalLines: Int
+    }
+
+    /// Three parked revisions of one photo, an earlier choice in the real journal file, and the real queue store.
+    /// `failingWrite` interrupts that occurrence of the per-revision state write once, nil for none.
+    /// `seed` replaces the earlier choice. `duringFailedWrite` runs while the failing queue statement executes.
+    /// `journalLines` pads the journal log to that many lines and then makes its folder read-only, so the line that
+    /// passes 1,000 lines saves but its compaction fails.
+    #if DEBUG
+        @MainActor
+        private func decideWithSiblingWriteFault(
+            keepDeleted: Bool, failingWrite: Int?, refusesRestore: Bool = false, name: String,
+            seed: ((EditReplacementJournalFileStore, [UploadBackupRevision]) throws -> Void)? = nil,
+            duringFailedWrite: ((EditReplacementJournalFileStore) -> Void)? = nil, journalLines: Int? = nil
+        ) async throws -> DecisionWriteRun {
+            let account = directory.appendingPathComponent(name)
+            let journalDirectory = account.appendingPathComponent("journal")
+            try FileManager.default.createDirectory(at: journalDirectory, withIntermediateDirectories: true)
+            let fileJournal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: journalDirectory))
+            let journal = RestoreRefusingJournal(inner: fileJournal, refusesRestore: refusesRestore)
+            let revisions = [date, date.addingTimeInterval(60), date.addingTimeInterval(120)].map {
+                UploadBackupRevision(date: $0)
+            }
+            if let seed {
+                try seed(fileJournal, revisions)
+            } else {
+                try fileJournal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "gone"), for: source)
+                if keepDeleted {
+                    try fileJournal.backUpAgain(revision: revisions[0], for: source)
+                } else {
+                    try fileJournal.startDeletionCheck(at: date, for: source)
+                }
+            }
+            let logURL = journalDirectory.appendingPathComponent(EditReplacementJournalFileStore.logFileName)
+            func logLineCount() throws -> Int {
+                try String(contentsOf: logURL, encoding: .utf8).split(separator: "\n").count
+            }
+            if let journalLines {
+                let padding = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "padding")
+                var waits = false
+                while try logLineCount() < journalLines {
+                    if waits {
+                        try fileJournal.clearDeletionCheck(for: padding)
+                    } else {
+                        try fileJournal.startDeletionCheck(at: date, for: padding)
+                    }
+                    waits.toggle()
+                }
+                XCTAssertEqual(try logLineCount(), journalLines, name)
+                try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: journalDirectory.path)
+            }
+            defer {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: journalDirectory.path)
+            }
+            let suite = "deletion-atomic-\(name)-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let lines = RecordedLogLines()
+            var configuration = PhotoLibraryBackupController.Configuration(
+                accountDataDirectory: account, databasePolicy: .conservative, defaults: defaults)
+            configuration.backgroundLog = BackgroundWorkLog { lines.append($1) }
+            let controller = PhotoLibraryBackupController(
+                configuration: configuration, identityResolver: nil, uploader: MockUploader(),
+                replacementJournal: journal)
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            let observer = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: account.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { observer.close() }
+            let rows = revisions.map { revision in
+                UploadBackupSyncQueueEntry(
+                    source: source, revision: revision, originalFilename: "photo.heic", state: .failedPermanent,
+                    lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                    updatedAt: date)
+            }
+            for row in rows { XCTAssertTrue(queue.upsert(row), name) }
+            let item = try XCTUnwrap(controller.failedItems().first { $0.revision == rows[0].revision }, name)
+            let journalBefore = journal.entry(for: source)
+            let fault = try failingWrite.map {
+                try SQLiteReadInterrupt(
+                    in: queue, matching: "attempts=COALESCE(?, attempts)", occurrence: $0,
+                    onFire: duringFailedWrite.map { body in { body(fileJournal) } })
+            }
+            let decided = keepDeleted ? controller.keepDeleted(item) : controller.backUpAgain(item)
+            fault?.stop()
+            let rowsAfter = try rows.map { try observer.entry(for: $0.source, revision: $0.revision) }
+            let journalAfter = journal.entry(for: source)
+            let message = controller.lastMessage
+            await controller.shutdown()
+            let journalLinesAfter = try logLineCount()
+            let reloaded = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: journalDirectory))
+            return DecisionWriteRun(
+                decided: decided, fired: fault?.fired ?? false, rowsBefore: rows, rowsAfter: rowsAfter,
+                journalBefore: journalBefore, journalAfter: journalAfter, reloadedJournal: reloaded.entry(for: source),
+                restoreAttempts: journal.restoreAttempts, message: message, lines: lines.values,
+                journalLines: journalLinesAfter)
+        }
+    #endif
+
+    /// A sibling revision whose stored receipt no longer decodes is unknown, not absent: the decision must not skip
+    /// it and choose an older revision (#1004 B2, row 15). The healthy and the single-revision routes are pinned by
+    /// testOneChoiceSettlesEveryParkedRevisionOfThePhoto and testControllerMapsDecisionRowsAndWritesBothChoices.
+    #if DEBUG
+        @MainActor
+        func testACorruptSiblingReceiptStopsTheDecisionInsteadOfChoosingAnOlderRevision() async throws {
+            for keepDeleted in [false, true] {
+                let account = directory.appendingPathComponent("corrupt-receipt-\(keepDeleted)")
+                try FileManager.default.createDirectory(at: account, withIntermediateDirectories: true)
+                let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: account))
+                let suite = "deletion-corrupt-receipt-\(UUID().uuidString)"
+                let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+                defer { defaults.removePersistentDomain(forName: suite) }
+                let controller = PhotoLibraryBackupController(
+                    configuration: .init(
+                        accountDataDirectory: account, databasePolicy: .conservative, defaults: defaults),
+                    identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+                let queue = try XCTUnwrap(controller.queueStoreForTesting)
+                let rows = [date, date.addingTimeInterval(60)].map { timestamp in
+                    UploadBackupSyncQueueEntry(
+                        source: source, revision: UploadBackupRevision(date: timestamp), originalFilename: "photo.heic",
+                        state: .failedPermanent,
+                        lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                        updatedAt: date)
+                }
+                for row in rows { XCTAssertTrue(queue.upsert(row)) }
+                let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == rows[0].revision })
+                let url = account.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)
+                var handle: OpaquePointer?
+                XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+                XCTAssertEqual(
+                    sqlite3_exec(
+                        handle,
+                        "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B' "
+                            + "WHERE revision_us=\(rows[1].revision.rawValue);", nil, nil, nil),
+                    SQLITE_OK)
+                sqlite3_close(handle)
+
+                let decided = keepDeleted ? controller.keepDeleted(olderItem) : controller.backUpAgain(olderItem)
+
+                XCTAssertFalse(decided, "an unknown sibling stops the decision")
+                XCTAssertTrue(journal.entry(for: source).isEmpty, "no choice for a revision the decision cannot see")
+                var observer: OpaquePointer?
+                XCTAssertEqual(sqlite3_open(url.path, &observer), SQLITE_OK)
+                var stmt: OpaquePointer?
+                XCTAssertEqual(
+                    sqlite3_prepare_v2(
+                        observer, "SELECT state, last_error FROM backup_sync_queue ORDER BY revision_us;", -1, &stmt,
+                        nil),
+                    SQLITE_OK)
+                var states: [String] = []
+                var errors: [String?] = []
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    states.append(String(cString: sqlite3_column_text(stmt, 0)))
+                    errors.append(sqlite3_column_text(stmt, 1).map { String(cString: $0) })
+                }
+                sqlite3_finalize(stmt)
+                sqlite3_close(observer)
+                XCTAssertEqual(states, ["failedPermanent", "failedPermanent"], "no revision changes state")
+                XCTAssertEqual(errors, rows.map(\.lastError), "no reason changes")
+                await controller.shutdown()
+            }
+        }
+    #endif
 
     @MainActor
     func testOneChoiceSettlesEveryParkedRevisionOfThePhoto() async throws {
@@ -552,16 +1185,16 @@ final class DeletedPhotoTests: XCTestCase {
         park()
         let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == older })
         controller.keepDeleted(olderItem)
-        XCTAssertEqual(queue.entry(for: source, revision: older)?.state, .skippedRemoteDeletion)
-        XCTAssertEqual(queue.entry(for: source, revision: newer)?.state, .skippedRemoteDeletion)
+        XCTAssertEqual(try queue.entry(for: source, revision: older)?.state, .skippedRemoteDeletion)
+        XCTAssertEqual(try queue.entry(for: source, revision: newer)?.state, .skippedRemoteDeletion)
         XCTAssertTrue(controller.failedItems().isEmpty)
 
         park()
         let again = try XCTUnwrap(controller.failedItems().first { $0.revision == older })
         controller.backUpAgain(again)
         XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, newer, "consent covers the newest version")
-        XCTAssertEqual(queue.entry(for: source, revision: newer)?.state, .discovered)
-        XCTAssertEqual(queue.entry(for: source, revision: older)?.state, .dismissedFailure)
+        XCTAssertEqual(try queue.entry(for: source, revision: newer)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: older)?.state, .dismissedFailure)
         XCTAssertTrue(controller.failedItems().filter { $0.issue == .deletedElsewhere }.isEmpty)
         await controller.shutdown()
         queue.close()
@@ -585,7 +1218,7 @@ final class DeletedPhotoTests: XCTestCase {
             PhotoLibraryCatalogManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
         for id in [source.identifier, plain.identifier] {
-            _ = catalog.upsert(PhotoLibraryCatalogMapper.entry(for: info(id), observedAt: date))
+            XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info(id), observedAt: date)]))
         }
         catalog.close()
         try addEarlierUpload()
@@ -617,7 +1250,7 @@ final class DeletedPhotoTests: XCTestCase {
         let catalog = try XCTUnwrap(
             PhotoLibraryCatalogManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
-        _ = catalog.upsert(PhotoLibraryCatalogMapper.entry(for: info, observedAt: date))
+        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)]))
         XCTAssertTrue(catalog.markRemoved([source.identifier], removedAt: date.addingTimeInterval(60)).succeeded)
         catalog.close()
         let controller = PhotoLibraryBackupController(
@@ -631,7 +1264,7 @@ final class DeletedPhotoTests: XCTestCase {
             UploadBackupSyncQueueManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
         defer { queue.close() }
-        XCTAssertTrue(queue.rows(kind: .photoLibraryAsset, identifiers: [source.identifier]).isEmpty)
+        XCTAssertTrue(try queue.decisionRows(kind: .photoLibraryAsset, identifiers: [source.identifier]).isEmpty)
         XCTAssertFalse(controller.isSyncing)
         await controller.shutdown()
     }
@@ -652,7 +1285,7 @@ final class DeletedPhotoTests: XCTestCase {
             PhotoLibraryCatalogManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
         let entry = PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)
-        _ = catalog.upsert(entry)
+        XCTAssertTrue(catalog.upsertBatch([entry]))
         catalog.close()
         let candidate = try XCTUnwrap(
             PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
@@ -682,4 +1315,68 @@ final class DeletedPhotoTests: XCTestCase {
             "the duplicate check must verify the photo again instead of trusting the state from before the delete")
         await controller.shutdown()
     }
+}
+
+/// The real journal file, with a restore that can refuse, so a test reaches the path where the earlier choice
+/// cannot be written back.
+private final class RestoreRefusingJournal: EditReplacementJournaling, @unchecked Sendable {
+    private let inner: EditReplacementJournalFileStore
+    private let refusesRestore: Bool
+    private let lock = NSLock()
+    private var attempts = 0
+    var restoreAttempts: Int { lock.withLock { attempts } }
+
+    init(inner: EditReplacementJournalFileStore, refusesRestore: Bool) {
+        self.inner = inner
+        self.refusesRestore = refusesRestore
+    }
+
+    func restoreDeletionChoice(
+        _ previous: EditReplacementDeletionChoice, ifStill written: EditReplacementDeletionChoice,
+        for source: UploadSourceIdentity
+    ) throws {
+        lock.withLock { attempts += 1 }
+        if refusesRestore { throw UploadError.backend("refused") }
+        try inner.restoreDeletionChoice(previous, ifStill: written, for: source)
+    }
+
+    func keepDeleted(for source: UploadSourceIdentity) throws { try inner.keepDeleted(for: source) }
+    func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws {
+        try inner.backUpAgain(revision: revision, for: source)
+    }
+    func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws {
+        try inner.startDeletionCheck(at: date, for: source)
+    }
+    func clearDeletionCheck(for source: UploadSourceIdentity) throws { try inner.clearDeletionCheck(for: source) }
+    func clearDeletionChoice(for source: UploadSourceIdentity) throws { try inner.clearDeletionChoice(for: source) }
+    func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry { inner.entry(for: source) }
+    func supersededSourceIdentifiers() -> Set<String> { inner.supersededSourceIdentifiers() }
+    func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {
+        try inner.addSuperseded(uid, for: source)
+    }
+    func addRemoteSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {
+        try inner.addRemoteSuperseded(uid, for: source)
+    }
+    func addProven(_ nodeID: String, inherited: [String], for source: UploadSourceIdentity) throws {
+        try inner.addProven(nodeID, inherited: inherited, for: source)
+    }
+    func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws {
+        try inner.prepareToRetire(relatedByMain, for: source)
+    }
+    func clearRetireIntent(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {
+        try inner.clearRetireIntent(nodeIDs, for: source)
+    }
+    func settle(_ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity) throws {
+        try inner.settle(nodeIDs, related: related, trashed: trashed, for: source)
+    }
+    func settleGone(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {
+        try inner.settleGone(nodeIDs, for: source)
+    }
+    func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws {
+        try inner.recordUpload(edited: edited, for: source)
+    }
+    func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {
+        try inner.unretire(nodeIDs, for: source)
+    }
+    func namesAnyLink(_ linkIDs: Set<String>) -> Bool { inner.namesAnyLink(linkIDs) }
 }

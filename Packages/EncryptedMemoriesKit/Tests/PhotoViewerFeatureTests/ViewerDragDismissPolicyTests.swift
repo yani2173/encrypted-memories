@@ -31,7 +31,7 @@ final class ViewerDragDismissPolicyTests: XCTestCase {
                 velocity: CGSize(width: CGFloat.nan, height: 400)))
     }
 
-    func testProgressAndScaleAndOpacityTrackTheDragWithinBounds() {
+    func testProgressAndScaleTrackTheDragWithinBounds() {
         XCTAssertEqual(ViewerDragDismissPolicy.progress(translationY: 0, viewportHeight: 800), 0)
         XCTAssertEqual(ViewerDragDismissPolicy.progress(translationY: 400, viewportHeight: 800), 0.5, accuracy: 0.0001)
         // Clamped at 1 past a full-screen drag.
@@ -42,11 +42,6 @@ final class ViewerDragDismissPolicyTests: XCTestCase {
         XCTAssertEqual(ViewerDragDismissPolicy.displayScale(progress: 1), ViewerDragDismissPolicy.minimumDisplayScale)
         XCTAssertGreaterThan(
             ViewerDragDismissPolicy.displayScale(progress: 0.5), ViewerDragDismissPolicy.minimumDisplayScale)
-
-        // Backdrop dims from opaque toward the minimum as the drag grows.
-        XCTAssertEqual(ViewerDragDismissPolicy.backdropOpacity(progress: 0), 1)
-        XCTAssertEqual(
-            ViewerDragDismissPolicy.backdropOpacity(progress: 1), ViewerDragDismissPolicy.minimumBackdropOpacity)
     }
 
     func testReleaseDismissesPastDistanceOrOnFastFlick() {

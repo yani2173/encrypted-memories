@@ -130,3 +130,9 @@ import Testing
             ) == 1)
     }
 }
+
+extension MLNativeAnalysisCapabilitySnapshot {
+    var availableKinds: [MLNativeAnalysisKind] {
+        capabilities.compactMap { $0.isAvailable ? $0.kind : nil }
+    }
+}
