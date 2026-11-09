@@ -288,6 +288,46 @@ extension DriveSessionStubSuite {
             #expect(!later.contains { $0.hasPrefix("/drive/volumes/vol1/photos") }, "the rebuild runs once")
         }
 
+        /// A lineage index at the content checkpoint that still lists an unresolved link is not missing: the repair
+        /// sweep reads the link again. The index preparation of each launch must not rebuild the whole index for it, or
+        /// every launch with new photos would read the whole Proton library before the first queue write.
+        @Test func anUnresolvedLinkAloneStartsNoFullRebuildInTheIndexPreparation() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                    unresolvedRemoteLinkIDs: ["unreadable"]))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+            StubURLProtocol.route("POST /drive/shares/share1/links/fetch_metadata", json: #"{"Code":1000,"Links":[]}"#)
+            let service = makeService(content: content, lineage: lineage)
+
+            try await service.prepareRemoteIndex { _ in }
+
+            let paths = StubURLProtocol.requests().map(\.path)
+            #expect(!paths.contains { $0.hasPrefix("/drive/volumes/vol1/photos") }, "no full rebuild: \(paths)")
+            #expect(paths.contains("/drive/volumes/vol1/events/one"), "the events update the index: \(paths)")
+            let contentCheckpoint = content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")
+            #expect(contentCheckpoint?.eventID == "two")
+            #expect(
+                lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: contentCheckpoint) == .incomplete,
+                "the unresolved link stays for the repair sweep, so lineage reads stay unproven")
+        }
+
         /// A background window that expires while its pass waits for the index build must end at once. The build
         /// itself keeps running: a later preparation joins it instead of starting a second one, and the timeline
         /// metadata pass stays held until the build ends.

@@ -383,10 +383,15 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     /// rebuilds the index once in each launch for each key epoch, with the progress of a content build. A photo's
     /// resolve never starts that build: it reads the incomplete lineage index, which keeps its reads unproven. A store
     /// that cannot write never rebuilds.
+    /// Unresolved links alone keep the index incomplete but are no reason for the build: the repair sweep of each
+    /// refresh reads them again, and a build for them would read the whole library on every launch with new photos.
     private func rebuildsMissingLineage(material: Material) -> Bool {
         guard let lineageIndexStore, lineageIndexStore.acceptsWrites, !rebuiltLineageEpochs.contains(material.epoch)
         else { return false }
-        return lineageHealth(material: material) == .incomplete
+        guard let checkpoint = contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch) else {
+            return true
+        }
+        return !lineageIndexStore.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: checkpoint.eventID)
     }
 
     /// Read after the lookup: a failed lookup marks the store incomplete.
